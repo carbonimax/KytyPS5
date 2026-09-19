@@ -400,6 +400,13 @@ add_executable(push_descriptor_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(push_descriptor_policy_tests PRIVATE ${inc_headers})
 target_link_libraries(push_descriptor_policy_tests Vulkan::Headers)
+# Keeps device-address buffers alive until queued MoltenVK work completes (the game lost the device
+# otherwise). Needs a real Vulkan driver through SDL_VULKAN_LIBRARY, so it stays opt-in.
+add_executable(device_address_lifetime_gpu_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DeviceAddressLifetimeGpuTests.cpp"
+)
+target_include_directories(device_address_lifetime_gpu_tests PRIVATE ${inc_headers})
+target_link_libraries(device_address_lifetime_gpu_tests Vulkan::Headers)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
