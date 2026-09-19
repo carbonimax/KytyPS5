@@ -1039,6 +1039,8 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = SelectMaxPushDescriptors(
 	    driver_properties.driverID, push_descriptor_properties.maxPushDescriptors);
+	graphic_ctx.device_address_destruction_waits_for_queue =
+	    DeviceAddressBufferDestructionWaitsForQueue(driver_properties.driverID);
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 
