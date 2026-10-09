@@ -31,6 +31,9 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
+	bool                                      shader_buffer_int64_atomics_enabled   = false;
+	bool                                      shader_cull_distance_enabled          = false;
+	bool                                      image_view_min_lod_enabled            = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	// Layout extension only: a sampled depth target is rendered in the feedback-loop layout and the
 	// loop is chosen per pipeline (VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT).

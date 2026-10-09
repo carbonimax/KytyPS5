@@ -407,6 +407,8 @@ struct PipelineCache::ProgramCache {
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host_features = {graphics.shader_buffer_int64_atomics_enabled,
+		                         graphics.shader_cull_distance_enabled};
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -472,7 +474,7 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
+	explicit ProgramCache(GraphicContext& graphics): graphics(graphics), device(graphics.device) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -487,6 +489,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
+	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
 
