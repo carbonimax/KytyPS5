@@ -29,6 +29,8 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Only for ranges whose complete tracker pages have no cache-buffer owner.
+	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);
 	// Queue after changing ownership; a concurrent drain must not consume an event
 	// before the dirty pages it describes become visible.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
