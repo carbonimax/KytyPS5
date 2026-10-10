@@ -207,6 +207,8 @@ if(KYTY_THIN_LTO)
 	add_compile_options(-flto=thin)
 	# No shared -object_path_lto: parallel links would overwrite each other's N.x86_64.thinlto.o (missing .llvm.* symbols).
 	add_link_options(-flto=thin)
+	# Its module-level .zerofill asm reserves the guest ranges; as LTO bitcode the segments are dropped (SIGBUS at start).
+	set_source_files_properties("${KYTY_SOURCE_DIR}/kernel/macosGuestAddressSpace.cpp" PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
