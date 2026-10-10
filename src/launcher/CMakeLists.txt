@@ -52,6 +52,19 @@ add_custom_target(stage_updater
 	VERBATIM)
 add_dependencies(launcher kyty_emulator stage_updater)
 
+if(APPLE AND BUILD_TESTING)
+	find_package(Qt6 COMPONENTS Test REQUIRED)
+	set(mac_test_sources ${launcher_src})
+	list(REMOVE_ITEM mac_test_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+	add_executable(mac_launcher_tests EXCLUDE_FROM_ALL ${mac_test_sources} ${launcher_forms} resources.qrc "${KYTY_TESTS_DIR}/MacLauncherTests.cpp")
+	set_target_properties(mac_launcher_tests PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+	target_include_directories(mac_launcher_tests PRIVATE include src)
+	target_link_libraries(mac_launcher_tests PRIVATE Qt6::Concurrent Qt6::Network Qt6::Widgets Qt6::Test Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
+	target_compile_options(mac_launcher_tests PRIVATE -frtti)
+	add_test(NAME mac_launcher COMMAND mac_launcher_tests --local)
+	set_tests_properties(mac_launcher PROPERTIES TIMEOUT 120)
+endif()
+
 if(KYTY_CLANG_CL)
 	add_custom_command(TARGET launcher POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_PDB_FILE:kyty_emulator> $<TARGET_FILE_DIR:launcher>/$<TARGET_PDB_FILE_NAME:kyty_emulator>
