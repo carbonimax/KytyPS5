@@ -199,6 +199,16 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# ThinLTO for Kyty's own code only (common, the emulator and the tests built from its sources); 3rdparty above is unchanged.
+# Under Rosetta every out-of-line call is expensive, and the hot paths call small accessors across translation units.
+option(KYTY_THIN_LTO "Build Kyty's own code with ThinLTO" OFF)
+if(KYTY_THIN_LTO)
+	add_compile_options(-flto=thin)
+	# No shared -object_path_lto: parallel links would overwrite each other's N.x86_64.thinlto.o (missing .llvm.* symbols).
+	add_link_options(-flto=thin)
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
