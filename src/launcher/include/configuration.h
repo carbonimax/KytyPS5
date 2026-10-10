@@ -14,6 +14,9 @@
 #include <QString>
 #include <QStringList>
 #include <QVariant>
+#if defined(__APPLE__)
+#include <QProcessEnvironment>
+#endif
 
 template <class T>
 inline QStringList EnumToList() {
@@ -152,6 +155,18 @@ public:
 	bool red_zone_protection_enabled = false;
 #endif
 	QStringList host_input_mapping;
+#if defined(__APPLE__)
+	bool mac_srt_readback_elide = true;
+	bool mac_materialize_compiled = true;
+	bool mac_commit_overlap_fast = true;
+	bool mac_image_lookup_fast = true;
+	bool mac_pervertex_unique_disabled = true;
+	QString mac_moltenvk_path;
+	QString mac_extra_environment = RecommendedMacEnvironment();
+	static QString RecommendedMacEnvironment();
+	static QString MacRuntimeDirectory();
+	bool MacEnvironment(QProcessEnvironment& environment, QString& error) const;
+#endif
 
 	QString elf = QStringLiteral("eboot.bin");
 
@@ -192,6 +207,15 @@ public:
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
 		host_input_mapping = other.host_input_mapping;
+#if defined(__APPLE__)
+		mac_srt_readback_elide = other.mac_srt_readback_elide;
+		mac_materialize_compiled = other.mac_materialize_compiled;
+		mac_commit_overlap_fast = other.mac_commit_overlap_fast;
+		mac_image_lookup_fast = other.mac_image_lookup_fast;
+		mac_pervertex_unique_disabled = other.mac_pervertex_unique_disabled;
+		mac_moltenvk_path = other.mac_moltenvk_path;
+		mac_extra_environment = other.mac_extra_environment;
+#endif
 	}
 
 	void CopyGameInfoFrom(const Configuration& other) {

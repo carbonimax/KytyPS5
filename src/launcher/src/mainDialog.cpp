@@ -182,7 +182,11 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
+#if defined(__APPLE__)
+	m_ui->widget->SetRuntimeDirectory(Configuration::MacRuntimeDirectory());
+#else
 	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
+#endif
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -470,7 +474,23 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setProgram(interpreter);
 	process->setArguments(args);
 #endif
+#if defined(__APPLE__)
+	auto environment = QProcessEnvironment::systemEnvironment();
+	QString error;
+	if (!info.MacEnvironment(environment, error)) {
+		QMessageBox::critical(this, tr("Error"), error);
+		return;
+	}
+	process->setProcessEnvironment(environment);
+	const auto runtime = Configuration::MacRuntimeDirectory();
+	if (!QDir().mkpath(runtime)) {
+		QMessageBox::critical(this, tr("Error"), tr("Cannot create runtime folder: %1").arg(runtime));
+		return;
+	}
+	process->setWorkingDirectory(runtime);
+#else
 	process->setWorkingDirectory(dir.path());
+#endif
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);
