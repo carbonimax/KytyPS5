@@ -222,6 +222,9 @@ static QStringList GetSaveDataDirs(const Configuration& info) {
 
 	QSet<QString> seen;
 	QStringList   roots({QDir::currentPath(), QCoreApplication::applicationDirPath()});
+#if defined(__APPLE__)
+	roots.append(Configuration::MacRuntimeDirectory());
+#endif
 
 	QDir current_parent(QDir::currentPath());
 	if (current_parent.cdUp()) {
@@ -380,7 +383,7 @@ void ConfigurationListWidget::WriteSettings() {
 	if (file.exists()) {
 		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
 	} else {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
 		                                CONF_APP_NAME);
 #else
@@ -422,7 +425,7 @@ void ConfigurationListWidget::ReadSettings() {
 	if (file.exists()) {
 		s = std::make_unique<QSettings>(CONF_FILE_NAME, QSettings::IniFormat);
 	} else {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 		s = std::make_unique<QSettings>(QSettings::IniFormat, QSettings::UserScope, CONF_ORG_NAME,
 		                                CONF_APP_NAME);
 #else

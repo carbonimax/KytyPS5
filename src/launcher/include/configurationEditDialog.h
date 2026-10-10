@@ -12,6 +12,11 @@ class QResizeEvent;
 class QToolButton;
 class QSettings;
 class QWidget;
+#if defined(__APPLE__)
+class QCheckBox;
+class QLineEdit;
+class QPlainTextEdit;
+#endif
 
 class Configuration;
 namespace Ui {
@@ -43,6 +48,17 @@ private:
 	QListWidget*                 m_game_dirs_list         = nullptr;
 	QToolButton*                 m_remove_game_dir_button = nullptr;
 	bool                         m_global_settings        = false;
+#if defined(__APPLE__)
+	QCheckBox* m_mac_elide = nullptr;
+	QCheckBox* m_mac_compiled = nullptr;
+	QCheckBox* m_mac_overlap = nullptr;
+	QCheckBox* m_mac_findimage = nullptr;
+	QCheckBox* m_mac_unique = nullptr;
+	QLineEdit* m_mac_moltenvk = nullptr;
+	QPlainTextEdit* m_mac_environment = nullptr;
+	void InitMacPerformance();
+	void SetMacPerformance(const Configuration& info);
+#endif
 
 protected:
 	void Init(const Configuration& info);

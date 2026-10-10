@@ -31,6 +31,12 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+#if defined(__APPLE__)
+#include <QFormLayout>
+#include <QLabel>
+#include <QPlainTextEdit>
+#include <QTabWidget>
+#endif
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -126,6 +132,9 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	m_ui->setupUi(this);
 	setMinimumWidth(width());
 	InitGameDirectories();
+#if defined(__APPLE__)
+	InitMacPerformance();
+#endif
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
 
@@ -206,6 +215,9 @@ static void ListInit(QComboBox* combo, T value) {
 }
 
 void ConfigurationEditDialog::Init(const Configuration& info) {
+#if defined(__APPLE__)
+	SetMacPerformance(info);
+#endif
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
@@ -493,6 +505,32 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
+#if defined(__APPLE__)
+	Configuration candidate;
+	candidate.mac_srt_readback_elide = m_mac_elide->isChecked();
+	candidate.mac_materialize_compiled = m_mac_compiled->isChecked();
+	candidate.mac_commit_overlap_fast = m_mac_overlap->isChecked();
+	candidate.mac_image_lookup_fast = m_mac_findimage->isChecked();
+	candidate.mac_pervertex_unique_disabled = m_mac_unique->isChecked();
+	candidate.mac_moltenvk_path = m_mac_moltenvk->text().trimmed();
+	if (!candidate.mac_moltenvk_path.isEmpty()) {
+		candidate.mac_moltenvk_path = QFileInfo(candidate.mac_moltenvk_path).absoluteFilePath();
+	}
+	candidate.mac_extra_environment = m_mac_environment->toPlainText();
+	auto environment = QProcessEnvironment::systemEnvironment();
+	QString error;
+	if (!candidate.MacEnvironment(environment, error)) {
+		QMessageBox::critical(this, tr("Save failed"), error);
+		return;
+	}
+	m_info.mac_srt_readback_elide = candidate.mac_srt_readback_elide;
+	m_info.mac_materialize_compiled = candidate.mac_materialize_compiled;
+	m_info.mac_commit_overlap_fast = candidate.mac_commit_overlap_fast;
+	m_info.mac_image_lookup_fast = candidate.mac_image_lookup_fast;
+	m_info.mac_pervertex_unique_disabled = candidate.mac_pervertex_unique_disabled;
+	m_info.mac_moltenvk_path = candidate.mac_moltenvk_path;
+	m_info.mac_extra_environment = candidate.mac_extra_environment;
+#endif
 	UpdateInfo(m_info, *m_ui, m_global_settings);
 
 	emit accept();
@@ -558,3 +596,67 @@ void ConfigurationEditDialog::remove_selected_game_directories() {
 void ConfigurationEditDialog::update_game_directory_buttons() {
 	m_remove_game_dir_button->setEnabled(!m_game_dirs_list->selectedItems().isEmpty());
 }
+
+#if defined(__APPLE__)
+void ConfigurationEditDialog::InitMacPerformance() {
+	auto* page = new QWidget(m_ui->settings_tabs);
+	auto* layout = new QVBoxLayout(page);
+	auto* switches = new QGridLayout;
+	const auto add_switch = [page, switches](const char* name, const QString& label, const QString& tip, int row, int column) {
+		auto* checkbox = new QCheckBox(label, page);
+		checkbox->setObjectName(QString::fromLatin1(name));
+		checkbox->setToolTip(tip);
+		switches->addWidget(checkbox, row, column);
+		return checkbox;
+	};
+	m_mac_elide = add_switch("mac_elide", tr("SRT readback elision (ELIDE)"), tr("Read clean SRT bytes from backing memory; dirty bytes still read back."), 0, 0);
+	m_mac_compiled = add_switch("mac_compiled", tr("Compiled resources (COMPILED)"), tr("Evaluate resource descriptors through predecoded plans."), 0, 1);
+	m_mac_overlap = add_switch("mac_overlap", tr("Fast overlap checks (OVERLAP_FAST)"), tr("Use the exact index for resource overlap checks."), 1, 0);
+	m_mac_findimage = add_switch("mac_findimage", tr("Image lookup cache (FINDIMAGE)"), tr("Cache exact image and backing lookups; KYTY_IMAGE_LOOKUP_FAST=1."), 1, 1);
+	m_mac_unique = add_switch("mac_unique", tr("PerVertex UNIQUE=0"), tr("Disable unique-vertex capture; unchecked selects UNIQUE=1."), 2, 0);
+	layout->addLayout(switches);
+	auto* form = new QFormLayout;
+	form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	m_mac_moltenvk = new QLineEdit(page);
+	m_mac_moltenvk->setObjectName("mac_moltenvk");
+	m_mac_moltenvk->setPlaceholderText(tr("Bundled MoltenVK (leave empty)"));
+	m_mac_moltenvk->setToolTip(tr("Path to a MoltenVK dylib. Empty uses Contents/Frameworks/libMoltenVK.dylib."));
+	auto* library_row = new QHBoxLayout;
+	library_row->addWidget(m_mac_moltenvk);
+	auto* browse = new QPushButton(tr("Browse…"), page);
+	library_row->addWidget(browse);
+	connect(browse, &QPushButton::clicked, this, [this]() {
+		const auto path = QFileDialog::getOpenFileName(this, tr("Select MoltenVK"), m_mac_moltenvk->text(), tr("Dynamic libraries (*.dylib);;All files (*)"));
+		if (!path.isEmpty()) {
+			m_mac_moltenvk->setText(path);
+		}
+	});
+	form->addRow(tr("MoltenVK dylib:"), library_row);
+	m_mac_environment = new QPlainTextEdit(page);
+	m_mac_environment->setObjectName("mac_environment");
+	m_mac_environment->setPlaceholderText("KEY=VALUE\nKEY2=VALUE2");
+	m_mac_environment->setLineWrapMode(QPlainTextEdit::NoWrap);
+	m_mac_environment->setToolTip(tr("One KEY=VALUE per line, without shell expansion. Checkbox and MoltenVK variables are reserved. Duplicate extra keys use the last value."));
+	layout->addLayout(form);
+	auto* environment_label = new QLabel(tr("Additional environment (KEY=VALUE, one per line):"), page);
+	environment_label->setBuddy(m_mac_environment);
+	layout->addWidget(environment_label);
+	layout->addWidget(m_mac_environment, 1);
+	auto* recommended = new QPushButton(tr("Recommended values"), page);
+	recommended->setObjectName("mac_recommended");
+	recommended->setToolTip(tr("Reset this tab to the adopted Mac performance settings and bundled MoltenVK."));
+	layout->addWidget(recommended, 0, Qt::AlignLeft);
+	connect(recommended, &QPushButton::clicked, this, [this]() { SetMacPerformance(Configuration {}); });
+	m_ui->settings_tabs->addTab(page, tr("macOS / performance"));
+}
+
+void ConfigurationEditDialog::SetMacPerformance(const Configuration& info) {
+	m_mac_elide->setChecked(info.mac_srt_readback_elide);
+	m_mac_compiled->setChecked(info.mac_materialize_compiled);
+	m_mac_overlap->setChecked(info.mac_commit_overlap_fast);
+	m_mac_findimage->setChecked(info.mac_image_lookup_fast);
+	m_mac_unique->setChecked(info.mac_pervertex_unique_disabled);
+	m_mac_moltenvk->setText(info.mac_moltenvk_path);
+	m_mac_environment->setPlainText(info.mac_extra_environment);
+}
+#endif

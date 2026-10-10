@@ -1,4 +1,11 @@
 #include "configuration.h"
+#if defined(__APPLE__)
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QRegularExpression>
+#include <QStandardPaths>
+#endif
 
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
@@ -36,6 +43,15 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
 	KYTY_CFG_SET(elf);
+#if defined(__APPLE__)
+	KYTY_CFG_SET(mac_srt_readback_elide);
+	KYTY_CFG_SET(mac_materialize_compiled);
+	KYTY_CFG_SET(mac_commit_overlap_fast);
+	KYTY_CFG_SET(mac_image_lookup_fast);
+	KYTY_CFG_SET(mac_pervertex_unique_disabled);
+	KYTY_CFG_SET(mac_moltenvk_path);
+	KYTY_CFG_SET(mac_extra_environment);
+#endif
 #undef KYTY_CFG_SET
 	return values;
 }
@@ -87,6 +103,15 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	    s.value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();
 #endif
 	elf = s.value("elf", elf).toString();
+#if defined(__APPLE__)
+	mac_srt_readback_elide = s.value("mac_srt_readback_elide", mac_srt_readback_elide).toBool();
+	mac_materialize_compiled = s.value("mac_materialize_compiled", mac_materialize_compiled).toBool();
+	mac_commit_overlap_fast = s.value("mac_commit_overlap_fast", mac_commit_overlap_fast).toBool();
+	mac_image_lookup_fast = s.value("mac_image_lookup_fast", mac_image_lookup_fast).toBool();
+	mac_pervertex_unique_disabled = s.value("mac_pervertex_unique_disabled", mac_pervertex_unique_disabled).toBool();
+	mac_moltenvk_path = s.value("mac_moltenvk_path", mac_moltenvk_path).toString();
+	mac_extra_environment = s.value("mac_extra_environment", mac_extra_environment).toString();
+#endif
 #undef KYTY_CFG_GET
 }
 
@@ -148,6 +173,67 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 	    (command_buffer_dump_enabled && command_buffer_dump_folder.isEmpty())) {
 		return fail(tr("Enabled logging and command buffer dumps require an output path."));
 	}
+#if defined(__APPLE__)
+	auto environment = QProcessEnvironment::systemEnvironment();
+	if (!MacEnvironment(environment, error)) {
+		return false;
+	}
+#endif
 
 	return true;
 }
+
+#if defined(__APPLE__)
+QString Configuration::MacRuntimeDirectory() {
+	// A local INI keeps portable installations and test runs self-contained.
+	const QFileInfo ini(QStringLiteral("Kyty.ini"));
+	return (ini.isFile() ? ini.absolutePath() : QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)) + "/KytyPS5";
+}
+
+QString Configuration::RecommendedMacEnvironment() {
+	// Supporting switches from the adopted stack; omit diagnostics and benchmark cache paths.
+	return QStringLiteral("KYTY_PERVERTEX_EXPERIMENTAL=1\nKYTY_SKIP_EMPTY_SUBMIT=1\nKYTY_SUBMIT_SPLIT_DRAWS=32\nMVK_CONFIG_PERVERTEX_PREPASS=1\nKYTY_COLOR_CLEAR_NO_READBACK=1\nMVK_CONFIG_PERVERTEX_BATCH_RESIDENCY=1\nMVK_CONFIG_PERVERTEX_SCRATCH_POOL=1\nKYTY_READBACK_CLEAN_BACKING=1\nMVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=0\nKYTY_AMD_PATCH=1\nKYTY_INDIRECT_GPU=1\nKYTY_INDIRECT_GPU_MESH=1\nMVK_CONFIG_MESH_INDIRECT_GPU=1\nKYTY_READBACK_WINDOW_KIB=512\nMVK_CONFIG_PERVERTEX_UNIQUE_TG_SIMDS=8");
+}
+
+bool Configuration::MacEnvironment(QProcessEnvironment& environment, QString& error) const {
+	auto result = environment;
+	result.insert("KYTY_SRT_READBACK_ELIDE", mac_srt_readback_elide ? "1" : "0");
+	result.insert("KYTY_MATERIALIZE_COMPILED", mac_materialize_compiled ? "1" : "0");
+	result.insert("KYTY_COMMIT_OVERLAP_FAST", mac_commit_overlap_fast ? "1" : "0");
+	result.insert("KYTY_IMAGE_LOOKUP_FAST", mac_image_lookup_fast ? "1" : "0");
+	result.insert("MVK_CONFIG_PERVERTEX_CAPTURE_UNIQUE", mac_pervertex_unique_disabled ? "0" : "1");
+	const QStringList managed = {"KYTY_SRT_READBACK_ELIDE", "KYTY_MATERIALIZE_COMPILED", "KYTY_COMMIT_OVERLAP_FAST", "KYTY_IMAGE_LOOKUP_FAST", "MVK_CONFIG_PERVERTEX_CAPTURE_UNIQUE", "SDL_VULKAN_LIBRARY"};
+	const QRegularExpression key_pattern(QStringLiteral("^[A-Za-z_][A-Za-z0-9_]*$"));
+	const auto lines = mac_extra_environment.split('\n');
+	for (int index = 0; index < lines.size(); ++index) {
+		auto line = lines.at(index);
+		if (line.endsWith('\r')) {
+			line.chop(1);
+		}
+		if (line.trimmed().isEmpty()) {
+			continue;
+		}
+		const auto separator = line.indexOf('=');
+		const auto key = line.left(separator);
+		if (separator < 1 || !key_pattern.match(key).hasMatch() || line.contains(QChar::Null) || managed.contains(key)) {
+			error = tr("Invalid environment line %1. Use KEY=VALUE; checkbox and MoltenVK variables are reserved.").arg(index + 1);
+			return false;
+		}
+		result.insert(key, line.mid(separator + 1));
+	}
+	const auto path = mac_moltenvk_path.trimmed();
+	if (path.contains(QChar::Null)) {
+		error = tr("Invalid MoltenVK path.");
+		return false;
+	}
+	const auto library = QDir::cleanPath(path.isEmpty() ? QCoreApplication::applicationDirPath() + "/../Frameworks/libMoltenVK.dylib" : QFileInfo(path).absoluteFilePath());
+	if (!QFileInfo(library).isFile() || !QFileInfo(library).isReadable()) {
+		error = tr("MoltenVK library is not readable: %1").arg(library);
+		return false;
+	}
+	result.insert("SDL_VULKAN_LIBRARY", library);
+	environment = result;
+	error.clear();
+	return true;
+}
+#endif
