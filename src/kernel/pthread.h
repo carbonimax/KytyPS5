@@ -6,10 +6,6 @@
 
 // IWYU pragma: no_include <pthread.h>
 
-extern "C" {
-struct sched_param;
-}
-
 namespace Loader {
 struct Program;
 } // namespace Loader
@@ -60,7 +56,9 @@ using Pthread           = PthreadPrivate*;
 using KernelCpumask     = uint64_t;
 using PthreadMutex      = PthreadMutexPrivate*;
 using PthreadMutexattr  = PthreadMutexattrPrivate*;
-using KernelSchedParam  = struct sched_param;
+// Guest sched_param is four bytes; host sched_param may contain additional fields.
+struct KernelSchedParam { int32_t sched_priority; };
+static_assert(sizeof(KernelSchedParam) == 4);
 using PthreadRwlock     = PthreadRwlockPrivate*;
 using PthreadRwlockattr = PthreadRwlockattrPrivate*;
 using KernelUseconds    = unsigned int;
