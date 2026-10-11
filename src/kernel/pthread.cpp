@@ -1978,7 +1978,8 @@ int KYTY_SYSV_ABI PthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedP
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	int result = pthread_attr_getschedparam(&(*attr)->p, param);
+	sched_param native_param {};
+	int result = pthread_attr_getschedparam(&(*attr)->p, &native_param);
 
 	// Host priority mapping is lossy; return the exact guest value.
 	param->sched_priority = (*attr)->guest_priority;
@@ -2146,7 +2147,7 @@ int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedP
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	KernelSchedParam pparam {};
+	sched_param pparam {};
 	if (param->sched_priority <= 478) {
 		pparam.sched_priority = +2;
 	} else if (param->sched_priority >= 733) {
