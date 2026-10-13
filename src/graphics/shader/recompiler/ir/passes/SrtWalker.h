@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -19,6 +20,9 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Emulator opt-in: a scalar read below NullPageEnd (0x10000) is refused instead of read. In a
+	// block whose reachability is not proven it ends that path; the GPU would fault there.
+	bool null_reads_end_speculation = false;
 };
 
 class SrtReadCapture {
@@ -108,6 +112,8 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// True once since the last call if an evaluation stopped at a guest null page read.
+	bool TakeNullRead() { return std::exchange(m_null_read, false); }
 
 private:
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
@@ -130,6 +136,7 @@ private:
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
 	ResourcePlan::EvaluationContext& m_context;
+	bool                            m_null_read = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
