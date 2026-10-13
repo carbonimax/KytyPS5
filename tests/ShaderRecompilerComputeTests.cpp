@@ -20108,6 +20108,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20142,9 +20143,9 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
-    m_runtime_context.maintenance8_enabled = true;
-    // The harness requires and enables minLod (optional in the renderer since host features).
-    m_runtime_context.image_view_min_lod_enabled = true;
+    m_runtime_context.maintenance8_enabled = m_maintenance8_enabled;
+    // Only the full mode requires and enables minLod, together with maintenance8.
+    m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -20181,6 +20182,7 @@ private:
 
   void Init(Mode mode) {
     const bool full = mode == Mode::Full;
+    m_maintenance8_enabled = full;
     const bool portable_compute = mode == Mode::PortableCompute;
     const bool portable_graphics = mode == Mode::PortableGraphics;
     static vk::detail::DynamicLoader loader;
