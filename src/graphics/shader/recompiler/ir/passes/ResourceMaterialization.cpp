@@ -1536,8 +1536,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			return false;
 		}
 		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
-			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
+			auto& evaluator = capture_reads && written ? clean : walker;
+			clean.TakeNullRead();
+			walker.TakeNullRead();
+			if (evaluator.EvaluateDescriptor(source, value)) return true;
+			// A descriptor used only by unproven paths that reads the guest null page ends those
+			// paths (emulator opt-in, see SrtRuntime::null_reads_end_speculation).
+			const bool null_read = clean.TakeNullRead() || walker.TakeNullRead();
+			if (active.empty() || active[source] != 1u || !null_read) {
+				return SpecializationFail(fmt::format("descriptor evaluation source={}", source));
+			}
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;

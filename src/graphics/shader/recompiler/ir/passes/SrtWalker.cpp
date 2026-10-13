@@ -55,6 +55,8 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+// Guest null page: never mapped, so a read below it would fault on the GPU and on the host.
+constexpr uint64_t NullPageEnd = 0x10000;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -448,6 +450,7 @@ void CompileSrtWalker(ResourcePlan& program) {
 	code.mov(code.rbp, code.rsp);
 	code.cmp(code.r8, user_data_count);
 	code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
+	code.mov(code.r8, code.r9); // Sixth argument: lowest readable address (NullPageEnd or 0).
 	code.mov(code.r9, AddressMask & ~uint64_t {3});
 	// Follow shadPS4's VisitPointer: copy one table level in offset order, then
 	// descend through its child pointers. Seed the descriptor evaluator's memo.
@@ -467,6 +470,10 @@ void CompileSrtWalker(ResourcePlan& program) {
 			code.cmp(code.rdi, code.r10);
 			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
 		}
+		// After the underflow check above, the lowest read address cannot wrap.
+		code.lea(code.rax, code.ptr[code.rdi + first]);
+		code.cmp(code.rax, code.r8);
+		code.jb(failed, Xbyak::CodeGenerator::T_NEAR);
 		for (const auto& [offset, read]: reads) {
 			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
 			using Entry = ResourcePlan::EvaluationContext::Entry;
@@ -546,7 +553,8 @@ void SrtWalker::ResetUnknowns() {
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session != m_session) continue;
 		for (auto& entry: context.values)
-			if (entry.generation == (context.generation | 2u)) entry.generation = 0;
+			if (entry.generation == (context.generation | 2u) ||
+			    entry.generation == (context.generation | 3u)) entry.generation = 0;
 	}
 }
 
@@ -593,13 +601,21 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	    m_context.values[index].generation == (m_context.generation | 2u)) {
 		return false;
 	}
+	// A completed unknown caused by a null page read stays one when its memo is reused.
+	if (m_context.values[index].generation == (m_context.generation | 3u)) {
+		m_null_read = true;
+		return false;
+	}
 	m_context.values[index].generation = m_context.generation | 1u;
+	const bool null_before = std::exchange(m_null_read, false);
 	uint64_t out = 0;
 	const bool evaluated = EvaluateInst(*inst, out);
+	const bool null_read = m_null_read;
+	m_null_read = null_before || null_read;
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
-		memo.generation = m_context.generation | 2u;
+		memo.generation = m_context.generation | (null_read ? 3u : 2u);
 		return false;
 	}
 	memo.value      = out;
@@ -734,6 +750,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	}
+	if (m_runtime.null_reads_end_speculation && address < NullPageEnd) {
+		m_null_read = true;
+		return false;
+	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
@@ -774,7 +794,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			SrtWalker clean_active(*this, inst.Arg(1), true);
 			SrtWalker active(*this, inst.Arg(1), false, &clean_active);
-			return active.EvaluateWide(inst.Arg(0), result);
+			const bool evaluated = active.EvaluateWide(inst.Arg(0), result);
+			if (active.TakeNullRead() || clean_active.TakeNullRead()) m_null_read = true;
+			return evaluated;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
@@ -1166,9 +1188,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
-		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
+		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t, uint64_t);
+		// Native plans have no control flow: every read is proven, so a null page read refuses.
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		    m_context.values.data(), m_context.generation, m_runtime.user_data.size(),
+		    m_runtime.null_reads_end_speculation ? NullPageEnd : uint64_t {0});
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
@@ -1199,44 +1223,68 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		m_clean_evaluator->ResetUnknowns();
 		m_clean_evaluator->m_reachable_blocks = &visited;
 	}
+	// Block levels: 0 = unreached, 1 = reached only through undecided branches, 2 = proven.
+	// Pending entries carry Speculative when an undecided branch led to them.
+	constexpr uint32_t Speculative = 1u << 31u;
 	for (;;) {
 		reachable.assign(m_program.control_flow.size(), 0u);
 		pending.clear();
 		pending.push_back(0u);
 		while (!pending.empty()) {
-			const auto index = pending.back();
+			const auto entry = pending.back();
 			pending.pop_back();
-			if (reachable.at(index)) continue;
-			reachable[index] = 1u;
+			const bool speculative = (entry & Speculative) != 0u;
+			const auto index = entry & ~Speculative;
+			const auto level = static_cast<uint8_t>(speculative ? 1u : 2u);
+			// A block first reached speculatively is visited again once proven.
+			if (reachable.at(index) >= level) continue;
+			reachable[index] = level;
 			const auto& block = m_program.control_flow[index];
 			uint32_t condition = 0;
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 			if (!block.condition.IsEmpty() &&
 			    (m_runtime.read_specialization_memory != nullptr || !m_program.capture_specialization_reads) &&
 			    predicate.Evaluate(block.condition, condition)) {
-				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+				pending.push_back(block.successors[condition != 0u ? 0u : 1u] | (speculative ? Speculative : 0u));
 			} else {
-				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+				// Only an undecided choice speculates; a single unconditional edge keeps the level.
+				const bool choice = !block.condition.IsEmpty() || block.successors.size() > 1u;
+				for (const auto successor: block.successors)
+					pending.push_back(successor | (choice || speculative ? Speculative : 0u));
 			}
 		}
-		if (reachable == visited) break;
+		// Phi evaluation only sees whether a block is reachable, so levels do not need another pass.
+		const bool stable = std::ranges::equal(reachable, visited, [](uint8_t now, uint8_t before) {
+			return (now != 0u) == (before != 0u);
+		});
 		visited.swap(reachable);
-		if (m_program.control_phi_predecessors.empty()) break;
+		if (stable || m_program.control_phi_predecessors.empty()) break;
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
 		ResetUnknowns();
 		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
+	// Sources take their block's level; sources outside the control flow are proven.
+	active.assign(m_program.descriptor_sources.size(), 2u);
 	for (const auto& block: m_program.control_flow)
 		for (const auto source: block.sources) active.at(source) = 0u;
 	for (uint32_t index = 0; index < visited.size(); ++index) {
 		if (!visited[index]) continue;
 		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) active[source] = 1u;
-		for (const auto slot: block.srt_reads)
-			if (!refresh(slot)) return false;
+		bool dead = false;
+		for (const auto slot: block.srt_reads) {
+			TakeNullRead();
+			if (m_clean_evaluator != nullptr) m_clean_evaluator->TakeNullRead();
+			if (refresh(slot)) continue;
+			const bool null_read =
+			    TakeNullRead() || (m_clean_evaluator != nullptr && m_clean_evaluator->TakeNullRead());
+			if (visited[index] != 1u || !null_read) return false;
+			dead = true;
+			break;
+		}
+		if (dead) continue; // Its sources stay inactive unless another block uses them.
+		for (const auto source: block.sources) active[source] = std::max(active[source], visited[index]);
 	}
 	return true;
 }

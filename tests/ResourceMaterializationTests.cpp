@@ -1,11 +1,16 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
 #include <memory>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -688,11 +693,12 @@ void TestSharedControlPredicates() {
                 (!known || result == uint32_t{conjunction}),
             "shared predicate changed its uniform factor or cached runtime values");
       std::vector<uint32_t> flat;
+      // Block levels: 2 = proven, 1 = reached only through an undecided branch.
       Check(walker.RefreshFlatBuffer(flat) &&
                 plan.visited_blocks == (known
-                    ? (conjunction ? std::vector<uint8_t>{1, 1, 0, 1}
-                                   : std::vector<uint8_t>{1, 0, 1, 0})
-                    : std::vector<uint8_t>{1, 1, 1, 1}),
+                    ? (conjunction ? std::vector<uint8_t>{2, 2, 0, 2}
+                                   : std::vector<uint8_t>{2, 0, 2, 0})
+                    : std::vector<uint8_t>{2, 1, 1, 1}),
             "shared predicate skipped an unknown branch or followed a rejected branch");
     }
   }
@@ -1057,7 +1063,7 @@ void TestCyclicControlPredicatesRemainUnknown() {
             !walker.Evaluate(plan.control_flow[2].condition, value),
         "cyclic varying control acquired an unsupported uniform value");
   std::vector<uint32_t> flat;
-  Check(walker.RefreshFlatBuffer(flat) && plan.visited_blocks == std::vector<uint8_t>({1, 1, 1, 1}),
+  Check(walker.RefreshFlatBuffer(flat) && plan.visited_blocks == std::vector<uint8_t>({2, 1, 1, 1}),
         "cyclic control lost a possible branch during reachability");
 }
 
@@ -1336,6 +1342,214 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+
+// Walker scalar reads: slot 0 reads the guest null page, slot 1 an ordinary address.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan NullReadPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarAddress;
+  memory.planning_only = true;
+  program.memory_info.push_back(memory);
+  for (const uint32_t address : {0x100u, 0x20000u}) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(
+        ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back(
+        {Value(&read), static_cast<uint32_t>(program.srt_reads.size())});
+  }
+  DescriptorSource source;
+  source.dwords[0] = Value(0u);
+  source.dword_count = 1;
+  program.descriptor_sources.push_back(source);
+  return ExtractResourcePlan(program);
+}
+
+// The callback refuses the null page itself, so a missing guard fails the test instead of
+// dereferencing a low host address.
+bool ReadAboveNullPage(void *, uint64_t address, std::span<uint32_t> words) {
+  if (address < 0x10000u) return false;
+  words[0] = 7u;
+  return true;
+}
+
+bool RejectAnyRead(void *, uint64_t, std::span<uint32_t>) { return false; }
+
+bool Walk(Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
+          std::vector<Libs::Graphics::ShaderRecompiler::IR::ResourceBlock> blocks,
+          bool null_reads_end_speculation, std::vector<uint32_t> &flat) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  plan.control_flow = std::move(blocks);
+  const SrtRuntime runtime{.read_memory = ReadAboveNullPage,
+                           .read_specialization_memory = RejectAnyRead,
+                           .null_reads_end_speculation = null_reads_end_speculation};
+  return SrtWalker(plan, runtime).RefreshFlatBuffer(flat);
+}
+
+void TestUnconditionalEdgesKeepProvenReachability() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = NullReadPlan();
+  std::vector<uint32_t> flat;
+  // B0 -> B1 unconditionally; B1's known-true condition selects B2, which reads the null page.
+  Check(!Walk(plan,
+              {{.successors = {1}},
+               {.condition = Value(1u), .successors = {2, 3}},
+               {.srt_reads = {0}},
+               {}},
+              true, flat),
+        "a required null-page read on a proven path was dropped as speculative");
+  // B0 -> B1 unconditionally: B1's descriptor source stays proven.
+  Check(Walk(plan, {{.successors = {1}}, {.sources = {0}, .srt_reads = {1}}}, true, flat) &&
+            plan.active_sources[0] == 2u && flat[1] == 7u,
+        "an unconditional edge downgraded its successor to speculative");
+}
+
+void TestUndecidedNullReadEndsOnlyThatPath() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Block values;
+  // No user data: this condition cannot be decided.
+  auto &unknown = values.AppendNewInst(ValueOpcode::GetUserData,
+                                       {Value(static_cast<ScalarReg>(0))});
+  auto plan = NullReadPlan();
+  std::vector<uint32_t> flat;
+  // B0 chooses B1 or B2 undecidably; B1 reads the null page, B2 uses the descriptor source.
+  const std::vector<ResourceBlock> blocks{
+      {.condition = Value(&unknown), .successors = {1, 2}},
+      {.srt_reads = {0}},
+      {.sources = {0}, .srt_reads = {1}}};
+  Check(Walk(plan, blocks, true, flat) && flat[0] == 0u && flat[1] == 7u &&
+            plan.active_sources[0] == 1u,
+        "an undecided null-page path was not abandoned alone");
+  Check(!Walk(plan, blocks, false, flat),
+        "a null-page read was tolerated without the emulator opt-in");
+  // B0 -> B1 -> B2, whose undecided choice loops back to B1 or exits: the speculative back
+  // edge must not downgrade the proven B1.
+  Check(Walk(plan,
+             {{.successors = {1}},
+              {.successors = {2}, .sources = {0}, .srt_reads = {1}},
+              {.condition = Value(&unknown), .successors = {1, 3}},
+              {}},
+             true, flat) &&
+            plan.active_sources[0] == 2u && flat[1] == 7u,
+        "a speculative back edge downgraded a proven block");
+}
+
+// Interpreted walker: exact frontier of the refusal, including the first readable address.
+void TestWalkerNullPageBoundary() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Seen {
+    uint64_t address = 0;
+    uint32_t calls = 0;
+  };
+  const auto record = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &seen = *static_cast<Seen *>(data);
+    seen.address = address;
+    ++seen.calls;
+    words[0] = 7u;
+    return true;
+  };
+  for (const auto &[address, refused] : std::initializer_list<std::pair<uint32_t, bool>>{
+           {0x0u, true}, {0x18u, true}, {0xffffu, true}, {0x10000u, false}}) {
+    auto plan = ExtractResourcePlan(SrtProgram(address));
+    Seen seen;
+    const SrtRuntime runtime{.read_memory = record, .userdata = &seen,
+                             .null_reads_end_speculation = true};
+    std::vector<uint32_t> flat;
+    SrtWalker walker(plan, runtime);
+    const bool refreshed = walker.RefreshFlatBuffer(flat);
+    Check(refreshed != refused && walker.TakeNullRead() == refused &&
+              seen.calls == (refused ? 0u : 1u),
+          "null-page refusal missed its frontier or still read the address");
+    Check(refused || (seen.address == 0x10000u && flat[0] == 7u),
+          "the first address above the null page was not read");
+  }
+  // Without the opt-in the walker reads as before: the guard never turns a read into zero.
+  auto plan = ExtractResourcePlan(SrtProgram(0x18u));
+  Seen seen;
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(plan, {.read_memory = record, .userdata = &seen}).RefreshFlatBuffer(flat) &&
+            seen.calls == 1u && seen.address == 0x18u && flat[0] == 7u,
+        "the null-page guard changed reads without the emulator opt-in");
+}
+
+// Native x86 walker: a table based in the null page is refused before any host load.
+void TestNativeWalkRefusesNullPage() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0u);
+  program.user_data_base = 4;
+  program.user_data_count = 2;
+  auto &block = *program.blocks[0];
+  auto &low = block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(4))});
+  auto &high = block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(5))});
+  auto &root = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&low), Value(&high)});
+  auto *read = program.srt_reads[0].value.Instruction();
+  read->SetArg(0, Value(&root));
+  read->SetArg(1, Value(0x18u));
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.srt_code != nullptr, "user-data SRT read did not compile an x86 walker");
+  const auto words = [](uint64_t base) {
+    return std::array<uint32_t, 2>{static_cast<uint32_t>(base), static_cast<uint32_t>(base >> 32u)};
+  };
+  std::vector<uint32_t> flat;
+  // Lowest read address 0x18, 0x30 and 0xfffc: all inside the null page. The accepted side of
+  // 0x10000 cannot be dereferenced on the host; the interpreted walker covers that frontier.
+  for (const uint64_t base : {0x0ull, 0x18ull, 0xffe4ull}) {
+    const auto user_data = words(base);
+    Check(!SrtWalker(plan, {.user_data = user_data, .null_reads_end_speculation = true})
+               .RefreshFlatBuffer(flat),
+          "native SRT walk read a table in the guest null page");
+  }
+  std::array<uint32_t, 8> table{};
+  table[6] = 0x12345678u;
+  const auto user_data = words(reinterpret_cast<uint64_t>(table.data()));
+  Check(SrtWalker(plan, {.user_data = user_data, .null_reads_end_speculation = true})
+                .RefreshFlatBuffer(flat) &&
+            flat.size() == 1 && flat[0] == table[6],
+        "native SRT walk refused an ordinary host table");
+}
+
+// Descriptor evaluation: only a source used by unproven paths becomes a null descriptor.
+void TestSpeculativeNullDescriptorIsZero() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0x18u);
+  auto &source = program.descriptor_sources[0];
+  source.dwords[0] = program.srt_reads[0].value;
+  source.dwords[2] = Value(0u);
+  source.dwords[3] = Value(0u);
+  source.dword_count = 4;
+  program.info.buffers.push_back({.source = 0});
+  auto plan = ExtractResourcePlan(program);
+  Block values;
+  auto &unknown = values.AppendNewInst(ValueOpcode::GetUserData,
+                                       {Value(static_cast<ScalarReg>(0))});
+  const auto materialize = [&](std::vector<ResourceBlock> blocks, bool opt_in) {
+    plan.control_flow = std::move(blocks);
+    const SrtRuntime runtime{.read_memory = ReadAboveNullPage,
+                             .read_specialization_memory = RejectAnyRead,
+                             .null_reads_end_speculation = opt_in};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    return materialized && snapshot.buffers.size() == 1 &&
+           std::ranges::all_of(snapshot.buffers[0].dwords, [](uint32_t dword) { return dword == 0u; });
+  };
+  const std::vector<ResourceBlock> speculative{
+      {.condition = Value(&unknown), .successors = {1, 2}}, {.sources = {0}}, {}};
+  Check(materialize(speculative, true),
+        "a speculative descriptor reading the null page was not replaced by a null descriptor");
+  Check(!materialize(speculative, false),
+        "a null-page descriptor was zeroed without the emulator opt-in");
+  Check(!materialize({{.successors = {1}}, {.sources = {0}}}, true),
+        "a proven descriptor reading the null page was zeroed instead of refused");
+}
+
 } // namespace
 
 namespace Common {
@@ -1374,6 +1588,11 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestUnconditionalEdgesKeepProvenReachability();
+  TestUndecidedNullReadEndsOnlyThatPath();
+  TestWalkerNullPageBoundary();
+  TestNativeWalkRefusesNullPage();
+  TestSpeculativeNullDescriptorIsZero();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
