@@ -9,6 +9,7 @@
 #endif
 #include <windows.h> // IWYU pragma: keep
 
+#include "common/logging/log.h"
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
@@ -64,6 +65,40 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	return FILE_ATTRIBUTE_NORMAL;
 }
 
+// ReadFile does not report a fault in the destination buffer with a single code: the cached fast
+// path returns ERROR_NOACCESS, while a read that the file system serves through an IRP (cold cache,
+// page locking) can return ERROR_INVALID_USER_BUFFER or a quota error instead.
+static bool IsBufferFaultError(DWORD native_error) {
+	switch (native_error) {
+		case ERROR_NOACCESS:
+		case ERROR_INVALID_USER_BUFFER:
+		case ERROR_INVALID_ADDRESS:
+		case ERROR_WORKING_SET_QUOTA:
+		case ERROR_NOT_ENOUGH_QUOTA: return true;
+		default: return false;
+	}
+}
+
+// True when [data, data + size) contains a page that a store cannot reach without faulting.
+static bool HasNonWritablePage(const void* data, uint32_t size) {
+	constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+	                           PAGE_EXECUTE_WRITECOPY;
+	auto       address = reinterpret_cast<uintptr_t>(data);
+	const auto end     = address + size;
+	while (address < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) == 0) {
+			return true;
+		}
+		if (info.State != MEM_COMMIT || (info.Protect & writable) == 0 ||
+		    (info.Protect & PAGE_GUARD) != 0) {
+			return true;
+		}
+		address = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return false;
+}
+
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read, int* error) {
 	if (error != nullptr) {
 		*error = 0;
@@ -73,7 +108,14 @@ void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read,
 		const bool ok = ReadFile(f.handle, data, size, &w, nullptr) != 0;
 		if (!ok && error != nullptr) {
 			const auto native_error = GetLastError();
-			*error = native_error == ERROR_NOACCESS ? EFAULT : EIO;
+			const bool buffer_fault =
+			    native_error != ERROR_HANDLE_EOF &&
+			    (IsBufferFaultError(native_error) ||
+			     HasNonWritablePage(static_cast<const uint8_t*>(data) + w, size - w));
+			*error = buffer_fault ? EFAULT : EIO;
+			LOGF("FILE read error: native=%u size=%u got=%u -> %s\n",
+			     static_cast<uint32_t>(native_error), size, static_cast<uint32_t>(w),
+			     buffer_fault ? "EFAULT" : "EIO");
 		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;

@@ -284,6 +284,7 @@ bool File::ReadIntoGuest(void* data, uint32_t size, uint32_t* bytes_read) {
 	Read(data, size, &total, &error);
 	if (error == EFAULT && total < size && Seek(start + total)) {
 		// Host I/O cannot invoke the guest write-fault handler; ordinary stores can.
+		const uint32_t     direct    = total;
 		constexpr uint32_t ChunkSize = 1024u * 1024u;
 		std::vector<uint8_t> chunk(std::min(size - total, ChunkSize));
 		while (total < size) {
@@ -298,6 +299,7 @@ bool File::ReadIntoGuest(void* data, uint32_t size, uint32_t* bytes_read) {
 				break;
 			}
 		}
+		LOGF("FILE read bounce: size=%u direct=%u total=%u error=%d\n", size, direct, total, error);
 	}
 	*bytes_read = total;
 	return error == 0;
