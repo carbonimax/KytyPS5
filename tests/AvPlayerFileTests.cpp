@@ -173,6 +173,71 @@ void CheckFileUriSource() {
 	Source missing(allocator, {}, {}, 2, false, 0);
 	Check(missing.Init("file://", AvPlayerSourceFileMp4) != 0, "reject an empty file:// source");
 }
+
+struct Events {
+	std::vector<int32_t> ids;
+	unsigned             Count(int32_t id) const {
+		return static_cast<unsigned>(std::count(ids.begin(), ids.end(), id));
+	}
+};
+void KYTY_SYSV_ABI RecordEvent(void* object, int32_t id, int32_t, void*) {
+	static_cast<Events*>(object)->ids.push_back(id);
+}
+
+// Plays the 24-frame fixture to its end and returns the number of video frames received.
+unsigned PlayToEnd(AvPlayerInternal* player) {
+	unsigned            frames   = 0;
+	const auto          deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	AvPlayerFrameInfoEx info {};
+	while (AvPlayerIsActive(player) != 0) {
+		Check(std::chrono::steady_clock::now() < deadline, "play the stream to its end");
+		frames += AvPlayerGetVideoDataEx(player, &info);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	return frames;
+}
+
+void CheckStopAtEndOfStream() {
+	VideoMemory memory;
+	Events      events;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	auto* player = create_player(allocator, {}, {&events, RecordEvent}, false, 6);
+	Check(player != nullptr, "create player");
+	Check(add_source(player, "/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "add video source");
+	Check(AvPlayerSetAvSyncMode(player, 1) == 0, "free-running video");
+	Check(AvPlayerIsActive(player) != 0 && events.Count(AVPLAYER_EVENT_STATE_STOP) == 0,
+	      "a source that has not started does not stop");
+
+	Check(AvPlayerStart(player) == 0, "start playback");
+	Check(PlayToEnd(player) == 24, "receive every video frame");
+	Check(events.Count(AVPLAYER_EVENT_STATE_STOP) == 1, "the natural end reports STATE_STOP");
+	AvPlayerFrameInfoEx info {};
+	Check(AvPlayerGetVideoDataEx(player, &info) == 0 && AvPlayerIsActive(player) == 0 &&
+	          events.Count(AVPLAYER_EVENT_STATE_STOP) == 1,
+	      "polling after the end does not repeat STATE_STOP");
+	Check(AvPlayerStop(player) == 0 && events.Count(AVPLAYER_EVENT_STATE_STOP) == 1,
+	      "stopping an ended stream does not repeat STATE_STOP");
+
+	Check(AvPlayerStart(player) == 0, "restart playback");
+	Check(PlayToEnd(player) == 24 && events.Count(AVPLAYER_EVENT_STATE_STOP) == 2,
+	      "a restarted stream reports its end again");
+
+	Check(AvPlayerSetLooping(player, 1) == 0 && AvPlayerStart(player) == 0, "start looping");
+	unsigned   frames   = 0;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (frames < 60) {
+		Check(std::chrono::steady_clock::now() < deadline, "loop past the end of the stream");
+		Check(AvPlayerIsActive(player) != 0, "a looping stream stays active");
+		frames += AvPlayerGetVideoDataEx(player, &info);
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	Check(events.Count(AVPLAYER_EVENT_STATE_STOP) == 2, "a looping stream does not report its end");
+	Check(AvPlayerStop(player) == 0 && events.Count(AVPLAYER_EVENT_STATE_STOP) == 3,
+	      "an explicit stop reports STATE_STOP");
+	Check(AvPlayerClose(player) == 0 && events.Count(AVPLAYER_EVENT_STATE_STOP) == 3 &&
+	          memory.allocations == memory.deallocations,
+	      "close a stopped player");
+}
 }
 
 int main() {
@@ -221,6 +286,7 @@ int main() {
 	content_root = root;
 	CheckVideoReadAhead(root);
 	CheckFileUriSource();
+	CheckStopAtEndOfStream();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");
