@@ -372,6 +372,15 @@ static AvPlayerSourceType source_type_from_path(std::string_view path) {
 	return AvPlayerSourceUnknown;
 }
 
+// Sources may be given as file:// URIs; the file callbacks and the guest file system take paths.
+static std::string path_from_source_uri(std::string_view uri) {
+	constexpr std::string_view scheme = "file://";
+	if (uri.size() >= scheme.size() && ieq(uri.substr(0, scheme.size()), scheme)) {
+		uri.remove_prefix(scheme.size());
+	}
+	return std::string(uri);
+}
+
 static bool source_type_is_file(AvPlayerSourceType type) {
 	return type == AvPlayerSourceUnknown || type == AvPlayerSourceFileMp4 ||
 	       type == AvPlayerSourceFileWebm;
@@ -688,7 +697,7 @@ public:
 	                     AVPLAYER_DEMUX_BUFFER_MIN, AVPLAYER_DEMUX_BUFFER_MAX)) {}
 	~Source() { Close(); }
 	int Init(const std::string& p, AvPlayerSourceType requested) {
-		path        = p;
+		path        = path_from_source_uri(p);
 		source_type = requested == AvPlayerSourceUnknown ? source_type_from_path(path) : requested;
 		if (source_type == AvPlayerSourceHls) {
 			return AVPLAYER_ERROR_NOT_SUPPORTED;
