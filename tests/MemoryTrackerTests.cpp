@@ -1304,7 +1304,6 @@ void TestFaultOnProtectedStack() {
 }
 #endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 MemoryTracker *g_fault_tracker = nullptr;
 uint64_t g_fault_begin = 0;
 uint64_t g_fault_end = 0;
@@ -1353,10 +1352,13 @@ void TestHostReadIntoCleanTrackedPage() {
   for (uint64_t i = 0; i < data.size(); i++) {
     data[i] = static_cast<uint8_t>(i * 13 + 5);
   }
-  auto path = (std::filesystem::temp_directory_path() / "kyty-protected-read-XXXXXX").string();
-  const int fd = ::mkstemp(path.data());
-  Check(fd >= 0 && ::write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size()) &&
-            ::close(fd) == 0,
+  const auto path = (std::filesystem::temp_directory_path() /
+                     ("kyty-protected-read-" +
+                      std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())))
+                        .string();
+  std::FILE *output = std::fopen(path.c_str(), "wb");
+  Check(output != nullptr && std::fwrite(data.data(), 1, data.size(), output) == data.size() &&
+            std::fclose(output) == 0,
         "temporary file setup failed");
   Common::File file;
   Check(file.Open(path, Common::File::Mode::Read), "temporary file open failed");
@@ -1380,7 +1382,6 @@ void TestHostReadIntoCleanTrackedPage() {
   tracker.UntrackMemory(address, size);
   Release(memory);
 }
-#endif
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -1404,12 +1405,10 @@ int main(int argc, char **argv) {
     TestHostReadIntoUnownedGpuPage();
     return 0;
   }
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--protected-read-only") == 0) {
     TestHostReadIntoCleanTrackedPage();
     return 0;
   }
-#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
@@ -1434,10 +1433,8 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
 #endif
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   // Installs the process-wide write-fault handler, so run last.
   TestHostReadIntoCleanTrackedPage();
-#endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }
