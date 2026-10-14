@@ -163,6 +163,16 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
 }
+
+void CheckFileUriSource() {
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, 2, false, 0);
+	Check(source.Init("FILE:///app0/movie.m4v", AvPlayerSourceUnknown) == 0,
+	      "open a file:// source and detect its type from the path");
+	Source missing(allocator, {}, {}, 2, false, 0);
+	Check(missing.Init("file://", AvPlayerSourceFileMp4) != 0, "reject an empty file:// source");
+}
 }
 
 int main() {
@@ -210,6 +220,7 @@ int main() {
 	}
 	content_root = root;
 	CheckVideoReadAhead(root);
+	CheckFileUriSource();
 	std::error_code error;
 	std::filesystem::remove_all(root, error);
 	Check(!error, "release all archive handles");
