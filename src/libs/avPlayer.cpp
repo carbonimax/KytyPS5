@@ -866,7 +866,10 @@ public:
 				std::lock_guard lock(mutex);
 				if (state == State::Playing) {
 					was_playing_video = video_id.has_value();
-					stop_event        = event;
+					// A stream that ended on its own already reported STATE_STOP.
+					if (!end_reported) {
+						stop_event = event;
+					}
 				}
 				state = State::Stopped;
 			}
@@ -914,6 +917,20 @@ public:
 		std::lock_guard lock(mutex);
 		return state == State::Ready ||
 		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
+	}
+	// True once per playback when a non-looping stream has been played to its end; the caller
+	// then reports STATE_STOP. Start, Jump and stream changes restart playback and re-arm it.
+	bool TakeNaturalEnd() {
+		std::lock_guard lock(mutex);
+		if (state != State::Playing || end_reported || loop || pipeline_failed ||
+		    !DrainedNoLock()) {
+			return false;
+		}
+		end_reported = true;
+		if (video_id) {
+			::printf("AvPlayer video reached the end\n");
+		}
+		return true;
 	}
 	uint64_t CurrentTime() const {
 		std::lock_guard lock(mutex);
@@ -1223,6 +1240,7 @@ private:
 		worker_stop     = false;
 		interrupt_io    = false;
 		pipeline_failed = false;
+		end_reported    = false;
 		demux_eof       = false;
 		video_done      = !video_id;
 		audio_done      = !audio_id;
@@ -1694,6 +1712,7 @@ private:
 	State                                    state                    = State::Ready;
 	bool                                     paused                   = false;
 	bool                                     seek_video_frame_pending = false;
+	bool                                     end_reported             = false;
 	std::atomic_bool                         loop {false};
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
@@ -1729,6 +1748,11 @@ static void pump_warnings(AvPlayerInternal* h) {
 	while (auto w = h->source->TakeWarning()) {
 		int32_t warning = *w;
 		emit_event(h->event, AVPLAYER_EVENT_WARNING_ID, &warning);
+	}
+}
+static void report_natural_end(AvPlayerInternal* h) {
+	if (h->source->TakeNaturalEnd()) {
+		emit_event(h->event, AVPLAYER_EVENT_STATE_STOP);
 	}
 }
 static AvPlayerInternal* create_player(const AvPlayerMemAllocator&     mem,
@@ -2018,6 +2042,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 	AvPlayerFrameInfoEx ex {};
 	if (!h->source->Video(&ex)) {
 		pump_warnings(h);
+		report_natural_end(h);
 		return 0;
 	}
 	std::memset(video_info, 0, sizeof(*video_info));
@@ -2037,6 +2062,9 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfo
 	}
 	auto ok = h->source->Video(video_info) ? 1 : 0;
 	pump_warnings(h);
+	if (ok == 0) {
+		report_natural_end(h);
+	}
 	return ok;
 }
 Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* audio_info) {
@@ -2046,11 +2074,24 @@ Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 	}
 	auto ok = h->source->Audio(audio_info) ? 1 : 0;
 	pump_warnings(h);
+	if (ok == 0) {
+		report_natural_end(h);
+	}
 	return ok;
 }
 Bool KYTY_SYSV_ABI AvPlayerIsActive(AvPlayerInternal* h) {
 	PRINT_NAME();
-	return h != nullptr && (h->source == nullptr || h->source->Active());
+	if (h == nullptr) {
+		return 0;
+	}
+	if (h->source == nullptr) {
+		return 1;
+	}
+	const bool active = h->source->Active();
+	if (!active) {
+		report_natural_end(h);
+	}
+	return active ? 1 : 0;
 }
 uint64_t KYTY_SYSV_ABI AvPlayerCurrentTime(AvPlayerInternal* h) {
 	PRINT_NAME();
