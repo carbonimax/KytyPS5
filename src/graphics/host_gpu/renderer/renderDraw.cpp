@@ -1166,13 +1166,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	// Without the dynamic loop state the loop is a pipeline property: find out before the pipeline.
+	bool depth_feedback = false;
+	if (state.depth_info.image_id && !m_context.GetGraphics().attachment_feedback_loop_dynamic &&
+	    m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		auto&      cache       = m_context.GetTextureCache();
+		auto&      image       = cache.GetImage(state.depth_info.image_id);
+		const auto draw_writes = state.depth_info.AttachmentWriteAspects();
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				if (binding.image_id != state.depth_info.image_id ||
+				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				const auto native =
+				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+				if (native == image.views.end()) continue;
+				depth_feedback |= static_cast<bool>(DepthFeedbackAspects(
+				    draw_writes, state.depth_info.desc.view_info, native->info));
+			}
+		}
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, depth_feedback);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
