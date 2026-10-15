@@ -54,6 +54,8 @@ static constexpr uint32_t AgcDmemOffset  = 0x40000;
 struct DriverDmem {
 	std::mutex mutex;
 	int64_t    physical_offset = -1;
+	// The host cannot own DriverDmemBase (x86_64 macOS under Rosetta keeps 0xfc0000000 and up).
+	bool unavailable = false;
 };
 
 static DriverDmem g_driver_dmem;
@@ -4130,7 +4132,7 @@ LIB_NAME("Graphics5Driver", "Graphics5Driver");
 
 int Initialize() {
 	std::scoped_lock lock {g_driver_dmem.mutex};
-	if (g_driver_dmem.physical_offset >= 0) {
+	if (g_driver_dmem.physical_offset >= 0 || g_driver_dmem.unavailable) {
 		return OK;
 	}
 	int64_t physical_offset = -1;
@@ -4147,7 +4149,19 @@ int Initialize() {
 		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
 		return result;
 	}
-	EXIT_IF(reinterpret_cast<uint64_t>(address) != DriverDmemBase);
+	if (reinterpret_cast<uint64_t>(address) != DriverDmemBase) {
+		// The guest address space has no room at the fixed driver address, so the hint-less map
+		// landed elsewhere. Guest shaders reach the table only through that fixed address: run
+		// without it (calls through it stay unresolved) instead of exiting.
+		EXIT_IF(LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), DriverDmemSize) != OK);
+		EXIT_IF(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical_offset, DriverDmemSize) != OK);
+		LOGF_COLOR(Log::Color::Red,
+		           "Graphics5Driver: driver memory cannot be placed at 0x%016" PRIx64
+		           " (host placed it at 0x%016" PRIx64 "); the driver function table is disabled\n",
+		           DriverDmemBase, reinterpret_cast<uint64_t>(address));
+		g_driver_dmem.unavailable = true;
+		return OK;
+	}
 	std::memset(address, 0, DriverDmemSize);
 	struct FunctionShaderBindings {
 		uint64_t code;

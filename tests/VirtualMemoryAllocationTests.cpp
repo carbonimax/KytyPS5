@@ -6,6 +6,7 @@
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/agc.h"
 #include "libs/errno.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
@@ -757,6 +758,50 @@ void TestGuestAddressSpaceHasNoFixedFallback() {
 	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(phys_addr, SceKernelPageSize),
 	        "KernelCheckedReleaseDirectMemory");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// The driver memory lives at a fixed guest address that guest shaders hardcode. Where the host
+// cannot own it (x86_64 macOS under Rosetta keeps 0xfc0000000 and up), startup runs without it and
+// leaves neither a stray mapping nor its direct memory behind; elsewhere it is mapped there.
+void TestDriverMemoryStartup() {
+	const char*        test        = "DriverMemoryStartup";
+	constexpr uint64_t driver_base = 0x0fe0000000ull;
+	constexpr uint64_t driver_size = 0x200000;
+	const auto         pool_size   = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+	const auto         available   = [&] {
+		int64_t offset = -1;
+		size_t  size   = 0;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelAvailableDirectMemorySize(0, pool_size, 0, &offset, &size),
+		        "KernelAvailableDirectMemorySize");
+		return size;
+	};
+	const auto before = available();
+	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize");
+	Libs::LibKernel::Memory::VirtualQueryInfo info {};
+	const bool mapped = Libs::LibKernel::Memory::KernelVirtualQuery(
+	                        reinterpret_cast<void*>(driver_base), 0, &info, sizeof(info)) == OK;
+#if defined(__APPLE__) && defined(__x86_64__)
+	Check(test, !mapped, "driver memory reported mapped at an address the host cannot own");
+	Check(test, available() == before, "unplaceable driver memory kept its direct memory");
+	// The hint-less map lands at the start of the user area; it must have been unmapped.
+	Libs::LibKernel::Memory::VirtualQueryInfo stray {};
+	Check(test,
+	      Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void*>(0x7000000000ull), 0, &stray,
+	                                                  sizeof(stray)) != OK ||
+	          std::strcmp(stray.name, "SceAgcDriver") != 0,
+	      "unplaceable driver memory left its mapping behind");
+#else
+	Check(test,
+	      mapped && info.start == driver_base && info.end == driver_base + driver_size &&
+	          info.is_direct && std::strcmp(info.name, "SceAgcDriver") == 0,
+	      "driver memory is not mapped at its fixed address");
+	(void)before;
+#endif
+	const auto after_first = available();
+	CheckOk(test, Libs::Graphics::Gen5Driver::Initialize(), "Gen5Driver::Initialize(repeat)");
+	Check(test, available() == after_first, "repeated startup allocated direct memory again");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -4976,6 +5021,8 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif
+	// Last: on hosts that own the driver address, its memory stays mapped.
+	RunTest(TestDriverMemoryStartup);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);
