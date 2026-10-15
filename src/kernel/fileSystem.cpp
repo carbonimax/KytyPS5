@@ -1,4 +1,7 @@
 #include "kernel/fileSystem.h"
+#include "graphics/host_gpu/renderer/mipStats.h"
+
+#include <functional>
 
 #include "common/archive.h"
 #include "common/assert.h"
@@ -671,6 +674,11 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
+	if (bytes_read >= 1024u * 1024u) {
+		Graphics::MipStats::NoteRepeatedFileRead(
+		    std::hash<std::string> {}(Common::PathToString(file->real_name)),
+		    static_cast<uint64_t>(pos), bytes_read);
+	}
 
 	return bytes_read;
 }
