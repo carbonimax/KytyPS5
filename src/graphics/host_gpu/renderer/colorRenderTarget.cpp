@@ -71,8 +71,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
-	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	// EQAA (coverage samples > color fragments, e.g. 4 samples / 2 fragments): the host target keeps
+	// every coverage sample as a full sample so it matches the depth target; the guest layout
+	// (pitch, size, metadata) below still comes from the fragment count.
+	const auto samples = render_sample_count(rt.attrib.num_samples);
+	if (samples == 0 || rt.attrib.num_fragments > rt.attrib.num_samples) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
