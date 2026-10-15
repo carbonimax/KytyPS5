@@ -711,6 +711,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Host call stack from the faulting context (unwind data only, no symbols): identifies
+		// the emulator code that called into a driver or system DLL that faulted.
+		if (info->native_context != nullptr) {
+			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host backtrace:\n");
+			for (int frame = 0; frame < 48 && context.Rip != 0; frame++) {
+				HMODULE module = nullptr;
+				char    path[MAX_PATH] = "?";
+				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+				                       reinterpret_cast<LPCSTR>(context.Rip), &module) &&
+				    GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+					const char* name = std::strrchr(path, '\\');
+					std::printf("  #%02d %s+0x%" PRIx64 "\n", frame, name != nullptr ? name + 1 : path,
+					            static_cast<uint64_t>(context.Rip - reinterpret_cast<uint64_t>(module)));
+				} else {
+					std::printf("  #%02d 0x%016" PRIx64 "\n", frame, static_cast<uint64_t>(context.Rip));
+				}
+				DWORD64 image_base = 0;
+				auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (entry == nullptr) {
+					// Leaf function: the return address is on top of the stack.
+					if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) break;
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(uint64_t);
+					continue;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 frame_base   = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
+				                 &handler_data, &frame_base, nullptr);
+			}
+		}
+#endif
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
