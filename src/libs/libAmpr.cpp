@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "graphics/host_gpu/renderer/mipStats.h"
 #include "common/assert.h"
 #include "common/dateTime.h"
 #include "common/file.h"
@@ -1186,6 +1187,7 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 			     command.file_id, static_cast<uint32_t>(result), Common::PathToString(host_path).c_str());
 			return result;
 		}
+		Graphics::MipStats::NoteRepeatedFileRead(command.file_id, command.file_offset, bytes_read);
 	} else if (const auto* payload =
 	               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
 		const auto& command = *payload;
