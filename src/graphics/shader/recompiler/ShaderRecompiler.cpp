@@ -485,6 +485,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+		LOGF("%s scalar call: stage=%s hash=0x%016" PRIx64 " pc=0x%08x\n", GetDumpLabel(options),
+		     StageName(options.stage), options.shader_hash, source.decoded.instructions[i].pc);
 		EXIT_NOT_IMPLEMENTED(source.call.has_value() || options.stage != ShaderType::Compute);
 		source.call = ShaderSource::Call {.instruction = i};
 	}
@@ -503,6 +505,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	query.blocks.push_back(&block);
 	struct Producer { bool ready = false; std::map<uint32_t, Value> values; };
 	std::map<uint32_t, Producer> producers;
+	// First scalar register (use pc, register) that cannot be traced to a unique definition.
+	std::optional<std::pair<uint32_t, uint32_t>> unresolved;
 	std::function<Value(uint32_t, uint32_t)> Register;
 	std::function<Value(uint32_t, Value)> Resolve = [&](uint32_t before, Value value) -> Value {
 		value = value.Resolve();
@@ -524,9 +528,16 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		return value;
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code);
+		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code);
+		const auto fail = [&]() {
+			if (!unresolved) unresolved.emplace(source.decoded.instructions[before].pc, code);
+			return Value(0u);
+		};
+		if (!definition) return fail();
+		const auto index = *definition;
 		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
+			if (code < query.user_data_base || code - query.user_data_base >= query.user_data_count)
+				return fail();
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
 		}
 		auto [entry, inserted] = producers.try_emplace(index);
@@ -554,14 +565,39 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		if (!producer.ready || !producer.values.contains(code)) return fail();
 		return producer.values.at(code).Resolve();
 	};
+	std::array<Value, 2> target;
 	for (uint32_t i = 0; i < 2u; ++i) {
-		const auto value = Register(source.call->instruction, call.src0.reg + i);
-		EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+		target[i] = Register(source.call->instruction, call.src0.reg + i);
+		if (!unresolved && !ValidateRuntimeValue(query, target[i], RuntimeValueType::Integer))
+			unresolved.emplace(call.pc, call.src0.reg + i);
+	}
+	if (unresolved) {
+		// The callee address is data-dependent (for example a per-hit table entry loaded inside a
+		// ray traversal loop), so no single leaf can be linked. Running the caller without its
+		// callee hangs the GPU in such traversals, so the program is compiled empty instead: the
+		// dispatch has no effect.
+		LOGF("%s scalar call at pc 0x%08x has no unique target: stage=%s hash=0x%016" PRIx64
+		     " (first unresolved s%u at pc 0x%08x); shader disabled\n",
+		     GetDumpLabel(options), call.pc, StageName(options.stage), options.shader_hash,
+		     unresolved->second, unresolved->first);
+		if (options.dump_ir) {
+			LOGF("%s disabled program:\n%s", GetDumpLabel(options),
+			     Decoder::ProgramToString(source.decoded).c_str());
+		}
+		source.decoded.instructions.resize(1);
+		auto& end = source.decoded.instructions.front();
+		end.opcode = Decoder::Opcode::S_ENDPGM;
+		end.src_count = 0;
+		source.decoded.has_swap_pc = false;
+		source.call.reset();
+		return;
+	}
+	for (uint32_t i = 0; i < 2u; ++i) {
 		auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
-		root.SetArg(0, value);
+		root.SetArg(0, target[i]);
 		source.call->target[i] = Value(&root);
 	}
 	RewriteToSsa(query.blocks);
