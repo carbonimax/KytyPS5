@@ -299,6 +299,41 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
 }
 
+void PageManager::RestoreProtection(uint64_t vaddr, uint64_t size) noexcept {
+	using Mode       = Common::VirtualMemory::Mode;
+	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
+	uint64_t   run_begin = 0;
+	Mode       run_mode  = Mode::ReadWrite;
+	bool       in_run    = false;
+	const auto flush     = [&](uint64_t at) {
+        if (in_run) {
+            if (!Common::VirtualMemory::Protect(run_begin, at - run_begin, run_mode)) {
+                Fatal("protection restore failed at 0x%016" PRIx64, run_begin);
+            }
+            in_run = false;
+        }
+	};
+	for (auto address = begin; address < end; address += PAGE_SIZE) {
+		const auto* region = m_impl->FindRegion(address);
+		const auto  mode   = region != nullptr
+		                         ? region->pages[(address % REGION_SIZE) / PAGE_SIZE].Perms()
+		                         : Mode::ReadWrite;
+		if (mode == Mode::ReadWrite) {
+			flush(address);
+			continue;
+		}
+		if (in_run && mode == run_mode) {
+			continue;
+		}
+		flush(address);
+		run_begin = address;
+		run_mode  = mode;
+		in_run    = true;
+	}
+	flush(end);
+}
+
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 

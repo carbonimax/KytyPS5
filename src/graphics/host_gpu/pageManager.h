@@ -24,6 +24,10 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	// Re-applies the watch protections of [vaddr, vaddr+size) to the host pages, after the
+	// mapping was recreated with plain guest permissions. Takes no tracker lock: the caller
+	// holds the address-space lock that concurrent watcher updates wait for before protecting.
+	void RestoreProtection(uint64_t vaddr, uint64_t size) noexcept;
 
 private:
 	struct Impl;
