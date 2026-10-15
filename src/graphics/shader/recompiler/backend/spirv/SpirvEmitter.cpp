@@ -238,6 +238,10 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	     (program.stage == ShaderType::Vertex || program.stage == ShaderType::Local ||
 	      program.stage == ShaderType::TessellationEvaluation) &&
 	     host_features.subgroup_size == 64u && Emitter::PackedVertexWave32Enabled());
+	state.emulated_lane_id =
+	    !host_features.vertex_subgroups &&
+	    (program.stage == ShaderType::Vertex || program.stage == ShaderType::Local ||
+	     program.stage == ShaderType::TessellationEvaluation);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u

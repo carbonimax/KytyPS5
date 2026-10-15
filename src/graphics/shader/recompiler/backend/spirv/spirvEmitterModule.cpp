@@ -571,7 +571,14 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id || state.packed_wave32) {
+	if ((state.program.info.subgroup_local_invocation_id || state.packed_wave32) &&
+	    state.emulated_lane_id) {
+		// SPIRV-Cross rejects SubgroupLocalInvocationId in a vertex function: main stores a scan here.
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate);
+		state.builder.AddName(variable, "gl_SubgroupInvocationID");
+		state.subgroup_local_invocation_id_variable = variable;
+	} else if (state.program.info.subgroup_local_invocation_id || state.packed_wave32) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -781,6 +788,10 @@ void DefineModule(EmitterState& state) {
 	}
 	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
+	if (state.emulated_lane_id &&
+	    (state.program.info.subgroup_local_invocation_id || state.packed_wave32)) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
