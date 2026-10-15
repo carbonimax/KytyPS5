@@ -291,8 +291,15 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
+static void HwCtxIgnoreUserClipPlane(CommandProcessor& cp, uint32_t cmd_offset, uint32_t value) {
+	// Plane equations only matter while PA_CL_CLIP_CNTL.UCP_ENA enables them, and hw_check()
+	// still rejects draws that enable user clip planes. Games may program planes ahead of time.
+	static std::atomic<uint32_t> logged {0};
+	if (value != 0 && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("PA_CL_UCP: ignoring plane register 0x%04" PRIx32 " = 0x%08" PRIx32
+		     " (UCP_ENA=0x%02" PRIx8 ")\n",
+		     cmd_offset, value, cp.GetCtx().GetClipControl().user_clip_planes);
+	}
 }
 
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
@@ -2913,7 +2920,7 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	for (auto cmd_offset = Pm4::PA_CL_UCP_0_X; cmd_offset <= Pm4::PA_CL_UCP_5_W; cmd_offset++) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
-			HwCtxIgnoreDisabledUserClipPlane(cp, value);
+			HwCtxIgnoreUserClipPlane(cp, cmd_offset, value);
 		};
 	}
 
