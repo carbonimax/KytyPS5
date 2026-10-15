@@ -8,6 +8,21 @@ uint32_t MeshArray(EmitterState& state, spv::StorageClass storage, uint32_t type
 	return state.builder.DefineGlobalVariable(TypePointer(state, storage, array), storage);
 }
 
+// The per-primitive layer is declared as a member of a block array, like glslang's
+// gl_MeshPerPrimitiveEXT[]. A bare BuiltIn Layer array makes the AMD proprietary Vulkan driver
+// (26.8.1) crash in vkCreateGraphicsPipelines as soon as the mesh shader stores to it.
+uint32_t MeshLayerArray(EmitterState& state, uint32_t count) {
+	const auto block = state.builder.DecoratedType(
+	    spv::OpTypeStruct,
+	    {{spv::OpMemberDecorate, {0, spv::DecorationBuiltIn, spv::BuiltInLayer}},
+	     {spv::OpMemberDecorate, {0, spv::DecorationPerPrimitiveEXT}},
+	     {spv::OpDecorate, {spv::DecorationBlock}}},
+	    TypeU32(state));
+	const auto array = state.builder.Type(spv::OpTypeArray, block, ConstantU32(state, count));
+	return state.builder.DefineGlobalVariable(TypePointer(state, spv::StorageClassOutput, array),
+	                                          spv::StorageClassOutput);
+}
+
 uint32_t MeshElement(EmitterState& state, uint32_t variable, spv::StorageClass storage,
                      uint32_t type, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
@@ -74,29 +89,27 @@ void DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
 		const bool cull = output.kind == IR::StageOutputKind::CullDistance;
 		auto& variable = clip ? state.clip_distance_variable
 		                 : cull ? state.cull_distance_variable : output.variable_id;
-		if (variable == 0) {
+		if (variable == 0 && output.kind == IR::StageOutputKind::Layer) {
+			variable = MeshLayerArray(state, mesh.max_primitives);
+			state.interface_variables.push_back(variable);
+			state.builder.AddName(variable, output.debug_name.c_str());
+		} else if (variable == 0) {
 			const auto element_type = clip || cull
 			                              ? state.builder.Type(spv::OpTypeArray, type,
 			                                                   ConstantU32(state, clip ? clip_distance_count
 			                                                                           : cull_distance_count))
 			                              : type;
-			variable = MeshArray(state, spv::StorageClassOutput, element_type,
-			                     output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives
-			                                                             : mesh.max_vertices);
+			variable = MeshArray(state, spv::StorageClassOutput, element_type, mesh.max_vertices);
 			state.interface_variables.push_back(variable);
 			state.builder.AddName(variable, output.debug_name.c_str());
 			if (output.kind == IR::StageOutputKind::Parameter) {
 				state.builder.AddAnnotation(spv::OpDecorate, variable,
 				                            spv::DecorationLocation, output.location);
 			} else {
-				const auto builtin = clip ? spv::BuiltInClipDistance
+				const auto builtin = clip   ? spv::BuiltInClipDistance
 				                     : cull ? spv::BuiltInCullDistance
-				                     : output.kind == IR::StageOutputKind::Layer ? spv::BuiltInLayer
-				                                                                 : spv::BuiltInPosition;
+				                            : spv::BuiltInPosition;
 				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
-			}
-			if (output.kind == IR::StageOutputKind::Layer) {
-				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPerPrimitiveEXT);
 			}
 		}
 		output.variable_id = variable;
@@ -235,8 +248,10 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				const auto layer = MeshLoad(state, output.mesh_data_variable,
 				                            spv::StorageClassWorkgroup, TypeU32(state),
 				                            vertex[state.input_info.vertex->mesh.provoking_vertex]);
-				const auto pointer = MeshElement(state, output.variable_id, spv::StorageClassOutput,
-				                                 TypeU32(state), index);
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassOutput, TypeU32(state)),
+				                          pointer, output.variable_id, index, ConstantU32(state, 0));
 				state.builder.AddFunction(spv::OpStore, pointer, layer);
 			}
 		});
