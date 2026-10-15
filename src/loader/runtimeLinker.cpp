@@ -665,6 +665,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		if (access != GpuAccess::Execute &&
+		    Libs::LibKernel::Memory::WaitBackingRemap(info->access_violation_vaddr)) {
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
