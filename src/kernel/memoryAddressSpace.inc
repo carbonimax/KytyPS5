@@ -443,6 +443,7 @@ public:
 			return true;
 		}
 
+		BeginBackingRemap(old.vaddr, old.size);
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -460,6 +461,9 @@ public:
 				     ok;
 			}
 			if (ok) {
+				RestoreBackingProtection(old.vaddr, left_size);
+				RestoreBackingProtection(right_addr, right_size);
+				EndBackingRemap();
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -475,8 +479,11 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			RestoreBackingProtection(old.vaddr, old.size);
+			EndBackingRemap();
 			return false;
 		}
+		EndBackingRemap();
 		std::lock_guard lock(m_mutex);
 		m_maps.emplace(old.vaddr, old);
 		return false;
