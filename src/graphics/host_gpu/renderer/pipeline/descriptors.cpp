@@ -768,7 +768,21 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			const auto mapped_size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (mapped_size == 0) {
+				// Guest shaders often leave descriptors that a runtime branch never uses filled
+				// with stale data. Hardware only faults on access, so bind nothing (reads return
+				// zero, writes are dropped) instead of aborting.
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+					LOGF("FindBuffers: unmapped buffer descriptor ignored: shader=0x%016" PRIx64
+					     " buffer=%u addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     program.shader_hash, resource, address, size);
+				}
+				source = {};
+				continue;
+			}
+			size   = mapped_size;
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}
