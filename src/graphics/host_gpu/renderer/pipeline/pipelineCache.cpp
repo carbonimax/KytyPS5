@@ -417,7 +417,8 @@ struct PipelineCache::ProgramCache {
 		options.dump_label  = label;
 		options.input_info  = stage_input;
 		options.host_features = {graphics.shader_buffer_int64_atomics_enabled,
-		                         graphics.shader_cull_distance_enabled, graphics.subgroup_size};
+		                         graphics.shader_cull_distance_enabled, graphics.subgroup_size,
+		                         graphics.vertex_subgroups_supported};
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
