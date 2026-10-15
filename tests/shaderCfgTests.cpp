@@ -10619,6 +10619,38 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+// Wave32 vertex shaders are packed as two guest waves per host subgroup only in a 64-lane host
+// subgroup: a 32-lane host (MoltenVK) cannot read SubgroupLocalInvocationId in a vertex function.
+// Pixel shaders stay packed (also correct in 32 lanes). Packing declares that built-in.
+void TestPackedWave32FollowsHostSubgroupSize() {
+  if (std::getenv("KYTY_VS_PACKED_WAVE32") != nullptr || std::getenv("KYTY_PS_PACKED_WAVE32") != nullptr) {
+    return;
+  }
+  const auto declares_lane = [](const TestCompileResult &result) {
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv).find("BuiltIn SubgroupLocalInvocationId") !=
+           std::string::npos;
+  };
+  const uint32_t vertex_shader[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  auto vertex = MakeCompileOptions(ShaderType::Vertex);
+  vertex.wave_size = 32u;
+  Check(declares_lane(RecompileForTest(vertex_shader, vertex)),
+        "wave32 vertex shader was not packed for a 64-lane host subgroup");
+  vertex.host_features.subgroup_size = 32u;
+  Check(!declares_lane(RecompileForTest(vertex_shader, vertex)),
+        "wave32 vertex shader was packed for a 32-lane host subgroup");
+  vertex.wave_size = 64u;
+  vertex.host_features.subgroup_size = 64u;
+  Check(!declares_lane(RecompileForTest(vertex_shader, vertex)),
+        "wave64 vertex shader was packed");
+  const uint32_t pixel_shader[] = {EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  auto pixel = MakeCompileOptions(ShaderType::Pixel);
+  pixel.wave_size = 32u;
+  pixel.host_features.subgroup_size = 32u;
+  Check(declares_lane(RecompileForTest(pixel_shader, pixel)),
+        "wave32 pixel shader was not packed for a 32-lane host subgroup");
+}
+
 void TestOptionalShaderHostFeatures() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   const uint32_t plain_shader[] = {EncodeSopp(0x01)};
@@ -16789,6 +16821,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestOptionalShaderHostFeatures();
+  TestPackedWave32FollowsHostSubgroupSize();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
