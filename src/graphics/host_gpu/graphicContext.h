@@ -32,7 +32,11 @@ struct GraphicContext {
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
+	// Layout extension only: a sampled depth target is rendered in the feedback-loop layout and the
+	// loop is chosen per pipeline (VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT).
 	bool                               attachment_feedback_loop_enabled      = false;
+	// Also VK_EXT_attachment_feedback_loop_dynamic_state: the loop is toggled per draw instead.
+	bool                               attachment_feedback_loop_dynamic      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               supports_block_texel_view              = false;
