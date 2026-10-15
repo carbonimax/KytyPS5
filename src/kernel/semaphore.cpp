@@ -1,4 +1,6 @@
 #include "kernel/semaphore.h"
+#include "kernel/syncTrace.h"
+#include <optional>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -143,6 +145,8 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 
 	m_count += signal_count;
 
+	SyncTrace::Wake(SyncTrace::Kind::Sema, this, m_name.c_str(), signal_count,
+	                static_cast<int>(m_waiting_threads.size()));
 	WakeWaiters();
 
 	m_cond_var.SignalAll();
@@ -221,11 +225,14 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
+	SyncTrace::Wait trace(SyncTrace::Kind::Sema, this, m_name.c_str(), need_count,
+	                      infinitely ? -1 : static_cast<int64_t>(micros));
 
 	while (!waiter.ready) {
 		if ((elapsed >= micros && !infinitely)) {
 			RemoveWaiter(&waiter);
 			*ptr_micros = 0;
+			trace.SetResult(1);
 			return Result::TimedOut;
 		}
 
@@ -406,10 +413,16 @@ public:
 		const bool    timed_wait = (micros != nullptr);
 		Common::Timer timer;
 		timer.Start();
+		std::optional<LibKernel::SyncTrace::Wait> trace;
+		if (m_count <= 0 && LibKernel::SyncTrace::Enabled()) {
+			trace.emplace(LibKernel::SyncTrace::Kind::PosixSem, this, "", 0,
+			              timed_wait ? static_cast<int64_t>(*micros) : -1);
+		}
 
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {
 				SyncGuest();
+				if (trace) trace->SetResult(1);
 				return POSIX_ETIMEDOUT;
 			}
 
@@ -459,6 +472,7 @@ public:
 
 		m_count++;
 		SyncGuest();
+		LibKernel::SyncTrace::Wake(LibKernel::SyncTrace::Kind::PosixSem, this, "", 1, static_cast<int>(m_waiters));
 		m_cond_var.Signal();
 
 		return OK;

@@ -1,4 +1,7 @@
 #include "kernel/eventQueue.h"
+#include "kernel/syncTrace.h"
+
+#include <optional>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -183,12 +186,18 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	uint32_t      elapsed = 0;
 	Common::Timer t;
 	t.Start();
+	std::optional<SyncTrace::Wait> trace;
 
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
 
 		if (ret != 0 || (elapsed >= micros && micros != 0)) {
+			if (trace && ret == 0) trace->SetResult(1);
 			return ret;
+		}
+		if (!trace && SyncTrace::Enabled()) {
+			trace.emplace(SyncTrace::Kind::Equeue, this, m_name.c_str(), 0,
+			              micros == 0 ? -1 : static_cast<int64_t>(micros));
 		}
 
 		uint32_t   timer_wait = 0;
@@ -250,6 +259,8 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 		} else {
 			event.triggered = true;
 		}
+		SyncTrace::Wake(SyncTrace::Kind::Equeue, this, m_name.c_str(),
+		                (static_cast<uint64_t>(static_cast<uint16_t>(filter)) << 48u) | ident, 0);
 
 		m_cond_var.Signal();
 
