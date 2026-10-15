@@ -307,6 +307,15 @@ struct PipelineCache::ProgramCache {
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (options.stage == ShaderType::Pixel) {
+			// Pixel waves run in 64-lane amdvlk subgroups with no required size: record the guest
+			// wave size and cross-lane use of every pixel shader.
+			LOGF("PS lanes: hash=0x%016" PRIx64 " wave=%u shuffle=%d ballot=%d lid=%d\n",
+			     options.shader_hash, result.program.wave_size,
+			     result.program.info.subgroup_shuffle ? 1 : 0,
+			     result.program.info.subgroup_ballot ? 1 : 0,
+			     result.program.info.subgroup_local_invocation_id ? 1 : 0);
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
 		                         options.maintenance8_enabled)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
