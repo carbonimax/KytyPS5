@@ -141,7 +141,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.line_width = false;
 		cmdbuf.setLineWidth(line_width);
 	}
-	if (dirty_state.feedback_loop_aspects && graphics.attachment_feedback_loop_enabled) {
+	if (dirty_state.feedback_loop_aspects && graphics.attachment_feedback_loop_dynamic) {
 		dirty_state.feedback_loop_aspects = false;
 		cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_aspects);
 	}
