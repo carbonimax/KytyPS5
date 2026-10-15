@@ -111,6 +111,8 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	bool                                            packed_wave32 = false;
+	// The host has no subgroup builtins in this stage: the lane id is a Private variable.
+	bool                                            emulated_lane_id = false;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	uint32_t                                         bda_pagetable_variable  = 0;

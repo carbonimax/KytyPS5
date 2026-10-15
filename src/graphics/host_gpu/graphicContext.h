@@ -46,6 +46,7 @@ struct GraphicContext {
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
+	bool                               vertex_subgroups_supported            = false;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;

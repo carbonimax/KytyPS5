@@ -626,6 +626,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
+	graphics.vertex_subgroups_supported    = static_cast<bool>(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eVertex);
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
 	graphics.required_subgroup_size_stages = subgroup_size_control.requiredSubgroupSizeStages;
@@ -635,11 +636,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
 
-	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
+	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s vertex=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
-	     graphics.SupportsComputeWave64() ? "true" : "false");
+	     graphics.SupportsComputeWave64() ? "true" : "false",
+	     graphics.vertex_subgroups_supported ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout == VK_TRUE;

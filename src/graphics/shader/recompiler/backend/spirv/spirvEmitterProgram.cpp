@@ -505,7 +505,8 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
-	if (other_half == nullptr) {
+	// BallotFindLSB makes SPIRV-Cross add gl_SubgroupSize, which Metal rejects in a vertex function.
+	if (other_half == nullptr && !state.emulated_lane_id) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
 		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
@@ -741,6 +742,14 @@ void EmitProgram(EmitterState& state) {
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
+	}
+	if (state.emulated_lane_id && state.subgroup_local_invocation_id_variable != 0) {
+		// shortcut: assumes the launched lanes are 0..n-1 at entry; replace when the host reports vertex subgroups.
+		const auto lane = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformIAdd, TypeU32(state), lane,
+		                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationExclusiveScan,
+		                          ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.subgroup_local_invocation_id_variable, lane);
 	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
