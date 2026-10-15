@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
+#include "graphics/host_gpu/renderer/mipStats.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -703,6 +704,15 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// A sampled texture whose descriptor enables mip statistics counts in its counter, which
+		// texture streamers read back (MipStats::Report).
+		if (MipStats::ReliefEnabled() && !program.info.images[i].written &&
+		    snapshot.images[i].dword_count >= 8) {
+			const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+			if (descriptor.MipStatsCntEn()) {
+				MipStats::Mark(descriptor.MipStatsCntId());
+			}
+		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
