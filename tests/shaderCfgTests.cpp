@@ -10654,8 +10654,48 @@ void TestMemoryFedScalarLeafCall() {
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
       EncodeSMovB32(14, 130), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(joined, options); },
-              "ambiguous reaching definitions were accepted for a call target");
+  // Ambiguous reaching definitions leave the call target unresolved: the program is compiled
+  // empty (a lone S_ENDPGM, no call) and the cause is logged. Checked in a child with the log on
+  // stdout, since the fixture configures a silent log.
+  int joined_log_pipe[2] = {-1, -1};
+  Check(::pipe(joined_log_pipe) == 0, "pipe failed while starting the unresolved call test");
+  const pid_t joined_pid = ::fork();
+  Check(joined_pid >= 0, "fork failed while starting the unresolved call test");
+  if (joined_pid == 0) {
+    ::close(joined_log_pipe[0]);
+    std::fflush(stdout);
+    ::dup2(joined_log_pipe[1], STDOUT_FILENO);
+    Config::ConfigOptions console;
+    console.printf_direction = Config::LogDirection::Console;
+    Config::Load(console);
+    Log::Initialize();
+    const auto disabled = PrepareShaderSource(joined, options);
+    const bool empty = !disabled.call && !disabled.decoded.has_swap_pc &&
+                       disabled.decoded.instructions.size() == 1 &&
+                       disabled.decoded.instructions[0].opcode == Decoder::Opcode::S_ENDPGM;
+    Log::Flush();
+    std::fflush(stdout);
+    ::_exit(empty ? 0 : 1);
+  }
+  ::close(joined_log_pipe[1]);
+  std::string joined_log;
+  char joined_chunk[256];
+  for (;;) {
+    const auto got = ::read(joined_log_pipe[0], joined_chunk, sizeof(joined_chunk));
+    if (got > 0) joined_log.append(joined_chunk, static_cast<size_t>(got));
+    else if (got == 0 || errno != EINTR) break;
+  }
+  ::close(joined_log_pipe[0]);
+  int joined_status = 0;
+  pid_t joined_waited = -1;
+  do {
+    joined_waited = ::waitpid(joined_pid, &joined_status, 0);
+  } while (joined_waited < 0 && errno == EINTR);
+  Check(joined_waited == joined_pid && WIFEXITED(joined_status) && WEXITSTATUS(joined_status) == 0,
+        "ambiguous call target was not compiled as an empty program");
+  Check(joined_log.find("has no unique target") != std::string::npos &&
+            joined_log.find("shader disabled") != std::string::npos,
+        "ambiguous call target was disabled without its log line");
   const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
   ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
               "call metadata bypassed the multiple-call rejection");
