@@ -237,7 +237,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    (workgroup == nullptr && program.wave_size == 32u &&
 	     (program.stage == ShaderType::Vertex || program.stage == ShaderType::Local ||
 	      program.stage == ShaderType::TessellationEvaluation) &&
-	     Emitter::PackedVertexWave32Enabled());
+	     host_features.subgroup_size == 64u && Emitter::PackedVertexWave32Enabled());
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
