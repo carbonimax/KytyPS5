@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -33,6 +34,18 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+
+// Clear new multisampled color images to zero (KYTY_MSAA_ZERO_INIT=0 disables). They never
+// upload guest memory (InitializeImage returns early), so unless a guest clear is materialized
+// they start with whatever the host allocation held, e.g. recycled VRAM in transient targets.
+// Zero matches what the guest sees after a CMASK fast clear to zero.
+bool MsaaZeroInit() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MSAA_ZERO_INIT");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -1291,6 +1304,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
+			}
+			if (MsaaZeroInit() && inserted.info.samples > 1 && !inserted.info.IsDepth() &&
+			    inserted.backing.image != nullptr && inserted.backing.layers != 0) {
+				// Defines the native image only; guest bytes are untouched. ClearImage commits a
+				// GPU write, which drops BufferModified (never uploaded for multisampled images).
+				vk::ClearValue zero {};
+				zero.color = vk::ClearColorValue {};
+				ClearImage(command, result, inserted.backing.format,
+				           {vk::ImageAspectFlagBits::eColor, 0, inserted.info.resources.levels, 0,
+				            inserted.backing.layers},
+				           zero);
 			}
 		}
 		auto& image = m_slot_images[result];
