@@ -228,8 +228,16 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 		Fail(program, "shader requires shaderCullDistance, which is not enabled on the host GPU");
 	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	// A wave32 pixel shader cannot require a 32-lane subgroup on drivers without fragment
+	// subgroup size control (amdvlk: compute only). Packing is also correct in a 32-lane subgroup.
 	state.packed_wave32 =
-	    workgroup != nullptr && program.wave_size == 32u && workgroup->host_subgroup_size == 64u;
+	    (workgroup != nullptr && program.wave_size == 32u && workgroup->host_subgroup_size == 64u) ||
+	    (program.stage == ShaderType::Pixel && program.wave_size == 32u &&
+	     Emitter::PackedPixelWave32Enabled()) ||
+	    (workgroup == nullptr && program.wave_size == 32u &&
+	     (program.stage == ShaderType::Vertex || program.stage == ShaderType::Local ||
+	      program.stage == ShaderType::TessellationEvaluation) &&
+	     Emitter::PackedVertexWave32Enabled());
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
