@@ -22,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -180,6 +181,43 @@ static uint32_t        g_test_backing_store_unmaps_before_failure = UINT32_MAX;
 static callback_func_t g_test_before_backing_map                   = nullptr;
 static callback_func_t g_test_backing_read                         = nullptr;
 #endif
+
+// Windows cannot unmap part of a file view: a partial unmap remaps the surviving parts, which
+// briefly leaves them unmapped and resets their protection. Guest accesses in that window wait
+// (WaitBackingRemap), and the GPU tracker's watch protections are restored afterwards.
+static std::atomic<uint64_t> g_remap_begin {0};
+static std::atomic<uint64_t> g_remap_end {0};
+
+static void BeginBackingRemap(uint64_t vaddr, uint64_t size) noexcept {
+	g_remap_end.store(vaddr + size, std::memory_order_relaxed);
+	g_remap_begin.store(vaddr, std::memory_order_release);
+}
+
+static void RestoreBackingProtection(uint64_t vaddr, uint64_t size) noexcept {
+	if (g_gpu_resources != nullptr && size != 0) {
+		g_gpu_resources->RestorePageProtection(vaddr, size);
+	}
+	if (size != 0) {
+		LOGF("Memory: partial unmap remapped 0x%016" PRIx64 " size 0x%" PRIx64 ", watch protection restored\n",
+		     vaddr, size);
+	}
+}
+
+static void EndBackingRemap() noexcept {
+	g_remap_begin.store(0, std::memory_order_release);
+	g_remap_end.store(0, std::memory_order_relaxed);
+}
+
+bool WaitBackingRemap(uint64_t vaddr) noexcept {
+	const auto begin = g_remap_begin.load(std::memory_order_acquire);
+	if (begin == 0 || vaddr < begin || vaddr >= g_remap_end.load(std::memory_order_relaxed)) {
+		return false;
+	}
+	while (g_remap_begin.load(std::memory_order_acquire) == begin) {
+		std::this_thread::yield();
+	}
+	return true;
+}
 
 #include "memoryAddressSpace.inc"
 
