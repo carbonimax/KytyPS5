@@ -1,4 +1,7 @@
 #include "kernel/eventFlag.h"
+#include "kernel/syncTrace.h"
+
+#include <optional>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -124,6 +127,7 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 		return Result::AlreadyWaiting;
 	}
 
+	std::optional<SyncTrace::Wait> trace;
 	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
 	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
 		if ((elapsed >= micros && !infinitely)) {
@@ -131,7 +135,12 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 				*result = m_bits;
 			}
 			update_timeout();
+			if (trace) trace->SetResult(1);
 			return Result::TimedOut;
+		}
+		if (!trace && SyncTrace::Enabled()) {
+			trace.emplace(SyncTrace::Kind::EventFlag, this, m_name.c_str(), bits,
+			              infinitely ? -1 : static_cast<int64_t>(micros));
 		}
 
 		m_waiting_threads++;
@@ -190,6 +199,7 @@ void KernelEventFlagPrivate::Set(uint64_t bits) {
 
 	m_bits |= bits;
 
+	SyncTrace::Wake(SyncTrace::Kind::EventFlag, this, m_name.c_str(), m_bits, m_waiting_threads);
 	m_cond_var.SignalAll();
 }
 
@@ -205,6 +215,12 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 	}
 
 	m_bits &= bits;
+	if (m_waiting_threads > 0) {
+		SyncTrace::Note("EVF_CLEAR obj=%p name=%s mask=0x%llx bits=0x%llx waiters=%d",
+		                static_cast<void*>(this), m_name.c_str(),
+		                static_cast<unsigned long long>(bits),
+		                static_cast<unsigned long long>(m_bits), m_waiting_threads);
+	}
 }
 
 void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
