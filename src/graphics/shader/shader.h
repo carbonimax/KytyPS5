@@ -55,6 +55,8 @@ struct ShaderHostFeatures {
 	bool cull_distance        = true;
 	// Host subgroup size of graphics stages (MoltenVK: 32, amdvlk: 64).
 	uint32_t subgroup_size    = 64;
+	// Subgroup builtins in vertex functions (MoltenVK: no, SPIRV-Cross rejects them).
+	bool vertex_subgroups     = true;
 };
 
 struct ShaderStageRuntime {

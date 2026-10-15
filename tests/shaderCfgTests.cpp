@@ -10651,6 +10651,37 @@ void TestPackedWave32FollowsHostSubgroupSize() {
         "wave32 pixel shader was not packed for a 32-lane host subgroup");
 }
 
+// Without vertex subgroup builtins (MoltenVK), a vertex shader reading its lane must not declare
+// SubgroupLocalInvocationId nor use BallotFindLSB (SPIRV-Cross then adds gl_SubgroupSize).
+void TestVertexLaneWithoutHostVertexSubgroups() {
+  const auto disassemble = [](const TestCompileResult &result) {
+    CheckSpirvBinaryValidates(result.spirv);
+    return DisassembleSpirvBinary(result.spirv);
+  };
+  const uint32_t vertex_shader[] = {
+      // An inline -1 mask keeps the lane id live; unset vertex VGPR masks fold to zero.
+      EncodeVop2(0x23, 0, 193, 2),     // v_mbcnt_lo_u32_b32 v0, -1, v2
+      EncodeVop1(0x02, 24, 0 + 256),   // v_readfirstlane_b32 s24, v0
+      EncodeVop1(0x01, 1, 24),         // v_mov_b32 v1, s24
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+  auto vertex = MakeCompileOptions(ShaderType::Vertex);
+  vertex.wave_size = 64u;
+  vertex.host_features.subgroup_size = 32u;
+  const auto native = disassemble(RecompileForTest(vertex_shader, vertex));
+  Check(native.find("BuiltIn SubgroupLocalInvocationId") != std::string::npos,
+        "vertex lane did not use SubgroupLocalInvocationId on a host with vertex subgroups");
+  Check(native.find("OpGroupNonUniformBallotFindLSB") != std::string::npos,
+        "vertex first lane did not use BallotFindLSB on a host with vertex subgroups");
+  vertex.host_features.vertex_subgroups = false;
+  const auto emulated = disassemble(RecompileForTest(vertex_shader, vertex));
+  Check(emulated.find("BuiltIn SubgroupLocalInvocationId") == std::string::npos,
+        "vertex shader declared SubgroupLocalInvocationId without host vertex subgroups");
+  Check(emulated.find("OpGroupNonUniformBallotFindLSB") == std::string::npos,
+        "vertex shader used BallotFindLSB without host vertex subgroups");
+  Check(emulated.find("OpGroupNonUniformIAdd") != std::string::npos,
+        "vertex lane was not computed by a subgroup scan without host vertex subgroups");
+}
+
 void TestOptionalShaderHostFeatures() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   const uint32_t plain_shader[] = {EncodeSopp(0x01)};
@@ -16822,6 +16853,7 @@ int main(int argc, char **argv) {
   TestCapturedBufferAtomicsX2();
   TestOptionalShaderHostFeatures();
   TestPackedWave32FollowsHostSubgroupSize();
+  TestVertexLaneWithoutHostVertexSubgroups();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
