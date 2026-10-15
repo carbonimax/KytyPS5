@@ -53,6 +53,8 @@ struct CompiledShaderInfo;
 struct ShaderHostFeatures {
 	bool buffer_int64_atomics = true;
 	bool cull_distance        = true;
+	// Host subgroup size of graphics stages (MoltenVK: 32, amdvlk: 64).
+	uint32_t subgroup_size    = 64;
 };
 
 struct ShaderStageRuntime {
