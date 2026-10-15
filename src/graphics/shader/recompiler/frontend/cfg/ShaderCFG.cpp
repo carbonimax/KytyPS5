@@ -8,6 +8,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <optional>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -1687,27 +1688,47 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                             uint32_t before, uint32_t code) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
+	// Walk every path back from the use. Control-flow joins are accepted only when all paths
+	// reach the same defining instruction, or all reach the entry without a definition.
+	std::vector<std::pair<const BasicBlock*, uint32_t>> pending {{&*found, before}};
+	std::vector<uint32_t> visited;
+	std::optional<uint32_t> definition;
+	while (!pending.empty()) {
+		const auto [block, end] = pending.back();
+		pending.pop_back();
+		std::optional<uint32_t> reaching;
+		for (uint32_t i = end; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
+			// A scalar call may clobber any register; its callee is not visible here.
+			if (inst.opcode == Opcode::S_SWAPPC_B64) return std::nullopt;
+			if (MayWriteScalarRegister(inst, code)) {
+				reaching = i;
+				break;
+			}
 		}
-		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+		if (!reaching && block->id == graph.entry_block) reaching = UINT32_MAX;
+		if (reaching) {
+			if (definition && *definition != *reaching) return std::nullopt;
+			definition = reaching;
+			if (*reaching != UINT32_MAX) continue;
+		}
+		for (const auto predecessor_id: block->predecessors) {
+			if (std::ranges::find(visited, predecessor_id) != visited.end()) continue;
+			visited.push_back(predecessor_id);
+			const auto* predecessor = graph.FindBlock(predecessor_id);
+			EXIT_IF(predecessor == nullptr);
+			pending.emplace_back(predecessor, predecessor->inst_end);
+		}
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+	EXIT_IF(!definition);
+	return definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
