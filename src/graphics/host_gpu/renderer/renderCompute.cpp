@@ -191,6 +191,56 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// See ResourceSnapshot::gpu_flat_reads. Acquiring the sources can merge cache buffers: call this
+// before the shader buffers are bound, and again after them for the final (unmerged) pointers.
+static std::vector<std::pair<Buffer*, uint64_t>> AcquireGpuFlatSources(
+    RenderContext& context, const ShaderRecompiler::IR::CompiledShaderInfo& program,
+    const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	std::vector<std::pair<Buffer*, uint64_t>> sources;
+	if (snapshot.gpu_flat_reads.empty() ||
+	    program.bindings.descriptor_counts[static_cast<size_t>(
+	        ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt)] == 0) {
+		return sources;
+	}
+	auto& cache = context.GetBufferCache();
+	sources.reserve(snapshot.gpu_flat_reads.size());
+	for (const auto& [slot, address]: snapshot.gpu_flat_reads) {
+		(void)slot;
+		sources.push_back(cache.ObtainBuffer(address, sizeof(uint32_t), false));
+	}
+	return sources;
+}
+
+// Copies the GPU-written dwords of the flattened SRT into the dispatch's upload.
+static void RecordGpuFlatReads(vk::CommandBuffer command, const vk::DescriptorBufferInfo& flat,
+                               const ShaderRecompiler::IR::ResourceSnapshot&  snapshot,
+                               std::span<const std::pair<Buffer*, uint64_t>> sources) {
+	if (sources.empty()) {
+		return;
+	}
+	EXIT_IF(!flat.buffer || sources.size() != snapshot.gpu_flat_reads.size());
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                        nullptr);
+	for (size_t i = 0; i < sources.size(); i++) {
+		const auto slot = snapshot.gpu_flat_reads[i].first;
+		EXIT_IF(uint64_t {slot} * sizeof(uint32_t) + sizeof(uint32_t) > flat.range);
+		const vk::BufferCopy region {sources[i].second,
+		                             flat.offset + uint64_t {slot} * sizeof(uint32_t),
+		                             sizeof(uint32_t)};
+		command.copyBuffer(sources[i].first->Handle(), flat.buffer, 1, &region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &after, 0, nullptr,
+	                        0, nullptr);
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.program->bindings.descriptor_counts[
@@ -347,9 +397,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
+	(void)AcquireGpuFlatSources(m_context, program, resources);
 	RebindBuffers(bindings);
+	const auto flat_sources = AcquireGpuFlatSources(m_context, program, resources);
 
 	auto              vk_buffer        = buffer.Handle();
+	RecordGpuFlatReads(vk_buffer, bindings.flattened_srt, resources, flat_sources);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -465,13 +518,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	const auto& resources = *input_info.stage.resources;
+	(void)AcquireGpuFlatSources(m_context, program, resources);
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	const auto flat_sources = AcquireGpuFlatSources(m_context, program, resources);
+	const auto vk_buffer = buffer.Handle();
+	RecordGpuFlatReads(vk_buffer, bindings.flattened_srt, resources, flat_sources);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
