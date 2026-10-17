@@ -81,6 +81,10 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Ranges that may hold CPU-modified bytes since the previous call (false: sync everything).
+	[[nodiscard]] bool TakeCpuDirtyLog(RangeSet& out) noexcept {
+		return m_memory_tracker.TakeCpuDirtyLog(out);
+	}
 	void               RunGarbageCollector();
 
 private:

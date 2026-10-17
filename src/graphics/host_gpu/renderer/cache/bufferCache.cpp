@@ -119,6 +119,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		// The new buffer may cover CPU-dirty pages that no earlier full sync visited.
+		m_memory_tracker.LogCpuDirty(buffer.CpuAddress(), buffer.Size());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -633,6 +635,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	// Dirty bytes only exist on GPU-dirty tracker pages; the page bits are cheaper to test.
+	if (GuestGpu::IsGpuThread() && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size)) {
+		return false;
+	}
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
