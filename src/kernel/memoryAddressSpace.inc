@@ -57,6 +57,16 @@ static void CopySparseRange(const Regions& regions, uint64_t vaddr, void* data, 
 	}
 }
 
+// Mapping of a thread's last backing read (GuestBackingStore::TryReadBackingCached).
+struct BackingReadCache {
+	const void* store          = nullptr;
+	uint64_t    generation     = 0;
+	uint64_t    vaddr          = 0;
+	uint64_t    size           = 0;
+	uint64_t    backing_offset = 0;
+};
+static thread_local BackingReadCache t_backing_read_cache;
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -191,6 +201,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		BumpMapGeneration();
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -201,6 +212,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		BumpMapGeneration();
 		const auto      end   = vaddr + size;
 		auto            first = m_maps.upper_bound(vaddr);
 		if (first == m_maps.begin()) {
@@ -237,6 +249,9 @@ public:
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
+		if (TryReadBackingCached(vaddr, data, size)) {
+			return true;
+		}
 
 		std::shared_lock lock(m_mutex);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -272,6 +287,15 @@ public:
 			const auto  offset = entry.backing_offset + current - entry.vaddr;
 			std::memcpy(destination + (current - vaddr), m_backing_base + offset, bytes);
 			current += bytes;
+		}
+		if (BackingReadCacheEnabled()) {
+			// Writers bump the generation under the exclusive lock: it is stable here.
+			auto& cache          = t_backing_read_cache;
+			cache.store          = this;
+			cache.generation     = m_map_generation.load(std::memory_order_relaxed);
+			cache.vaddr          = first->second.vaddr;
+			cache.size           = first->second.size;
+			cache.backing_offset = first->second.backing_offset;
 		}
 		return true;
 	}
@@ -316,12 +340,14 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			BumpMapGeneration();
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
 #else
 		std::lock_guard lock(m_mutex);
+		BumpMapGeneration();
 		void* mapped = MapView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			return false;
@@ -346,6 +372,7 @@ public:
 		std::vector<MapEntry> targets;
 		{
 			std::lock_guard lock(m_mutex);
+			BumpMapGeneration();
 			auto            current = vaddr;
 			while (current < end) {
 				MapEntry entry {};
@@ -408,6 +435,7 @@ public:
 		MapEntry old {};
 		{
 			std::lock_guard lock(m_mutex);
+			BumpMapGeneration();
 			auto            next = m_maps.upper_bound(vaddr);
 			if (next != m_maps.begin()) {
 				auto entry = std::prev(next);
@@ -434,6 +462,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				BumpMapGeneration();
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -485,6 +514,7 @@ public:
 		}
 		EndBackingRemap();
 		std::lock_guard lock(m_mutex);
+		BumpMapGeneration();
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -495,6 +525,7 @@ public:
 		}
 
 		std::lock_guard lock(m_mutex);
+		BumpMapGeneration();
 		RemoveMappingsUnlocked(vaddr, size);
 
 		if (placeholder_preserved != nullptr) {
@@ -693,10 +724,51 @@ private:
 	int m_fd = -1;
 #endif
 
+	// KYTY_BACKING_READ_CACHE=0 disables. Backing reads (SRT descriptor walks: ~0.4 M block reads/s
+	// in one title) took the shared lock and searched the mapping tree each time. Each thread now
+	// remembers the mapping of its last read with the map generation of that time. A read inside
+	// that mapping copies from the backing view without the lock when no writer started since
+	// (seqlock: the generation is read before and after the copy). The backing view itself stays
+	// mapped for the store's lifetime, so a copy racing a remap is harmless and is retried locked.
+	static bool BackingReadCacheEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_BACKING_READ_CACHE");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		return enabled;
+	}
+
+	void BumpMapGeneration() { m_map_generation.fetch_add(1, std::memory_order_release); }
+
+	bool TryReadBackingCached(uint64_t vaddr, void* data, uint64_t size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+		if (g_test_backing_read != nullptr) {
+			return false;
+		}
+#endif
+		const auto& cache = t_backing_read_cache;
+		if (cache.store != this || vaddr < cache.vaddr || size > cache.size ||
+		    vaddr - cache.vaddr > cache.size - size) {
+			return false;
+		}
+		const auto generation = m_map_generation.load(std::memory_order_acquire);
+		if (generation != cache.generation) {
+			return false;
+		}
+		const auto offset = cache.backing_offset + (vaddr - cache.vaddr);
+		if (!RangeOk(offset, size)) {
+			return false;
+		}
+		std::memcpy(data, m_backing_base + offset, size);
+		std::atomic_thread_fence(std::memory_order_acquire);
+		return m_map_generation.load(std::memory_order_relaxed) == generation;
+	}
+
 	uint8_t*                     m_backing_base = nullptr;
 	uint64_t                     m_size         = 0;
 	std::shared_mutex            m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	std::atomic<uint64_t>        m_map_generation {0};
 };
 
 class GuestAddressSpace {
