@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -35,17 +36,45 @@ public:
 		Block::iterator instruction;
 		uint64_t visited = 0;
 		bool queued = false;
+		Inst*    inst     = nullptr;
+		uint32_t previous = 0; // definition slot before the pass
 	};
 
+	FoldWorklist() = default;
+	~FoldWorklist() {
+		for (const auto& location: locations) {
+			location.inst->SetDefinition(0, location.previous);
+		}
+	}
+	FoldWorklist(const FoldWorklist&)            = delete;
+	FoldWorklist& operator=(const FoldWorklist&) = delete;
+
 	void Register(Block::iterator instruction) {
-		locations.emplace(&*instruction, Location {instruction});
-		Queue(&*instruction);
+		auto* inst = &*instruction;
+		locations.push_back({instruction, 0, false, inst, inst->Definition(0)});
+		inst->SetDefinition(0, static_cast<uint32_t>(locations.size()));
+		Queue(inst);
+	}
+
+	// Locations live in a vector indexed through the instruction's backend definition slot
+	// (unused until SPIR-V emission, restored by the destructor), which avoids a hash map node
+	// per instruction.
+	[[nodiscard]] Location* Find(Inst* inst) {
+		const auto index = inst->Definition(0);
+		if (index == 0 || index > locations.size()) return nullptr;
+		auto& location = locations[index - 1];
+		return location.inst == inst ? &location : nullptr;
+	}
+	[[nodiscard]] Location& At(Inst* inst) {
+		auto* location = Find(inst);
+		EXIT_IF(location == nullptr);
+		return *location;
 	}
 
 	void Queue(Inst* inst) {
-		const auto found = locations.find(inst);
-		if (found != locations.end() && !found->second.queued) {
-			found->second.queued = true;
+		auto* found = Find(inst);
+		if (found != nullptr && !found->queued) {
+			found->queued = true;
 			pending.push_back(inst);
 		}
 	}
@@ -60,9 +89,9 @@ public:
 		// stay dynamic. Visit their union once per drain, including cyclic Phi edges.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
-			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.visited == generation) continue;
-			found->second.visited = generation;
+			auto* found = Find(inst);
+			if (found == nullptr || found->visited == generation) continue;
+			found->visited = generation;
 			Queue(inst);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
@@ -76,11 +105,11 @@ public:
 		return result;
 	}
 
-	std::unordered_map<Inst*, Location> locations;
 	std::vector<Inst*> pending;
 	std::unordered_set<Inst*> lowered_ancillary;
 
 private:
+	std::vector<Location>               locations;
 	std::vector<Inst*> affected;
 	uint64_t generation = 0;
 };
@@ -925,7 +954,7 @@ private:
 		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
-		const auto where = m_worklist.locations.at(source).instruction;
+		const auto where = m_worklist.At(source).instruction;
 		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
 		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
 		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
@@ -967,7 +996,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		do {
 			for (size_t i = 0; i < worklist.pending.size(); ++i) {
 				auto* inst = worklist.pending[i];
-				auto& location = worklist.locations.at(inst);
+				auto& location = worklist.At(inst);
 				location.queued = false;
 				const auto opcode = inst->GetOpcode();
 				if (opcode == ValueOpcode::Identity || opcode == ValueOpcode::Void) continue;
