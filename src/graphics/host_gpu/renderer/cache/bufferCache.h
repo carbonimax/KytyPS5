@@ -57,6 +57,10 @@ public:
 	// (KYTY_READBACK_WINDOW_KIB, clamped to the faulting buffer) are published in one sync.
 	void                   ReadFaultMemory(uint64_t vaddr);
 	void                   InvalidateFaultMemory(uint64_t vaddr);
+	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
+	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
+	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
+	void                   ReadMemoryWindow(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

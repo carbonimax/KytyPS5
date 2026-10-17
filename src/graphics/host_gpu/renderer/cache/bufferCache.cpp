@@ -392,6 +392,25 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 	});
 }
 
+void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BACKING_READ_WINDOW");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	if (!enabled || !GuestGpu::IsGpuThread()) {
+		ReadMemory(vaddr, size);
+		return;
+	}
+	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	const auto base   = buffer.CpuAddress();
+	const auto window = ReadbackWindowBytes();
+	const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
+	const auto last   = std::min(base + buffer.Size(), Common::AlignUp(vaddr + size, window));
+	if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
+	}
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
