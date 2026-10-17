@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -104,11 +105,74 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+// An SRT walk reads descriptor tables one dword at a time, often the same dwords through both
+// readers. During one program lookup the readers serve dwords from whole 64-byte blocks of
+// backing read once, when no byte of the block is GPU-dirty: then both readers would return
+// exactly those backing bytes. Other blocks keep the per-dword reads.
+class SrtBlockCache {
+public:
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		if (values.size() != 1 || (address & 3u) != 0u) {
+			return false;
+		}
+		const uint64_t block = address & ~uint64_t {BlockBytes - 1};
+		auto&          entry = m_entries[(block / BlockBytes) % m_entries.size()];
+		if (entry.block != block) {
+			entry.block = block;
+			entry.valid = Libs::LibKernel::Memory::TryReadCleanBufferBacking(
+			    block, entry.words.data(), BlockBytes);
+		}
+		if (!entry.valid) {
+			return false;
+		}
+		values[0] = entry.words[(address % BlockBytes) / sizeof(uint32_t)];
+		return true;
+	}
+
+private:
+	static constexpr uint64_t BlockBytes = 64;
+	struct Entry {
+		uint64_t                                    block = UINT64_MAX;
+		bool                                        valid = false;
+		std::array<uint32_t, BlockBytes / sizeof(uint32_t)> words {};
+	};
+	std::array<Entry, 16> m_entries;
+};
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (userdata != nullptr && static_cast<SrtBlockCache*>(userdata)->Read(address, values)) {
+		return true;
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// Ordinary SRT reads (descriptor tables, user data pointers) bypass the page protection: a
+// 4 KiB page that merely shares bytes with GPU-written data would otherwise fault and flush
+// the whole queue. Only bytes the GPU actually wrote are synchronized; unmapped addresses
+// keep the direct read so they fail exactly as before.
+bool ReadShaderGuestMemoryOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (userdata != nullptr && static_cast<SrtBlockCache*>(userdata)->Read(address, values)) {
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                   values.size_bytes())) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	return true;
+}
+
+bool SrtBackingReadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_BACKING_READS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -351,12 +415,17 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		SrtBlockCache                                block_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .userdata                   = &block_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .null_reads_end_speculation = true,
 		};
+		if (SrtBackingReadsEnabled()) {
+			runtime.read_memory = ReadShaderGuestMemoryOrdinary;
+		}
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
