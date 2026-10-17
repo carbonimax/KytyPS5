@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -338,6 +339,68 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	});
+}
+
+namespace {
+
+// KYTY_READBACK_WINDOW_KIB (default 256, rounded down to a power of two, at most 64 MiB; 0
+// restores page-sized readbacks): bytes published around a guest memory fault.
+uint64_t ReadbackWindowBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_READBACK_WINDOW_KIB");
+		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
+		const auto  size  = std::bit_floor(std::min<uint64_t>(kib, 64ull * 1024ull) * 1024ull);
+		return std::max(size, TRACKER_PAGE_SIZE);
+	}();
+	return bytes;
+}
+
+} // namespace
+
+void BufferCache::ReadFaultMemory(uint64_t vaddr) {
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+		ReadMemory(vaddr, 1);
+		return;
+	}
+	PublishFaultWindow(vaddr, false);
+}
+
+void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
+	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+		InvalidateMemory(vaddr, 1);
+		return;
+	}
+	if (!GuestRange {vaddr, 1}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr] { PublishFaultWindow(vaddr, true); });
+}
+
+void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write] {
+		if (is_write && !IsRegionRegistered(vaddr, 1)) {
+			// Cache buffers cover whole tracker pages, so this page has nothing to download.
+			m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+			                               TRACKER_PAGE_SIZE);
+			m_memory_tracker.ReleaseUnownedRegion(vaddr, 1);
+			return;
+		}
+		auto&      buffer = m_slot_buffers[FindBuffer(vaddr, 1)];
+		const auto base   = buffer.CpuAddress();
+		// Each fault costs a queue flush and a full timeline wait, and guests walk GPU-written
+		// ranges page by page. Publish the GPU-modified bytes of the whole aligned window at
+		// once: the neighbouring pages become clean (still write-tracked), so later accesses
+		// to them no longer need the GPU. Only the faulting page becomes CPU-modified.
+		const auto window = ReadbackWindowBytes();
+		const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
+		const auto last   = std::min(base + buffer.Size(), Common::AlignDown(vaddr, window) + window);
+		if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
+		}
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, 1);
 		}
 	});
 }
