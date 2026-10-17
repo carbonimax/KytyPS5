@@ -773,6 +773,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	# The case checks page-granular fault publication; the default readback window publishes
+	# whole 256 KiB windows by design (BufferCache::ReadFaultMemory).
+	set_tests_properties(buffer_cache_dirty_gc PROPERTIES ENVIRONMENT KYTY_READBACK_WINDOW_KIB=0)
 	add_test(NAME color_render_target_1d
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
