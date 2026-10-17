@@ -670,70 +670,13 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
-	const auto flags = inst.Flags<SrtReadFlags>();
-	if (flags.index >= m_program.memory_info.size()) {
-		return false;
+	uint64_t address = 0;
+	switch (RawReadAddress(inst, address, result)) {
+		case RawReadKind::Unknown: return false;
+		case RawReadKind::Constant: return true;
+		case RawReadKind::Memory: break;
 	}
-	const auto& mem    = m_program.memory_info[flags.index];
 	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
-	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
-		uint64_t enabled = 0;
-		if (!Arg(inst, 4, enabled)) return false;
-		if (enabled == 0u) {
-			result = 0u;
-			return true;
-		}
-	}
-	const auto* handle = inst.Arg(0).ResolveInstruction();
-	if (handle == nullptr) {
-		return false;
-	}
-	uint64_t low    = 0;
-	uint64_t high   = 0;
-	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
-		return false;
-	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
-		}
-		if (immediate < 0) {
-			return false;
-		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
-		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			result = 0u;
-			return true;
-		}
-		address = (base & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
-		}
-	}
 	if (m_runtime.null_reads_end_speculation && address < NullPageEnd) {
 		m_null_read = true;
 		return false;
@@ -750,6 +693,96 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	result = word;
 	return true;
+}
+
+bool SrtWalker::DeferFlatRead(const Inst& inst, uint32_t flat_offset, std::vector<uint32_t>& flat) {
+	if (m_runtime.defer_flat_read == nullptr || m_runtime.gpu_flat_reads == nullptr ||
+	    flat_offset >= flat.size() || inst.Flags<SrtReadFlags>().clean != 0u ||
+	    (inst.GetOpcode() != ValueOpcode::LoadAddressU32 &&
+	     inst.GetOpcode() != ValueOpcode::ReadConstBuffer) ||
+	    !IsRawRead(m_program, inst)) {
+		return false;
+	}
+	uint64_t address  = 0;
+	uint64_t constant = 0;
+	// Null-page reads stay on the regular path, which refuses them.
+	if (RawReadAddress(inst, address, constant) != RawReadKind::Memory ||
+	    (m_runtime.null_reads_end_speculation && address < NullPageEnd) ||
+	    !m_runtime.defer_flat_read(address)) {
+		return false;
+	}
+	flat[flat_offset] = 0u;
+	m_runtime.gpu_flat_reads->emplace_back(flat_offset, address);
+	return true;
+}
+
+SrtWalker::RawReadKind SrtWalker::RawReadAddress(const Inst& inst, uint64_t& address,
+                                                 uint64_t& result) {
+	const auto flags = inst.Flags<SrtReadFlags>();
+	if (flags.index >= m_program.memory_info.size()) {
+		return RawReadKind::Unknown;
+	}
+	const auto& mem    = m_program.memory_info[flags.index];
+	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
+	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
+		uint64_t enabled = 0;
+		if (!Arg(inst, 4, enabled)) return RawReadKind::Unknown;
+		if (enabled == 0u) {
+			result = 0u;
+			return RawReadKind::Constant;
+		}
+	}
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr) {
+		return RawReadKind::Unknown;
+	}
+	uint64_t low    = 0;
+	uint64_t high   = 0;
+	uint64_t offset = 0;
+	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+		return RawReadKind::Unknown;
+	}
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+	address              = 0;
+	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
+		uint64_t records = 0;
+		uint64_t word3   = 0;
+		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+			return RawReadKind::Unknown;
+		}
+		if (immediate < 0) {
+			return RawReadKind::Unknown;
+		}
+		const auto byte_offset =
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		if (vector) {
+			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
+			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
+				return RawReadKind::Unknown;
+			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
+				result = 0u;
+				return RawReadKind::Constant;
+			}
+		}
+		const auto size = stride == 0u
+		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			result = 0u;
+			return RawReadKind::Constant;
+		}
+		address = (base & ~uint64_t {3}) + byte_offset;
+	} else {
+		const auto relative = (immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return RawReadKind::Unknown;
+		}
+	}
+	return RawReadKind::Memory;
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
@@ -1162,7 +1195,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
-	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
+	if (m_runtime.gpu_flat_reads != nullptr) m_runtime.gpu_flat_reads->clear();
+	if (m_program.srt_code && m_runtime.read_memory == nullptr && m_runtime.defer_flat_read == nullptr) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
@@ -1180,6 +1214,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
+		if (!clean && inst != nullptr && DeferFlatRead(*inst, read.flat_offset, flat)) return true;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
 	};

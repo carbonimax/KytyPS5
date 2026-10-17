@@ -38,6 +38,9 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+	// Flattened SRT dwords (index, guest address) whose guest memory is GPU-written and that
+	// no host-side decision depends on: the host copies them on the GPU before the dispatch.
+	std::vector<std::pair<uint32_t, uint64_t>> gpu_flat_reads;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
