@@ -933,7 +933,8 @@ bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderD
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           uint32_t color_output_mask, DrawRenderState& state) {
+                           uint32_t color_output_mask, DrawRenderState& state,
+                           bool single_sample) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -959,7 +960,6 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
-	const bool single_sample = DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info, ctx.GetAaConfig());
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, single_sample);
@@ -1052,6 +1052,21 @@ static void MergeAliasedColorTargets(DrawRenderState& state) {
 	}
 }
 
+// The pixel shader permutation depends on whether the draw is single-sampled, which is only known
+// once its targets are resolved, and resolving them needs the shader outputs. The first lookup
+// therefore guesses, and a wrong guess compiles a permutation that is thrown away (in one title,
+// hundreds of extra pixel shader compiles per run). Guess what this shader last resolved to, else what
+// the previous draw resolved to; the check after target resolution still corrects any miss.
+struct SingleSampleGuess {
+	std::unordered_map<uint64_t, bool> by_shader;
+	bool                               last = true;
+};
+
+static SingleSampleGuess& GetSingleSampleGuess() {
+	static thread_local SingleSampleGuess guess;
+	return guess;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -1060,7 +1075,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	auto&      guess      = GetSingleSampleGuess();
+	bool       guessed    = guess.last;
+	if (const auto it = guess.by_shader.find(ps_address); it != guess.by_shader.end()) {
+		guessed = it->second;
+	}
+	RefreshShaders(buffer, draw, color_output_mask, state, guessed);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1136,11 +1157,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 
 	// Shader outputs identify active attachments; finalize centroid after resolving them.
-	if (state.ps_active &&
-	    state.ps_input_info.ps_single_sample !=
-	        DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
-	                             buffer.GetRegisters().GetAaConfig())) {
-		RefreshShaders(buffer, draw, color_output_mask, state);
+	const bool single_sample = DrawUsesSingleSample(std::span {state.color_info, state.color_count},
+	                                                state.depth_info,
+	                                                buffer.GetRegisters().GetAaConfig());
+	if (state.ps_active) {
+		guess.last                  = single_sample;
+		guess.by_shader[ps_address] = single_sample;
+		if (state.ps_input_info.ps_single_sample != single_sample) {
+			RefreshShaders(buffer, draw, color_output_mask, state, single_sample);
+		}
 	}
 
 	return true;
