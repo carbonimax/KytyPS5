@@ -416,7 +416,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	} else {
 		key.push_back(0u);
 	}
-	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	key.push_back(static_cast<uint32_t>(info.fetch_embedded) |
+	              (static_cast<uint32_t>(info.indirect_draw_parameters) << 1u) |
+	              (static_cast<uint32_t>(static_cast<uint8_t>(info.indirect_vertex_offset_slot)) << 8u) |
+	              (static_cast<uint32_t>(static_cast<uint8_t>(info.indirect_instance_offset_slot)) << 16u));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
@@ -520,6 +523,16 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+}
+
+bool VertexStageIsPlain(const HW::VertexShaderInfo& regs, const HW::Context& context) {
+	if (regs.es_regs.data_addr == 0 || (context.GetShaderStages() & 0x20u) != 0) {
+		return false;
+	}
+	const auto [data, hash] = ShaderGetMappedData(regs.es_regs.data_addr, "VertexStageIsPlain():");
+	(void)hash;
+	// Mirrors PrepareProgram below.
+	return !(data.type == Prospero::ShaderBinaryType::kGs && regs.gs_regs.rsrc2.lds_size != 0);
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

@@ -17,6 +17,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
@@ -946,18 +947,59 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	const auto prim_type = CurrentBuffer().GetUserConfig().GetPrimType();
-	const bool gpu_capable =
+	const bool gpu_list_draw =
 	    gpu_indirect_enabled && indexed && count_addr == nullptr && m_index_buffer_size != 0 &&
 	    (m_index_type_and_size == 0 || m_index_type_and_size == 1) &&
-	    registers.vertex_offset == Pm4::SH_NOP && registers.instance_offset == Pm4::SH_NOP &&
 	    registers.index_offset == Pm4::SH_NOP &&
 	    (prim_type == Prospero::PrimitiveType::kTriList ||
 	     prim_type == Prospero::PrimitiveType::kLineList ||
 	     prim_type == Prospero::PrimitiveType::kPointList);
+	const bool gpu_capable = gpu_list_draw && registers.vertex_offset == Pm4::SH_NOP &&
+	                         registers.instance_offset == Pm4::SH_NOP;
+	// A plain vertex shader draws the guest arguments directly (vkCmdDrawIndexedIndirect) and
+	// reads the offsets the guest draw patches into user SGPRs from gl_BaseVertex and
+	// gl_BaseInstance: no CPU read (and no GPU drain), no conversion
+	// pass and no break in rendering. KYTY_GPU_INDIRECT_DIRECT=0 disables it.
+	static const bool gpu_direct_enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_INDIRECT_DIRECT");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	ShaderIndirectDrawParameters direct {};
+	if (gpu_list_draw && gpu_direct_enabled &&
+	    m_renderer.GetGraphics().shader_draw_parameters_enabled) {
+		const auto slot = [](uint32_t location, int8_t& result) {
+			if (location == Pm4::SH_NOP) {
+				return true;
+			}
+			if (location < Pm4::SPI_SHADER_USER_DATA_GS_0 ||
+			    location > Pm4::SPI_SHADER_USER_DATA_GS_31) {
+				return false;
+			}
+			result = static_cast<int8_t>(location - Pm4::SPI_SHADER_USER_DATA_GS_0);
+			return true;
+		};
+		direct.enabled = slot(registers.vertex_offset, direct.vertex_offset_slot) &&
+		                 slot(registers.instance_offset, direct.instance_offset_slot) &&
+		                 VertexStageIsPlain(CurrentBuffer().GetShaders().GetVs(),
+		                                    CurrentBuffer().GetRegisters());
+	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
+
+		if (direct.enabled && m_renderer.GetBufferCache().IsRegionGpuModified(
+		                          args_addr, sizeof(DrawIndexedIndirectArgs))) {
+			m_num_instances_address = args_addr + offsetof(DrawIndexedIndirectArgs, instance_count);
+			DrawIndex({.index_count         = 1,
+			           .index_addr          = reinterpret_cast<const void*>(m_index_base_addr),
+			           .instance_count      = 1,
+			           .offset_source       = DrawOffsetSource::IndirectArgs,
+			           .indirect_args       = args_addr,
+			           .index_limit         = m_index_buffer_size,
+			           .indirect_parameters = direct});
+			continue;
+		}
 
 		if (gpu_capable && m_renderer.GetBufferCache().IsRegionGpuModified(
 		                       args_addr, sizeof(DrawIndexedIndirectArgs))) {

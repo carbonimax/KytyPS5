@@ -1401,10 +1401,37 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
 			                      entry_ir.BitwiseOr(vertex_count, IR::U32(IR::Value(1u << 28u))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      builtin(IR::StageInputKind::VertexIndex));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			const auto* vertex = options.input_info.vertex;
+			if (vertex != nullptr && vertex->indirect_draw_parameters) {
+				// GPU-built indirect draw: the host draw applied the guest base vertex and first
+				// instance. Native fetches expect zero-based indices plus the offsets in the user
+				// SGPRs the guest draw would patch; rewritten fetches use the host offsets.
+				const auto base_vertex   = builtin(IR::StageInputKind::BaseVertex);
+				const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
+				auto vertex_index   = builtin(IR::StageInputKind::VertexIndex);
+				auto instance_index = builtin(IR::StageInputKind::InstanceIndex);
+				if (!vertex->fetch_embedded) {
+					vertex_index   = entry_ir.ISub(vertex_index, base_vertex);
+					instance_index = entry_ir.ISub(instance_index, base_instance);
+				}
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), vertex_index);
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8), instance_index);
+				const auto patch = [&](int8_t slot, const IR::U32& value) {
+					if (slot < 0) return;
+					const auto reg = static_cast<IR::ScalarReg>(options.user_data_base +
+					                                            static_cast<uint32_t>(slot));
+					if (IR::RegIndex(reg) >= IR::NumScalarRegs) return;
+					entry_ir.SetScalarReg(reg, value);
+					entry_ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
+				};
+				patch(vertex->indirect_vertex_offset_slot, base_vertex);
+				patch(vertex->indirect_instance_offset_slot, base_instance);
+			} else {
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      builtin(IR::StageInputKind::VertexIndex));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+				                      builtin(IR::StageInputKind::InstanceIndex));
+			}
 		}
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&

@@ -664,7 +664,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool single_sample) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool single_sample,
+    ShaderIndirectDrawParameters indirect) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -683,6 +684,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		EXIT_NOT_IMPLEMENTED(Prospero::ResolveRenderTargetFormat(target.info.format,
 		                                                       target.info.channel_type)
 		                         .buffer_format != Prospero::BufferFormat::k32UInt);
+	}
+	if (indirect.enabled) {
+		// The command processor only sends plain vertex shaders down this path.
+		EXIT_NOT_IMPLEMENTED(tess_active || vertex_info[0].logical_stage != ShaderType::Vertex ||
+		                     !m_graphics.shader_draw_parameters_enabled);
+		vertex_info[0].indirect_draw_parameters      = true;
+		vertex_info[0].indirect_vertex_offset_slot   = indirect.vertex_offset_slot;
+		vertex_info[0].indirect_instance_offset_slot = indirect.instance_offset_slot;
 	}
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);

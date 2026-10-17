@@ -30,6 +30,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<ui
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
 
+// True when the vertex stage compiles to a plain host vertex shader (not mesh-emulated NGG).
+bool VertexStageIsPlain(const HW::VertexShaderInfo& regs, const HW::Context& context);
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
 std::array<ShaderParams, 3>

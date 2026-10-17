@@ -158,6 +158,19 @@ struct ShaderVertexInputInfo {
 	ShaderTessellationInputInfo tess;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// A GPU-built indirect draw (vkCmdDrawIndexedIndirect on the guest arguments): the host
+	// draw applies the arguments' base vertex and first instance, and the user SGPRs the guest
+	// draw would patch with them (slot index, or -1) are read from gl_BaseVertex/gl_BaseInstance.
+	bool                    indirect_draw_parameters = false;
+	int8_t                  indirect_vertex_offset_slot   = -1;
+	int8_t                  indirect_instance_offset_slot = -1;
+};
+
+// See ShaderVertexInputInfo::indirect_draw_parameters.
+struct ShaderIndirectDrawParameters {
+	bool   enabled              = false;
+	int8_t vertex_offset_slot   = -1;
+	int8_t instance_offset_slot = -1;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

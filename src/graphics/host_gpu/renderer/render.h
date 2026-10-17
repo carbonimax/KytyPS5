@@ -64,6 +64,9 @@ struct DrawIndexArgs {
 	// built from the arguments on the GPU (see MeshIndirectArgs).
 	uint64_t         indirect_args              = 0;
 	uint32_t         index_limit                = 0;
+	// With indirect_args and enabled: the guest arguments feed vkCmdDrawIndexedIndirect directly
+	// (no conversion pass, no break in rendering); the vertex shader reads the offsets.
+	ShaderIndirectDrawParameters indirect_parameters;
 };
 
 struct DrawAutoArgs {

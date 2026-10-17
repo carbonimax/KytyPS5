@@ -453,8 +453,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR supported_workgroup_layout {};
 	vk::PhysicalDeviceVulkan12Features supported_features12 {};
 	supported_features12.pNext = workgroup_layout_extension ? &supported_workgroup_layout : nullptr;
+	vk::PhysicalDeviceVulkan11Features supported_features11 {};
+	supported_features11.pNext = &supported_features12;
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
-	supported_features13.pNext = &supported_features12;
+	supported_features13.pNext = &supported_features11;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
 	supported_robustness2.pNext = supported_features13.pNext;
@@ -532,6 +534,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    features12.shaderSharedInt64Atomics != VK_FALSE,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
+	// gl_BaseVertex/gl_BaseInstance in vertex shaders: GPU-written indexed indirect draws are
+	// drawn directly with it; without it they take the conversion pass or the CPU read.
+	features11.shaderDrawParameters         = supported_features11.shaderDrawParameters;
+	graphics.shader_draw_parameters_enabled = features11.shaderDrawParameters == VK_TRUE;
+	LOGF("Vulkan shaderDrawParameters: %s\n",
+	     graphics.shader_draw_parameters_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};

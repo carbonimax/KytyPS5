@@ -458,6 +458,8 @@ struct DrawCallInfo {
 	// Guest address of GPU-written DrawIndexedIndirectArgs. When set, the counts above are
 	// placeholders and the draw is built on the GPU (see MeshIndirectArgs).
 	uint64_t             indirect_args  = 0;
+	// See DrawIndexArgs::indirect_parameters.
+	ShaderIndirectDrawParameters indirect_parameters {};
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -911,7 +913,10 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info, ctx.GetAaConfig()));
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+	    DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
+	                         ctx.GetAaConfig()),
+	    draw.indirect_parameters);
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1131,6 +1136,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
 	const bool gpu_args    = draw.indirect_args != 0;
+	// The guest arguments are drawn as they are; no conversion pass (see DrawIndexArgs).
+	const bool gpu_direct  = gpu_args && draw.indirect_parameters.enabled;
+	EXIT_IF(gpu_direct && mesh_active);
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -1201,7 +1209,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::DeviceAddress            mesh_record   = 0;
 	uint64_t                     gpu_output    = 0;
 	std::pair<Buffer*, uint64_t> gpu_arguments = {nullptr, 0};
-	if (gpu_args) {
+	if (gpu_direct) {
+		gpu_arguments = m_context.GetBufferCache().ObtainBuffer(
+		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
+		EXIT_IF(gpu_arguments.first == nullptr || (gpu_arguments.second & 3u) != 0);
+	} else if (gpu_args) {
 		// The GPU writes this slot; the CPU only reserves it.
 		const auto [mapped, offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
 		EXIT_IF(mapped == nullptr);
@@ -1237,7 +1249,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (gpu_args) {
+	if (gpu_args && !gpu_direct) {
 		// Build the draw's command (and for mesh emulation its record) from the GPU-written
 		// arguments. This compute pass and its barriers must precede rendering and the
 		// graphics bindings below.
@@ -1318,6 +1330,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
 	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	} else if (gpu_direct) {
+		vk_buffer.drawIndexedIndirect(gpu_arguments.first->Handle(), gpu_arguments.second, 1,
+		                              sizeof(vk::DrawIndexedIndirectCommand));
 	} else if (gpu_args) {
 		vk_buffer.drawIndexedIndirect(records.Handle(),
 		                              gpu_output + MeshIndirectArgs::RecordOffset, 1,
@@ -1444,7 +1459,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance, args.indirect_args};
+	                        args.instance_count, args.first_instance, args.indirect_args,
+	                        args.indirect_parameters};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
