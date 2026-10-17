@@ -33,7 +33,7 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	// KYTY_ASYNC_READBACK (default 0): guest-thread fault readbacks do not stall the GPU thread.
+	// KYTY_ASYNC_READBACK (default 1): guest-thread fault readbacks do not stall the GPU thread.
 	[[nodiscard]] static bool AsyncFaultReadbacks();
 
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;

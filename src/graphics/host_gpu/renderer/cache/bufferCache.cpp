@@ -762,7 +762,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 bool BufferCache::AsyncFaultReadbacks() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_ASYNC_READBACK");
-		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+		// Default on; KYTY_ASYNC_READBACK=0 restores synchronous readbacks (and, by default, turns
+		// compute preemption and the readback queue off with them).
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
 	}();
 	return enabled;
 }
