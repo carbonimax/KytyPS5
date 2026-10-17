@@ -25,12 +25,21 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// GPU-thread only: GPU-dirty page bits change only on that thread, so they can be read
+	// without the region lock. False means no byte of the range can be GPU-dirty.
+	[[nodiscard]] bool MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Only for ranges whose complete tracker pages have no cache-buffer owner.
 	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);
+	// Records a range whose pages may have become CPU-dirty, so that a later full-memory
+	// synchronization (PrepareBda) only has to visit the ranges logged since the previous one.
+	void LogCpuDirty(uint64_t vaddr, uint64_t size) noexcept;
+	// Moves the logged ranges to `out`. Returns false when the log overflowed or was never
+	// taken: the caller must then synchronize everything.
+	[[nodiscard]] bool TakeCpuDirtyLog(RangeSet& out) noexcept;
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -51,6 +60,8 @@ public:
 			}();
 			if (should_flush) {
 				on_flush();
+			} else {
+				LogCpuDirty(manager->GetCpuAddr() + offset, bytes);
 			}
 		});
 	}
@@ -152,6 +163,10 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::mutex                                     m_dirty_log_mutex;
+	RangeSet                                       m_dirty_log;
+	size_t                                         m_dirty_log_adds     = 0;
+	bool                                           m_dirty_log_overflow = true;
 };
 
 } // namespace Libs::Graphics

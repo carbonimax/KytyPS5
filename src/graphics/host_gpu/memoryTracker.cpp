@@ -63,7 +63,36 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	// A new region starts CPU-dirty.
+	LogCpuDirty(index * TRACKER_REGION_SIZE, TRACKER_REGION_SIZE);
 	return ptr;
+}
+
+void MemoryTracker::LogCpuDirty(uint64_t vaddr, uint64_t size) noexcept {
+	constexpr size_t MaxLoggedAdds = 8192;
+	if (size == 0) {
+		return;
+	}
+	std::lock_guard lock(m_dirty_log_mutex);
+	if (m_dirty_log_overflow) {
+		return;
+	}
+	if (++m_dirty_log_adds > MaxLoggedAdds) {
+		m_dirty_log_overflow = true;
+		m_dirty_log.Clear();
+		return;
+	}
+	m_dirty_log.Add(vaddr, size);
+}
+
+bool MemoryTracker::TakeCpuDirtyLog(RangeSet& out) noexcept {
+	std::lock_guard lock(m_dirty_log_mutex);
+	const bool complete  = !m_dirty_log_overflow;
+	out                  = std::move(m_dirty_log);
+	m_dirty_log          = {};
+	m_dirty_log_adds     = 0;
+	m_dirty_log_overflow = false;
+	return complete;
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -82,12 +111,19 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size) {
+	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+	});
+}
+
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	LogCpuDirty(vaddr, size);
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -138,6 +174,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+	LogCpuDirty(vaddr, size);
 }
 
 } // namespace Libs::Graphics

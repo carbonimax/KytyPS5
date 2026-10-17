@@ -90,6 +90,7 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_bda_full_sync_pending.store(true, std::memory_order_release);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -129,9 +130,21 @@ void RenderContext::PrepareBda() {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	RangeSet         dirty;
+	// Take the log before synchronizing: pages dirtied meanwhile are logged for the next call.
+	const bool       complete = m_buffer_cache.TakeCpuDirtyLog(dirty);
+	const bool       mapped   = m_bda_full_sync_pending.exchange(false, std::memory_order_acq_rel);
+	if (!complete || mapped) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	} else {
+		dirty.ForEach([this](uint64_t start, uint64_t end) {
+			m_mapped_ranges.ForEachInRange(start, end - start, [this](uint64_t begin, uint64_t last) {
+				m_buffer_cache.SynchronizeBuffersInRange(begin, last - begin);
+			});
+		});
+	}
 	m_fault_process_pending = true;
 }
 
