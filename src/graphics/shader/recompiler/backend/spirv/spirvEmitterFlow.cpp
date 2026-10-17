@@ -746,6 +746,15 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	// Zero-kind predicates are already inverted by translation.
+	if (ctx.state.packed_wave32) {
+		// A 64-lane host subgroup holds two guest waves: vote within this invocation's half.
+		const auto ballot    = ctx.Ballot(inst.Arg(0));
+		const auto reference = zero ? ctx.Ballot(IR::Value(true))
+		                            : ConstantU32CompositeZero(ctx.state, 4);
+		const auto compare   = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
+		                             TypeBoolVector(ctx.state, 4), ballot, reference);
+		return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
+	}
 	auto predicate = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
