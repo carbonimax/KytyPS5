@@ -32,6 +32,8 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Stopped at a packet boundary to let queued compute work run first.
+	[[nodiscard]] bool Yielded() const noexcept { return m_yielded; }
 
 private:
 	friend class CommandProcessor;
@@ -46,6 +48,7 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	bool                      m_yielded       = false;
 };
 
 class CommandProcessor {
@@ -185,6 +188,7 @@ private:
 	FlipInfo  m_flip;
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;
+	uint64_t  m_compute_seen                = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
 };
