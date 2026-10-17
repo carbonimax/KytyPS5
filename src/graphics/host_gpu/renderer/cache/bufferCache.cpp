@@ -405,6 +405,30 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 	});
 }
 
+bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_OWNED_WRITE_DATA");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	if (!enabled || size == 0 || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid() ||
+	    m_scheduler.Current().IsInvalid() || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (!buffer.IsInBounds(vaddr, size) ||
+	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	// The pages stay GPU-modified: a later readback copies the cached buffer, which then holds
+	// these bytes in command-stream order with the GPU writes around them.
+	WriteDataBuffer(buffer, vaddr, data, size);
+	return true;
+}
+
 void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BACKING_READ_WINDOW");
