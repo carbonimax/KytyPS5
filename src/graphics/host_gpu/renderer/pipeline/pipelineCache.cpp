@@ -25,6 +25,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -502,6 +504,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 PipelineCache::~PipelineCache() {
 	Save();
+	StopPeriodicSave();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -568,6 +571,10 @@ void PipelineCache::InitializeDriverCache() {
 			    payload_read != initial_data.size() || cached_signature != signature ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
+			} else {
+				m_saved_payload_hash = payload_hash;
+			}
+			if (initial_data.empty()) {
 				PipelineCacheLog(
 				    "Vulkan pipeline cache: invalidating {} (driver, emulator, or data mismatch)",
 				    path);
@@ -601,11 +608,62 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	StartPeriodicSave();
+}
+
+void PipelineCache::StartPeriodicSave() {
+	uint64_t interval_s = 30;
+	if (const char* value = std::getenv("KYTY_PIPELINE_CACHE_SAVE_S"); value != nullptr) {
+		interval_s = std::strtoull(value, nullptr, 10);
+	}
+	if (interval_s == 0) {
+		PipelineCacheLog("Vulkan pipeline cache: periodic save disabled");
+		return;
+	}
+	m_saver = std::jthread([this, interval_s](std::stop_token stop) {
+		KYTY_PROFILER_THREAD("PipelineCacheSave");
+		std::mutex lock_mutex;
+		while (!stop.stop_requested()) {
+			{
+				std::unique_lock lock(lock_mutex);
+				m_saver_wake.wait_for(lock, stop, std::chrono::seconds(interval_s),
+				                      [] { return false; });
+			}
+			if (stop.stop_requested()) {
+				return;
+			}
+			WriteDriverCache(false);
+		}
+	});
+}
+
+void PipelineCache::StopPeriodicSave() {
+	if (m_saver.joinable()) {
+		m_saver.request_stop();
+		m_saver_wake.notify_all();
+		m_saver.join();
+	}
 }
 
 void PipelineCache::Save() {
+	StopPeriodicSave();
 	if (m_driver_cache == nullptr) {
 		return;
+	}
+	if (WriteDriverCache(true)) {
+		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
+	}
+}
+
+bool PipelineCache::WriteDriverCache(bool final_save) {
+	std::lock_guard save_lock(m_save_mutex);
+	if (m_driver_cache == nullptr) {
+		return false;
+	}
+	const auto created = m_pipelines_created.load(std::memory_order_relaxed);
+	if (!final_save && created == m_pipelines_saved) {
+		return true;
 	}
 
 	size_t               size = 0;
@@ -628,15 +686,20 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	if (payload_hash == m_saved_payload_hash) {
+		// Cache hits do not change the driver data; skip rewriting an identical file.
+		m_pipelines_saved = created;
+		return true;
+	}
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -653,12 +716,14 @@ void PipelineCache::Save() {
 	    !DriverCachePolicy::ReplaceCacheFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
-	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_pipelines_saved    = created;
+	m_saved_payload_hash = payload_hash;
+	PipelineCacheLog("Vulkan pipeline cache: {} {} bytes to {} ({} new pipelines)",
+	                 final_save ? "saved" : "snapshot", payload.size(),
+	                 Common::PathToString(m_driver_cache_path), created);
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -972,6 +1037,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	m_pipelines_created.fetch_add(1, std::memory_order_relaxed);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
@@ -1000,6 +1066,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+	m_pipelines_created.fetch_add(1, std::memory_order_relaxed);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
