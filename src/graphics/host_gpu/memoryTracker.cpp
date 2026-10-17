@@ -150,6 +150,7 @@ void MemoryTracker::ReleaseUnownedRegion(uint64_t vaddr, uint64_t size) {
 		manager->ChangeState<DirtySource::Gpu, false>(address, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(address, bytes);
 	});
+	LogCpuDirty(vaddr, size);
 }
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
