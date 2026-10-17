@@ -24,6 +24,8 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -1221,8 +1223,24 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+// KYTY_BARRIER_DEDUP=0 disables. Guest cache flush events often come in runs (partial flushes,
+// write-back/invalidate, RELEASE_MEM) with no work between them. A full barrier recorded when
+// nothing has been recorded since the previous one orders nothing more: the previous barrier
+// already orders and makes visible everything before it for all later commands.
+static bool GlobalBarrierDedupEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BARRIER_DEDUP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	if (GlobalBarrierDedupEnabled() && !CurrentBuffer().IsInvalid() &&
+	    CurrentBuffer().GlobalBarrierCurrent()) {
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1235,6 +1253,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().MarkGlobalBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

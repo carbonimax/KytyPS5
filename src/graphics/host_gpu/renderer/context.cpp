@@ -25,6 +25,7 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	++m_handle_uses;
 	return m_buffer;
 }
 
