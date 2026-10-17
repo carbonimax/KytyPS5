@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -430,6 +431,34 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+// KYTY_UPLOAD_BARRIER_BATCH=0 restores one barrier pair per upload.
+static bool UploadBarrierBatchEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_BARRIER_BATCH");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::BeginUploadBatch() noexcept {
+	if (UploadBarrierBatchEnabled()) {
+		m_upload_batch_depth++;
+	}
+}
+
+void BufferCache::EndUploadBatch() {
+	if (!UploadBarrierBatchEnabled()) {
+		return;
+	}
+	EXIT_IF(m_upload_batch_depth == 0);
+	if (--m_upload_batch_depth == 0) {
+		m_batch_ranges.clear();
+		if (m_scheduler.Active() && m_scheduler.Current().UploadPostPending()) {
+			m_scheduler.Current().FlushUploadPost();
+		}
+	}
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	std::vector<vk::BufferCopy> copies;
@@ -444,29 +473,85 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
 		auto& command = m_scheduler.Current();
+		const bool batch = m_upload_batch_depth != 0;
+		// Evaluated before any handle use: a pending trailing barrier means the previous recorded
+		// work is an upload of this batch, whose leading barrier already covers this one.
+		bool joined = batch && command.UploadPostPending();
 		command.EndRendering();
-		const auto native = command.Handle();
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		const auto native = batch ? command.HandleForUpload() : command.Handle();
+		if (!batch) {
+			vk::BufferMemoryBarrier before {};
+			before.srcAccessMask = vk::AccessFlagBits::eMemoryRead |
+			                       vk::AccessFlagBits::eMemoryWrite |
+			                       vk::AccessFlagBits::eTransferRead |
+			                       vk::AccessFlagBits::eTransferWrite;
+			before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+			before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			before.buffer              = buffer.Handle();
+			before.offset              = 0;
+			before.size                = buffer.Size();
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::PipelineStageFlagBits::eTransfer,
+			                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0,
+			                       nullptr);
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+			auto after          = before;
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+			                       vk::PipelineStageFlagBits::eAllCommands,
+			                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0,
+			                       nullptr);
+		} else {
+			// Destination ranges of this batch's copies: a later copy over the same bytes needs an
+			// explicit write-after-write dependency (the pending trailing barrier is not one).
+			bool overlap = false;
+			for (const auto& copy: copies) {
+				const uint64_t begin = copy.dstOffset;
+				const uint64_t end   = copy.dstOffset + copy.size;
+				for (const auto& range: m_batch_ranges) {
+					overlap |= range.buffer == buffer.Handle() && begin < range.end &&
+					           range.begin < end;
+				}
+			}
+			if (joined && m_batch_ranges.size() > 256) {
+				joined = false; // bound the overlap bookkeeping: start a new leading barrier
+			}
+			if (!joined) {
+				m_batch_ranges.clear();
+			}
+			vk::MemoryBarrier2 shared {};
+			if (!joined) {
+				// Everything recorded before orders and becomes visible before the batch's copies
+				// (global scope: the batch's later copies may target other buffers).
+				shared.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+				shared.srcAccessMask =
+				    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+				shared.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+				shared.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			} else if (overlap) {
+				shared.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+				shared.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+				shared.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+				shared.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+			}
+			if (!joined || overlap) {
+				vk::DependencyInfo dependency {};
+				dependency.dependencyFlags    = vk::DependencyFlagBits::eByRegion;
+				dependency.memoryBarrierCount = 1;
+				dependency.pMemoryBarriers    = &shared;
+				native.pipelineBarrier2(dependency);
+			}
+			native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+			                  copies.data());
+			for (const auto& copy: copies) {
+				m_batch_ranges.push_back(
+				    {buffer.Handle(), copy.dstOffset, copy.dstOffset + copy.size});
+			}
+			command.DeferUploadPost();
+		}
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
