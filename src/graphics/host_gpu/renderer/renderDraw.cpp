@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/meshIndirect.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -454,6 +455,9 @@ struct DrawCallInfo {
 	uint32_t             index_count    = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
+	// Guest address of GPU-written DrawIndexedIndirectArgs. When set, the counts above are
+	// placeholders and the draw is built on the GPU (see MeshIndirectArgs).
+	uint64_t             indirect_args  = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -1126,6 +1130,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool gpu_args    = draw.indirect_args != 0;
 	uint32_t   mesh_groups = 0;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
@@ -1140,27 +1145,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EXIT("unsupported mesh draw: primitive=%u indexed=%u restart=%u\n",
 			     static_cast<uint32_t>(ucfg.GetPrimType()), draw.IsIndexed(), primitive_restart_enable);
 		}
-		const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
-		if (primitives == 0 || draw.instance_count == 0) {
-			return;
-		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		if (!gpu_args) {
+			const auto primitives = mesh.InputPrimitiveCount(draw.index_count);
+			if (primitives == 0 || draw.instance_count == 0) {
+				return;
+			}
+			mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
+			    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
+			    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
+			        limits.maxMeshWorkGroupTotalCount) {
+				EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
+				     draw.instance_count);
+			}
 		}
 	}
+	EXIT_IF(gpu_args && !draw.IsIndexed());
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
+		// synchronizes registered BDA ranges before any draw commands are committed. A GPU-args
+		// draw registers the whole index buffer.
 		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		    index_source.address,
+		    gpu_args ? index_source.size
+		             : static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1184,6 +1194,32 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	// Mesh shaders load their draw parameters from a record by address (see
+	// EmitMeshDrawParameter). Reserve or write the record now: the ring can wait and restart the
+	// scheduler, which must not happen once recording starts below.
+	auto&                        records       = m_context.GetBufferCache().GetDrawRecordBuffer();
+	vk::DeviceAddress            mesh_record   = 0;
+	uint64_t                     gpu_output    = 0;
+	std::pair<Buffer*, uint64_t> gpu_arguments = {nullptr, 0};
+	if (gpu_args) {
+		// The GPU writes this slot; the CPU only reserves it.
+		const auto [mapped, offset] = records.Map(MeshIndirectArgs::OutputSize, 64);
+		EXIT_IF(mapped == nullptr);
+		records.Commit();
+		gpu_output    = offset;
+		gpu_arguments = m_context.GetBufferCache().ObtainBuffer(
+		    draw.indirect_args, MeshIndirectArgs::ArgumentsSize, false);
+		mesh_record = records.BufferDeviceAddress() + gpu_output + MeshIndirectArgs::RecordOffset;
+	} else if (mesh_active) {
+		const uint32_t draw_data[] {
+		    draw.index_count,
+		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+		    emit.first_instance, index_source.guest_element_size,
+		    static_cast<uint32_t>(index_source.address),
+		    static_cast<uint32_t>(index_source.address >> 32u)};
+		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		mesh_record = records.BufferDeviceAddress() + records.Copy(draw_data, sizeof(draw_data), 16);
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1201,6 +1237,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	if (gpu_args) {
+		// Build the draw's command (and for mesh emulation its record) from the GPU-written
+		// arguments. This compute pass and its barriers must precede rendering and the
+		// graphics bindings below.
+		m_context.GetCommandScheduler().EndRendering();
+		if (m_mesh_indirect == nullptr) {
+			m_mesh_indirect = std::make_unique<MeshIndirectArgs>(m_context.GetGraphics());
+		}
+		const auto index_limit =
+		    static_cast<uint32_t>(index_source.size / index_source.guest_element_size);
+		const bool native_offsets = !state.vertex_info[0].fetch_embedded;
+		if (mesh_active) {
+			const auto& mesh      = state.vertex_info[0].mesh;
+			const auto& limits    = m_context.GetGraphics().mesh_shader_properties;
+			const auto  max_total = std::max(1u, limits.maxMeshWorkGroupTotalCount);
+			m_mesh_indirect->Record(
+			    vk_buffer, *gpu_arguments.first, gpu_arguments.second, records, gpu_output,
+			    {.index_bytes          = index_source.guest_element_size,
+			     .index_address        = index_source.address,
+			     .index_limit          = index_limit,
+			     .primitive_size       = mesh.InputPrimitiveSize(),
+			     .primitive_step       = mesh.InputPrimitiveStep(),
+			     .primitives_per_group = mesh.primitives_per_group,
+			     .max_groups = std::min(std::max(1u, limits.maxMeshWorkGroupCount[0]), max_total),
+			     .max_instances  = std::max(1u, limits.maxMeshWorkGroupCount[1]),
+			     .max_total      = max_total,
+			     .native_offsets = native_offsets});
+		} else {
+			m_mesh_indirect->Record(vk_buffer, *gpu_arguments.first, gpu_arguments.second, records,
+			                        gpu_output,
+			                        {.index_limit    = index_limit,
+			                         .plain          = true,
+			                         .native_offsets = native_offsets});
+		}
+	}
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1208,28 +1279,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (!mesh_active) {
+	if (mesh_active) {
+		const uint32_t address[] {static_cast<uint32_t>(mesh_record),
+		                          static_cast<uint32_t>(mesh_record >> 32u)};
+		vk_buffer.pushConstants(pipeline.pipeline_layout,
+		                        vk::ShaderStageFlagBits::eMeshEXT |
+		                            vk::ShaderStageFlagBits::eFragment,
+		                        0, sizeof(address), address);
+	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
-	}
-	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
-		std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
-		const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
-		                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
-		                                      : vk::ShaderStageFlagBits::eVertex);
-		if (mesh_active) {
-			draw_data = {
-			    draw.index_count,
-			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-			    emit.first_instance, index_source.guest_element_size,
-			    static_cast<uint32_t>(index_source.address),
-			    static_cast<uint32_t>(index_source.address >> 32u)};
-		} else {
-			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+		if (state.ps_input_info.object_primitive_id) {
+			// Mesh draws use dwords 0-1 for their record address (object IDs exclude mesh draws).
+			const uint32_t object_id = buffer.GetUserConfig().GetObjectId();
+			vk_buffer.pushConstants(pipeline.pipeline_layout,
+			                        vk::ShaderStageFlagBits::eFragment | vk::ShaderStageFlagBits::eVertex,
+			                        0, sizeof(object_id), &object_id);
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
-		                        draw_dwords * sizeof(uint32_t), draw_data.data());
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
@@ -1247,8 +1312,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (mesh_active && gpu_args) {
+		vk_buffer.drawMeshTasksIndirectEXT(records.Handle(),
+		                                   gpu_output + MeshIndirectArgs::CommandOffset, 1,
+		                                   sizeof(vk::DrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+	} else if (gpu_args) {
+		vk_buffer.drawIndexedIndirect(records.Handle(),
+		                              gpu_output + MeshIndirectArgs::RecordOffset, 1,
+		                              sizeof(vk::DrawIndexedIndirectCommand));
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
@@ -1349,8 +1422,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 			break;
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
-	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
-	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
+	const bool gpu_args = args.indirect_args != 0;
+	// A GPU-args draw covers the whole index buffer; the command processor only sends list
+	// draws with 16- or 32-bit indices, which need neither restart nor widening.
+	EXIT_IF(gpu_args && (args.index_limit == 0 || index_source.guest_element_size == 1));
+	index_source.size =
+	    static_cast<uint64_t>(gpu_args ? args.index_limit : args.index_count) *
+	    index_source.guest_element_size;
+	const bool primitive_restart = !gpu_args && ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;
 	if (index_source.guest_element_size == 1) {
@@ -1365,7 +1444,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	                        args.instance_count, args.first_instance, args.indirect_args};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1390,6 +1469,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    primitive_restart);
 	ResetBindings();
 }
+
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {

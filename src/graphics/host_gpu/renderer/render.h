@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -28,6 +29,7 @@ struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
 struct RenderColorInfo;
 struct DrawCallInfo;
+class MeshIndirectArgs;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
@@ -57,6 +59,11 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Guest address of GPU-written DrawIndexedIndirectArgs: the counts above are placeholders,
+	// index_addr is the index buffer base, and index_limit its size in elements. The draw is
+	// built from the arguments on the GPU (see MeshIndirectArgs).
+	uint64_t         indirect_args              = 0;
+	uint32_t         index_limit                = 0;
 };
 
 struct DrawAutoArgs {
@@ -146,7 +153,8 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -213,6 +221,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<MeshIndirectArgs>     m_mesh_indirect; // Created on the first GPU-args draw.
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
