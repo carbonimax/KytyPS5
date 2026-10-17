@@ -85,6 +85,28 @@ void MemoryTracker::LogCpuDirty(uint64_t vaddr, uint64_t size) noexcept {
 	m_dirty_log.Add(vaddr, size);
 }
 
+uint64_t MemoryTracker::ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcept {
+	CheckNotInUploadCallback();
+	if (vaddr % TRACKER_PAGE_SIZE != 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	size = std::min(size, TRACKER_REGION_SIZE - vaddr % TRACKER_REGION_SIZE);
+	auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (manager == nullptr) {
+		return 0;
+	}
+	uint64_t marked = 0;
+	{
+		std::scoped_lock lock(manager->lock);
+		marked = manager->UnmodifiedPrefix<DirtySource::Gpu>(vaddr % TRACKER_REGION_SIZE, size);
+		if (marked != 0) {
+			manager->ChangeState<DirtySource::Cpu, true>(vaddr, marked);
+		}
+	}
+	LogCpuDirty(vaddr, marked);
+	return marked;
+}
+
 bool MemoryTracker::TakeCpuDirtyLog(RangeSet& out) noexcept {
 	std::lock_guard lock(m_dirty_log_mutex);
 	const bool complete  = !m_dirty_log_overflow;

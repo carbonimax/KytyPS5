@@ -37,6 +37,9 @@ public:
 	// Records a range whose pages may have become CPU-dirty, so that a later full-memory
 	// synchronization (PrepareBda) only has to visit the ranges logged since the previous one.
 	void LogCpuDirty(uint64_t vaddr, uint64_t size) noexcept;
+	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
+	// the first GPU-modified page and at the region end. Returns the bytes marked.
+	uint64_t ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcept;
 	// Moves the logged ranges to `out`. Returns false when the log overflowed or was never
 	// taken: the caller must then synchronize everything.
 	[[nodiscard]] bool TakeCpuDirtyLog(RangeSet& out) noexcept;
