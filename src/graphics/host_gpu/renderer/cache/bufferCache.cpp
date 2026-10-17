@@ -811,6 +811,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	// Dirty bytes only exist on GPU-dirty tracker pages; the page bits are cheaper to test.
+	if (GuestGpu::IsGpuThread() && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size)) {
+		return false;
+	}
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
