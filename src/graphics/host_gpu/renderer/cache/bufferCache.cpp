@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -307,6 +308,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	const bool             guest_thread = !GuestGpu::IsGpuThread();
+	PerfStats::ScopedTimer timer(
+	    guest_thread ? PerfStats::Counter::ReadbackSyncNs : PerfStats::Counter::Count,
+	    guest_thread ? PerfStats::Counter::ReadbackSyncCount : PerfStats::Counter::Count);
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			// Cache buffers cover whole tracker pages, so this range has nothing to download.

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 namespace Libs::Graphics {
 
@@ -49,7 +50,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const bool gpu_thread = PerfStats::IsGpuThread();
+	const auto result     = [&] {
+		PerfStats::ScopedTimer timer(
+		    gpu_thread ? PerfStats::Counter::WaitGpuThreadNs : PerfStats::Counter::WaitOtherNs,
+		    gpu_thread ? PerfStats::Counter::WaitGpuThreadCount
+		               : PerfStats::Counter::WaitOtherCount);
+		return m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	}();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }

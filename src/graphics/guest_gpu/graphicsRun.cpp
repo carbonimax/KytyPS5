@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/presentation/videoOut.h"
@@ -444,6 +445,7 @@ void GuestGpu::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
+	PerfStats::MarkGpuThread();
 	g_gpu_state  = gpu;
 
 	for (;;) {
@@ -504,7 +506,11 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+				command();
+			}
+			PerfStats::MaybeReport();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -515,7 +521,12 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+			complete = gpu->Process(submission);
+		}
+		PerfStats::MaybeReport();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
