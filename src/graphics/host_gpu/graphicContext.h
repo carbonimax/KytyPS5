@@ -40,6 +40,7 @@ struct GraphicContext {
 	// Also VK_EXT_attachment_feedback_loop_dynamic_state: the loop is toggled per draw instead.
 	bool                               attachment_feedback_loop_dynamic      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               conditional_rendering_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

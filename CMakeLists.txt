@@ -314,6 +314,21 @@ add_custom_command(
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
+set(dcc_clear_shader_source "${gpu_tiler_shader_dir}/dcc_clear_check.comp")
+set(dcc_clear_shader_spv "${gpu_tiler_generated_dir}/dcc_clear_check.spv")
+set(dcc_clear_shader_header "${gpu_tiler_generated_dir}/dcc_clear_check_spv.h")
+add_custom_command(
+	OUTPUT "${dcc_clear_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dcc_clear_shader_spv}" "${dcc_clear_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dcc_clear_shader_spv} -DOUTPUT=${dcc_clear_shader_header}
+	        -DSYMBOL=DCC_CLEAR_CHECK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dcc_clear_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dcc_clear_shader_header}")
+
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 function(add_gpu_blit_shader shader_name shader_file)
 	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")

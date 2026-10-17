@@ -134,7 +134,12 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_color_clear_resolver(graphics, scheduler) {
+	// KYTY_COLOR_CLEAR_GPU=0: read GPU-written color metadata back on the CPU (drains the GPU).
+	const char* color_clear_gpu = std::getenv("KYTY_COLOR_CLEAR_GPU");
+	m_color_clear_gpu = m_color_clear_resolver.Available() &&
+	                    (color_clear_gpu == nullptr || std::strcmp(color_clear_gpu, "0") != 0);
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -1099,12 +1104,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
+	const auto slice_size = range.size / layers;
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// Or decide on the GPU, without waiting for the metadata bytes.
+		if (MaterializeColorClearOnGpu(id, desc, range.address + slice_size * first, slice_size,
+		                               image_first, count)) {
+			return;
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1142,6 +1152,171 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
+	}
+}
+
+// GPU-written color metadata: a compute check writes one predicate per (slice, clear code) and
+// each candidate clear runs under conditional rendering, so the CPU never waits for the bytes.
+// Cleared slices are rewritten to 0xff on the GPU, as the CPU path does in the backing. Ported
+// from the BryKytyPS5 fork (MaterializeDccClearOnGpu and dccClearResolver, GPL-2.0), extended
+// to CMask register clears. Returns false when the CPU path must decide.
+bool TextureCache::MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc,
+                                              uint64_t slices_address, uint64_t slice_size,
+                                              uint32_t image_first, uint32_t count) {
+	if (!m_color_clear_gpu || count == 0 || count > DccClearResolver::MaxSlices) {
+		return false;
+	}
+	std::array<vk::ClearColorValue, DccClearResolver::CodeCount> colors {};
+	uint32_t                                                     code_mask = 0;
+	for (uint32_t index = 0; index < DccClearResolver::CodeCount; index++) {
+		if (DecodeColorClear(desc, DccClearResolver::Code(index), colors[index])) {
+			code_mask |= 1u << index;
+		}
+	}
+	if (code_mask == 0) {
+		// No key clears this view, so the metadata bytes cannot change the image.
+		return true;
+	}
+	// A GPU check consumed every clear it found, and neither the GPU nor the CPU has written the
+	// slices since, so this lookup would find no clear either.
+	if (ColorSlicesChecked(slices_address, slice_size, count, code_mask) &&
+	    !m_buffer_cache.IsRegionCpuModified(slices_address, slice_size * count)) {
+		return true;
+	}
+	const auto& view = desc.view_info;
+	// Storage bindings too: the CPU path consumes their keys the same way.
+	if ((desc.type != BindingType::RenderTarget && desc.type != BindingType::Texture &&
+	     desc.type != BindingType::Storage) ||
+	    desc.info.IsVolume() || desc.info.IsDepth() || view.base_level != 0 ||
+	    view.level_count != 1 ||
+	    !(m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+	      vk::FormatFeatureFlagBits::eColorAttachment)) {
+		return false;
+	}
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.depth_id || image.info.IsDepth() || image.info.IsVolume() ||
+		    image.info.samples != 1 || image.backing.image == nullptr ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) ||
+		    image_first >= image.backing.layers || count > image.backing.layers - image_first) {
+			return false;
+		}
+	}
+	// The check consumes cleared slices on the GPU, so the metadata stays GPU-owned.
+	const auto [metadata, metadata_offset] =
+	    m_buffer_cache.ObtainBuffer(slices_address, slice_size * count, true, false);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	m_color_clear_resolver.Record(native, *metadata, metadata_offset, slice_size, count, code_mask,
+	                              true);
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		TrackImage(id);
+		if (image.IsBufferModified() || image.IsCpuDirty()) {
+			// A predicated clear may not happen, so the image must already hold guest contents.
+			InitializeImage(id);
+			if (image.IsBufferModified() || image.IsCpuDirty()) {
+				EXIT("TextureCache: color clear target retained guest ownership\n");
+			}
+		}
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentRead |
+		                  vk::AccessFlagBits2::eColorAttachmentWrite,
+		              {}, native);
+		ImageViewInfo attachment_view {};
+		attachment_view.format      = view.format;
+		attachment_view.type        = count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+		attachment_view.base_layer  = image_first;
+		attachment_view.layer_count = count;
+		attachment_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		vk::RenderingAttachmentInfo attachment {};
+		attachment.imageView   = image.FindView(attachment_view);
+		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		const vk::Extent2D extent {image.info.extent.width, image.info.extent.height};
+		vk::RenderingInfo  rendering {};
+		rendering.renderArea.extent    = extent;
+		rendering.layerCount           = count;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &attachment;
+		native.beginRendering(&rendering);
+		for (uint32_t slice = 0; slice < count; slice++) {
+			for (uint32_t index = 0; index < DccClearResolver::CodeCount; index++) {
+				if ((code_mask & (1u << index)) == 0) {
+					continue;
+				}
+				vk::ConditionalRenderingBeginInfoEXT condition {};
+				condition.buffer = m_color_clear_resolver.PredicateBuffer();
+				condition.offset = DccClearResolver::PredicateOffset(slice, index);
+				native.beginConditionalRenderingEXT(&condition);
+				const vk::ClearAttachment clear {vk::ImageAspectFlagBits::eColor, 0,
+				                                 vk::ClearValue {colors[index]}};
+				const vk::ClearRect       rect {vk::Rect2D {{0, 0}, extent}, slice, 1};
+				native.clearAttachments(1, &clear, 1, &rect);
+				native.endConditionalRenderingEXT();
+			}
+		}
+		native.endRendering();
+		// Transit does not separate attachment writes in the same layout; order the clears
+		// before the work that follows.
+		vk::MemoryBarrier2 ordered {};
+		ordered.srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+		ordered.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+		ordered.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		ordered.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &ordered;
+		native.pipelineBarrier2(dependency);
+		CommitGpuWrite(image);
+	}
+	MarkColorSlicesChecked(slices_address, slice_size, count, code_mask);
+	return true;
+}
+
+bool TextureCache::ColorSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+                                      uint32_t code_mask) {
+	std::scoped_lock lock {m_color_checked_mutex};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto found = m_color_checked.find(address + slice_size * slice);
+		if (found == m_color_checked.end() || found->second.size != slice_size ||
+		    (found->second.code_mask & code_mask) != code_mask) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void TextureCache::MarkColorSlicesChecked(uint64_t address, uint64_t slice_size, uint32_t count,
+                                          uint32_t code_mask) {
+	std::scoped_lock lock {m_color_checked_mutex};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		m_color_checked[address + slice_size * slice] = {slice_size, code_mask};
+	}
+	m_color_checked_any.store(true, std::memory_order_release);
+}
+
+void TextureCache::OnBufferGpuWrite(uint64_t address, uint64_t size) {
+	if (size == 0 || !m_color_checked_any.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock {m_color_checked_mutex};
+	auto entry = m_color_checked.lower_bound(address);
+	if (entry != m_color_checked.begin()) {
+		const auto previous = std::prev(entry);
+		if (previous->first + previous->second.size > address) {
+			entry = previous;
+		}
+	}
+	while (entry != m_color_checked.end() && entry->first < address + size) {
+		entry = m_color_checked.erase(entry);
+	}
+	if (m_color_checked.empty()) {
+		m_color_checked_any.store(false, std::memory_order_release);
 	}
 }
 
@@ -1939,6 +2114,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
+	OnBufferGpuWrite(address, size);
 	std::scoped_lock lock {m_lock};
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
