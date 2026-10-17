@@ -52,6 +52,20 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Guest read and write faults on tracked memory: like ReadMemory and InvalidateMemory for
+	// the faulting byte, but the GPU-written bytes of the whole readback window around it
+	// (KYTY_READBACK_WINDOW_KIB, clamped to the faulting buffer) are published in one sync.
+	void                   ReadFaultMemory(uint64_t vaddr);
+	void                   InvalidateFaultMemory(uint64_t vaddr);
+	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
+	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
+	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
+	void                   ReadMemoryWindow(uint64_t vaddr, uint64_t size);
+	// GPU thread: a command-processor write (WRITE_DATA) into GPU-owned memory. Instead of
+	// draining the GPU to publish the page, the bytes go to the backing and to the cached buffer
+	// at this point of the command stream. Returns false when the regular CPU write must be used
+	// (KYTY_GPU_OWNED_WRITE_DATA=0 always does).
+	[[nodiscard]] bool     WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -89,6 +103,8 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+
+	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);

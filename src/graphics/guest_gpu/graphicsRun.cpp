@@ -342,6 +342,18 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// Destinations whose bytes the GPU owns: write through the command stream.
+	{
+		const auto address = reinterpret_cast<uint64_t>(dst);
+		const auto bytes   = write_one_address ? uint64_t {sizeof(uint32_t)}
+		                                       : uint64_t {dw_num} * sizeof(uint32_t);
+		if (m_renderer.GetBufferCache().WriteGpuOwned(
+		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
+			m_renderer.GetTextureCache().InvalidateMemory(address, bytes);
+			return;
+		}
+	}
+
 	if (write_one_address) {
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
