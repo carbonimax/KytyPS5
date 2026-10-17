@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace Libs::Graphics {
 
@@ -65,6 +66,22 @@ inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
 			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 		default:
 			return {};
+	}
+}
+
+// Aspects a depth/stencil attachment layout lets the attachment write; nullopt for other layouts.
+inline std::optional<vk::ImageAspectFlags> DepthAttachmentWritableAspects(vk::ImageLayout layout) {
+	using enum vk::ImageAspectFlagBits;
+	switch (layout) {
+		case vk::ImageLayout::eDepthStencilAttachmentOptimal: return eDepth | eStencil;
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+		case vk::ImageLayout::eStencilAttachmentOptimal: return vk::ImageAspectFlags {eStencil};
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthAttachmentOptimal: return vk::ImageAspectFlags {eDepth};
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal: return vk::ImageAspectFlags {};
+		default: return std::nullopt;
 	}
 }
 

@@ -107,7 +107,20 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Every use of the handle counts as possible recording (see GlobalBarrierCurrent).
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// True when nothing can have been recorded since MarkGlobalBarrier: no handle use since.
+	[[nodiscard]] bool GlobalBarrierCurrent() const noexcept {
+		return m_global_barrier_mark == m_handle_uses;
+	}
+	void MarkGlobalBarrier() const noexcept { m_global_barrier_mark = m_handle_uses; }
+	// Buffer-cache upload batches: the trailing barrier of an upload is deferred. Every Handle()
+	// use first records it, so nothing else is ever recorded between an upload and its barrier;
+	// HandleForUpload() is for the next upload of the same batch only.
+	[[nodiscard]] vk::CommandBuffer HandleForUpload() const;
+	[[nodiscard]] bool UploadPostPending() const noexcept { return m_upload_post_pending; }
+	void               DeferUploadPost() const noexcept { m_upload_post_pending = true; }
+	void               FlushUploadPost() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -137,6 +150,9 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable uint64_t    m_handle_uses          = 0;
+	mutable uint64_t    m_global_barrier_mark = UINT64_MAX;
+	mutable bool        m_upload_post_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

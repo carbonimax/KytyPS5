@@ -25,7 +25,32 @@ bool CommandBuffer::IsInvalid() const {
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	++m_handle_uses;
+	if (m_upload_post_pending) {
+		FlushUploadPost();
+	}
 	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::HandleForUpload() const {
+	EXIT_IF(IsInvalid());
+	++m_handle_uses;
+	return m_buffer;
+}
+
+void CommandBuffer::FlushUploadPost() const {
+	m_upload_post_pending = false;
+	// All copies of the batch complete and become visible before any later command.
+	vk::MemoryBarrier2 after {};
+	after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	after.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	after.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.dependencyFlags    = vk::DependencyFlagBits::eByRegion;
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &after;
+	m_buffer.pipelineBarrier2(dependency);
 }
 
 void CommandBuffer::Begin() {
