@@ -10,8 +10,12 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 
@@ -178,8 +182,18 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// Periodic snapshots keep the driver cache when the emulator is killed instead of closed.
+	std::mutex                  m_save_mutex;
+	std::atomic<uint64_t>       m_pipelines_created {0};
+	uint64_t                    m_pipelines_saved    = 0;
+	uint64_t                    m_saved_payload_hash = 0;
+	std::condition_variable_any m_saver_wake;
+	std::jthread                m_saver;
 
 	void InitializeDriverCache();
+	void StartPeriodicSave();
+	void StopPeriodicSave();
+	bool WriteDriverCache(bool final_save);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
