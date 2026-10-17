@@ -1308,18 +1308,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
 				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+					result = overlap.image;
 				}
 			}
 		} else if (block_alias) {
@@ -1362,11 +1356,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
-		if (view_mip >= 0) {
-			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
-		}
-		if (view_layer >= 0) {
-			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+		// The descriptor's base level and layer are relative to its own data. When it resolves
+		// into a larger image that starts before that data, offset them by where the data starts
+		// in the final image (a position taken from an earlier candidate may no longer apply).
+		if (desc.info.data.address != image.info.data.address) {
+			const int32_t mip   = desc.info.MipOf(image.info);
+			const int32_t layer = mip >= 0 ? desc.info.SliceOf(image.info, mip) : -1;
+			if (layer >= 0) {
+				desc.view_info.base_level += static_cast<uint32_t>(mip);
+				desc.view_info.base_layer += static_cast<uint32_t>(layer);
+			}
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
