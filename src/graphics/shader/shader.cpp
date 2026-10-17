@@ -15,11 +15,15 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -302,6 +306,38 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			LOGF("ShaderGetVertexInputInfo(): null vertex table pointer shader=0x%016" PRIx64 "\n",
 			     shader_addr);
 			return false;
+		}
+		// Copy the used part of both tables through the backing: a table sharing a 4 KiB page
+		// with GPU-written bytes would otherwise fault on the GPU thread and drain the GPU, as SRT
+		// tables did (KYTY_SRT_BACKING_READS); only GPU-written bytes the read covers are
+		// synchronized. KYTY_VERTEX_TABLE_BACKING_READS=0 reads them in place.
+		static const bool backing_reads = [] {
+			const char* value = std::getenv("KYTY_VERTEX_TABLE_BACKING_READS");
+			return value == nullptr || std::strcmp(value, "0") != 0;
+		}();
+		std::array<uint32_t, 64>                                   attrib_copy {};
+		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX * 4u> buffer_copy {};
+		uint32_t attrib_count = 0;
+		for (const auto& in: metadata.input_semantics) {
+			attrib_count = std::max<uint32_t>(attrib_count, static_cast<uint32_t>(in.semantic) + 1u);
+		}
+		if (backing_reads && GuestGpu::IsGpuThread() && attrib_count <= attrib_copy.size()) {
+			const auto read_table = [](const uint32_t* table, uint32_t* out, uint32_t dwords) {
+				const auto address = reinterpret_cast<uint64_t>(table);
+				if (dwords != 0 && !Libs::LibKernel::Memory::TryReadBufferBacking(
+				                       address, out, dwords * sizeof(uint32_t))) {
+					std::memcpy(out, table, dwords * sizeof(uint32_t));
+				}
+			};
+			read_table(attrib, attrib_copy.data(), attrib_count);
+			uint32_t buffer_count = 0;
+			for (const auto& in: metadata.input_semantics) {
+				buffer_count = std::max(buffer_count, (attrib_copy[in.semantic] & 0x1fu) + 1u);
+			}
+			buffer_count = std::min<uint32_t>(buffer_count, ShaderVertexInputInfo::RES_MAX);
+			read_table(buffer, buffer_copy.data(), buffer_count * 4u);
+			attrib = attrib_copy.data();
+			buffer = buffer_copy.data();
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
