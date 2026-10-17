@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -109,6 +110,29 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// Ordinary SRT reads (descriptor tables, user data pointers) bypass the page protection: a
+// 4 KiB page that merely shares bytes with GPU-written data would otherwise fault and flush
+// the whole queue. Only bytes the GPU actually wrote are synchronized; unmapped addresses
+// keep the direct read so they fail exactly as before.
+bool ReadShaderGuestMemoryOrdinary(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                   values.size_bytes())) {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	return true;
+}
+
+bool SrtBackingReadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_BACKING_READS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -357,6 +381,9 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .null_reads_end_speculation = true,
 		};
+		if (SrtBackingReadsEnabled()) {
+			runtime.read_memory = ReadShaderGuestMemoryOrdinary;
+		}
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
