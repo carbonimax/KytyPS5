@@ -169,8 +169,85 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::FindPendingPublish(uint64_t vaddr,
+                                                                                uint64_t size) {
+	std::lock_guard lock(m_pending_mutex);
+	for (const auto& pending: m_pending_publishes) {
+		if (pending.begin < vaddr + size && vaddr < pending.end) {
+			return pending.done;
+		}
+	}
+	return nullptr;
+}
+
+void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
+	// Readbacks are only left pending in asynchronous mode.
+	if (!AsyncFaultReadbacks()) {
+		return;
+	}
+	uint64_t tick = 0;
+	{
+		std::lock_guard lock(m_pending_mutex);
+		for (const auto& pending: m_pending_publishes) {
+			if (pending.begin < vaddr + size && vaddr < pending.end) {
+				tick = std::max(tick, pending.tick);
+			}
+		}
+	}
+	if (tick != 0) {
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+}
+
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	WaitPendingPublishes(vaddr, size);
+	Common::UniqueFunction<void> publish;
+	if (!RecordDownload(buffer, vaddr, size, publish)) {
+		return false;
+	}
+	if constexpr (async) {
+		m_scheduler.DeferPriorityOperation(std::move(publish));
+	} else {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		publish();
+	}
+	return true;
+}
+
+std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(Buffer&  buffer,
+                                                                              uint64_t vaddr,
+                                                                              uint64_t size) {
+	Common::UniqueFunction<void> publish;
+	if (!RecordDownload(buffer, vaddr, size, publish)) {
+		return nullptr;
+	}
+	auto done = std::make_shared<ReadbackCompletion>();
+	{
+		std::lock_guard lock(m_pending_mutex);
+		m_pending_publishes.push_back({vaddr, vaddr + size, m_scheduler.CurrentTick(), done});
+	}
+	// Runs once the copy's command buffer completed. The pages keep their GPU ownership (and
+	// protection) until the bytes are published; GPU-thread users of the range wait for this.
+	m_scheduler.DeferPriorityOperation(
+	    [this, vaddr, size, done, publish = std::move(publish)]() mutable {
+		    publish();
+		    m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		    {
+			    std::lock_guard lock(m_pending_mutex);
+			    std::erase_if(m_pending_publishes,
+			                  [&](const PendingPublish& pending) { return pending.done == done; });
+		    }
+		    done->Signal();
+	    });
+	m_scheduler.Flush();
+	return done;
+}
+
+bool BufferCache::RecordDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                 Common::UniqueFunction<void>& publish_out) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -235,21 +312,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (temporary) {
 		m_scheduler.DeferRelease([owner = std::move(temporary)]() mutable { owner.reset(); });
 	}
-	auto publish = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
+	publish_out = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
 		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	};
-	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
-	} else {
-		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
-		publish();
-	}
 	return true;
 }
 
@@ -343,6 +412,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	});
 }
 
+bool BufferCache::AsyncFaultReadbacks() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_READBACK");
+		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
 namespace {
 
 // KYTY_READBACK_WINDOW_KIB (default 256, rounded down to a power of two, at most 64 MiB; 0
@@ -379,6 +456,42 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 }
 
 void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
+	if (!GuestGpu::IsGpuThread() && AsyncFaultReadbacks()) {
+		// The GPU thread only records and submits the copy; this thread waits for the
+		// publication, so other GPU work is not stalled behind the readback.
+		std::shared_ptr<ReadbackCompletion> wait_for;
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write, &wait_for] {
+			if (is_write && !IsRegionRegistered(vaddr, 1)) {
+				// Cache buffers cover whole tracker pages, so this page has nothing to download.
+				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+				                               TRACKER_PAGE_SIZE);
+				m_memory_tracker.ReleaseUnownedRegion(vaddr, 1);
+				return;
+			}
+			auto&      buffer = m_slot_buffers[FindBuffer(vaddr, 1)];
+			const auto base   = buffer.CpuAddress();
+			const auto window = ReadbackWindowBytes();
+			const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
+			const auto last   = std::min(base + buffer.Size(), Common::AlignDown(vaddr, window) + window);
+			if (begin >= last) {
+				return;
+			}
+			// A readback of the same window is already queued: wait for it instead.
+			if ((wait_for = FindPendingPublish(begin, last - begin)) != nullptr) {
+				return;
+			}
+			wait_for = DownloadForFault(buffer, begin, last - begin);
+			if (wait_for == nullptr) {
+				// No GPU-written byte left in the window: nothing to publish.
+				m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
+			}
+		});
+		if (wait_for != nullptr) {
+			wait_for->Wait();
+		}
+		// A write retries against the now write-protected page and takes the CPU-dirty path.
+		return;
+	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, 1)) {
 			// Cache buffers cover whole tracker pages, so this page has nothing to download.
@@ -419,7 +532,13 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 		return false;
 	}
 	auto& buffer = m_slot_buffers[*owner];
-	if (!buffer.IsInBounds(vaddr, size) ||
+	if (!buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	// A fault readback of these bytes either completes first (they are published and not
+	// GPU-owned any more) or has not been recorded yet and copies the buffer with this write.
+	WaitPendingPublishes(vaddr, size);
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
 	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		return false;
 	}
@@ -781,6 +900,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	if (is_written) {
+		WaitPendingPublishes(vaddr, size);
+	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -921,7 +1043,9 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	if (GuestGpu::IsGpuThread() && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size)) {
 		return false;
 	}
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Bytes of a fault readback still in flight left the dirty set but are not published yet.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -946,6 +1070,7 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		WaitPendingPublishes(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());

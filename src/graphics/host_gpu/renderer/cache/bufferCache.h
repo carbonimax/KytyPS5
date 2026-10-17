@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -12,7 +13,10 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <condition_variable>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -28,6 +32,9 @@ inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
+	// KYTY_ASYNC_READBACK (default 0): guest-thread fault readbacks do not stall the GPU thread.
+	[[nodiscard]] static bool AsyncFaultReadbacks();
+
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
@@ -125,6 +132,40 @@ private:
 
 	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
+	// A guest-fault readback whose copy was submitted without waiting on the GPU thread: the
+	// priority-operation thread publishes it and releases the page protection.
+	struct ReadbackCompletion {
+		std::mutex              mutex;
+		std::condition_variable signal;
+		bool                    done = false;
+		void Signal() {
+			{
+				std::lock_guard lock(mutex);
+				done = true;
+			}
+			signal.notify_all();
+		}
+		void Wait() {
+			std::unique_lock lock(mutex);
+			signal.wait(lock, [this] { return done; });
+		}
+	};
+	struct PendingPublish {
+		uint64_t                            begin = 0;
+		uint64_t                            end   = 0;
+		uint64_t                            tick  = 0;
+		std::shared_ptr<ReadbackCompletion> done;
+	};
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion> FindPendingPublish(uint64_t vaddr,
+	                                                                     uint64_t size);
+	// GPU thread: waits until no queued fault readback covers the range (its publication
+	// releases the page protection, which must not race new GPU ownership of the pages).
+	void WaitPendingPublishes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool RecordDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                  Common::UniqueFunction<void>& publish);
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion> DownloadForFault(Buffer& buffer, uint64_t vaddr,
+	                                                                   uint64_t size);
+
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -187,6 +228,8 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	std::mutex                                        m_pending_mutex;
+	std::vector<PendingPublish>                       m_pending_publishes;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	struct BatchRange {
