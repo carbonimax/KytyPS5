@@ -75,6 +75,21 @@ public:
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	// GPU thread: while a batch is open, the CPU-data uploads into cache buffers share one leading
+	// and one trailing barrier. The trailing barrier is recorded at the latest when the batch
+	// closes, or before anything else is recorded (CommandBuffer::Handle).
+	class UploadBatch {
+	public:
+		explicit UploadBatch(BufferCache& cache) noexcept: m_cache(cache) {
+			m_cache.BeginUploadBatch();
+		}
+		~UploadBatch() { m_cache.EndUploadBatch(); }
+		UploadBatch(const UploadBatch&)            = delete;
+		UploadBatch& operator=(const UploadBatch&) = delete;
+
+	private:
+		BufferCache& m_cache;
+	};
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -123,6 +138,8 @@ private:
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void BeginUploadBatch() noexcept;
+	void EndUploadBatch();
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -145,6 +162,13 @@ private:
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
+	struct BatchRange {
+		vk::Buffer buffer;
+		uint64_t   begin = 0;
+		uint64_t   end   = 0;
+	};
+	uint32_t                m_upload_batch_depth = 0;
+	std::vector<BatchRange> m_batch_ranges; // destinations copied since the batch's leading barrier
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
