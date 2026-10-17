@@ -37,6 +37,12 @@ public:
 		m_pre_submit         = callback;
 		m_pre_submit_context = context;
 	}
+	// The next submission waits for `value` of `semaphore` (readback-queue copies that read
+	// buffers later commands may overwrite).
+	void WaitBeforeNextSubmit(vk::Semaphore semaphore, uint64_t value) noexcept {
+		m_external_wait       = semaphore;
+		m_external_wait_value = std::max(m_external_wait_value, value);
+	}
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -127,6 +133,9 @@ private:
 	uint64_t                     m_retired_tick = 0;
 	void (*m_pre_submit)(void*)                         = nullptr;
 	void*                        m_pre_submit_context   = nullptr;
+	vk::Semaphore                m_external_wait        = nullptr;
+	uint64_t                     m_external_wait_value  = 0;
+	uint64_t                     m_external_waited      = 0;
 };
 
 } // namespace Libs::Graphics

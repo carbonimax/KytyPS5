@@ -408,6 +408,18 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_external_wait_value > m_external_waited) {
+		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
+			submit.AddWait(m_external_wait, m_external_wait_value);
+		} else {
+			vk::SemaphoreWaitInfo wait {};
+			wait.semaphoreCount = 1;
+			wait.pSemaphores    = &m_external_wait;
+			wait.pValues        = &m_external_wait_value;
+			EXIT_IF(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+		}
+		m_external_waited = m_external_wait_value;
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

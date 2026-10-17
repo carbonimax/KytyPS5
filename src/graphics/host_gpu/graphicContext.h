@@ -59,6 +59,10 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// KYTY_READBACK_QUEUE: second queue for guest-fault readback copies of GPU writes that have
+	// already completed, so they do not wait behind queued work (null when unavailable/off).
+	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	vk::Queue                          readback_queue  = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
