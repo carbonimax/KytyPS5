@@ -355,14 +355,42 @@ void BufferCache::ReadFaultMemory(uint64_t vaddr) {
 }
 
 void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
-	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	if (!gpu_thread && CommandScheduler::InDeferredOperation()) {
 		InvalidateMemory(vaddr, 1);
 		return;
 	}
 	if (!GuestRange {vaddr, 1}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr] { PublishFaultWindow(vaddr, true); });
+	bool flushed = false;
+	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr, &flushed] {
+		flushed = true;
+		PublishFaultWindow(vaddr, true);
+	});
+	// KYTY_WRITE_FAULT_READAHEAD=N (pages, default 15; 0 disables): a guest thread that write-
+	// faults on the page after its previous write fault (a sequential writer, e.g. a constant
+	// ring) also gets the next N CPU-clean pages unprotected and marked CPU-modified, up to the
+	// first GPU-modified page. Writes that reach them before the next synchronization do not
+	// fault, and the run is unprotected and re-protected with one call each.
+	static const uint64_t readahead = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_READAHEAD");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 15ull;
+	}();
+	if (readahead == 0 || gpu_thread || flushed) {
+		return;
+	}
+	static thread_local uint64_t last_page  = 0;
+	static thread_local uint64_t next_page  = 0;
+	const auto                   page       = vaddr / TRACKER_PAGE_SIZE;
+	const bool                   sequential = page == last_page + 1 || page == next_page;
+	last_page                               = page;
+	if (!sequential) {
+		return;
+	}
+	const auto marked = m_memory_tracker.ExtendCpuModified((page + 1) * TRACKER_PAGE_SIZE,
+	                                                       readahead * TRACKER_PAGE_SIZE);
+	next_page         = page + 1 + marked / TRACKER_PAGE_SIZE;
 }
 
 void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
