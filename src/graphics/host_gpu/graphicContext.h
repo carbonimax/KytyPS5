@@ -159,6 +159,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created by GraphicContext::CreateImage with parameters the image backing pool can reuse.
+	bool                         poolable   = false;
 };
 
 
