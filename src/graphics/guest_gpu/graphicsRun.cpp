@@ -24,6 +24,8 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -1036,6 +1038,29 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+// KYTY_GPU_OWNED_EOP_LABEL=0 disables. A RELEASE_MEM label often shares a tracker page with
+// GPU-written bytes (for example a fence next to a small buffer written by compute). The CPU
+// store then faulted on the GPU thread and drained the GPU to publish the page. When a cache
+// buffer owns that GPU-modified page, write the label like WRITE_DATA does: into the backing
+// and into the cached buffer at this point of the command stream.
+static bool GpuOwnedEopLabelEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_OWNED_EOP_LABEL");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size) {
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	if (GpuOwnedEopLabelEnabled() &&
+	    m_renderer.GetBufferCache().WriteGpuOwned(address, data, size)) {
+		m_renderer.GetTextureCache().InvalidateMemory(address, size);
+		return;
+	}
+	std::memcpy(dst, data, size);
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -1089,7 +1114,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
+		WriteEopLabel(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1132,7 +1157,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
+					WriteEopLabel(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						TriggerEopEventAtEndOfPipe(interrupt_context_id);

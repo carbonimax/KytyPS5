@@ -1258,7 +1258,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	SrtReadCapture capture {runtime, reads};
-	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	// Captured specialization reads must see every read: never defer flat reads then.
+	if (capture_reads) observed.defer_flat_read = nullptr;
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
