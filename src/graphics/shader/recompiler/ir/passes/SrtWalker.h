@@ -62,6 +62,12 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 void CompileSrtWalker(ResourcePlan& program);
+// Inputs a materialization of `program` can read besides guest memory, the shader base and the
+// indirect argument address: the user data dwords (indices relative to user_data_base) of every
+// GetUserData value the plan owns, and whether any indirect descriptor reads workgroup counts.
+// Returns false when the set cannot be bounded (a user data operand that is not a register).
+bool SrtPlanInputs(const ResourcePlan& program, std::vector<uint32_t>& user_data,
+                   bool& workgroup_counts);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 

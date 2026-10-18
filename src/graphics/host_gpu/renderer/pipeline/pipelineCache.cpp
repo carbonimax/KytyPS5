@@ -32,8 +32,10 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -237,17 +239,64 @@ bool SrtMemoEnabled() {
 	return enabled;
 }
 
+// KYTY_SRT_MEMO_KEY (default 1; 0 disables, 2 also verifies). The memo compares only the inputs a
+// materialization of the plan can read: the user data dwords of the GetUserData values the plan
+// owns and, when an indirect descriptor uses them, the workgroup counts (SrtPlanInputs), besides
+// the shader base and the indirect argument address. Other user data dwords are only copied into
+// ResourceSnapshot::user_data, which such a hit refreshes. With 2, every hit that the full
+// comparison would have missed is materialized again from scratch and compared; differences are
+// written to srt_verify.txt (or KYTY_SRT_VERIFY_FILE) and the fresh result is used.
+int SrtMemoKeyMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_SRT_MEMO_KEY");
+		return value == nullptr ? 1 : std::atoi(value);
+	}();
+	return mode;
+}
+
+// Results of the SRT verification modes (=2), never the console.
+void SrtVerifyLog(const std::string& line) {
+	static std::mutex mutex;
+	static FILE*      file = [] {
+		const char* path = std::getenv("KYTY_SRT_VERIFY_FILE");
+		return std::fopen(path != nullptr ? path : "srt_verify.txt", "w");
+	}();
+	std::lock_guard lock(mutex);
+	if (file == nullptr) return;
+	std::fputs(line.c_str(), file);
+	std::fputc('\n', file);
+	std::fflush(file);
+}
+
+struct SrtMemoInputs {
+	std::vector<uint32_t> user_data; // indices into SrtRuntime::user_data
+	bool                  workgroup_counts = false;
+};
+
 class SrtMaterializationMemo {
 public:
 	[[nodiscard]] static bool Supported(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 		return runtime.read_memory != nullptr && runtime.read_specialization_memory != nullptr;
 	}
 
-	[[nodiscard]] bool Replays(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+	// `inputs` (KYTY_SRT_MEMO_KEY): compare only these inputs; *partial is set when an input
+	// outside them differs (the snapshot's user data must then be refreshed).
+	[[nodiscard]] bool Replays(const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                           const SrtMemoInputs* inputs = nullptr, bool* partial = nullptr) {
 		if (!m_valid || m_shader_base != runtime.shader_base ||
 		    m_indirect_args_address != runtime.indirect_args_address ||
-		    !std::ranges::equal(m_user_data, runtime.user_data) ||
-		    !std::ranges::equal(m_workgroup_counts, runtime.workgroup_counts)) {
+		    m_user_data.size() != runtime.user_data.size()) {
+			return false;
+		}
+		const bool same_workgroups = std::ranges::equal(m_workgroup_counts, runtime.workgroup_counts);
+		bool       same_inputs     = same_workgroups && std::ranges::equal(m_user_data, runtime.user_data);
+		if (!same_inputs && inputs != nullptr && (same_workgroups || !inputs->workgroup_counts)) {
+			same_inputs = std::ranges::all_of(inputs->user_data, [&](uint32_t index) {
+				return index >= m_user_data.size() || m_user_data[index] == runtime.user_data[index];
+			});
+			if (same_inputs && partial != nullptr) *partial = true;
+		}
+		if (!same_inputs) {
 			return false;
 		}
 		for (const auto& read: m_reads) {
@@ -474,9 +523,15 @@ struct PipelineCache::ProgramCache {
 			}
 			// Programs with calls refresh their source reads per lookup; they are not memoized.
 			if (!HasCalls && SrtMemoEnabled() && SrtMaterializationMemo::Supported(runtime)) {
+				bool partial             = false;
 				t_refuse_gpu_dirty_reads = runtime.defer_flat_read != nullptr;
-				const bool replayed      = srt_memo.Replays(runtime);
+				const bool replayed      = srt_memo.Replays(runtime, MemoInputs(), &partial);
 				t_refuse_gpu_dirty_reads = false;
+				if (replayed && partial) {
+					// Same result as a fresh walk except the copied user data.
+					resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+					if (SrtMemoKeyMode() == 2) VerifyKeyedHit(runtime, emulate_image_min_lod);
+				}
 				if (!replayed) {
 					EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 					    resource_plan, srt_memo.Record(runtime), resources, specialization,
@@ -504,6 +559,64 @@ struct PipelineCache::ProgramCache {
 			return nullptr;
 		}
 
+		const SrtMemoInputs* MemoInputs() {
+			if (SrtMemoKeyMode() == 0) return nullptr;
+			if (!memo_inputs_ready) {
+				memo_inputs_ready = true;
+				memo_inputs_known = ShaderRecompiler::IR::SrtPlanInputs(
+				    resource_plan, memo_inputs.user_data, memo_inputs.workgroup_counts);
+			}
+			return memo_inputs_known ? &memo_inputs : nullptr;
+		}
+
+		// KYTY_SRT_MEMO_KEY=2: a keyed hit must equal a fresh materialization.
+		void VerifyKeyedHit(const ShaderRecompiler::IR::SrtRuntime& runtime, bool emulate_image_min_lod) {
+			static std::atomic<uint64_t> checked {0}, mismatched {0};
+			const auto bad = CompareWithFresh(runtime, emulate_image_min_lod);
+			const auto n   = checked.fetch_add(1) + 1;
+			const auto m   = mismatched.fetch_add(bad.empty() ? 0 : 1) + (bad.empty() ? 0 : 1);
+			if ((!bad.empty() && m <= 1000) || (n & (n - 1)) == 0 || n % 65536 == 0) {
+				SrtVerifyLog(fmt::format("srt-key verify: hash=0x{:016x} {}{} checked={} mismatched={}",
+				                         resource_plan.shader_hash, bad.empty() ? "same" : "DIFFERENT:",
+				                         bad, n, m));
+			}
+		}
+
+		// Materializes `runtime` again from scratch and compares with the current result. On a
+		// difference the fresh result is kept and the memo records again.
+		std::string CompareWithFresh(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                             bool emulate_image_min_lod) {
+			ShaderRecompiler::IR::ResourceSnapshot       fresh;
+			ShaderRecompiler::IR::ResourceSpecialization fresh_specialization;
+			const auto                                   active = resource_plan.active_sources;
+			auto                                         source = runtime;
+			if (source.gpu_flat_reads != nullptr) source.gpu_flat_reads = &fresh.gpu_flat_reads;
+			const bool ok = ShaderRecompiler::IR::MaterializeResources(
+			    resource_plan, source, fresh, fresh_specialization, emulate_image_min_lod);
+			std::string bad;
+			if (!ok) bad += " materialize";
+			if (fresh.buffers != resources.buffers) bad += " buffers";
+			if (fresh.images != resources.images) bad += " images";
+			if (fresh.samplers != resources.samplers) bad += " samplers";
+			if (fresh.flattened_srt != resources.flattened_srt) bad += " flat";
+			if (fresh.user_data != resources.user_data) bad += " user_data";
+			if (fresh.specialization_reads != resources.specialization_reads) bad += " spec_reads";
+			if (!(fresh.uniform_fill == resources.uniform_fill)) bad += " fill";
+			if (fresh.gpu_flat_reads != resources.gpu_flat_reads) bad += " gpu_flat";
+			if (!(fresh_specialization == specialization)) bad += " specialization";
+			if (resource_plan.active_sources != active) bad += " active";
+			if (bad.empty()) return bad;
+			// Use the fresh result; the next lookup records again.
+			if (ok) {
+				resources      = std::move(fresh);
+				specialization = std::move(fresh_specialization);
+			} else {
+				resource_plan.active_sources = active;
+			}
+			srt_memo.Invalidate();
+			return bad;
+		}
+
 		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
@@ -511,6 +624,9 @@ struct PipelineCache::ProgramCache {
 		std::vector<Permutation>                    permutations;
 		bool                                       skip_dispatch = false;
 		SrtMaterializationMemo                      srt_memo;
+		SrtMemoInputs                               memo_inputs;
+		bool                                        memo_inputs_ready = false;
+		bool                                        memo_inputs_known = false;
 	};
 
 	struct ProgramKeyHash {
@@ -707,6 +823,7 @@ struct PipelineCache::ProgramCache {
 			    entry->second.specialization, !graphics.image_view_min_lod_enabled));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			entry->second.memo_inputs_ready = false;
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
