@@ -10824,8 +10824,8 @@ void TestMemoryFedScalarLeafCall() {
   IR::SrtRuntime runtime{.read_memory = read, .userdata = &memory, .read_specialization_memory = read};
   const auto options = MakeCompileOptions(ShaderType::Compute);
   auto source = PrepareShaderSource(shader, options);
-  Check(source.call && source.decoded.has_swap_pc &&
-            source.decoded.instructions[source.call->instruction].branch_target == UINT32_MAX,
+  Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
+            source.decoded.instructions[source.calls[0].instruction].branch_target == UINT32_MAX,
         "memory-fed SWAPPC did not retain an unresolved target");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal([&] { (void)TranslateProgram(source.decoded, options); },
@@ -10833,7 +10833,7 @@ void TestMemoryFedScalarLeafCall() {
 #endif
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(linked.has_swap_pc && source.revision == 1 && linked.instructions.back().branch_target == 0x40 &&
-            linked.instructions[source.call->instruction].branch_target == 0x44 &&
+            linked.instructions[source.calls[0].instruction].branch_target == 0x44 &&
             source.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x100, 12},
         "aliased call target, exact leaf range, or continuation was lost");
   const auto* storage = linked.instructions.data();
@@ -10925,7 +10925,7 @@ void TestMemoryFedScalarLeafCall() {
   auto pair_source = PrepareShaderSource(high_writer, options);
   IR::SrtWalker pair_walker(pair_source.call_targets, runtime);
   uint32_t high = 1;
-  Check(pair_walker.Evaluate(pair_source.call->target[1], high) && high == 0,
+  Check(pair_walker.Evaluate(pair_source.calls[0].target[1], high) && high == 0,
         "scalar pair producer used a stale preceding high-half definition");
   const uint32_t joined[] = {
       EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1),
@@ -10946,7 +10946,7 @@ void TestMemoryFedScalarLeafCall() {
     Config::Load(console);
     Log::Initialize();
     const auto disabled = PrepareShaderSource(joined, options);
-    const bool empty = !disabled.call && !disabled.decoded.has_swap_pc &&
+    const bool empty = disabled.calls.empty() && !disabled.decoded.has_swap_pc &&
                        disabled.decoded.instructions.size() == 1 &&
                        disabled.decoded.instructions[0].opcode == Decoder::Opcode::S_ENDPGM;
     Log::Flush();
@@ -10972,10 +10972,105 @@ void TestMemoryFedScalarLeafCall() {
   Check(joined_log.find("has no unique target") != std::string::npos &&
             joined_log.find("shader disabled") != std::string::npos,
         "ambiguous call target was disabled without its log line");
-  const uint32_t multiple[] = {EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
-  ExpectFatal([&] { (void)PrepareShaderSource(multiple, options); },
-              "call metadata bypassed the multiple-call rejection");
 #endif
+}
+
+// Programs with several S_SWAPPC_B64 sites link one copy of the callee per site.
+void TestScalarLeafCallSites() {
+  using namespace ShaderRecompiler;
+  constexpr uint64_t base = 0xfe0040000ull;
+  constexpr auto low = static_cast<uint32_t>(base);
+  constexpr auto high = static_cast<uint32_t>(base >> 32u);
+  struct Memory {
+    std::array<uint32_t, 128> words{};
+    bool clean = true;
+  } memory;
+  const auto read = [](void *data, uint64_t address, std::span<uint32_t> out) {
+    const auto& m = *static_cast<Memory*>(data);
+    const auto end = base + sizeof(m.words);
+    if (!m.clean || address < base || address > end || out.size_bytes() > end - address)
+      return false;
+    std::memcpy(out.data(), reinterpret_cast<const uint8_t*>(m.words.data()) + address - base,
+                out.size_bytes());
+    return true;
+  };
+  // Leaf A at +0x100 writes s3; leaf B at +0x180 writes s4. Both return through s[14:15].
+  memory.words[64] = EncodeSMovB32(3, 255);
+  memory.words[65] = 0x12345678u;
+  memory.words[66] = EncodeSop1(0x20, 0, 14);
+  memory.words[96] = EncodeSMovB32(4, 130);
+  memory.words[97] = EncodeSop1(0x20, 0, 14);
+  std::array<uint32_t, 64> user_data{};
+  user_data[3] = 3u << 28u;
+  IR::SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto caller = [&](uint32_t first, uint32_t second) {
+    return std::vector<uint32_t>{
+        EncodeSMovB32(14, 255), low + first, EncodeSMovB32(15, 255), high,
+        EncodeSop1(0x21, 14, 14), // pc 0x10
+        EncodeSMovB32(14, 255), low + second, EncodeSMovB32(15, 255), high,
+        EncodeSop1(0x21, 14, 14), // pc 0x24
+        EncodeSopp(0x01)};        // pc 0x28
+  };
+  const auto returns_to = [](const Decoder::Program& linked, size_t index, uint32_t pc) {
+    return linked.instructions[index].opcode == Decoder::Opcode::S_BRANCH &&
+           linked.instructions[index].branch_target == pc;
+  };
+
+  // Same leaf from two sites: two copies, each returning to its own site.
+  const auto same = caller(0x100, 0x100);
+  auto source = PrepareShaderSource(same, options);
+  Check(source.calls.size() == 2 && source.calls[0].instruction == 2 && source.calls[1].instruction == 5,
+        "two scalar call sites were not both recorded");
+  const auto& linked = RefreshShaderSource(source, runtime);
+  Check(source.revision == 1 && linked.instructions.size() == 11 &&
+            linked.instructions[2].branch_target == 0x2c && linked.instructions[5].branch_target == 0x38 &&
+            linked.instructions[7].pc == 0x2c && returns_to(linked, 8, 0x14) &&
+            linked.instructions[9].pc == 0x38 && returns_to(linked, 10, 0x28),
+        "same-leaf call sites did not each get a copy returning to the site");
+  Check(source.linked->functions.size() == 2 && source.linked->functions[0].offset == 0 &&
+            source.linked->functions[1].offset == 3 && source.linked->functions[1].size == 3 &&
+            source.linked->code.size() == same.size() + 6 &&
+            std::ranges::count(source.reads, std::pair<uint64_t, uint64_t>{base + 0x100, 12}) == 1,
+        "same-leaf copies or their memory dependency were not recorded once");
+  (void)TranslateProgram(linked, options);
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 1, "unchanged leaf copies were relinked");
+  memory.words[65] = 0x87654321u;
+  (void)RefreshShaderSource(source, runtime);
+  Check(source.revision == 2 && source.linked->code[same.size() + 1] == 0x87654321u &&
+            source.linked->code[same.size() + 4] == 0x87654321u,
+        "changed leaf bytes left a stale copy");
+
+  // Different leaves: each site links its own target.
+  const auto different = caller(0x100, 0x180);
+  auto split = PrepareShaderSource(different, options);
+  const auto& split_linked = RefreshShaderSource(split, runtime);
+  Check(split.calls.size() == 2 && split_linked.instructions.size() == 11 &&
+            split_linked.instructions[5].branch_target == 0x38 &&
+            split_linked.instructions[9].opcode == Decoder::Opcode::S_MOV_B32 &&
+            split_linked.instructions[9].dst.reg == 4 && returns_to(split_linked, 10, 0x28) &&
+            split.linked->functions[1].size == 2 &&
+            std::ranges::count(split.reads, std::pair<uint64_t, uint64_t>{base + 0x100, 12}) == 1 &&
+            std::ranges::count(split.reads, std::pair<uint64_t, uint64_t>{base + 0x180, 8}) == 1,
+        "call sites with different leaves were not linked to their own targets");
+  (void)TranslateProgram(split_linked, options);
+
+  // A site whose target cannot be resolved disables the whole program, even if others resolve.
+  for (const auto& program: {
+           // The second target is the return address written by the first call.
+           std::vector<uint32_t>{EncodeSop1(0x21, 14, 14), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)},
+           // The second target is defined differently on two paths.
+           std::vector<uint32_t>{
+               EncodeSMovB32(14, 255), low + 0x100, EncodeSMovB32(15, 255), high, EncodeSop1(0x21, 14, 14),
+               EncodeSopp(0x04, 2), EncodeSMovB32(14, 129), EncodeSopp(0x02, 1), EncodeSMovB32(14, 130),
+               EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)}}) {
+    const auto disabled = PrepareShaderSource(program, options);
+    Check(disabled.calls.empty() && !disabled.decoded.has_swap_pc && disabled.decoded.instructions.size() == 1 &&
+              disabled.decoded.instructions[0].opcode == Decoder::Opcode::S_ENDPGM,
+          "unresolvable call site did not compile an empty program");
+  }
 }
 
 void TestNewShaderRecompilerSetpcBranch() {
@@ -11021,7 +11116,7 @@ void TestFusedShaderHandoffPreservesRegisters() {
   for (const auto handoff: {EncodeSop1(0x20, 0, 6), 0xbefd2106u}) {
     front[2] = handoff; // SETPC or captured SWAPPC with NULL destination
     auto source = PrepareShaderSource(front, options);
-    Check(!source.decoded.has_swap_pc && !source.call,
+    Check(!source.decoded.has_swap_pc && source.calls.empty(),
           "fused SETPC handoff entered scalar call preparation");
     auto translated = TranslateProgram(source.decoded, options);
     uint32_t allocations = 0;
@@ -16753,6 +16848,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
+  TestScalarLeafCallSites();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

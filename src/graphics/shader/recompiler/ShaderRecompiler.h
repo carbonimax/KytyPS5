@@ -44,19 +44,29 @@ struct CompileResult {
 
 // Decoded source and typed scalar call queries are retained once per cache source.
 struct ShaderSource {
+	// One S_SWAPPC_B64 call site, in program order.
 	struct Call {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
+		// Callee address evaluated by the last refresh.
+		uint64_t address = 0;
 	};
+	// The caller followed by one copy of the callee per call site, in call-site order. Each copy
+	// returns to its own call site, so a callee called from two sites is linked twice.
 	struct Linked {
+		struct Function {
+			uint32_t offset; // words after the caller code
+			uint32_t size;   // words
+		};
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
+		std::vector<Function> functions;
 		std::vector<uint32_t> observed_function;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::optional<Call> call;
+	std::vector<Call> calls;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
