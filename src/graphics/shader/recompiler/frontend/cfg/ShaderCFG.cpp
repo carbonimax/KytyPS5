@@ -1689,7 +1689,8 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 }
 
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                             uint32_t before, uint32_t code) {
+                                             uint32_t before, uint32_t code,
+                                             std::vector<uint32_t>* crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1706,8 +1707,14 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 		std::optional<uint32_t> reaching;
 		for (uint32_t i = end; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			// A scalar call may clobber any register; its callee is not visible here.
-			if (inst.opcode == Opcode::S_SWAPPC_B64) return std::nullopt;
+			// A scalar call may clobber any register; its callee is not visible here. The caller
+			// may accept the crossing and check the linked callee instead. The return address that
+			// the call itself writes is never a resolvable value.
+			if (inst.opcode == Opcode::S_SWAPPC_B64) {
+				if (crossed_calls == nullptr || MayWriteScalarRegister(inst, code)) return std::nullopt;
+				if (std::ranges::find(*crossed_calls, i) == crossed_calls->end()) crossed_calls->push_back(i);
+				continue;
+			}
 			if (MayWriteScalarRegister(inst, code)) {
 				reaching = i;
 				break;
