@@ -2034,6 +2034,42 @@ void TestNativeStoreCompletion() {
 #endif
 }
 
+// Some drivers lower every SPIR-V memory barrier, and a Subgroup control barrier too, to a
+// workgroup S_BARRIER. Guest atomics, store waits and GLC polls run in wave-divergent code (a
+// decoupled look-back), so a multi-wave workgroup must not get such a barrier from them; its GLC
+// dword loads are atomic so that a polling loop still re-reads memory.
+void TestMultiWaveWorkgroupHiddenBarriers() {
+  using namespace ShaderRecompiler;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  options.input_info.compute = &compute;
+  const std::array code = {
+      EncodeMubuf0(0x32, 4, false, true), EncodeMubuf1(1, 0, 0), // BUFFER_ATOMIC_ADD GLC
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0),       // BUFFER_STORE_DWORD
+      0xbbfd0000u,                                               // S_WAITCNT_VSCNT null, 0
+      EncodeMubuf0(0x0c, 8, false, true), EncodeMubuf1(2, 0, 0), // BUFFER_LOAD_DWORD GLC
+      EncodeMubuf0(0x1c, 12, false), EncodeMubuf1(2, 0, 0),
+      EncodeSopp(0x01),
+  };
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const uint32_t threads : {wave_size, 256u}) {
+      compute.threads_num[0] = threads;
+      compute.wave_size = options.wave_size = wave_size;
+      const auto result = RecompileForTest(code, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto source = DisassembleSpirvBinary(result.spirv);
+      const bool single = threads == wave_size;
+      Check((source.find("OpMemoryBarrier") != std::string::npos) == single,
+            "atomic fence must exist only in a single-wave workgroup");
+      Check((source.find("OpControlBarrier") != std::string::npos) == single,
+            "store completion barrier must exist only in a single-wave workgroup");
+      Check((source.find("OpAtomicLoad") != std::string::npos) == !single,
+            "a multi-wave workgroup must poll GLC dwords with atomic loads");
+    }
+  }
+}
+
 void TestSopkCompareImmediateExtension() {
   using namespace ShaderRecompiler;
   for (uint32_t opcode = 0x03; opcode <= 0x0e; opcode++) {
@@ -16524,6 +16560,7 @@ int main() {
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
   TestNativeStoreCompletion();
+  TestMultiWaveWorkgroupHiddenBarriers();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();

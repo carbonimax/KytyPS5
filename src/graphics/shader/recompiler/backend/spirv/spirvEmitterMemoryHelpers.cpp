@@ -582,7 +582,24 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	return old;
 }
 
+bool WorkgroupIsSingleWave(const EmitterState& state) {
+	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	if (workgroup == nullptr || state.program.stage == ShaderType::TessellationControl) {
+		return true;
+	}
+	uint64_t threads = 1;
+	for (const auto count: workgroup->threads_num) {
+		threads *= std::max(count, 1u);
+	}
+	return threads <= state.program.wave_size;
+}
+
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
+	// RDNA atomics carry no fence of their own: a returned value is ordered by its use (S_WAITCNT
+	// VMCNT), and other waves observe memory through GLC accesses.
+	if (!WorkgroupIsSingleWave(state)) {
+		return;
+	}
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {
