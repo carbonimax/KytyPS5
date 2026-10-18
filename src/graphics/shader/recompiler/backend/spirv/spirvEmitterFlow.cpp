@@ -649,6 +649,11 @@ uint32_t EmitIdentity(ValueEmitContext&, uint32_t value) {
 void EmitVoid(ValueEmitContext&) {}
 
 void EmitStoreCompletion(EmitterState& state) {
+	// Coherent stores are write-through and coherent loads are atomic in multi-wave workgroups
+	// (see LoadWordInBounds), where this subgroup barrier would desynchronize S_BARRIER.
+	if (!WorkgroupIsSingleWave(state)) {
+		return;
+	}
 	state.builder.AddFunction(
 	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
 	    ConstantU32(state, spv::ScopeDevice),

@@ -476,6 +476,15 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 
+// Whether every invocation of a native workgroup belongs to one guest wave. amdvlk lowers each
+// SPIR-V memory barrier, and a Subgroup-scope control barrier too, to a workgroup S_BARRIER.
+// Guest atomics and S_WAITCNT_VSCNT often run in code that only some waves of a workgroup reach
+// (a ticket taken by one lane, a decoupled look-back spin). There the hidden S_BARRIER of one wave
+// pairs with a real workgroup barrier of the other waves, so every later S_BARRIER synchronizes
+// the wrong program points: LDS reads see stale data and spin loops never end. Such barriers are
+// only emitted where the workgroup is a single wave, which no other wave can wait for.
+bool WorkgroupIsSingleWave(const EmitterState& state);
+
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value);
 

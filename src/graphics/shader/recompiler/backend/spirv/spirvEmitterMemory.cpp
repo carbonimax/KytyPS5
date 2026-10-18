@@ -408,6 +408,15 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if ((resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
+	    resource.element_bits == 32u && !WorkgroupIsSingleWave(ctx.state)) {
+		// A GLC load reads memory each time it runs; a guest spin loop polls with one. Without a
+		// barrier in the loop, amdvlk hoists a Volatile buffer load out of it, so use an atomic.
+		ctx.state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(ctx.state), value, pointer,
+		                              ConstantU32(ctx.state, spv::ScopeDevice),
+		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone));
+		return value;
+	}
 	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
 	                              resource.memory_access);
 	return value;
