@@ -48,6 +48,8 @@ struct ShaderSource {
 	struct Call {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
+		// Caller registers whose target queries cross this call: its callee must preserve them.
+		std::vector<uint32_t> preserved;
 		// Callee address evaluated by the last refresh.
 		uint64_t address = 0;
 	};

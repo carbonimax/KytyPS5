@@ -528,7 +528,14 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		return value;
 	};
 	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code);
+		// Another call site may lie between the definition and its use. The query assumes that
+		// call preserves the register; its linked callee is checked against that.
+		std::vector<uint32_t> crossed;
+		const auto definition = CFG::FindScalarDefinition(source.decoded, graph, before, code, &crossed);
+		for (const auto instruction: crossed) {
+			auto& site = *std::ranges::find(source.calls, instruction, &ShaderSource::Call::instruction);
+			if (std::ranges::find(site.preserved, code) == site.preserved.end()) site.preserved.push_back(code);
+		}
 		const auto fail = [&]() {
 			if (!unresolved) unresolved.emplace(source.decoded.instructions[before].pc, code);
 			return Value(0u);
@@ -717,6 +724,11 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 			                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
 			                     inst.opcode == Decoder::Opcode::S_ENDPGM);
 			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) || CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			// The caller's target queries assumed that this call keeps these registers.
+			for (const auto code: site.preserved) {
+				if (CFG::MayWriteScalarRegister(inst, code))
+					EXIT("shader call at pc 0x%08x: leaf writes s%u, which a later call target reads", call.pc, code);
+			}
 			const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
 			if (returns) {
 				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);

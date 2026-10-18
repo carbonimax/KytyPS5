@@ -10968,7 +10968,8 @@ void TestScalarLeafCallSites() {
   // Same leaf from two sites: two copies, each returning to its own site.
   const auto same = caller(0x100, 0x100);
   auto source = PrepareShaderSource(same, options);
-  Check(source.calls.size() == 2 && source.calls[0].instruction == 2 && source.calls[1].instruction == 5,
+  Check(source.calls.size() == 2 && source.calls[0].instruction == 2 && source.calls[1].instruction == 5 &&
+            source.calls[0].preserved.empty() && source.calls[1].preserved.empty(),
         "two scalar call sites were not both recorded");
   const auto& linked = RefreshShaderSource(source, runtime);
   Check(source.revision == 1 && linked.instructions.size() == 11 &&
@@ -11003,6 +11004,28 @@ void TestScalarLeafCallSites() {
             std::ranges::count(split.reads, std::pair<uint64_t, uint64_t>{base + 0x180, 8}) == 1,
         "call sites with different leaves were not linked to their own targets");
   (void)TranslateProgram(split_linked, options);
+
+  // A target read before an earlier call site is resolved across it; that callee must keep it.
+  const std::vector<uint32_t> crossing{
+      EncodeSMovB32(14, 2), EncodeSMovB32(15, 3), EncodeSop1(0x21, 14, 14),
+      EncodeSMovB32(14, 2), EncodeSMovB32(15, 3), EncodeSop1(0x21, 14, 14), EncodeSopp(0x01)};
+  user_data[2] = low + 0x180;
+  user_data[3] = high;
+  auto cross = PrepareShaderSource(crossing, options);
+  Check(cross.calls.size() == 2 && cross.calls[0].preserved == std::vector<uint32_t>{2, 3} &&
+            cross.calls[1].preserved.empty(),
+        "target registers read across an earlier call were not recorded as preserved");
+  const auto& cross_linked = RefreshShaderSource(cross, runtime);
+  Check(cross_linked.instructions[2].branch_target == 0x1c && cross_linked.instructions[5].branch_target == 0x24 &&
+            cross.reads.back() == std::pair<uint64_t, uint64_t>{base + 0x180, 8},
+        "call target read across an earlier call was not linked");
+  (void)TranslateProgram(cross_linked, options);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  user_data[2] = low + 0x100; // leaf A writes s3, the high half of the next target
+  ExpectFatal([&] { (void)RefreshShaderSource(cross, runtime); },
+              "leaf clobbering a later call target was linked");
+  user_data[2] = low + 0x180;
+#endif
 
   // A site whose target cannot be resolved disables the whole program, even if others resolve.
   for (const auto& program: {
