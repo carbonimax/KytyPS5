@@ -22,6 +22,7 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
+	runtime.captured_ranges = &m_ranges;
 	return runtime;
 }
 
@@ -46,6 +47,8 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 }
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	// Without the strict reader every read of a clean evaluation fails: no block serves it.
+	if (runtime.read_specialization_memory == nullptr) runtime.blocks = nullptr;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -701,17 +704,28 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		return false;
 	}
 	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
-	} else {
-		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	if (!ReadWord(vector, address, word)) {
+		return false;
 	}
 	result = word;
 	return true;
+}
+
+bool SrtWalker::ReadWord(bool vector, uint64_t address, uint32_t& word) {
+	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	if (reader == nullptr) {
+		if (vector) return false;
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		return true;
+	}
+	// A clean block gives exactly what either reader would return.
+	if (m_runtime.blocks != nullptr && m_runtime.blocks->Read(address, word)) {
+		if (m_runtime.captured_ranges != nullptr) {
+			m_runtime.captured_ranges->emplace_back(address, sizeof(uint32_t));
+		}
+		return true;
+	}
+	return reader(m_runtime.userdata, address, {&word, 1});
 }
 
 bool SrtWalker::DeferFlatRead(const Inst& inst, uint32_t flat_offset, std::vector<uint32_t>& flat) {

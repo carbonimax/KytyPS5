@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <span>
 #include <utility>
 
@@ -12,6 +13,40 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+
+// Clean 64-byte guest blocks served to the walker inline (emulator opt-in, KYTY_SRT_FAST_READS).
+// A block is clean when both runtime readers would return exactly its bytes; for such a block a
+// read needs no reader call. `fill` loads an entry (and lets the caller record it); an entry is
+// current only for the epoch it was filled in. Reads of a block that is not clean go through the
+// runtime readers.
+struct SrtGuestBlocks {
+	static constexpr uint64_t BlockBytes = 64;
+	static constexpr uint32_t NoRecord   = UINT32_MAX;
+	struct Entry {
+		uint64_t                 block  = UINT64_MAX;
+		uint32_t                 epoch  = 0;
+		uint32_t                 record = NoRecord; // caller's record of this fill
+		uint16_t                 mask   = 0;        // dwords read since the fill
+		bool                     valid  = false;    // clean: `words` are what both readers return
+		std::array<uint32_t, 16> words {};
+	};
+	std::array<Entry, 16> entries {};
+	uint32_t              epoch = 1;
+	void (*fill)(void* userdata, Entry& entry, uint64_t block) = nullptr;
+	void* fill_userdata = nullptr;
+
+	// `address` is dword aligned.
+	bool Read(uint64_t address, uint32_t& word) {
+		const uint64_t block = address & ~(BlockBytes - 1u);
+		auto&          entry = entries[(block / BlockBytes) % entries.size()];
+		if (entry.block != block || entry.epoch != epoch) [[unlikely]] fill(fill_userdata, entry, block);
+		if (!entry.valid) return false;
+		const auto index = static_cast<uint32_t>(address % BlockBytes) / 4u;
+		entry.mask = static_cast<uint16_t>(entry.mask | (1u << index));
+		word       = entry.words[index];
+		return true;
+	}
+};
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -31,6 +66,10 @@ struct SrtRuntime {
 	// evaluation (control flow, descriptors, specialization) uses a deferred value.
 	bool (*defer_flat_read)(uint64_t address)                 = nullptr;
 	std::vector<std::pair<uint32_t, uint64_t>>* gpu_flat_reads = nullptr;
+	// Only set together with both readers, which it must agree with (SrtGuestBlocks).
+	SrtGuestBlocks* blocks = nullptr;
+	// Set by SrtReadCapture: reads served from `blocks` are captured here like reader reads.
+	std::vector<std::pair<uint64_t, uint64_t>>* captured_ranges = nullptr;
 };
 
 class SrtReadCapture {
@@ -140,6 +179,8 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	// One guest dword through `blocks` when it is clean, else through the runtime reader.
+	bool ReadWord(bool vector, uint64_t address, uint32_t& word);
 	enum class RawReadKind { Unknown, Constant, Memory };
 	// Address of a raw read, or its value when it reads no memory (Constant).
 	RawReadKind RawReadAddress(const Inst& inst, uint64_t& address, uint64_t& constant);
