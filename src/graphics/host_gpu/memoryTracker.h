@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -90,14 +91,22 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback();
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
-		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
-			if (!is_written) {
-				manager->lock.unlock();
+		{
+			// KYTY_PROTECT_COALESCE: read-only synchronizations may defer the re-protection
+			// (the caller then copies the bytes after PageManager::FlushDeferredProtect).
+			std::optional<PageManager::DeferCapture> capture;
+			if (!is_written && PageManager::DeferringProtect()) {
+				capture.emplace();
 			}
-		});
+			Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				manager->lock.lock();
+				manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+				    manager->GetCpuAddr() + offset, bytes, range_func);
+				if (!is_written) {
+					manager->lock.unlock();
+				}
+			});
+		}
 		upload_func();
 		if (is_written) {
 			Iterate<false>(vaddr, size,

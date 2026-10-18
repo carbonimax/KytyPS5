@@ -31,6 +31,12 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Called at the start of every submission (GPU thread), while set: work recorded earlier
+	// may read host memory that is filled late (KYTY_PROTECT_COALESCE deferred uploads).
+	void SetPreSubmit(void (*callback)(void*), void* context) noexcept {
+		m_pre_submit         = callback;
+		m_pre_submit_context = context;
+	}
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
@@ -119,6 +125,8 @@ private:
 	std::deque<SubmittedFence>    m_submitted_fences;
 	std::vector<vk::Fence>        m_free_fences;
 	uint64_t                     m_retired_tick = 0;
+	void (*m_pre_submit)(void*)                         = nullptr;
+	void*                        m_pre_submit_context   = nullptr;
 };
 
 } // namespace Libs::Graphics

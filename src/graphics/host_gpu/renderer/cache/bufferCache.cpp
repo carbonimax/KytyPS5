@@ -485,7 +485,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, !is_written); });
 	if (source) {
 		auto& command = m_scheduler.Current();
 		const bool batch = m_upload_batch_depth != 0;
@@ -574,12 +574,65 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+static bool ProtectCoalesceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PROTECT_COALESCE");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+bool BufferCache::BeginDeferredUploads() {
+	if (!ProtectCoalesceEnabled() || !m_staging_buffer.IsCoherent() || m_deferring_uploads) {
+		return false;
+	}
+	m_deferring_uploads = true;
+	PageManager::BeginDeferredProtect();
+	m_scheduler.SetPreSubmit(
+	    [](void* context) { static_cast<BufferCache*>(context)->FlushDeferredUploads(); }, this);
+	return true;
+}
+
+// Order matters: the recorded protections first, then the bytes. A guest write that lands
+// before a page's protection is applied is in the copy; a later one faults and is logged.
+void BufferCache::FlushDeferredUploads() {
+	PageManager::FlushDeferredProtect();
+	for (const auto& copy: m_deferred_copies) {
+		if (!LibKernel::Memory::CopySparseMemory(copy.address, copy.destination, copy.size)) {
+			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+		}
+	}
+	m_deferred_copies.clear();
+}
+
+void BufferCache::EndDeferredUploads() {
+	FlushDeferredUploads();
+	PageManager::EndDeferredProtect();
+	m_scheduler.SetPreSubmit(nullptr, nullptr);
+	m_deferring_uploads = false;
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     uint64_t total_size) {
+                                     uint64_t total_size, bool may_defer) {
 	if (copies.empty()) {
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	if (m_deferring_uploads && may_defer) {
+		// No wait for ring space here (a wait submits): such uploads take the immediate path.
+		const auto [mapped, offset] = m_staging_buffer.Map(total_size, 4, false);
+		if (mapped != nullptr) {
+			for (auto& copy: copies) {
+				m_deferred_copies.push_back(
+				    {buffer.CpuAddress() + copy.dstOffset, mapped + copy.srcOffset, copy.size});
+				copy.srcOffset += offset;
+			}
+			m_staging_buffer.Commit(); // coherent: no flush to order after the copies
+			return m_staging_buffer.Handle();
+		}
+		// Immediate path: everything recorded so far is applied first, in order.
+		FlushDeferredUploads();
+	}
 
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
@@ -828,11 +881,15 @@ void BufferCache::ProcessFaultBuffer() {
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	// Take before walking: writes queued during synchronization remain pending.
 	const auto pending = m_memory_tracker.TakeBdaSync();
+	const bool deferred = BeginDeferredUploads();
 	pending.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
 			SynchronizeBuffersInRange(start, finish - start);
 		});
 	});
+	if (deferred) {
+		EndDeferredUploads();
+	}
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
