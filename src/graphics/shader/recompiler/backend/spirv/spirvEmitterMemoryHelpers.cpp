@@ -123,6 +123,7 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	uint32_t next_child_slot = UINT32_MAX;
 	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = buffers[root.indirect_resources[ordinal]];
+		if (candidate.null_fallback) return UINT32_MAX;
 		if (candidate.packed_stride != shared.packed_stride ||
 		    candidate.descriptor_format != shared.descriptor_format ||
 		    candidate.descriptor_swizzle != shared.descriptor_swizzle ||
@@ -236,6 +237,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
+	// Keep the real backing handle valid, but discard every access, including 64-bit atomics.
+	if (state.program.info.buffers[mem.resource].null_fallback) access.length = ConstantU32(state, 0);
 	return access;
 }
 

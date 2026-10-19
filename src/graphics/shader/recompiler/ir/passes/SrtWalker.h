@@ -24,6 +24,7 @@ struct SrtRuntime {
 	// Emulator opt-in: a scalar read below NullPageEnd (0x10000) is refused instead of read. In a
 	// block whose reachability is not proven it ends that path; the GPU would fault there.
 	bool null_reads_end_speculation = false;
+	bool null_descriptor_supported  = true;
 };
 
 class SrtReadCapture {

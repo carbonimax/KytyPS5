@@ -1285,6 +1285,47 @@ void TestSignedStorageSpecialization() {
   }
 }
 
+void TestNullDescriptorFallbackTransitions() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using namespace Libs::Graphics;
+  Program program;
+  program.stage = ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  program.user_data_count = 2u;
+  auto &block = AddValueBlock(program);
+  DescriptorSource image;
+  image.dword_count = 8u;
+  image.dwords.fill(Value(0u));
+  image.dwords[0] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0))}));
+  image.dwords[1] = Value(uint32_t(Prospero::BufferFormat::k32Float) << 20u);
+  image.dwords[3] = Value(DstSel(4, 5, 6, 7) | (uint32_t(Prospero::ImageType::kColor2D) << 28u));
+  program.descriptor_sources.push_back(image);
+  DescriptorSource buffer;
+  buffer.dword_count = 4u;
+  buffer.dwords.fill(Value(0u));
+  buffer.dwords[0] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(1))}));
+  buffer.dwords[2] = Value(16u);
+  program.descriptor_sources.push_back(buffer);
+  program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Sampled, .read = true});
+  program.info.buffers.push_back({.source = 1u, .read = true, .written = true});
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> data{};
+  SrtRuntime runtime{.user_data = data, .null_descriptor_supported = false};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization, native;
+  for (const uint32_t address : {0u, 1u, 0u}) {
+    data.fill(address);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization), "null fallback refresh failed");
+    Check(specialization.images[0].null_fallback == (address == 0u) && specialization.buffers[0].null_fallback == (address == 0u), "null/real transition retained stale fallback state");
+    runtime.null_descriptor_supported = true;
+    Check(MaterializeResources(plan, runtime, snapshot, native) && !native.images[0].null_fallback && !native.buffers[0].null_fallback, "native null descriptors entered fallback");
+    Check((specialization == native) == (address != 0u), "null fallback state is missing from the permutation key");
+    runtime.null_descriptor_supported = false;
+  }
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.images[0].null_fallback && program.info.buffers[0].null_fallback, "fallback state was not propagated to native IR");
+}
+
 void TestIndirectImageSamplerClasses(bool mixed) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
@@ -1587,6 +1628,7 @@ int main() {
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
+  TestNullDescriptorFallbackTransitions();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestUnconditionalEdgesKeepProvenReachability();
   TestUndecidedNullReadEndsOnlyThatPath();

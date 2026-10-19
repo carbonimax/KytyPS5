@@ -1111,6 +1111,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];
+			if (resource.null_fallback) {
+				EXIT_IF(descriptors.images[i].image_id);
+				continue;
+			}
 			const auto& texture = descriptors.images[i];
 			EXIT_IF(texture.image_id &&
 			        resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()));
@@ -1118,6 +1122,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
 			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
+				EXIT_IF(!m_context.GetGraphics().null_descriptor_enabled && !texture.image_id);
 				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
 			}
 		}

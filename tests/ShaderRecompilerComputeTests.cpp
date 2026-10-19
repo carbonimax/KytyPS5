@@ -20233,6 +20233,7 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
+    m_runtime_context.null_descriptor_enabled = true;
     m_runtime_context.maintenance8_enabled = m_maintenance8_enabled;
     // Only the full mode requires and enables minLod, together with maintenance8.
     m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
@@ -40311,6 +40312,374 @@ void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
   }
 }
 
+void CheckNullDescriptorFallbackSpirv() {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char *name = "NullDescriptorFallbackSpirv";
+  for (const auto opcode : {ValueOpcode::ImageRead, ValueOpcode::ImageWrite, ValueOpcode::ImageSampleRaw, ValueOpcode::ImageGatherRaw, ValueOpcode::ImageQueryDimensions, ValueOpcode::ImageQueryLod, ValueOpcode::ImageAtomicIAdd32, ValueOpcode::ImageAtomicIAdd64}) {
+    for (const u32 layout : {0u, 1u, 2u}) {
+      const bool indirect = layout != 0u;
+      const auto access = ImageOpcodeInfoOf(opcode);
+      if (indirect && opcode != ValueOpcode::ImageRead && opcode != ValueOpcode::ImageWrite && opcode != ValueOpcode::ImageSampleRaw && opcode != ValueOpcode::ImageGatherRaw) continue;
+      Program program{};
+      program.stage = ShaderType::Compute;
+      program.wave_size = 32;
+      program.srt_plan_complete = program.resource_tracking_complete = true;
+      program.block_storage.push_back(std::make_unique<Block>());
+      auto &block = *program.block_storage.back();
+      program.blocks.push_back(&block);
+      auto &key = block.AppendNewInst(ValueOpcode::LaneId);
+      auto &handle = block.AppendNewInst(ValueOpcode::GetImageResource, {Value(&key), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+      auto &sampler = block.AppendNewInst(ValueOpcode::GetSamplerResource, {Value(0u), Value(0u), Value(0u), Value(0u)});
+      auto &address = block.AppendNewInst(ValueOpcode::MakeImageAddress, {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+      auto &texel = block.AppendNewInst(ValueOpcode::CompositeConstructU32x4, {Value(7u), Value(7u), Value(7u), Value(7u)});
+      ImageResource image{};
+      const bool storage = opcode == ValueOpcode::ImageWrite || access.access == ImageAccess::Atomic;
+      image.resource_class = storage ? ImageResourceClass::Storage : ImageResourceClass::Sampled;
+      image.numeric_class = access.access == ImageAccess::Atomic ? Prospero::TextureNumericClass::Uint : Prospero::TextureNumericClass::Float;
+      image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      image.read = opcode != ValueOpcode::ImageWrite;
+      image.written = storage;
+      image.atomic = access.access == ImageAccess::Atomic;
+      image.atomic64 = opcode == ValueOpcode::ImageAtomicIAdd64;
+      image.null_fallback = layout != 2u;
+      if (indirect) {
+        if (!storage) image.conversion_format = Prospero::BufferFormat::k8UScaled; // UScaled conversion is unsupported by StoreTexel; writes retain the native float format.
+        image.shader_swizzle = DstSel(1, 5, 6, 7);
+        image.indirect_root = 0;
+        image.indirect_resources = {0u, 1u, 2u};
+      }
+      program.info.images.push_back(image);
+      program.descriptor_sources.resize(1);
+      program.descriptor_sources[0].dword_count = 8;
+      if (indirect) {
+        program.descriptor_sources[0].indirect_descriptor.emplace();
+        auto child = image;
+        child.indirect_resources.clear();
+        child.null_fallback = !image.null_fallback;
+        program.info.images.push_back(child);
+        child.null_fallback = image.null_fallback;
+        program.info.images.push_back(child);
+      }
+      program.info.samplers.push_back({});
+      if (access.needs_sampler) program.info.sampled_pairs.push_back({});
+      MemoryInfo memory{};
+      memory.kind = ResourceKind::Image;
+      memory.dmask = opcode == ValueOpcode::ImageGatherRaw ? 1u : 0xfu;
+      memory.image_dimension = image.dimension;
+      memory.image_address_components = 2;
+      memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLevelZero;
+      memory.data_bits = image.atomic64 ? 64u : 32u;
+      program.memory_info.push_back(memory);
+      Inst *operation = nullptr;
+      switch (opcode) {
+        case ValueOpcode::ImageRead: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&address), Value(true)}); break;
+        case ValueOpcode::ImageWrite: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&address), Value(&texel), Value(true)}); break;
+        case ValueOpcode::ImageQueryDimensions: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&address)}); break;
+        case ValueOpcode::ImageQueryLod: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&sampler), Value(&address)}); break;
+        case ValueOpcode::ImageSampleRaw: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&sampler), Value(&address), Value(true)}); break;
+        case ValueOpcode::ImageGatherRaw: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&sampler), Value(&address), Value(0u), Value(0u), Value(0u), Value(0u), Value(true)}); break;
+        case ValueOpcode::ImageAtomicIAdd32: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&address), Value(7u), Value(true)}); break;
+        case ValueOpcode::ImageAtomicIAdd64: operation = &block.AppendNewInst(opcode, {Value(&handle), Value(&address), Value(uint64_t{7}), Value(true)}); break;
+        default: std::abort();
+      }
+      operation->SetFlags(MemoryFlags{0u, 0u});
+      if (operation->GetType() != Type::Void) {
+        Value result(operation);
+        if (operation->GetType() == Type::U32x4) result = Value(&block.AppendNewInst(ValueOpcode::CompositeExtractU32x4, {result, Value(0u)}));
+        if (operation->GetType() == Type::U64) result = Value(&block.AppendNewInst(ValueOpcode::CompositeExtractU64, {result, Value(0u)}));
+        block.AppendNewInst(ValueOpcode::ReferenceU32, {result});
+      }
+      ShaderComputeInputInfo compute{};
+      CollectShaderInfo(program, {.compute = &compute});
+      if (!indirect) Require(name, "no null-only image capabilities", !program.info.compute_derivatives && !program.info.image_gather_extended, "null-only image operations requested native capabilities");
+      const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+      ValidateSpirv(name, spirv);
+      uint32_t images = 0;
+      for (uint32_t kind = FirstImageBinding; kind < uint32_t(DescriptorBindingKind::Samplers); ++kind) images += program.bindings.descriptor_counts[kind];
+      u32 real_slots = 0;
+      for (const auto &candidate : program.info.images) {
+        Require(name, "dense real slots and absent null slots", candidate.descriptor_index == (candidate.null_fallback ? UINT32_MAX : real_slots++), "a null reserved a slot or a real image lost its dense index");
+      }
+      Require(name, "image descriptor count", images == real_slots && real_slots == (layout == 2u ? 2u : indirect ? 1u : 0u), "wrong real image descriptor count");
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string text;
+      Require(name, "disassembly", tools.Disassemble(spirv, &text), "could not inspect fallback module");
+      if (opcode != ValueOpcode::ImageWrite) Require(name, "zero results", text.find("OpConstantNull") != std::string::npos, "null image result is not a typed zero");
+      Require(name, "native access preserved only for real candidates", indirect ? text.find("OpSwitch") != std::string::npos : text.find("OpTypeImage") == std::string::npos, "fallback emitted a null image access or lost candidate selection");
+      if (!indirect) continue;
+      // Inspect this fixture's switch, descriptor operands and raw-register join, not text presence.
+      std::vector<std::span<const u32>> definitions(spirv[3]);
+      std::vector<u32> labels(spirv[3]);
+      std::array<u32, 3> cases{};
+      std::array<u32, 3> native_accesses{};
+      std::span<const u32> join;
+      u32 label = 0, switches = 0;
+      const auto native_opcode = opcode == ValueOpcode::ImageWrite ? spv::OpImageWrite : opcode == ValueOpcode::ImageRead ? spv::OpImageFetch : opcode == ValueOpcode::ImageGatherRaw ? spv::OpImageGather : spv::OpImageSampleExplicitLod;
+      for (size_t offset = 5; offset < spirv.size();) {
+        const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+        const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (op == spv::OpLabel) label = words[1];
+        bool has_result = false, has_type = false;
+        spv::HasResultAndType(op, &has_result, &has_type);
+        if (has_result) {
+          const auto id = words[has_type ? 2u : 1u];
+          definitions[id] = words;
+          labels[id] = label;
+        }
+        if (op == spv::OpSwitch) {
+          ++switches;
+          Require(name, "three image branches", words.size() == 9u, "null and real image runs were merged");
+          for (u32 ordinal = 0; ordinal < 3u; ++ordinal) {
+            Require(name, "image switch ordinals", words[3u + 2u * ordinal] == ordinal, "candidate ordinal changed");
+            cases[ordinal] = words[4u + 2u * ordinal];
+          }
+        }
+        if (op == native_opcode) {
+          const auto branch = std::ranges::find(cases, label);
+          Require(name, "native image access in candidate branch", branch != cases.end(), "image access escaped candidate selection");
+          const auto ordinal = static_cast<u32>(branch - cases.begin());
+          Require(name, "no null image access", !program.info.images[ordinal].null_fallback, "a null branch accessed an image");
+          ++native_accesses[ordinal];
+          auto object = definitions[words[op == spv::OpImageWrite ? 1u : 3u]];
+          if (access.needs_sampler) {
+            Require(name, "sampled image operand", !object.empty() && (object[0] & 0xffffu) == spv::OpSampledImage, "sample lost its native image");
+            object = definitions[object[3]];
+          }
+          Require(name, "native image load", !object.empty() && (object[0] & 0xffffu) == spv::OpLoad, "real image descriptor was not loaded");
+          const auto pointer = definitions[object[3]];
+          Require(name, "native image descriptor pointer", pointer.size() == 5u && (pointer[0] & 0xffffu) == spv::OpAccessChain, "unexpected image descriptor pointer");
+          const auto slot = definitions[pointer[4]];
+          Require(name, "native image slot", slot.size() == 4u && (slot[0] & 0xffffu) == spv::OpConstant && slot[3] == program.info.images[ordinal].descriptor_index, "real access uses the wrong dense slot");
+        }
+        if (op == spv::OpPhi && words.size() == 9u && words[4] == cases[0] && words[6] == cases[1] && words[8] == cases[2]) join = words;
+        offset += words.size();
+      }
+      Require(name, "one separated image switch", switches == 1u, "image candidates lost their switch");
+      for (u32 ordinal = 0; ordinal < 3u; ++ordinal) {
+        const bool is_null = program.info.images[ordinal].null_fallback;
+        Require(name, "real accesses preserved, null writes absent", native_accesses[ordinal] == (is_null ? 0u : 1u), "missing real image access or unexpected null access");
+        if (opcode == ValueOpcode::ImageWrite) continue;
+        Require(name, "raw image join", !join.empty(), "candidate results do not join by predecessor");
+        auto value = definitions[join[3u + 2u * ordinal]];
+        if (is_null) {
+          Require(name, "null zero directly enters Phi before swizzle", value.size() == 3u && (value[0] & 0xffffu) == spv::OpConstantNull && value[1] == join[1], "null result was converted/swizzled or joined in a native type");
+          const auto type = definitions[value[1]];
+          Require(name, "null raw register vector", type.size() == 4u && (type[0] & 0xffffu) == spv::OpTypeVector && type[3] == 4u, "null join is not a register vector");
+          const auto scalar = definitions[type[2]];
+          Require(name, "null raw register bits", scalar.size() == 4u && (scalar[0] & 0xffffu) == spv::OpTypeInt && scalar[2] == 32u && scalar[3] == 0u, "null Phi uses floating-point conversion");
+        } else {
+          Require(name, "real conversion stays in its branch", value.size() == 4u && (value[0] & 0xffffu) == spv::OpBitcast && labels[value[2]] == cases[ordinal], "real conversion escaped its branch");
+          value = definitions[value[3]];
+          Require(name, "real swizzle vector", value.size() == 7u && ((value[0] & 0xffffu) == spv::OpCompositeConstruct || (value[0] & 0xffffu) == spv::OpConstantComposite), "real swizzle was lost");
+          const auto one = definitions[value[3]];
+          Require(name, "real swizzle produces one", one.size() == 4u && (one[0] & 0xffffu) == spv::OpConstant && one[3] == std::bit_cast<u32>(1.0f), "real candidate no longer produces the distinguishing one component");
+        }
+      }
+      if (opcode != ValueOpcode::ImageWrite) {
+        auto result = join[2];
+        // ImageRead additionally joins the execution-mask default, without a conversion.
+        for (const auto words : definitions) {
+          if (words.size() == 7u && (words[0] & 0xffffu) == spv::OpPhi && words[3] == join[2]) result = words[2];
+        }
+        Require(name, "raw join consumed directly", std::ranges::any_of(definitions, [&](const auto words) { return words.size() == 5u && (words[0] & 0xffffu) == spv::OpCompositeExtract && words[3] == result && words[4] == 0u; }), "joined null zero passes through another conversion before use");
+      }
+    }
+  }
+}
+
+void CheckNullBufferFallbackSpirv() {
+  using namespace ShaderRecompiler::IR;
+  constexpr const char *name = "NullBufferFallbackSpirv";
+  for (const auto opcode : {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU8, ValueOpcode::LoadBufferU16, ValueOpcode::StoreBufferU32, ValueOpcode::BufferAtomicIAdd64}) {
+    for (const bool zero_address : {true, false}) {
+      for (const u32 layout : {0u, 1u, 2u}) {
+        // Atomic64 uses the existing direct SSBO path; indirect selection is exercised by load/store.
+        if (opcode == ValueOpcode::BufferAtomicIAdd64 && layout != 0u) continue;
+        const bool indirect = layout != 0u;
+        const u32 count = indirect ? 3u : 2u;
+        const bool load = opcode != ValueOpcode::StoreBufferU32 && opcode != ValueOpcode::BufferAtomicIAdd64;
+        const auto case_name = std::string(name) + "/" + (zero_address ? "zero-address" : "zero-size") + "/layout=" + std::to_string(layout) + "/opcode=" + std::to_string(static_cast<u32>(opcode));
+        const auto check = [&](const char *stage, bool valid, const char *message, spv::Op op = spv::OpNop, u32 slot = UINT32_MAX, u32 label = 0u) {
+          Require(case_name.c_str(), stage, valid, std::string(message) + "; spv-op=" + std::to_string(static_cast<u32>(op)) + " slot=" + std::to_string(slot) + " label=" + std::to_string(label));
+        };
+        Program program{};
+        program.stage = ShaderType::Compute;
+        program.wave_size = 32;
+        program.srt_plan_complete = program.resource_tracking_complete = true;
+        program.block_storage.push_back(std::make_unique<Block>());
+        auto &block = *program.block_storage.back();
+        program.blocks.push_back(&block);
+        auto &lane = block.AppendNewInst(ValueOpcode::LaneId);
+        auto &offset = block.AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(8u)});
+        for (u32 resource = 0; resource < count; ++resource) {
+          const bool is_null = indirect ? ((resource == 1u) == (layout == 2u)) : resource == 0u;
+          DescriptorSource source{};
+          source.dword_count = 4u;
+          source.dwords.fill(Value(0u));
+          source.dwords[0] = Value(is_null && zero_address ? 0u : 0x1000u + resource * 0x100u);
+          source.dwords[1] = Value(4u << 16u);
+          source.dwords[2] = Value(is_null && !zero_address ? 0u : 16u);
+          source.dwords[3] = Value((u32(Prospero::BufferFormat::k32UInt) << 12u) | DstSel(4, 5, 6, 7));
+          program.descriptor_sources.push_back(source);
+          program.info.buffers.push_back({.source = resource, .read = opcode != ValueOpcode::StoreBufferU32, .written = !load, .atomic = opcode == ValueOpcode::BufferAtomicIAdd64});
+        }
+        const auto plan = ExtractResourcePlan(program);
+        ResourceSnapshot snapshot;
+        ResourceSpecialization specialization;
+        check("buffer fallback materialization", MaterializeResources(plan, SrtRuntime{.null_descriptor_supported = false}, snapshot, specialization), "buffer descriptors could not be specialized");
+        ApplyResourceSpecialization(program, specialization);
+        for (u32 resource = 0; resource < count; ++resource) {
+          const bool is_null = indirect ? ((resource == 1u) == (layout == 2u)) : resource == 0u;
+          const auto &buffer = program.info.buffers[resource];
+          check("address/size fallback and matching real geometry", buffer.null_fallback == is_null && buffer.packed_stride == 4u && buffer.descriptor_format == program.info.buffers[0].descriptor_format && buffer.descriptor_swizzle == program.info.buffers[0].descriptor_swizzle, "fallback flag is stale or the real witness cannot detect incorrect sharing", spv::OpNop, resource);
+          if (indirect) program.info.buffers[resource].indirect_root = 0u;
+        }
+        if (indirect) {
+          program.info.buffers[0].indirect_resources = {0u, 1u, 2u};
+          program.info.buffers[0].indirect_search_iterations = std::bit_width(3u);
+          program.descriptor_sources[0].indirect_descriptor.emplace();
+        }
+        for (u32 resource = 0; resource < (indirect ? 1u : count); ++resource) {
+          Value selection(0u);
+          if (indirect) {
+            auto &index = block.AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&lane)});
+            index.SetFlags<u32>(0u);
+            selection = Value(&index);
+          }
+          auto &handle = block.AppendNewInst(ValueOpcode::GetBufferResource, {selection, Value(0u), Value(0u), Value(0u)});
+          handle.SetFlags<u32>(resource);
+          const auto memory_index = static_cast<u32>(program.memory_info.size());
+          program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = resource, .data_dwords = opcode == ValueOpcode::BufferAtomicIAdd64 ? 2u : 1u, .data_bits = opcode == ValueOpcode::LoadBufferU8 ? 8u : opcode == ValueOpcode::LoadBufferU16 ? 16u : 32u, .offen = true});
+          Inst *operation = nullptr;
+          if (load) operation = &block.AppendNewInst(opcode, {Value(&handle), Value(0u), Value(&offset), Value(0u), Value(true)});
+          if (opcode == ValueOpcode::StoreBufferU32) operation = &block.AppendNewInst(opcode, {Value(&handle), Value(0u), Value(&offset), Value(0u), Value(7u), Value(true)});
+          if (opcode == ValueOpcode::BufferAtomicIAdd64) operation = &block.AppendNewInst(opcode, {Value(&handle), Value(0u), Value(&offset), Value(0u), Value(uint64_t{7}), Value(true)});
+          operation->SetFlags(MemoryFlags{memory_index, 0u});
+          if (operation->GetType() != Type::Void) {
+            Value result(operation);
+            if (operation->GetType() == Type::U8) result = Value(&block.AppendNewInst(ValueOpcode::ConvertU32U8, {result}));
+            if (operation->GetType() == Type::U16) result = Value(&block.AppendNewInst(ValueOpcode::ConvertU32U16, {result}));
+            if (operation->GetType() == Type::U64) result = Value(&block.AppendNewInst(ValueOpcode::CompositeExtractU64, {result, Value(0u)}));
+            block.AppendNewInst(ValueOpcode::ReferenceU32, {result});
+          }
+        }
+        ShaderComputeInputInfo compute{};
+        compute.wave_size = compute.host_subgroup_size = compute.threads_num[0] = 32u;
+        compute.threads_num[1] = compute.threads_num[2] = 1u;
+        CollectShaderInfo(program, {.compute = &compute});
+        const auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+        ValidateSpirv(case_name.c_str(), spirv);
+        check("buffer slots retained", program.bindings.descriptor_counts[u32(DescriptorBindingKind::Buffers)] == count, "fallback lost a valid backing descriptor");
+        std::vector<std::span<const u32>> definitions(spirv[3]);
+        std::vector<u32> labels(spirv[3]), object_lengths(spirv[3]), object_resources(spirv[3], UINT32_MAX);
+        std::vector<std::vector<u32>> successors(spirv[3]);
+        std::array<u32, 3> cases{}, accesses{}, lengths{};
+        u32 label = 0, entry = 0, switches = 0;
+        // Follow actual CFG edges: nested guards need dominance, not equal labels.
+        const auto reachable = [&](u32 target, u32 excluded_label, u32 edge_from, u32 edge_to) {
+          std::vector<bool> visited(spirv[3]);
+          std::vector<u32> pending{entry};
+          while (!pending.empty()) {
+            const auto current = pending.back();
+            pending.pop_back();
+            if (current == 0u || current == excluded_label || visited[current]) continue;
+            visited[current] = true;
+            if (current == target) return true;
+            for (const auto next : successors[current]) {
+              if (current != edge_from || next != edge_to) pending.push_back(next);
+            }
+          }
+          return false;
+        };
+        const auto dominates = [&](u32 block, u32 target) { return block != 0u && reachable(target, 0u, 0u, 0u) && !reachable(target, block, 0u, 0u); };
+        for (size_t position = 5; position < spirv.size();) {
+          const auto words = std::span<const u32>(spirv).subspan(position, spirv[position] >> 16u);
+          const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (op == spv::OpLabel) {
+            label = words[1];
+            if (entry == 0u) entry = label;
+          }
+          bool has_result = false, has_type = false;
+          spv::HasResultAndType(op, &has_result, &has_type);
+          if (has_result) {
+            const auto id = words[has_type ? 2u : 1u];
+            definitions[id] = words;
+            labels[id] = label;
+          }
+          if (op == spv::OpBranch) successors[label].push_back(words[1]);
+          if (op == spv::OpBranchConditional) successors[label] = {words[2], words[3]};
+          if (op == spv::OpSwitch) {
+            ++switches;
+            check("three buffer branches", indirect && words.size() == 9u, "mixed buffers shared a real length or lost a candidate", op, UINT32_MAX, label);
+            successors[label].push_back(words[2]);
+            for (u32 ordinal = 0; ordinal < count; ++ordinal) {
+              check("buffer switch ordinals", words[3u + 2u * ordinal] == ordinal, "buffer candidate ordinal changed", op, ordinal, label);
+              cases[ordinal] = words[4u + 2u * ordinal];
+              successors[label].push_back(cases[ordinal]);
+            }
+          }
+          position += words.size();
+        }
+        check("one candidate switch", switches == (indirect ? 1u : 0u), "missing per-candidate switch");
+        for (const auto words : definitions) {
+          if (words.empty()) continue;
+          const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (op == spv::OpArrayLength) {
+            label = labels[words[2]];
+            const auto pointer = definitions[words[3]];
+            check("static candidate buffer pointer", pointer.size() == 5u && (pointer[0] & 0xffffu) == spv::OpAccessChain, "candidate uses a shared descriptor pointer", op, UINT32_MAX, label);
+            const auto slot = definitions[pointer[4]];
+            check("static candidate buffer slot", slot.size() == 4u && (slot[0] & 0xffffu) == spv::OpConstant, "mixed buffers were merged into a dynamic slot", op, UINT32_MAX, label);
+            const auto candidate = std::ranges::find(program.info.buffers, slot[3], &BufferResource::descriptor_index);
+            check("candidate buffer slot", candidate != program.info.buffers.end(), "descriptor slot has no candidate", op, slot[3], label);
+            const auto resource = static_cast<u32>(candidate - program.info.buffers.begin());
+            check("candidate buffer branch dominance", !indirect || dominates(cases[resource], label), "candidate length escaped its branch", op, slot[3], label);
+            object_lengths[words[3]] = words[2];
+            object_resources[words[3]] = resource;
+            ++lengths[resource];
+          }
+        }
+        for (u32 resource = 0; resource < count; ++resource) check("mixed buffers cannot share their lengths", lengths[resource] == 1u, "missing or duplicate per-candidate length", spv::OpArrayLength, program.info.buffers[resource].descriptor_index, cases[resource]);
+        for (size_t position = 5; position < spirv.size();) {
+          const auto words = std::span<const u32>(spirv).subspan(position, spirv[position] >> 16u);
+          const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (op == spv::OpLabel) label = words[1];
+          if (op == spv::OpLoad || op == spv::OpStore || op == spv::OpAtomicIAdd) {
+            const auto pointer = definitions[words[op == spv::OpStore ? 1u : 3u]];
+            if (pointer.size() == 6u && (pointer[0] & 0xffffu) == spv::OpAccessChain && object_resources[pointer[3]] != UINT32_MAX) {
+              const auto resource = object_resources[pointer[3]];
+              const bool is_null = program.info.buffers[resource].null_fallback;
+              const auto slot = program.info.buffers[resource].descriptor_index;
+              const auto expected_op = load ? spv::OpLoad : opcode == ValueOpcode::StoreBufferU32 ? spv::OpStore : spv::OpAtomicIAdd;
+              check("native buffer operation preserved", op == expected_op, "buffer access changed opcode", op, slot, label);
+              check("candidate access branch dominance", !indirect || dominates(cases[resource], label), "access escaped candidate selection", op, slot, label);
+              check("own length dominates access", dominates(labels[object_lengths[pointer[3]]], label), "access escaped its object's length definition", op, slot, label);
+              ++accesses[resource];
+              const bool guarded = std::ranges::any_of(definitions, [&](const auto comparison) {
+                if (comparison.size() != 5u || (comparison[0] & 0xffffu) != spv::OpULessThan || comparison[3] != pointer[5]) return false;
+                const auto bound = definitions[comparison[4]];
+                if (is_null ? !(bound.size() == 4u && (bound[0] & 0xffffu) == spv::OpConstant && bound[3] == 0u) : comparison[4] != object_lengths[pointer[3]]) return false;
+                u32 branch_label = 0u;
+                for (size_t branch = 5; branch < spirv.size(); branch += spirv[branch] >> 16u) {
+                  const auto instruction = std::span<const u32>(spirv).subspan(branch, spirv[branch] >> 16u);
+                  if ((instruction[0] & 0xffffu) == spv::OpLabel) branch_label = instruction[1];
+                  if ((instruction[0] & 0xffffu) == spv::OpBranchConditional && instruction[1] == comparison[2]) {
+                    if (dominates(branch_label, label) && !reachable(label, 0u, branch_label, instruction[2]) && reachable(label, 0u, branch_label, instruction[3])) return true;
+                  }
+                }
+                return false;
+              });
+              check("effective null-zero or real-length guard", guarded, "access is not controlled by the true edge of index < 0 for null or its own array length for real", op, slot, label);
+            }
+          }
+          position += words.size();
+        }
+        for (u32 resource = 0; resource < count; ++resource) check("all candidate accesses checked", accesses[resource] == 1u, "a candidate access disappeared or escaped its length guard", spv::OpNop, program.info.buffers[resource].descriptor_index, cases[resource]);
+      }
+    }
+  }
+}
+
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
@@ -48590,6 +48959,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--null-descriptor-spirv-only") == 0) {
+    CheckNullDescriptorFallbackSpirv();
+    CheckNullBufferFallbackSpirv();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
