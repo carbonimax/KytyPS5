@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <type_traits>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -673,7 +674,17 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
-	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
+	const auto emit_resource = [&](uint32_t resource, uint32_t slot) {
+		if (state.program.info.images[resource].null_fallback) {
+			if constexpr (std::is_void_v<std::invoke_result_t<Emit, uint32_t, uint32_t>>) {
+				return;
+			} else {
+				return state.builder.Constant(spv::OpConstantNull, result_type);
+			}
+		}
+		return emit(resource, slot);
+	};
+	if (image.indirect_root != mem.resource) return emit_resource(mem.resource, 0u);
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()
 	                         ? &state.program.descriptor_sources[image.source]
@@ -704,7 +715,8 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 			auto& run = runs.back();
 			const auto& first = state.program.info.images[run.resource];
 			const auto next_slot = run.slot_bias + ordinal;
-			if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
+			if (!candidate.null_fallback && !first.null_fallback &&
+			    candidate.dimension == first.dimension && candidate.cube == first.cube &&
 			    IR::DescriptorBindingForImage(first) == kind &&
 			    (inst.GetOpcode() != IR::ValueOpcode::ImageWrite ||
 			     candidate.shader_swizzle == first.shader_swizzle) &&
@@ -722,7 +734,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	}
 	const auto EmitRun = [&](uint32_t index) {
 		const auto& run = runs[index];
-		if (run.count == 1u) return emit(run.resource, 0u);
+		if (run.count == 1u) return emit_resource(run.resource, 0u);
 		auto slot = Binary(state, spv::OpIAdd, TypeU32(state), selected,
 		                   ConstantU32(state, run.slot_bias));
 		if (run.first == 0u) {
@@ -736,7 +748,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 				slot = root_or_child;
 			}
 		}
-		return emit(run.resource, slot);
+		return emit_resource(run.resource, slot);
 	};
 	auto run_index = ConstantU32(state, 0u);
 	for (uint32_t index = 1; index < runs.size(); ++index) {
@@ -761,8 +773,9 @@ uint32_t EmitImageResult(ValueEmitContext& ctx, const IR::Inst& inst, const Emit
 	const bool gather = inst.GetOpcode() == IR::ValueOpcode::ImageGatherRaw;
 	const bool dref = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 	const bool scalar = dref && !gather;
+	// Null candidates return register zeros before a real candidate's format/swizzle conversion.
 	const bool mixed = std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
-		return state.program.info.images[resource].numeric_class != image.numeric_class;
+		return state.program.info.images[resource].null_fallback || state.program.info.images[resource].numeric_class != image.numeric_class;
 	});
 	const auto native_type = [&](uint32_t resource) {
 		return scalar ? TypeF32(state) : ImageVectorType(
@@ -849,6 +862,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
+	if (image.null_fallback && image.indirect_root != mem.resource) {
+		if (inst.GetType() != IR::Type::Void) ctx.Define(inst, state.builder.Constant(spv::OpConstantNull, TypeId(state, inst.GetType())));
+		return;
+	}
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(spv::CapabilityImageQuery);

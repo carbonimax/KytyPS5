@@ -157,6 +157,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		}
 	}
 	for (const auto& image: program.info.images) {
+		if (image.null_fallback) {
+			if (image.descriptor_index != UINT32_MAX) Fail(program, "null fallback image has a native descriptor slot");
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(image);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");

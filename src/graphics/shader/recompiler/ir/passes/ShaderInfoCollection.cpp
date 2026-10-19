@@ -288,6 +288,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
            const Inst& inst) {
 	auto& info = program.info;
 	const auto op = inst.GetOpcode();
+	if (ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+		const auto resource = program.memory_info.at(inst.Flags<MemoryFlags>().index).resource;
+		const auto& image = info.images.at(resource);
+		if (image.null_fallback && image.indirect_root != resource) return;
+	}
 	const auto buffer_access = BufferAccessOf(op);
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);

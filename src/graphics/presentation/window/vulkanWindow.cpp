@@ -239,6 +239,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
+		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+		    "vkEnumerateDeviceExtensionProperties", [&](uint32_t* count, vk::ExtensionProperties* values) {
+			    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
+		    });
+		const bool robustness2_extension = HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 		vk::PhysicalDeviceFeatures2 device_features2 {};
 
 		vk::PhysicalDeviceVulkan13Features features13 {};
@@ -267,7 +272,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		features12.pNext           = &fragment_barycentric;
 #endif
 		robustness2.pNext      = features12.pNext;
-		features11.pNext       = &robustness2;
+		features11.pNext       = robustness2_extension ? &robustness2 : robustness2.pNext;
 		features12.pNext       = &features11;
 		features13.pNext       = &features12;
 		device_features2.pNext = &features13;
@@ -339,7 +344,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
-		check_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
@@ -375,11 +379,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
 
 		if (!skip_device) {
-			auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
-			    "vkEnumerateDeviceExtensionProperties",
-			    [&](uint32_t* count, vk::ExtensionProperties* values) {
-				    return device.enumerateDeviceExtensionProperties(nullptr, count, values);
-			    });
 			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
 
 			for (const char* ext: device_extensions) {
@@ -513,8 +512,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	supported_features13.pNext = &supported_features12;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
+	const bool robustness2_extension = HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 	supported_robustness2.pNext = supported_features13.pNext;
-	supported_features13.pNext = &supported_robustness2;
+	supported_features13.pNext = robustness2_extension ? &supported_robustness2 : supported_robustness2.pNext;
 
 	const bool mesh_extension = HasExtension(device_extensions, VK_EXT_MESH_SHADER_EXTENSION_NAME);
 	vk::PhysicalDeviceMeshShaderFeaturesEXT supported_mesh {};
@@ -713,10 +713,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
-	robustness2.nullDescriptor      = VK_TRUE;
+	graphics.null_descriptor_enabled = robustness2_extension && supported_robustness2.nullDescriptor == VK_TRUE;
+	robustness2.nullDescriptor      = graphics.null_descriptor_enabled;
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
-	features13.pNext = &robustness2;
+	features13.pNext = robustness2_extension ? &robustness2 : robustness2.pNext;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
@@ -724,6 +725,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	LOGF("Vulkan null descriptors: extension=%s feature=%s path=%s\n", robustness2_extension ? "present" : "absent", graphics.null_descriptor_enabled ? "true" : "false", graphics.null_descriptor_enabled ? "native" : "shader fallback");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
@@ -1058,7 +1060,7 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if !defined(__APPLE__)
 	device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
@@ -1134,7 +1136,8 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
 		}
-		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,

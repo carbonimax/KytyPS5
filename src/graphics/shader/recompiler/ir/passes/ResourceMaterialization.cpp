@@ -817,8 +817,7 @@ private:
 	uint32_t                                    count = 0;
 };
 
-static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool null_descriptor_supported) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -833,6 +832,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		image.mip_count = ImageMipCount(base, descriptor);
 		if (NullImageDescriptor(descriptor)) {
+			image.null_fallback = !null_descriptor_supported;
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
@@ -1606,6 +1606,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		buffer.null_fallback      = !runtime.null_descriptor_supported && (descriptor.Base48() == 0u || descriptor.GetSize() == 0u);
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -1688,7 +1689,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1710,6 +1711,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.packed_stride              = source.packed_stride;
 		buffer.descriptor_format          = source.descriptor_format;
 		buffer.descriptor_swizzle         = source.descriptor_swizzle;
+		buffer.null_fallback              = source.null_fallback;
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
@@ -1741,6 +1743,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.null_fallback              = source.null_fallback;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
