@@ -59,9 +59,13 @@ static bool PerVertexExperimentalEnabled() {
 
 static void EnableExperimentalMesh(vk::PhysicalDevice device) {
 	Dl_info provider {};
-	EXIT_IF(dladdr(reinterpret_cast<void*>(SDL_Vulkan_GetVkGetInstanceProcAddr()), &provider) == 0 || provider.dli_fname == nullptr || provider.dli_fbase == nullptr);
+	if (dladdr(reinterpret_cast<void*>(SDL_Vulkan_GetVkGetInstanceProcAddr()), &provider) == 0 || provider.dli_fname == nullptr || provider.dli_fbase == nullptr) {
+		EXIT("Experimental mesh cannot identify the loaded Vulkan provider\n");
+	}
 	void* image = dlopen(provider.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
-	EXIT_IF(image == nullptr);
+	if (image == nullptr) {
+		EXIT("Experimental mesh cannot open the loaded Vulkan provider\n");
+	}
 	auto enable = reinterpret_cast<void (*)(VkPhysicalDevice)>(dlsym(image, "mvkEnableMeshTestDevice"));
 	Dl_info adapter {};
 	if (enable == nullptr || dladdr(reinterpret_cast<void*>(enable), &adapter) == 0 || adapter.dli_fbase != provider.dli_fbase) {
