@@ -94,13 +94,17 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
+#include <csignal>
+#include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+extern char **environ;
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1289,6 +1293,83 @@ void ExpectFatal(const char *name, Function function) {
 }
 #endif
 
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+struct MinLodRefusalCase { const char *name; const char *reason; };
+constexpr std::array min_lod_refusals{
+    MinLodRefusalCase{"zero-sharing", "image minLod fallback refused: conflicting shared sampler minima 1280 and 0 shader="},
+    MinLodRefusalCase{"different-sharing", "image minLod fallback refused: conflicting shared sampler minima 1280 and 1536 shader="},
+    MinLodRefusalCase{"indirect-refresh", "image minLod fallback refused: conflicting shared sampler minima 1280 and 1536 shader="},
+    MinLodRefusalCase{"dynamic-sharing", "image minLod fallback refused: conflicting shared sampler minima 1280 and 0 shader="},
+    MinLodRefusalCase{"image-candidate", "image minLod fallback refused: malformed indirect image index shader="},
+    MinLodRefusalCase{"sampler-candidate", "image minLod fallback refused: malformed indirect sampler index shader="},
+    MinLodRefusalCase{"missing-pair", "image minLod fallback refused: nonzero minimum has no sampling pair shader="},
+    MinLodRefusalCase{"malformed-pair", "image minLod fallback refused: malformed sampled pair shader="},
+    MinLodRefusalCase{"excluded-use", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"image-compare", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"image-helper", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"corner-sample", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"image-1d", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"image-3d", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"image-cube", "image minLod fallback refused: unsupported image use, shape, coordinates or conversion shader="},
+    MinLodRefusalCase{"minimum-beyond-view", "texture minimum LOD exceeds last mip level: min_lod=1792 last_level=6"},
+    MinLodRefusalCase{"anisotropy-ratio-one", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"unequal-filters", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"unnormalized-sampler", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"sampler-compare", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"table-border", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"invalid-interval", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="},
+    MinLodRefusalCase{"invalid-mip-filter", "image minLod fallback refused: unsupported sampler state or invalid mipmapped interval shader="}};
+
+void CheckImageMinLodRefusals(const char *executable) {
+  for (const auto &test : min_lod_refusals) {
+    auto *output = std::tmpfile();
+    Require(test.name, "fatal subprocess", output != nullptr, "cannot capture child diagnostics");
+    posix_spawn_file_actions_t actions;
+    Require(test.name, "fatal subprocess", posix_spawn_file_actions_init(&actions) == 0, "cannot initialize spawn actions");
+    const int fd = ::fileno(output);
+    Require(test.name, "fatal subprocess", posix_spawn_file_actions_adddup2(&actions, fd, STDOUT_FILENO) == 0 && posix_spawn_file_actions_adddup2(&actions, fd, STDERR_FILENO) == 0 && posix_spawn_file_actions_addclose(&actions, fd) == 0, "cannot redirect child diagnostics");
+    std::array<char *, 4> args{const_cast<char *>(executable), const_cast<char *>("--image-minlod-fatal-case"), const_cast<char *>(test.name), nullptr};
+    pid_t pid = -1;
+    const int spawned = ::posix_spawnp(&pid, executable, &actions, nullptr, args.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    Require(test.name, "fatal subprocess", spawned == 0, "cannot execute fresh minLod child: " + std::to_string(spawned));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    int status = 0;
+    pid_t waited = 0;
+    bool timed_out = false;
+    for (;;) {
+      waited = ::waitpid(pid, &status, WNOHANG);
+      if (waited == pid || (waited < 0 && errno != EINTR)) break;
+      if (std::chrono::steady_clock::now() >= deadline) {
+        timed_out = true;
+        Require(test.name, "fatal timeout cleanup", ::kill(pid, SIGKILL) == 0 || errno == ESRCH, "cannot kill timed-out minLod child");
+        const auto reap_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        do {
+          waited = ::waitpid(pid, &status, WNOHANG);
+          if (waited == pid || (waited < 0 && errno != EINTR)) break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } while (std::chrono::steady_clock::now() < reap_deadline);
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::rewind(output);
+    std::string diagnostic;
+    std::array<char, 4096> chunk{};
+    while (const auto count = std::fread(chunk.data(), 1, chunk.size(), output)) {
+      diagnostic.append(chunk.data(), count);
+      if (diagnostic.size() > 1024u * 1024u) break;
+    }
+    std::fclose(output);
+    if (timed_out || !WIFEXITED(status) || WEXITSTATUS(status) != (321 & 0xff) || diagnostic.find(test.reason) == std::string::npos) std::fputs(diagnostic.c_str(), stderr);
+    Require(test.name, "fatal subprocess", !timed_out && waited == pid, "fresh minLod child failed to finish within 30 seconds");
+    Require(test.name, "fatal exit", WIFEXITED(status) && WEXITSTATUS(status) == (321 & 0xff), "fresh minLod child did not use the renderer fatal exit");
+    Require(test.name, "fatal reason", diagnostic.find(test.reason) != std::string::npos, "fresh minLod child did not report the expected refusal reason");
+    std::printf("[host] minLod refusal %-24s ok\n", test.name);
+  }
+}
+#endif
+
 void CheckLeastRecentlyUsedCacheOrdering() {
   Common::LeastRecentlyUsedCache<uint32_t, uint64_t> cache;
   const auto first = cache.Insert(1, 1);
@@ -1991,7 +2072,8 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 class VulkanHarness {
 public:
-  VulkanHarness() { Init(); }
+  enum class Mode { Full, MinLodFallback };
+  explicit VulkanHarness(Mode mode = Mode::Full) : m_mode(mode) { Init(); }
   ~VulkanHarness() { Destroy(); }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -10519,6 +10601,304 @@ public:
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
+  }
+
+  void CheckImageMinLodFallback(std::string_view refusal = {}) {
+    constexpr const char *name = "ImageMinLodFallback";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x100000;
+    constexpr auto texture_address = base + 0x10000;
+    constexpr auto output_address = base + 0x80000;
+    constexpr u32 side = 64, last = 6;
+    EnsureRuntimeContext();
+    Require(name, "enabled features", !m_runtime_context.image_view_min_lod_enabled &&
+        !m_runtime_context.maintenance8_enabled && m_runtime_context.sample_rate_shading_enabled &&
+        !m_runtime_context.shader_buffer_int64_atomics_enabled && !m_runtime_context.shader_image_int64_atomics_enabled, "fixture must exercise the unsupported-native path with truthful renderer features");
+    std::array<std::vector<u32>, 2> codes;
+    for (u32 explicit_lod = 0; explicit_lod < codes.size(); ++explicit_lod) {
+      auto &code = codes[explicit_lod];
+      AppendVMovLiteral(&code, 20, std::bit_cast<u32>(65.0f / 128.0f));
+      AppendVMovLiteral(&code, 21, std::bit_cast<u32>(65.0f / 128.0f));
+      AppendVMovLiteral(&code, 22, std::bit_cast<u32>(0.0f));
+      code.push_back(EncodeMimg0(explicit_lod ? 0x24 : 0x27, 1));
+      code.push_back(EncodeMimg1(0, 20, 0, 2));
+      code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+      code.push_back(EncodeMubuf1(0, 3, 0));
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+          {.type = Prospero::ShaderBinaryType::kCs, .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    }
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000, 0, &physical) == 0,
+        "minLod fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, 0x10000) == 0 && mapped == reinterpret_cast<void *>(base),
+        "minLod fixture mapping failed");
+    std::memset(mapped, 0, size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      auto &executor = context.GetRenderExecutor();
+      ShaderTextureResource texture{{static_cast<u32>(texture_address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u),
+          ((side - 1u) >> 2u) | ((side - 1u) << 14u),
+          DstSel(4, 4, 4, 4) | (last << 16u) |
+              (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u | (last << 4u), 0, 0}};
+      ShaderBufferResource output{};
+      output.UpdateAddress48(output_address);
+      output.fields[2] = sizeof(u32);
+      output.fields[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(12 + i, output.fields[i], HW::UserSgprType::Unknown);
+      using M = Prospero::SamplerMipFilter;
+      if (refusal.empty()) {
+        struct LodCase { u32 base_level, minimum, sampler_min, sampler_max; float expected; Prospero::SamplerMipFilter mip; };
+        const std::array cases{
+            LodCase{0, 1280, 0, 0, 32.0f, M::kLinear},
+            LodCase{0, 0, 0, 0, 1.0f, M::kLinear},
+            LodCase{0, 256, 0, 0, 2.0f, M::kLinear},
+            LodCase{0, 384, 0, 0, 3.0f, M::kLinear},
+            LodCase{1, 384, 0, 0, 3.0f, M::kLinear},
+            LodCase{0, 256, 512, 1024, 4.0f, M::kLinear},
+            LodCase{0, 1280, 512, 1024, 32.0f, M::kLinear},
+            LodCase{0, 1536, 0, 0, 64.0f, M::kLinear},
+            LodCase{0, 1280, 0, 0, 32.0f, M::kLinear},
+            LodCase{0, 320, 0, 0, 2.0f, M::kPoint},
+            LodCase{0, 448, 0, 0, 4.0f, M::kPoint},
+            LodCase{0, 320, 1024, 0, 2.0f, M::kNone},
+            LodCase{0, 448, 1024, 0, 4.0f, M::kNone},
+            LodCase{0, 0, 0, 0, 1.0f, M::kLinear},
+            LodCase{0, 1280, 0, 0, 32.0f, M::kLinear},
+            LodCase{0, 1536, 0, 0, 64.0f, M::kLinear},
+            LodCase{0, 1280, 0, 0, 32.0f, M::kLinear}};
+        std::array<uint64_t, 2> program_ids{};
+        vk::Sampler first_sampler = nullptr;
+        ImageId sampled_image;
+        bool initialized = false;
+        for (u32 explicit_lod = 0; explicit_lod < codes.size(); ++explicit_lod) {
+          const auto &code = codes[explicit_lod];
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+              .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1, .wave_size = 64, .user_sgpr = 16});
+          for (size_t case_index = 0; case_index < cases.size(); ++case_index) {
+            const auto &test = cases[case_index];
+            texture.fields[1] = (texture.fields[1] & ~0xfff00u) | (test.minimum << 8u);
+            texture.fields[3] = (texture.fields[3] & ~(0xfu << 12u)) | (test.base_level << 12u);
+            ShaderSamplerResource sampler{{0, test.sampler_min | (test.sampler_max << 12u), static_cast<u32>(test.mip) << 26u, 0}};
+            for (u32 i = 0; i < 8; ++i) shaders.SetCsUserSgpr(i, texture.fields[i], HW::UserSgprType::Unknown);
+            for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(8 + i, sampler.fields[i], HW::UserSgprType::Unknown);
+            ShaderComputeInputInfo input{};
+            const auto pipeline = context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            Require(name, "runtime refresh", program_ids[explicit_lod] == 0 || program_ids[explicit_lod] == pipeline.id,
+                "numeric minLod payload or sampler interval changed structural specialization");
+            program_ids[explicit_lod] = pipeline.id;
+            PreparedBindings bindings;
+            executor.PrepareBindings(input.stage, bindings);
+            if (!initialized) {
+              sampled_image = bindings.images[0].image_id;
+              for (u32 mip = 0; mip <= last; ++mip) {
+                vk::ClearValue clear{};
+                clear.color.float32[0] = static_cast<float>(1u << mip);
+                TextureCacheTestAccess::ClearImage(context.GetTextureCache(), context.GetCommandScheduler().Current(),
+                    bindings.images[0].image_id, {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
+              }
+              initialized = true;
+            }
+            executor.RebindImages(bindings);
+            Require(name, "view invariants", bindings.images.size() == 1 && bindings.samplers.size() == 1 &&
+                bindings.images[0].desc.view_info.min_lod == 0 && bindings.images[0].desc.view_info.base_level == test.base_level &&
+                bindings.images[0].desc.view_info.level_count == last + 1u - test.base_level,
+                "fallback changed the view range or retained a native minimum");
+            const auto view = bindings.images[0].image_view;
+            executor.RebindImages(bindings);
+            Require(name, "unchanged rebind", bindings.images[0].image_view == view, "unchanged snapshot lost its effective binding");
+            if (case_index == 0) first_sampler = bindings.samplers[0];
+            if (test.minimum == 0) Require(name, "zero sampler identity", bindings.samplers[0] == context.GetSamplerCache().GetSampler(sampler, false), "zero minimum changed the existing sampler identity");
+            if (test.minimum == 1280 && test.sampler_min == 0 && test.sampler_max == 0 && test.mip == M::kLinear) Require(name, "effective sampler reuse", bindings.samplers[0] == first_sampler, "returning to the same clamp missed the existing cache");
+            processor.DispatchDirect(1, 1, 1, 0x41u);
+            u32 actual = 0;
+            context.GetBufferCache().ReadMemory(output_address, sizeof(actual));
+            Require(name, "strict sampled mip", LibKernel::Memory::TryReadBacking(output_address, &actual, sizeof(actual)) &&
+                std::abs(std::bit_cast<float>(actual) - test.expected) <= 1.0f / 64.0f,
+                "case " + std::to_string(case_index) + " returned " + std::to_string(std::bit_cast<float>(actual)) + " expected " + std::to_string(test.expected));
+            std::printf("[gpu] minLod native=0 explicit=%u base=%u T=%u result=%g\n", explicit_lod, test.base_level, test.minimum, std::bit_cast<float>(actual));
+          }
+        }
+        std::vector<u32> checker((side / 2u) * (side / 2u));
+        for (u32 y = 0; y < side / 2u; ++y) {
+          for (u32 x = 0; x < side / 2u; ++x) checker[y * (side / 2u) + x] = std::bit_cast<u32>(((x + y) & 1u) ? 4.0f : 0.0f);
+        }
+        auto upload = CreateHostBuffer(name, checker.size() * sizeof(u32), vk::BufferUsageFlagBits::eTransferSrc, {});
+        WriteBuffer(name, upload, checker);
+        auto &image = context.GetTextureCache().GetImage(sampled_image);
+        auto &scheduler = context.GetCommandScheduler();
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+        vk::BufferImageCopy copy{};
+        copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 1, 0, 1};
+        copy.imageExtent = vk::Extent3D{side / 2u, side / 2u, 1};
+        scheduler.Current().Handle().copyBufferToImage(upload.buffer, image.backing.image, vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+        context.GetTextureCache().MarkGpuWritten(sampled_image);
+        texture.fields[1] = (texture.fields[1] & ~0xfff00u) | (384u << 8u);
+        for (u32 filter : {0u, 1u}) {
+          ShaderSamplerResource sampler{{0, 0xa5000000u, (filter << 20u) | (filter << 22u) | (2u << 26u), 2u << 30u}};
+          for (u32 i = 0; i < 8; ++i) shaders.SetCsUserSgpr(i, texture.fields[i], HW::UserSgprType::Unknown);
+          for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(8 + i, sampler.fields[i], HW::UserSgprType::Unknown);
+          ShaderComputeInputInfo spatial{};
+          (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), spatial);
+          PreparedBindings bindings;
+          executor.PrepareBindings(spatial.stage, bindings);
+          auto expected_sampler = sampler;
+          expected_sampler.fields[1] |= 384u | (384u << 12u);
+          Require(name, "descriptor bit preservation", bindings.samplers[0] == context.GetSamplerCache().GetSampler(expected_sampler, false), "rewrite changed unrelated descriptor bits");
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+          u32 actual = 0;
+          context.GetBufferCache().ReadMemory(output_address, sizeof(actual));
+          // At mip 1, u=v=65/128 gives point texel (16,16)=0; linear weights 1/4,3/4 give 1.5. Mip 2 is 4.
+          const float expected = filter ? 2.75f : 2.0f;
+          Require(name, "spatial and fractional filtering", LibKernel::Memory::TryReadBacking(output_address, &actual, sizeof(actual)) &&
+              std::abs(std::bit_cast<float>(actual) - expected) <= 1.0f / 64.0f,
+              "equal XY point/bilinear filters changed the checker footprint or fractional mip blend");
+        }
+        scheduler.Finish();
+        DestroyBuffer(&upload);
+      }
+      texture.fields[1] = (texture.fields[1] & ~0xfff00u) | (1280u << 8u);
+      texture.fields[3] &= ~(0xfu << 12u);
+      ShaderSamplerResource common{{0, 0, static_cast<u32>(M::kLinear) << 26u, 0}};
+      for (u32 i = 0; i < 8; ++i) shaders.SetCsUserSgpr(i, texture.fields[i], HW::UserSgprType::Unknown);
+      for (u32 i = 0; i < 4; ++i) shaders.SetCsUserSgpr(8 + i, common.fields[i], HW::UserSgprType::Unknown);
+      const auto &code = codes.back();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+          .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1, .wave_size = 64, .user_sgpr = 16});
+      ShaderComputeInputInfo input{};
+      (void)context.GetPipelineCache().GetComputeProgram(shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+      const auto original_program = *input.stage.program;
+      const auto original_snapshot = *input.stage.resources;
+      auto program = original_program;
+      auto snapshot = original_snapshot;
+      const auto prepare = [&] {
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        return bindings.samplers;
+      };
+      if (!refusal.empty()) {
+        const auto duplicate_image = [&] {
+          program.info.images.push_back(program.info.images[0]);
+          snapshot.images.push_back(snapshot.images[0]);
+        };
+        const auto set_minimum = [&](u32 image, u32 minimum) { snapshot.images[image].dwords[1] = (snapshot.images[image].dwords[1] & ~0xfff00u) | (minimum << 8u); };
+        const auto sampler_slot = program.info.samplers[0].snapshot_index;
+        auto &sampler = snapshot.samplers[sampler_slot].dwords;
+        if (refusal == "zero-sharing" || refusal == "different-sharing") {
+          duplicate_image();
+          program.info.sampled_pairs.push_back({1, 0});
+          set_minimum(1, refusal == "zero-sharing" ? 0u : 1536u);
+        } else if (refusal == "indirect-refresh" || refusal == "dynamic-sharing") {
+          duplicate_image();
+          program.info.images[0].indirect_resources = {0, 1};
+          if (refusal == "dynamic-sharing") program.info.images[1].mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
+          else {
+            (void)prepare();
+            set_minimum(1, 1536u);
+          }
+        } else if (refusal == "image-candidate") program.info.images[0].indirect_resources = {99};
+        else if (refusal == "sampler-candidate") program.info.samplers[0].indirect_resources = {99};
+        else if (refusal == "missing-pair") program.info.sampled_pairs.clear();
+        else if (refusal == "malformed-pair") program.info.sampled_pairs[0].image = 99;
+        else if (refusal == "excluded-use") program.info.images[0].min_lod_sampler_exact = false;
+        else if (refusal == "image-compare") program.info.images[0].depth_compare = true;
+        else if (refusal == "image-helper") program.info.images[0].conversion_format = Prospero::BufferFormat::k5_6_5UNorm;
+        else if (refusal == "corner-sample") snapshot.images[0].dwords[5] |= 1u << 23u;
+        else if (refusal == "image-1d" || refusal == "image-3d" || refusal == "image-cube") {
+          const auto type = refusal == "image-1d" ? Prospero::ImageType::kColor1D : refusal == "image-3d" ? Prospero::ImageType::kColor3D : Prospero::ImageType::kCube;
+          snapshot.images[0].dwords[3] = (snapshot.images[0].dwords[3] & ~(0xfu << 28u)) | (static_cast<u32>(type) << 28u);
+          auto &resource = program.info.images[0];
+          if (refusal == "image-1d") {
+            resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+            snapshot.images[0].dwords[2] &= ~(0x3fffu << 14u);
+          } else if (refusal == "image-3d") resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+          else {
+            resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+            resource.cube = true;
+            snapshot.images[0].dwords[4] = 5u;
+          }
+        } else if (refusal == "minimum-beyond-view") set_minimum(0, 1792u);
+        else if (refusal == "anisotropy-ratio-one") sampler[2] = (2u << 20u) | (2u << 22u) | (2u << 26u);
+        else if (refusal == "unequal-filters") sampler[2] = (1u << 20u) | (2u << 26u);
+        else if (refusal == "unnormalized-sampler") sampler[0] = 1u << 15u;
+        else if (refusal == "sampler-compare") program.info.samplers[0].depth_compare = true;
+        else if (refusal == "table-border") sampler[3] = 3u << 30u;
+        else if (refusal == "invalid-interval") sampler[1] = 512u | (256u << 12u);
+        else if (refusal == "invalid-mip-filter") sampler[2] = 3u << 26u;
+        else Require(name, "fatal selector", false, "unknown minLod refusal case");
+        (void)prepare();
+        Require(name, "fatal refusal", false, "unsupported minLod binding unexpectedly prepared");
+      }
+      ShaderStageRuntime rebind_runtime{&original_program, &original_snapshot};
+      PreparedBindings rebound;
+      executor.PrepareBindings(rebind_runtime, rebound);
+      const auto retained_sampler = rebound.samplers[0];
+      context.GetTextureCache().GetImage(rebound.images[0].image_id).binding.needs_rebind = true;
+      executor.RebindImages(rebound);
+      Require(name, "cache image re-resolution", rebound.images[0].sample_min_lod == 1280 && rebound.samplers[0] == retained_sampler,
+          "an unchanged snapshot lost its relative minimum when cache discovery replaced the binding");
+      program.info.images.push_back(program.info.images[0]);
+      snapshot.images.push_back(snapshot.images[0]);
+      program.info.sampled_pairs.push_back({1, 0});
+      Require(name, "same minimum sharing", prepare().size() == 1, "identical image clamps did not share one sampler");
+      program.info.samplers.push_back(program.info.samplers[0]);
+      snapshot.images[1].dwords[1] = (snapshot.images[1].dwords[1] & ~0xfff00u) | (1536u << 8u);
+      program.info.samplers[1].snapshot_index = 1;
+      snapshot.samplers.push_back(snapshot.samplers[0]);
+      program.info.sampled_pairs[1].sampler = 1;
+      auto separate = prepare();
+      Require(name, "separate sampler clamps", separate.size() == 2 && separate[0] != separate[1], "independent compiled samplers lost distinct effective intervals");
+      snapshot.images[1] = snapshot.images[0];
+      program.info.images[0].indirect_resources = {0, 1};
+      program.info.sampled_pairs.resize(1);
+      program.info.samplers[0].indirect_resources = {0, 1};
+      auto indirect = prepare();
+      Require(name, "finite sampler candidates", indirect[0] == indirect[1], "equal finite candidates received different clamps");
+      snapshot.images[0] = {};
+      snapshot.images[0].dword_count = 8;
+      Require(name, "null root with live candidate", prepare()[0] == indirect[0], "null root suppressed a non-null image candidate");
+      snapshot.images[0] = original_snapshot.images[0];
+      program.info.samplers.resize(4, program.info.samplers[0]);
+      program.info.samplers[0].indirect_resources = {0, 1};
+      program.info.samplers[1].indirect_resources.clear();
+      for (u32 index : {2u, 3u}) {
+        program.info.samplers[index].snapshot_index = index - 2u;
+        program.info.samplers[index].integer_border = true;
+        program.info.samplers[index].force_point_filtering = true;
+        program.info.samplers[index].indirect_resources.clear();
+      }
+      program.info.samplers[2].indirect_resources = {2, 3};
+      program.info.images[1].numeric_class = Prospero::TextureNumericClass::Uint;
+      snapshot.images[1].dwords[0] = static_cast<u32>((base + 0x40000) >> 8u);
+      snapshot.images[1].dwords[1] = (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 20u) | (3u << 30u) | (1536u << 8u);
+      auto typed = prepare();
+      auto integer_expected = common;
+      integer_expected.SetPointFiltering();
+      integer_expected.fields[1] = 1536u | (1536u << 12u);
+      const auto integer_sampler = context.GetSamplerCache().GetSampler(integer_expected, true);
+      Require(name, "alternate typed finite candidates", typed[2] == integer_sampler && typed[3] == integer_sampler && typed[0] != typed[2],
+          "alternate integer sampler candidates silently retained the float clamp or zero");
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0, "fixture mapping release failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0, "fixture backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckNullTextureDescriptors() {
@@ -20001,6 +20381,7 @@ public:
   }
 
 private:
+  Mode m_mode = Mode::Full;
   bool m_rasterization_supported = true;
   u32   m_skipped_cases          = 0;
 
@@ -20035,10 +20416,15 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.shader_image_int64_atomics_enabled = true;
-    m_runtime_context.maintenance8_enabled = true;
-    // The harness requires and enables minLod (optional in the renderer since host features).
-    m_runtime_context.image_view_min_lod_enabled = true;
+    m_runtime_context.shader_image_int64_atomics_enabled = m_mode == Mode::Full;
+    m_runtime_context.maintenance8_enabled = m_mode == Mode::Full;
+    m_runtime_context.image_view_min_lod_enabled = m_mode == Mode::Full;
+    if (m_mode == Mode::MinLodFallback) {
+      m_runtime_context.sample_rate_shading_enabled = true;
+      m_runtime_context.subgroup_size = SubgroupSize();
+      Require("ImageMinLodFallback", "subgroup", m_runtime_context.subgroup_size == 32 || m_runtime_context.subgroup_size == 64,
+          "missing GPU qualification: production bindings require a 32- or 64-lane subgroup");
+    }
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -20071,6 +20457,72 @@ private:
                   &allocator_info, &m_runtime_context.allocator)),
               "vmaCreateAllocator");
     m_renderer = std::make_unique<RenderContext>(m_runtime_context);
+  }
+
+  void InitMinLodFallbackDevice(std::span<const vk::PhysicalDevice> devices) {
+    for (const auto physical : devices) {
+      vk::PhysicalDeviceVulkan12Features features12{};
+      vk::PhysicalDeviceVulkan13Features features13{};
+      features13.pNext = &features12;
+      vk::PhysicalDeviceFeatures2 features{};
+      features.pNext = &features13;
+      physical.getFeatures2(&features);
+      if (!features12.timelineSemaphore || !features12.bufferDeviceAddress ||
+          !features13.dynamicRendering || !features13.synchronization2 ||
+          !features.features.shaderInt64 || !features.features.sampleRateShading) continue;
+      const auto extensions = physical.enumerateDeviceExtensionProperties();
+      if (extensions.result != vk::Result::eSuccess) continue;
+      const auto has_extension = [&](const char *name) {
+        return std::ranges::any_of(extensions.value, [&](const auto &extension) { return std::strcmp(extension.extensionName.data(), name) == 0; });
+      };
+      if (!has_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) continue;
+      const auto queues = physical.getQueueFamilyProperties();
+      for (u32 queue = 0; queue < queues.size(); ++queue) {
+        const auto required = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+        if ((queues[queue].queueFlags & required) != required) continue;
+        m_physical_device = physical;
+        m_queue_family = queue;
+        break;
+      }
+      if (m_physical_device != nullptr) break;
+    }
+    Require("ImageMinLodFallback", "device", m_physical_device != nullptr,
+        "missing GPU qualification: Vulkan 1.3 graphics/compute, timelineSemaphore, BDA, shaderInt64, sampleRateShading or push descriptors");
+    m_physical_device.getMemoryProperties(&m_memory_properties);
+    float priority = 1.0f;
+    vk::DeviceQueueCreateInfo queue_info{};
+    queue_info.queueFamilyIndex = m_queue_family;
+    queue_info.queueCount = 1;
+    queue_info.pQueuePriorities = &priority;
+    vk::PhysicalDeviceVulkan12Features features12{};
+    features12.timelineSemaphore = true;
+    features12.bufferDeviceAddress = true;
+    vk::PhysicalDeviceVulkan13Features features13{};
+    features13.dynamicRendering = true;
+    features13.synchronization2 = true;
+    features13.pNext = &features12;
+    vk::PhysicalDeviceFeatures features{};
+    features.shaderInt64 = true;
+    features.sampleRateShading = true;
+    const std::array extensions{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    vk::DeviceCreateInfo device_info{};
+    device_info.pNext = &features13;
+    device_info.queueCreateInfoCount = 1;
+    device_info.pQueueCreateInfos = &queue_info;
+    device_info.pEnabledFeatures = &features;
+    device_info.enabledExtensionCount = extensions.size();
+    device_info.ppEnabledExtensionNames = extensions.data();
+    RequireVk("ImageMinLodFallback", "device", m_physical_device.createDevice(&device_info, nullptr, &m_device), "vkCreateDevice");
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
+    m_device.getQueue(m_queue_family, 0, &m_queue);
+    vk::CommandPoolCreateInfo pool_info{};
+    pool_info.queueFamilyIndex = m_queue_family;
+    pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+    RequireVk("ImageMinLodFallback", "device", m_device.createCommandPool(&pool_info, nullptr, &m_command_pool), "vkCreateCommandPool");
+    m_rasterization_supported = false;
+    const auto properties = m_physical_device.getProperties();
+    std::printf("[host] ImageMinLodFallback device=%s driverVersion=%u apiVersion=%u\n", properties.deviceName.data(), properties.driverVersion, properties.apiVersion);
+    std::printf("[host] ImageMinLodFallback timeline=1 synchronization2=1 dynamicRendering=1 shaderInt64=1 sampleRateShading=1 nullDescriptor=0 shaderImageInt64Atomics=0 shaderBufferInt64Atomics=0 shaderSharedInt64Atomics=0 minLod=0 maintenance8=0\n");
   }
 
   void Init() {
@@ -20107,6 +20559,10 @@ private:
                                                   physical_devices.data()),
               "vkEnumeratePhysicalDevices");
 
+    if (m_mode == Mode::MinLodFallback) {
+      InitMinLodFallbackDevice(physical_devices);
+      return;
+    }
     for (auto physical : physical_devices) {
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
@@ -49043,6 +49499,24 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     vulkan.CheckCubeFaceStorageExpansion();
+    return 0;
+  }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--image-minlod-fatal-case") == 0) {
+    Require("ImageMinLodFallback", "fatal selector", std::ranges::any_of(min_lod_refusals, [&](const auto &test) { return std::string_view(test.name) == argv[2]; }), "unknown minLod refusal case");
+    VulkanHarness vulkan(VulkanHarness::Mode::MinLodFallback);
+    vulkan.CheckImageMinLodFallback(argv[2]);
+    return 1;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--image-minlod-fallback-only") == 0) {
+    {
+      VulkanHarness vulkan(VulkanHarness::Mode::MinLodFallback);
+      vulkan.CheckImageMinLodFallback();
+    }
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    CheckImageMinLodRefusals(argv[0]);
+#endif
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {

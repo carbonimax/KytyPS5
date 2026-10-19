@@ -3758,6 +3758,7 @@ private:
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
+				image.min_lod_sampler_exact &= (memory.image_sample_flags & Decoder::ImageSampleFlagUnnormalized) == 0;
 				return i;
 			}
 		}
@@ -3774,6 +3775,7 @@ private:
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
 		Merge(image, op, pc);
+		image.min_lod_sampler_exact &= (memory.image_sample_flags & Decoder::ImageSampleFlagUnnormalized) == 0;
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
@@ -3787,6 +3789,7 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
+		image.min_lod_sampler_exact &= op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageQueryDimensions;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

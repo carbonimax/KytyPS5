@@ -24,6 +24,7 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+	uint32_t                  sample_min_lod = 0;
 };
 
 struct PreparedBindings {

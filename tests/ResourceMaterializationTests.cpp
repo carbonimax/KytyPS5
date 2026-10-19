@@ -1279,7 +1279,7 @@ void TestSignedStorageSpecialization() {
   }
 }
 
-void TestIndirectImageSamplerClasses(bool mixed) {
+void TestIndirectImageSamplerClasses(bool mixed, bool min_lod_exact = true) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
   using Libs::Graphics::Prospero::TextureNumericClass;
@@ -1296,6 +1296,7 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 0};
   program.info.images.resize(1);
   program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.info.images[0].min_lod_sampler_exact = min_lod_exact;
   program.descriptor_sources.push_back(root);
   program.info.samplers.resize(1);
   program.info.sampled_pairs.resize(1);
@@ -1323,9 +1324,14 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
             snapshot.samplers.size() == 1 && program.info.samplers.size() == (mixed ? 2u : 1u),
         "indirect images lost candidates or created unnecessary sampler variants");
+  Check(plan.info.images[0].min_lod_sampler_exact == min_lod_exact &&
+            std::ranges::all_of(program.info.images, [&](const auto &image) { return image.min_lod_sampler_exact == min_lod_exact; }),
+        "minLod eligibility changed during extraction, candidate expansion or duplicate compaction");
   user_data[0] = 0x33333333u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed image sampler refresh failed");
+  Check(std::ranges::all_of(program.info.images, [&](const auto &image) { return image.min_lod_sampler_exact == min_lod_exact; }),
+        "descriptor refresh lost the candidate minLod eligibility proof");
   for (uint32_t index = 0; index < program.info.samplers.size(); ++index) {
     const auto &sampler = program.info.samplers[index];
     Check(sampler.snapshot_index == 0u && sampler.source == plan.info.samplers[0].source &&
@@ -1373,7 +1379,9 @@ int main() {
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
-  for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  for (const bool mixed : {false, true}) {
+    for (const bool exact : {false, true}) TestIndirectImageSamplerClasses(mixed, exact);
+  }
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

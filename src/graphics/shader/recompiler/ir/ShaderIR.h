@@ -165,6 +165,7 @@ struct ImageResource {
 	bool                          atomic            = false;
 	bool                          atomic64          = false;
 	bool                          unfiltered_access_only = true;
+	bool                          min_lod_sampler_exact = true;
 	bool                          depth_compare     = false;
 	bool                          cube              = false;
 	bool                          r128              = false;

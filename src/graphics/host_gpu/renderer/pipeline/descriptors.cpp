@@ -31,8 +31,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -632,21 +634,139 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	if (!m_context.GetGraphics().image_view_min_lod_enabled && !storage &&
+	    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic && binding.desc.view_info.min_lod != 0) {
+		binding.sample_min_lod = binding.desc.view_info.min_lod;
+		const bool ordinary_type = descriptor.Type() == Prospero::ImageType::kColor2D || descriptor.Type() == Prospero::ImageType::kColor2DArray;
+		const bool ordinary_dimension = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D || resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+		if (resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+		    resource.min_lod_sampler_exact && ordinary_type && ordinary_dimension && !resource.cube &&
+		    !resource.depth_compare && !descriptor.CornerSample() && !shader_conversion &&
+		    resource.conversion_format == Prospero::BufferFormat::kInvalid && !multisampled &&
+		    binding.sample_min_lod <= (view_levels - 1u) * 256u) {
+			binding.desc.view_info.min_lod = 0;
+		}
+	}
+	return binding;
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	const auto& sampler = program.info.samplers[index];
+[[noreturn]] static void RefuseSamplerMinLod(const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t image, uint32_t sampler, uint32_t minimum, const char* reason, const ShaderSamplerResource& descriptor = {}) {
+	const auto image_pc = image < program.info.images.size() ? program.info.images[image].first_use_pc : UINT32_MAX;
+	const auto sampler_pc = sampler < program.info.samplers.size() ? program.info.samplers[sampler].first_use_pc : UINT32_MAX;
+	const auto dimension = image < program.info.images.size() ? static_cast<uint32_t>(program.info.images[image].dimension) : UINT32_MAX;
+	const auto snapshot_index = sampler < program.info.samplers.size() ? program.info.samplers[sampler].snapshot_index : UINT32_MAX;
+	EXIT("image minLod fallback refused: %s shader=0x%016" PRIx64
+	     " image=%u image_pc=0x%x dimension=%u sampler=%u sampler_pc=0x%x snapshot=%u relative_min=%u "
+	     "min=%u max=%u mag=%u min_filter=%u mip=%u unnormalized=%d compare=%u border=%u aniso=%u "
+	     "sampler_words=%08x,%08x,%08x,%08x\n", reason, program.shader_hash, image, image_pc, dimension, sampler, sampler_pc, snapshot_index,
+	     minimum, descriptor.MinLod(), descriptor.MaxLod(), descriptor.XyMagFilter(), descriptor.XyMinFilter(),
+	     descriptor.MipFilter(), descriptor.ForceUnormCoords(), descriptor.DepthCompareFunc(), descriptor.BorderColorType(),
+	     descriptor.MaxAnisoRatio(), descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]);
+	std::abort();
+}
+
+static ShaderSamplerResource EffectiveSamplerDescriptor(ShaderSamplerResource descriptor, const ShaderRecompiler::IR::SamplerResource& sampler) {
 	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
+	return descriptor;
+}
+
+static ShaderSamplerResource SamplerWithImageMinLod(ShaderSamplerResource descriptor, uint32_t minimum) {
+	const bool no_mips = descriptor.MipFilter() == static_cast<uint32_t>(Prospero::SamplerMipFilter::kNone);
+	const auto low = no_mips ? minimum : std::max<uint32_t>(descriptor.MinLod(), minimum);
+	const auto high = no_mips ? minimum : std::max<uint32_t>(descriptor.MaxLod(), minimum);
+	if (low > 0xfffu || high > 0xfffu) EXIT("image minLod sampler bounds are not representable: min=%u max=%u\n", low, high);
+	descriptor.fields[1] = (descriptor.fields[1] & 0xff000000u) | low | (high << 12u);
+	if (no_mips) {
+		descriptor.fields[2] = (descriptor.fields[2] & ~(3u << 26u)) | (static_cast<uint32_t>(Prospero::SamplerMipFilter::kPoint) << 26u);
+	}
+	return descriptor;
+}
+
+static std::array<uint32_t, ShaderRecompiler::IR::ShaderInfo::MaxSamplers> ResolveSamplerMinLods(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot, std::span<const TextureBinding> images) {
+	using Info = ShaderRecompiler::IR::ShaderInfo;
+	std::array<uint32_t, Info::MaxSamplers> minima {};
+	std::array<bool, Info::MaxSamplers> seen {};
+	std::array<bool, Info::MaxImages> covered {};
+	if (program.info.samplers.size() > minima.size() || images.size() > covered.size() || images.size() != program.info.images.size()) {
+		RefuseSamplerMinLod(program, UINT32_MAX, UINT32_MAX, 0, "malformed resource counts");
+	}
+	for (uint32_t index = 0; index < program.info.samplers.size(); ++index) {
+		const auto snapshot_index = program.info.samplers[index].snapshot_index;
+		if (snapshot_index >= snapshot.samplers.size() || snapshot.samplers[snapshot_index].dword_count < 4) {
+			RefuseSamplerMinLod(program, UINT32_MAX, index, 0, "missing or truncated sampler snapshot");
+		}
+	}
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image >= images.size() || pair.sampler >= program.info.samplers.size()) {
+			RefuseSamplerMinLod(program, pair.image, pair.sampler, 0, "malformed sampled pair");
+		}
+		const auto assign_image = [&](uint32_t image_index) {
+			if (image_index >= images.size()) RefuseSamplerMinLod(program, image_index, pair.sampler, 0, "malformed indirect image index");
+			const auto& image = images[image_index];
+			if (!image.image_id) return;
+			const auto minimum = image.sample_min_lod;
+			uint32_t typed = pair.sampler;
+			const auto& root = program.info.samplers[typed];
+			const bool integer = program.info.images[image_index].numeric_class != Prospero::TextureNumericClass::Float;
+			if (root.integer_border != integer) {
+				const auto found = std::ranges::find_if(program.info.samplers, [&](const auto& sampler) { return sampler.snapshot_index == root.snapshot_index && sampler.integer_border == integer; });
+				if (found == program.info.samplers.end()) RefuseSamplerMinLod(program, image_index, typed, minimum, "missing typed sampler variant");
+				typed = static_cast<uint32_t>(found - program.info.samplers.begin());
+			}
+			const auto assign_sampler = [&](uint32_t sampler_index) {
+				if (sampler_index >= program.info.samplers.size()) RefuseSamplerMinLod(program, image_index, sampler_index, minimum, "malformed indirect sampler index");
+				const auto& sampler = program.info.samplers[sampler_index];
+				const auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(snapshot.samplers[sampler.snapshot_index]);
+				if (sampler.integer_border != integer) RefuseSamplerMinLod(program, image_index, sampler_index, minimum, "incompatible typed sampler candidate", descriptor);
+				if (seen[sampler_index] && minima[sampler_index] != minimum) {
+					const auto reason = fmt::format("conflicting shared sampler minima {} and {}", minima[sampler_index], minimum);
+					RefuseSamplerMinLod(program, image_index, sampler_index, minimum, reason.c_str(), descriptor);
+				}
+				if (minimum != 0) {
+					if (image.desc.view_info.min_lod != 0) RefuseSamplerMinLod(program, image_index, sampler_index, minimum, "unsupported image use, shape, coordinates or conversion", descriptor);
+					const auto effective = EffectiveSamplerDescriptor(descriptor, sampler);
+					const auto point = static_cast<uint32_t>(Prospero::SamplerFilter::kPoint);
+					const auto linear = static_cast<uint32_t>(Prospero::SamplerFilter::kBilinear);
+					const auto no_mips = static_cast<uint32_t>(Prospero::SamplerMipFilter::kNone);
+					if (descriptor.XyMagFilter() > linear || descriptor.XyMinFilter() > linear ||
+					    descriptor.MipFilter() > static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) ||
+					    effective.XyMagFilter() != effective.XyMinFilter() ||
+					    (effective.XyMagFilter() != point && effective.XyMagFilter() != linear) ||
+					    effective.ForceUnormCoords() || sampler.depth_compare || effective.DepthCompareFunc() != 0 ||
+					    effective.BorderColorType() == static_cast<uint32_t>(Prospero::SamplerBorderColor::kFromTable) ||
+					    effective.MipFilter() > static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear) ||
+					    (effective.MipFilter() != no_mips && effective.MinLod() > effective.MaxLod()) || minimum > 0xfffu) {
+						RefuseSamplerMinLod(program, image_index, sampler_index, minimum, "unsupported sampler state or invalid mipmapped interval", descriptor);
+					}
+				}
+				seen[sampler_index] = true;
+				minima[sampler_index] = minimum;
+			};
+			assign_sampler(typed);
+			for (const auto candidate: program.info.samplers[typed].indirect_resources) assign_sampler(candidate);
+			covered[image_index] = true;
+		};
+		assign_image(pair.image);
+		for (const auto candidate: program.info.images[pair.image].indirect_resources) assign_image(candidate);
+	}
+	for (uint32_t image = 0; image < images.size(); ++image) {
+		if (images[image].image_id && images[image].sample_min_lod != 0 && !covered[image]) {
+			RefuseSamplerMinLod(program, image, UINT32_MAX, images[image].sample_min_lod, "nonzero minimum has no sampling pair");
+		}
+	}
+	return minima;
+}
+
+static vk::Sampler NativeSampler(RenderContext& context, const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value, uint32_t minimum) {
+	const auto& sampler = program.info.samplers[index];
+	auto descriptor = EffectiveSamplerDescriptor(DecodeNativeDescriptor<ShaderSamplerResource>(value), sampler);
+	if (minimum != 0) descriptor = SamplerWithImageMinLod(descriptor, minimum);
 	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
@@ -709,10 +829,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
 	}
+	std::array<uint32_t, ShaderRecompiler::IR::ShaderInfo::MaxSamplers> minima {};
+	if (!m_context.GetGraphics().image_view_min_lod_enabled && std::ranges::any_of(prepared.images, [](const auto& image) { return image.sample_min_lod != 0; })) {
+		minima = ResolveSamplerMinLods(program, snapshot, prepared.images);
+	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
-		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
+		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index], minima[i]));
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.info.user_data_registers) {
