@@ -386,8 +386,9 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadWordPrepared(ctx, inst, mem, resource);
+		return EmitBufferAccess(ctx, inst, mem, 1u, [&](const auto& selected, const auto& resource) {
+			return resource.object_pointer == 0u ? ConstantU32(ctx.state, 0) : LoadWordPrepared(ctx, inst, selected, resource);
+		});
 	});
 }
 
@@ -452,8 +453,9 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits,
                      bool sign_extend) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadSubwordPrepared(ctx, inst, mem, resource, bits, sign_extend);
+		return EmitBufferAccess(ctx, inst, mem, 1u, [&](const auto& selected, const auto& resource) {
+			return resource.object_pointer == 0u ? ConstantU32(ctx.state, 0) : LoadSubwordPrepared(ctx, inst, selected, resource, bits, sign_extend);
+		});
 	});
 }
 

@@ -139,6 +139,7 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	bool                   null_fallback      = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -172,6 +173,7 @@ struct ImageResource {
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
 	std::vector<uint32_t>         indirect_resources;
+	bool                          null_fallback     = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };
