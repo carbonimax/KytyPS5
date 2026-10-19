@@ -24,7 +24,11 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#endif
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -45,6 +49,30 @@ struct VulkanExtensions {
 	std::vector<const char*>             required_layers;
 	std::vector<vk::LayerProperties>     available_layers;
 };
+
+#if defined(__APPLE__)
+static bool PerVertexExperimentalEnabled() {
+	const auto* value = std::getenv("KYTY_PERVERTEX_EXPERIMENTAL");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static void EnableExperimentalMesh(vk::PhysicalDevice device) {
+	Dl_info provider {};
+	EXIT_IF(dladdr(reinterpret_cast<void*>(SDL_Vulkan_GetVkGetInstanceProcAddr()), &provider) == 0 || provider.dli_fname == nullptr || provider.dli_fbase == nullptr);
+	void* image = dlopen(provider.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+	EXIT_IF(image == nullptr);
+	auto enable = reinterpret_cast<void (*)(VkPhysicalDevice)>(dlsym(image, "mvkEnableMeshTestDevice"));
+	Dl_info adapter {};
+	if (enable == nullptr || dladdr(reinterpret_cast<void*>(enable), &adapter) == 0 || adapter.dli_fbase != provider.dli_fbase) {
+		dlclose(image);
+		EXIT("Experimental mesh requires mvkEnableMeshTestDevice from the loaded Vulkan provider\n");
+	}
+	LOGF("Experimental mesh Vulkan provider: %s\n", provider.dli_fname);
+	enable(static_cast<VkPhysicalDevice>(device));
+	dlclose(image);
+	LOGF("Experimental mesh adapter called; opt-in enabled\n");
+}
+#endif
 
 vk::PhysicalDeviceVulkan11Features WindowContext::RequiredVulkan11Features() noexcept {
 	vk::PhysicalDeviceVulkan11Features features {};
@@ -179,6 +207,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
+#if defined(__APPLE__)
+		if (PerVertexExperimentalEnabled()) {
+			EnableExperimentalMesh(device);
+		}
+#endif
 
 		vk::PhysicalDeviceProperties device_properties {};
 		device.getProperties(&device_properties);
@@ -566,6 +599,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.shader_buffer_int64_atomics_enabled ? "true" : "false",
 	     graphics.shader_cull_distance_enabled ? "true" : "false");
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+#if defined(__APPLE__)
+	if (PerVertexExperimentalEnabled() && !graphics.mesh_shader_enabled) {
+		EXIT("Experimental mesh requires VK_EXT_mesh_shader and meshShader support\n");
+	}
+#endif
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
