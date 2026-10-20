@@ -848,9 +848,29 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto lane   = ctx.FirstLane(ballot);
-	return ctx.Shuffle(inst, 0, lane);
+	// Helpers exist only in pixel shaders, which never run as two emulated halves; the halves
+	// path keeps its whole-wave result unchanged.
+	if (state.helper_invocation_variable == 0 || ctx.other_half != nullptr) {
+		return ctx.Shuffle(inst, 0, ctx.FirstLane(ballot));
+	}
+	// The ballot leaves helpers out. Once no live lane remains, a helper that WQM keeps in
+	// EXEC finds it empty: FindLSB has no lane to return and the shuffle no valid lane to
+	// read, so the helper could loop forever. It reads its own value instead, as the
+	// hardware does when it is the first lane left in EXEC. The ballot is the same for every
+	// active invocation, so the branch is uniform.
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	const auto any  = state.builder.AllocateId();
+	const auto live = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), any, low, high);
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), live, any, ConstantU32(state, 0));
+	return EmitValueOrDefaultIfCondition(state, live, TypeU32(state), ctx.Arg(inst, 0), [&] {
+		return ctx.Shuffle(inst, 0, ctx.FirstLane(ballot));
+	});
 }
 
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
