@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -443,6 +444,7 @@ struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t              color_count                              = 0;
+	uint32_t              aliased_passes                           = 0;
 	bool                  ps_active                                = true;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo  ps_input_info;
@@ -500,6 +502,35 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment            = state.color_attachments[target.target_slot];
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
+		if (target.merged_slots != 0 || target.pass_slots != 0) {
+			static std::atomic_uint log_count = 0;
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("AliasedColorTargets: attachment slot=%u merged=0x%x passes=0x%x image=%u VkImage=%p "
+				     "VkImageView=%p mip=%u+%u layer=%u+%u\n",
+				     target.target_slot, target.merged_slots, target.pass_slots, target.image_id.index,
+				     static_cast<void*>(static_cast<VkImage>(image.backing.image)),
+				     static_cast<void*>(static_cast<VkImageView>(image_view)), view.base_level,
+				     view.level_count, view.base_layer, view.layer_count);
+			}
+		}
+	}
+	// Metal rejects attachments that overlap; unmerged aliases must not reach it.
+	for (uint32_t i = 0; i < color_count; i++) {
+		for (uint32_t j = i + 1; j < color_count; j++) {
+			const auto& a = colors[i].desc.view_info;
+			const auto& b = colors[j].desc.view_info;
+			if (colors[i].image_id == colors[j].image_id &&
+			    a.base_level < b.base_level + b.level_count &&
+			    b.base_level < a.base_level + a.level_count &&
+			    a.base_layer < b.base_layer + b.layer_count &&
+			    b.base_layer < a.base_layer + a.layer_count) {
+				EXIT("color attachments overlap: slots %u and %u share image %u "
+				     "(mip %u+%u/%u+%u, layer %u+%u/%u+%u)\n",
+				     colors[i].target_slot, colors[j].target_slot, colors[i].image_id.index,
+				     a.base_level, a.level_count, b.base_level, b.level_count, a.base_layer,
+				     a.layer_count, b.base_layer, b.layer_count);
+			}
+		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
@@ -890,6 +921,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 
 	state.programs      = {};
 	state.ps_input_info = {};
+	state.aliased_passes = 0;
 	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	    target_export_mapping {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -905,9 +937,97 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
 	}
+	const bool single_sample = DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info, ctx.GetAaConfig());
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
-	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info, ctx.GetAaConfig()));
+	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info, single_sample);
+	if (!state.ps_active) {
+		return;
+	}
+	// Slots bound to identical CB registers that the PS really exports share one attachment.
+	uint32_t exported = 0;
+	for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
+		if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+			exported |= 1u << output.location;
+		}
+	}
+	uint32_t active = 0;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((color_output_mask & exported & (1u << slot)) != 0 &&
+		    ctx.GetRenderTarget(slot).base.addr != 0) {
+			active |= 1u << slot;
+		}
+	}
+	AliasedColorTargets aliased;
+	const auto          reason = PlanAliasedColorTargets(ctx, active, aliased);
+	if (!reason.empty()) {
+		// No exact shared attachment: each target keeps its own output and blend in its own pass.
+		const auto passes = PlanAliasedColorPasses(ctx, active, state.aliased_passes);
+		if (!passes.empty()) {
+			EXIT("aliased color targets: %s\nper-target passes: %s\n", reason.c_str(),
+			     passes.c_str());
+		}
+		return;
+	}
+	if (aliased.Active()) {
+		state.ps_input_info = {};
+		state.programs      = pipeline_cache.GetGraphicsPrograms(
+		    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
+		    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
+		    single_sample, &aliased);
+	}
+}
+
+// Merged targets were discovered like any other; check that they resolved to the same image view,
+// then keep only the attachment that carries their components.
+static void MergeAliasedColorTargets(DrawRenderState& state) {
+	const auto& pixel = state.ps_input_info;
+	std::array<uint32_t, 8> slots {};
+	for (uint32_t index = 0; index < 8u; index++) slots[index] = ShaderPixelExportTarget(pixel.target_shader_mask, index);
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		const auto color       = state.color_info[i];
+		const auto slot        = color.target_slot;
+		const auto index = static_cast<uint32_t>(std::find(slots.begin(), slots.end(), slot) - slots.begin());
+		if (index >= 8u || pixel.target_merge_mask[index] == 0) {
+			state.color_info[kept++] = color;
+			continue;
+		}
+		const auto destination = slots[pixel.target_merge_slot[index]];
+		if (destination == slot) {
+			state.color_info[kept++] = color;
+			continue;
+		}
+		RenderColorInfo* primary = nullptr;
+		for (uint32_t j = 0; j < kept; j++) {
+			primary =
+			    state.color_info[j].target_slot == destination ? &state.color_info[j] : primary;
+		}
+		const auto& view = color.desc.view_info;
+		if (primary == nullptr || primary->image_id != color.image_id ||
+		    !(primary->desc.view_info == view) ||
+		    primary->desc.info.samples != color.desc.info.samples) {
+			EXIT("aliased color targets: slot %u does not resolve to the image view of slot %u\n",
+			     slot, destination);
+		}
+		primary->merged_slots |= 1u << slot;
+		static std::atomic_uint log_count = 0;
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("AliasedColorTargets: merge slot=%u into slot=%u image=%u format=%u type=%u "
+			     "mip=%u+%u layer=%u+%u samples=%u components=0x%x/0x%x alpha_source=%u\n",
+			     slot, destination, color.image_id.index, static_cast<uint32_t>(view.format),
+			     static_cast<uint32_t>(view.type), view.base_level, view.level_count,
+			     view.base_layer, view.layer_count, color.desc.info.samples,
+			     pixel.target_merge_mask[pixel.target_merge_slot[index]], pixel.target_merge_mask[index],
+			     pixel.target_merge_alpha_source ? 1u : 0u);
+		}
+	}
+	state.color_count = kept;
+	if (pixel.target_merge_alpha_source && state.color_count != 1) {
+		EXIT("aliased color targets: E6 the second blend source needs a single attachment, "
+		     "got %u\n",
+		     state.color_count);
+	}
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -929,6 +1049,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
+	for (uint32_t index = 0; index < 8u; index++) {
+		const auto slot = ShaderPixelExportTarget(state.ps_input_info.target_shader_mask, index);
+		if (slot < 8u && state.ps_input_info.target_merge_mask[index] != 0) {
+			mrt_mask |= color_output_mask & (1u << slot);
+		}
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -939,6 +1065,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
 			}
+		}
+	}
+	MergeAliasedColorTargets(state);
+	if (state.aliased_passes != 0) {
+		uint32_t resolved = 0;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			resolved |= 1u << state.color_info[i].target_slot;
+			state.color_info[i].pass_slots = state.aliased_passes;
+		}
+		if (resolved != state.aliased_passes) {
+			EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
+			     resolved, state.aliased_passes);
 		}
 	}
 	if (draw.IsIndexed()) {
@@ -1114,6 +1252,19 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+static void ColorAttachmentPassBarrier(vk::CommandBuffer vk_buffer) {
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	vk_buffer.pipelineBarrier2(dependency);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1203,73 +1354,103 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 		}
 	}
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "CreatePipeline");
+	// Aliased targets without an exact shared attachment draw one pass each, in slot order.
+	const bool passes = state.aliased_passes != 0;
+	if (passes) {
+		std::array<GuestRange, ShaderVertexInputInfo::RES_MAX + 1> fixed_reads {};
+		uint32_t                                                   fixed_count = 0;
+		const auto& vertex_input = state.vertex_info[0];
+		for (int i = 0; !mesh_active && i < vertex_input.buffers_num; i++) {
+			fixed_reads[fixed_count++] = {vertex_input.buffers[i].addr,
+			                              VertexBufferDescriptorSize(i, vertex_input)};
+		}
+		// The mesh shader fetches the guest indices by address even when 8-bit ones were expanded.
+		if (draw.IsIndexed() && (index_source.host_data == nullptr || mesh_active)) {
+			fixed_reads[fixed_count++] = {index_source.address, index_source.size};
+		}
+		const auto reason =
+		    CheckAliasedColorPasses({state.color_info, state.color_count}, state.depth_info, stages,
+		                            {fixed_reads.data(), fixed_count});
+		if (!reason.empty()) {
+			EXIT("aliased color targets: per-target passes: %s\n", reason.c_str());
+		}
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs, depth_feedback);
-	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         feedback_aspects, stages);
+	const uint32_t pass_count = passes ? state.color_count : 1u;
+	std::array<PipelineCache::Pipeline*, RENDER_COLOR_ATTACHMENTS_MAX> pipelines {};
+	std::array<RenderState, RENDER_COLOR_ATTACHMENTS_MAX>              renderings {};
+	std::array<vk::ImageAspectFlags, RENDER_COLOR_ATTACHMENTS_MAX>     feedback {};
+	for (uint32_t pass = 0; pass < pass_count; pass++) {
+		auto* colors = passes ? state.color_info + pass : state.color_info;
+		const auto count = passes ? 1u : state.color_count;
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "CreatePipeline");
+		}
+		pipelines[pass] = &m_context.GetPipelineCache().GetGraphicsPipeline(std::span {colors, count}, state.depth_info, vertex_stages, buffer, state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable, state.programs, depth_feedback);
+		renderings[pass] = AcquireRenderTargets(buffer, colors, count, state.depth_info, feedback[pass], stages);
+	}
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
-	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
-	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
-	}
-	if (state.ps_active && !draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
-	}
-	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (!mesh_active) {
-		CommitIndexBuffer(vk_buffer, index_binding);
-	}
-	const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, state.ps_input_info.object_primitive_id);
-	if (draw_dwords != 0) {
-		std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
-		const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
-		                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
-		                                      : vk::ShaderStageFlagBits::eVertex);
-		if (mesh_active) {
-			draw_data = {
-			    draw.index_count,
-			    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-			    emit.first_instance, index_source.guest_element_size,
-			    static_cast<uint32_t>(index_source.address),
-			    static_cast<uint32_t>(index_source.address >> 32u)};
-		} else {
-			draw_data[0] = buffer.GetUserConfig().GetObjectId();
+	for (uint32_t pass = 0; pass < pass_count; pass++) {
+		auto& pipeline = *pipelines[pass];
+		SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+		if (!mesh_active) {
+			CommitVertexBuffers(vk_buffer, vertex_bindings);
 		}
-		vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
-		                        draw_dwords * sizeof(uint32_t), draw_data.data());
-	}
+		if (state.ps_active && !draw.IsIndexed()) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
+		}
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+		if (!mesh_active) {
+			CommitIndexBuffer(vk_buffer, index_binding);
+		}
+		const auto draw_dwords = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
+		    mesh_active, state.ps_input_info.object_primitive_id);
+		if (draw_dwords != 0) {
+			std::array<uint32_t, ShaderRecompiler::IR::PushData::MeshDrawDwordCount> draw_data {};
+			const auto draw_stages = vk::ShaderStageFlagBits::eFragment |
+			                         (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT
+			                                      : vk::ShaderStageFlagBits::eVertex);
+			if (mesh_active) {
+				draw_data = {
+				    draw.index_count,
+				    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+				    emit.first_instance, index_source.guest_element_size,
+				    static_cast<uint32_t>(index_source.address),
+				    static_cast<uint32_t>(index_source.address >> 32u)};
+			} else {
+				draw_data[0] = buffer.GetUserConfig().GetObjectId();
+			}
+			vk_buffer.pushConstants(pipeline.pipeline_layout, draw_stages, 0,
+			                        draw_dwords * sizeof(uint32_t), draw_data.data());
+		}
 
-	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-	                           rendering);
-	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
-	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+		                           renderings[pass]);
+		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
+		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
-	LogDrawPhase(draw.Name(), "BeginRendering");
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
-	}
-	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	if (!draw.IsIndexed()) {
-		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
-	}
-	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		LogDrawPhase(draw.Name(), "BeginRendering");
+		if (!draw.IsIndexed()) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
+		}
+		if (pass != 0) {
+			m_context.GetCommandScheduler().EndRendering();
+			ColorAttachmentPassBarrier(vk_buffer);
+		}
+		m_context.GetCommandScheduler().BeginRendering(renderings[pass]);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		if (!draw.IsIndexed()) {
+			SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
+		}
+		if (mesh_active) {
+			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else {
+			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);

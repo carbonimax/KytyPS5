@@ -53,6 +53,16 @@ uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	}
 }
 
+uint8_t RemapSourceAlphaToSrc1Color(uint8_t factor) {
+	switch (static_cast<Prospero::BlendFactor>(factor)) {
+		case Prospero::BlendFactor::kSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+		case Prospero::BlendFactor::kOneMinusSrcAlpha:
+			return static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Color);
+		default: return factor;
+	}
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -679,7 +689,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool single_sample) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info, bool single_sample, const AliasedColorTargets* aliased) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -785,6 +795,30 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+		if (aliased != nullptr && aliased->Active()) {
+			if (pixel_info.dual_source_blending || pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+				EXIT("aliased color targets: E10 the draw already uses the second blend source\n");
+			}
+			std::array<uint8_t, 8> export_for_slot {};
+			export_for_slot.fill(8);
+			for (uint32_t index = 0; index < 8u; index++) {
+				const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, index);
+				if (slot < 8u) export_for_slot[slot] = static_cast<uint8_t>(index);
+			}
+			for (uint32_t index = 0; index < 8u; index++) {
+				const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, index);
+				if (slot >= 8u || aliased->component_mask[slot] == 0) continue;
+				pixel_info.target_merge_slot[index] = export_for_slot[aliased->slot[slot]];
+				pixel_info.target_merge_mask[index] = aliased->component_mask[slot];
+			}
+			pixel_info.target_merge_alpha_source = aliased->alpha_source;
+			if (aliased->alpha_source) {
+				pixel_info.dual_source_blending = true;
+				if (pixel_info.target_merge_mask[1] == 0) {
+					pixel_info.target_output_mode[1] = pixel_info.target_output_mode[0];
+				}
+			}
+		}
 	}
 	vertex_info[0].pixel_input = mesh_active && pixel_active ? &pixel_info : nullptr;
 	if (context.GetClipControl().clip_disable) {
@@ -851,6 +885,32 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	const auto vs_id = vertex_program.id;
 	const auto ps_id = ps_active ? pixel_program.id : 0;
 
+	// Aliased targets were merged into one attachment when the pixel shader was selected.
+	AliasedColorTargets aliased;
+	uint32_t            aliased_targets = 0;
+	std::array<uint8_t, 8> component_mask {};
+	for (uint32_t index = 0; ps_active && index < 8u; index++) {
+		const auto slot = ShaderPixelExportTarget(ps_input_info->target_shader_mask, index);
+		if (slot < 8u && ps_input_info->target_merge_mask[index] != 0) {
+			aliased_targets |= 1u << slot;
+			component_mask[slot] = ps_input_info->target_merge_mask[index];
+		}
+	}
+	if (aliased_targets != 0) {
+		const auto reason = PlanAliasedColorTargets(ctx, aliased_targets, aliased);
+		if (!reason.empty() ||
+		    !std::equal(std::begin(aliased.component_mask), std::end(aliased.component_mask),
+		                component_mask.begin()) ||
+		    aliased.alpha_source != ps_input_info->target_merge_alpha_source) {
+			EXIT("aliased color targets changed after shader selection:%s\n", reason.c_str());
+		}
+		if (aliased.alpha_source && color_count != 1) {
+			EXIT("aliased color targets: E6 the second blend source needs a single attachment, "
+			     "got %u\n",
+			     color_count);
+		}
+	}
+
 	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < programs.vertex.size(); i++) {
 		key.vertex_shader_ids[i] = programs.vertex[i].id;
@@ -865,8 +925,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
-		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
-		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
+		const bool merged = aliased.component_mask[slot] != 0;
+		static_params.color_mask[slot] = merged ? aliased.write_mask[slot] : colors[i].export_mapping.ApplyMask(render_target_mask_slot(ctx.GetRenderTargetMask(), slot));
 		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
 			static_params.color_mask[slot] = 1u;
 		}
@@ -877,14 +937,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		auto alpha_source = ShaderAlphaBlendSource::None;
+		const auto& rt           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc           = merged ? aliased.blend[slot] : ctx.GetBlendControl(slot);
+		auto        alpha_source = ShaderAlphaBlendSource::None;
 		if (slot == 0 && ps_input_info != nullptr) {
 			alpha_source = ps_input_info->alpha_blend_source;
 		}
-		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
+		static_params.blend_enable[slot] = merged ? aliased.blend_enable[slot] : bc.enable && !rt.info.blend_bypass;
+		if (static_params.blend_enable[slot] && !merged && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
@@ -913,6 +973,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 					blend.separate_alpha_blend = false;
 					break;
 				case ShaderAlphaBlendSource::None: break;
+			}
+			if (slot == 0 && aliased.alpha_source) {
+				// The second source holds each component's owner alpha.
+				blend.color_srcblend  = RemapSourceAlphaToSrc1Color(blend.color_srcblend);
+				blend.color_destblend = RemapSourceAlphaToSrc1Color(blend.color_destblend);
+				blend.alpha_srcblend  = RemapSourceAlphaToSrc1Color(blend.alpha_srcblend);
+				blend.alpha_destblend = RemapSourceAlphaToSrc1Color(blend.alpha_destblend);
 			}
 			static_params.color_srcblend[slot]       = blend.color_srcblend;
 			static_params.color_comb_fcn[slot]       = blend.color_comb_fcn;

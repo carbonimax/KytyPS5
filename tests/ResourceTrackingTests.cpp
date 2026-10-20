@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/aliasedColorPassPolicy.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -7691,6 +7692,32 @@ void TestDmaAddressMaterialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 
+void TestAddressReadsAllowAliasedColorPasses() {
+  const auto stage_write = [](bool store) {
+    Fixture fixture;
+    const auto indices =
+        fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+    MemoryInfo global;
+    global.kind = ResourceKind::Global;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {indices, Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(global, 4));
+    if (store)
+      fixture.Emit(ValueOpcode::StoreAddressU32,
+                   {indices, Value(4u), Value(0u), Value(9u), Value(true)},
+                   fixture.AddMemory(global, 8));
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.uses_dma, "address read did not enable DMA");
+    return Libs::Graphics::AliasedPassStageWrite(
+        fixture.program.info, fixture.program.bindings,
+        fixture.program.has_address_writes);
+  };
+  Check(stage_write(false).empty(),
+        "an address read refused per-target passes");
+  Check(stage_write(true) == "address stores",
+        "an address store allowed per-target passes");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -8430,6 +8457,7 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("address reads allow aliased color passes", TestAddressReadsAllowAliasedColorPasses);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
