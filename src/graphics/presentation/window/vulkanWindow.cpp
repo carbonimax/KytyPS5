@@ -1104,6 +1104,7 @@ void WindowContext::CreateVulkan() {
 	    driver_properties.driverID, push_descriptor_properties.maxPushDescriptors);
 	graphic_ctx.device_address_destruction_waits_for_queue =
 	    DeviceAddressBufferDestructionWaitsForQueue(driver_properties.driverID);
+	graphic_ctx.release_waits_for_submission_fence = ReleaseWaitsForSubmissionFence(driver_properties.driverID);
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 

@@ -97,6 +97,11 @@ DeviceAddressBufferDestructionWaitsForQueue(vk::DriverId driver_id) {
 	return driver_id == vk::DriverId::eMoltenvk;
 }
 
+// MoltenVK resource release must follow submission completion, beyond timeline progress.
+[[nodiscard]] constexpr inline bool ReleaseWaitsForSubmissionFence(vk::DriverId driver_id) {
+	return driver_id == vk::DriverId::eMoltenvk;
+}
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_VULKANCOMMON_H_

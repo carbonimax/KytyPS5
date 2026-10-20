@@ -203,6 +203,8 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  static void DeleteBuffer(BufferCache &cache, BufferId id) { cache.DeleteBuffer(id); }
 };
 
 struct StreamBufferTestAccess {
@@ -596,6 +598,32 @@ struct RenderExecutorTestAccess {
 };
 
 namespace {
+
+// The driver policy mirrors the emulator, including device-address buffer retirement.
+template <typename Context, typename Driver>
+void SetReleasePolicy(Context &context, Driver driver) {
+  if constexpr (requires { context.release_waits_for_submission_fence; }) {
+    context.release_waits_for_submission_fence =
+        ReleaseWaitsForSubmissionFence(driver);
+  }
+  context.device_address_destruction_waits_for_queue =
+      DeviceAddressBufferDestructionWaitsForQueue(driver);
+}
+
+// Releases of earlier ticks can still wait for their submission fences after Finish: poll until the
+// allocation count has been stable for 20 consecutive polls (bounded to two seconds).
+template <typename Scheduler, typename Count>
+void SettleReleases(Scheduler &scheduler, Count live_allocations) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto last = live_allocations();
+  for (int stable = 0; stable < 20 && std::chrono::steady_clock::now() < deadline;) {
+    scheduler.PopPendingOperations();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto now = live_allocations();
+    stable = now == last ? stable + 1 : 0;
+    last = now;
+  }
+}
 
 using u32 = uint32_t;
 using BindingType = TextureCache::BindingType;
@@ -9860,6 +9888,403 @@ public:
                 direct_offset, allocation_size) == 0,
             "BGRA16 direct-memory release failed");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckSubmissionRelease() {
+    constexpr const char *name = "SubmissionRelease";
+    constexpr uint64_t scratch_size = 26615808;
+    constexpr int iterations = 200;
+    using Clock = std::chrono::steady_clock;
+    EnsureRuntimeContext();
+    const auto live_allocations = [&] {
+      VmaTotalStatistics statistics{};
+      vmaCalculateStatistics(m_runtime_context.allocator, &statistics);
+      return statistics.total.statistics.allocationCount;
+    };
+    // Uses a scratch in the current command buffer: the release must outlive this use.
+    const auto use_scratch = [&](CommandScheduler &scheduler, vk::Buffer target, uint32_t value, int fills) {
+      auto owner = std::make_unique<Libs::Graphics::Buffer>(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0, vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, scratch_size);
+      const TileManager::Result scratch{owner->Handle(), 0, scratch_size};
+      auto command = scheduler.Current().Handle();
+      for (int fill = 0; fill < fills; fill++) {
+        command.fillBuffer(scratch.buffer, 0, scratch.size, value + fill);
+      }
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = scratch.buffer;
+      barrier.size = scratch.size;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 0,
+                              nullptr, 1, &barrier, 0, nullptr);
+      const vk::BufferCopy copy{0, 0, 4096};
+      command.copyBuffer(scratch.buffer, target, 1, &copy);
+      scheduler.DeferRelease([owner = std::move(owner)]() mutable { owner.reset(); });
+    };
+    const auto release_all = [&](CommandScheduler &scheduler, uint32_t live,
+                                 const char *stage) {
+      const auto deadline = Clock::now() + std::chrono::seconds(2);
+      while (live_allocations() != live && Clock::now() < deadline) {
+        scheduler.PopPendingOperations();
+      }
+      Require(name, stage, live_allocations() == live,
+              "a released scratch was never destroyed");
+    };
+
+    auto target = CreateHostBuffer(name, 4096, vk::BufferUsageFlagBits::eTransferDst,
+                                   std::vector<u32>(1024, 0));
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      scheduler.Finish();
+      SettleReleases(scheduler, live_allocations);
+      const auto base = live_allocations();
+
+      // 1. Each release runs as early as the scheduler allows, like the renderer's polling.
+      for (int i = 0; i < iterations; i++) {
+        const auto tick = scheduler.CurrentTick();
+        use_scratch(scheduler, target.buffer, static_cast<uint32_t>(i), 1);
+        scheduler.Flush();
+        release_all(scheduler, base, "early release");
+        Require(name, "release after its tick", scheduler.IsFree(tick),
+                "a scratch was released before the timeline reached its tick");
+      }
+
+      // 2. Submissions held by an unsignaled wait keep their fences in flight: nothing is
+      // released and polling never blocks; once they run, every release follows.
+      vk::SemaphoreTypeCreateInfo gate_type{};
+      gate_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      gate_type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo gate_create{};
+      gate_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      gate_create.pNext = &gate_type;
+      vk::Semaphore gate = nullptr;
+      Require(name, "gate", m_runtime_context.device.createSemaphore(&gate_create, nullptr, &gate) ==
+                                vk::Result::eSuccess,
+              "failed to create the gate semaphore");
+      constexpr int held = 6;
+      for (int i = 0; i < held; i++) {
+        use_scratch(scheduler, target.buffer, 0x100u + static_cast<uint32_t>(i), 1);
+        if (i == 0) {
+          SubmitInfo gated;
+          gated.AddWait(gate, 1);
+          scheduler.Flush(gated);
+        } else {
+          scheduler.Flush();
+        }
+      }
+      const auto held_live = live_allocations();
+      auto longest_poll = Clock::duration::zero();
+      for (int poll = 0; poll < 200; poll++) {
+        const auto start = Clock::now();
+        scheduler.PopPendingOperations();
+        longest_poll = std::max(longest_poll, Clock::now() - start);
+      }
+      Require(name, "held releases", held_live == base + held && live_allocations() == held_live,
+              "a scratch of a held submission was released");
+      Require(name, "non-blocking poll", longest_poll < std::chrono::milliseconds(50),
+              "polling deferred operations blocked on held submissions");
+      vk::SemaphoreSignalInfo signal{};
+      signal.sType = vk::StructureType::eSemaphoreSignalInfo;
+      signal.semaphore = gate;
+      signal.value = 1;
+      Require(name, "gate signal", m_runtime_context.device.signalSemaphore(&signal) ==
+                                       vk::Result::eSuccess,
+              "failed to signal the gate semaphore");
+      release_all(scheduler, base, "held release");
+      for (int i = 0; i < 20; i++) {
+        use_scratch(scheduler, target.buffer, 0x200u + static_cast<uint32_t>(i), 1);
+        scheduler.Flush();
+        release_all(scheduler, base, "recycled fence release");
+      }
+      m_runtime_context.device.destroySemaphore(gate, nullptr);
+      std::printf("[gpu]     %-32s longest poll %lld us\n", name,
+                  static_cast<long long>(
+                      std::chrono::duration_cast<std::chrono::microseconds>(longest_poll).count()));
+    }
+
+    // 3. Shutdown with a release and an ordinary operation still pending: both run exactly once.
+    const auto before_context = live_allocations();
+    uint32_t ordinary = 0;
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      use_scratch(scheduler, target.buffer, 0x300u, 16);
+      scheduler.DeferOperation([&ordinary] { ordinary++; });
+      scheduler.Finish();
+      Require(name, "ordinary operation at finish", ordinary == 1,
+              "the timeline wait of Finish no longer released an ordinary operation");
+      use_scratch(scheduler, target.buffer, 0x400u, 16);
+      scheduler.DeferOperation([&ordinary] { ordinary++; });
+      scheduler.Flush();
+    }
+    Require(name, "shutdown drain", ordinary == 2 && live_allocations() == before_context,
+            "shutdown left a deferred operation or a scratch behind");
+    DestroyBuffer(&target);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckBufferCacheDeviceAddressRetire() {
+    constexpr const char *name = "BufferCacheDeviceAddressRetire";
+    constexpr int delete_iterations = 200;
+    constexpr int dirty_iterations = 50;
+    constexpr uintptr_t base = 0x0000000200700000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t entry_size = 0x8000;
+    constexpr uint32_t busy_count = 1u << 18;
+    constexpr uint32_t busy_iterations = 64;
+    using Clock = std::chrono::steady_clock;
+    // Same SPIR-V as kHeavySpirv in DeviceAddressLifetimeGpuTests.cpp.
+  // Shader source (glslangValidator -V --target-env vulkan1.2):
+  // #version 460
+  // #extension GL_EXT_buffer_reference : require
+  // #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+  // layout(local_size_x = 64) in;
+  // layout(buffer_reference, std430) buffer Words { uint v[]; };
+  // layout(push_constant) uniform Push { uint64_t src; uint64_t dst; uint iterations; uint count; } pc;
+  // void main() {
+  //     uint i = gl_GlobalInvocationID.x;
+  //     if (i >= pc.count) return;
+  //     Words src = Words(pc.src);
+  //     uint acc = i;
+  //     for (uint k = 0; k < pc.iterations; ++k) {
+  //         acc = acc * 1664525u + src.v[(acc + k) % pc.count];
+  //     }
+  //     Words(pc.dst).v[i] = acc;
+  // }
+    static constexpr uint32_t kHeavySpirv[] = {
+    0x07230203, 0x00010500, 0x0008000b, 0x00000050, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x0000000b, 0x00020011, 0x000014e3, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x000014e4, 0x00000001, 0x0007000f, 0x00000005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x0000000b, 0x00000014, 0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001,
+    0x00000001, 0x00030003, 0x00000002, 0x000001cc, 0x00070004, 0x455f4c47, 0x625f5458, 0x65666675,
+    0x65725f72, 0x65726566, 0x0065636e, 0x000d0004, 0x455f4c47, 0x735f5458, 0x65646168, 0x78655f72,
+    0x63696c70, 0x615f7469, 0x68746972, 0x6974656d, 0x79745f63, 0x5f736570, 0x36746e69, 0x00000034,
+    0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00000069, 0x00080005,
+    0x0000000b, 0x475f6c67, 0x61626f6c, 0x766e496c, 0x7461636f, 0x496e6f69, 0x00000044, 0x00040005,
+    0x00000012, 0x68737550, 0x00000000, 0x00040006, 0x00000012, 0x00000000, 0x00637273, 0x00040006,
+    0x00000012, 0x00000001, 0x00747364, 0x00060006, 0x00000012, 0x00000002, 0x72657469, 0x6f697461,
+    0x0000736e, 0x00050006, 0x00000012, 0x00000003, 0x6e756f63, 0x00000074, 0x00030005, 0x00000014,
+    0x00006370, 0x00040005, 0x00000021, 0x64726f57, 0x00000073, 0x00040006, 0x00000021, 0x00000000,
+    0x00000076, 0x00030005, 0x00000023, 0x00637273, 0x00030005, 0x00000029, 0x00636361, 0x00030005,
+    0x0000002b, 0x0000006b, 0x00040047, 0x0000000b, 0x0000000b, 0x0000001c, 0x00030047, 0x00000012,
+    0x00000002, 0x00050048, 0x00000012, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000012,
+    0x00000001, 0x00000023, 0x00000008, 0x00050048, 0x00000012, 0x00000002, 0x00000023, 0x00000010,
+    0x00050048, 0x00000012, 0x00000003, 0x00000023, 0x00000014, 0x00040047, 0x00000020, 0x00000006,
+    0x00000004, 0x00030047, 0x00000021, 0x00000002, 0x00050048, 0x00000021, 0x00000000, 0x00000023,
+    0x00000000, 0x00030047, 0x00000023, 0x000014ec, 0x00040047, 0x0000004f, 0x0000000b, 0x00000019,
+    0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020,
+    0x00000000, 0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x00040017, 0x00000009, 0x00000006,
+    0x00000003, 0x00040020, 0x0000000a, 0x00000001, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b,
+    0x00000001, 0x0004002b, 0x00000006, 0x0000000c, 0x00000000, 0x00040020, 0x0000000d, 0x00000001,
+    0x00000006, 0x00040015, 0x00000011, 0x00000040, 0x00000000, 0x0006001e, 0x00000012, 0x00000011,
+    0x00000011, 0x00000006, 0x00000006, 0x00040020, 0x00000013, 0x00000009, 0x00000012, 0x0004003b,
+    0x00000013, 0x00000014, 0x00000009, 0x00040015, 0x00000015, 0x00000020, 0x00000001, 0x0004002b,
+    0x00000015, 0x00000016, 0x00000003, 0x00040020, 0x00000017, 0x00000009, 0x00000006, 0x00020014,
+    0x0000001a, 0x00030027, 0x0000001f, 0x000014e5, 0x0003001d, 0x00000020, 0x00000006, 0x0003001e,
+    0x00000021, 0x00000020, 0x00040020, 0x0000001f, 0x000014e5, 0x00000021, 0x00040020, 0x00000022,
+    0x00000007, 0x0000001f, 0x0004002b, 0x00000015, 0x00000024, 0x00000000, 0x00040020, 0x00000025,
+    0x00000009, 0x00000011, 0x0004002b, 0x00000015, 0x00000032, 0x00000002, 0x0004002b, 0x00000006,
+    0x00000037, 0x0019660d, 0x00040020, 0x00000040, 0x000014e5, 0x00000006, 0x0004002b, 0x00000015,
+    0x00000045, 0x00000001, 0x0004002b, 0x00000006, 0x0000004d, 0x00000040, 0x0004002b, 0x00000006,
+    0x0000004e, 0x00000001, 0x0006002c, 0x00000009, 0x0000004f, 0x0000004d, 0x0000004e, 0x0000004e,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x0004003b,
+    0x00000007, 0x00000008, 0x00000007, 0x0004003b, 0x00000022, 0x00000023, 0x00000007, 0x0004003b,
+    0x00000007, 0x00000029, 0x00000007, 0x0004003b, 0x00000007, 0x0000002b, 0x00000007, 0x00050041,
+    0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006, 0x0000000f, 0x0000000e,
+    0x0003003e, 0x00000008, 0x0000000f, 0x0004003d, 0x00000006, 0x00000010, 0x00000008, 0x00050041,
+    0x00000017, 0x00000018, 0x00000014, 0x00000016, 0x0004003d, 0x00000006, 0x00000019, 0x00000018,
+    0x000500ae, 0x0000001a, 0x0000001b, 0x00000010, 0x00000019, 0x000300f7, 0x0000001d, 0x00000000,
+    0x000400fa, 0x0000001b, 0x0000001c, 0x0000001d, 0x000200f8, 0x0000001c, 0x000100fd, 0x000200f8,
+    0x0000001d, 0x00050041, 0x00000025, 0x00000026, 0x00000014, 0x00000024, 0x0004003d, 0x00000011,
+    0x00000027, 0x00000026, 0x00040078, 0x0000001f, 0x00000028, 0x00000027, 0x0003003e, 0x00000023,
+    0x00000028, 0x0004003d, 0x00000006, 0x0000002a, 0x00000008, 0x0003003e, 0x00000029, 0x0000002a,
+    0x0003003e, 0x0000002b, 0x0000000c, 0x000200f9, 0x0000002c, 0x000200f8, 0x0000002c, 0x000400f6,
+    0x0000002e, 0x0000002f, 0x00000000, 0x000200f9, 0x00000030, 0x000200f8, 0x00000030, 0x0004003d,
+    0x00000006, 0x00000031, 0x0000002b, 0x00050041, 0x00000017, 0x00000033, 0x00000014, 0x00000032,
+    0x0004003d, 0x00000006, 0x00000034, 0x00000033, 0x000500b0, 0x0000001a, 0x00000035, 0x00000031,
+    0x00000034, 0x000400fa, 0x00000035, 0x0000002d, 0x0000002e, 0x000200f8, 0x0000002d, 0x0004003d,
+    0x00000006, 0x00000036, 0x00000029, 0x00050084, 0x00000006, 0x00000038, 0x00000036, 0x00000037,
+    0x0004003d, 0x0000001f, 0x00000039, 0x00000023, 0x0004003d, 0x00000006, 0x0000003a, 0x00000029,
+    0x0004003d, 0x00000006, 0x0000003b, 0x0000002b, 0x00050080, 0x00000006, 0x0000003c, 0x0000003a,
+    0x0000003b, 0x00050041, 0x00000017, 0x0000003d, 0x00000014, 0x00000016, 0x0004003d, 0x00000006,
+    0x0000003e, 0x0000003d, 0x00050089, 0x00000006, 0x0000003f, 0x0000003c, 0x0000003e, 0x00060041,
+    0x00000040, 0x00000041, 0x00000039, 0x00000024, 0x0000003f, 0x0006003d, 0x00000006, 0x00000042,
+    0x00000041, 0x00000002, 0x00000004, 0x00050080, 0x00000006, 0x00000043, 0x00000038, 0x00000042,
+    0x0003003e, 0x00000029, 0x00000043, 0x000200f9, 0x0000002f, 0x000200f8, 0x0000002f, 0x0004003d,
+    0x00000006, 0x00000044, 0x0000002b, 0x00050080, 0x00000006, 0x00000046, 0x00000044, 0x00000045,
+    0x0003003e, 0x0000002b, 0x00000046, 0x000200f9, 0x0000002c, 0x000200f8, 0x0000002e, 0x00050041,
+    0x00000025, 0x00000047, 0x00000014, 0x00000045, 0x0004003d, 0x00000011, 0x00000048, 0x00000047,
+    0x00040078, 0x0000001f, 0x00000049, 0x00000048, 0x0004003d, 0x00000006, 0x0000004a, 0x00000008,
+    0x0004003d, 0x00000006, 0x0000004b, 0x00000029, 0x00060041, 0x00000040, 0x0000004c, 0x00000049,
+    0x00000024, 0x0000004a, 0x0005003e, 0x0000004c, 0x0000004b, 0x00000002, 0x00000004, 0x000100fd,
+    0x00010038,
+    };
+
+    EnsureRuntimeContext();
+    if (!m_runtime_context.release_waits_for_submission_fence ||
+        !m_runtime_context.device_address_destruction_waits_for_queue) {
+      std::printf("[gpu]     %-32s skipped (driver keeps per-use retire ticks)\n", name);
+      return;
+    }
+    const char *validation = std::getenv("MTL_DEBUG_LAYER");
+    Require(name, "oracle", validation != nullptr && std::strcmp(validation, "0") != 0,
+            "needs the Metal API validation layer (MTL_DEBUG_LAYER=1) to detect early destruction");
+    const auto live_allocations = [&] {
+      VmaTotalStatistics statistics{};
+      vmaCalculateStatistics(m_runtime_context.allocator, &statistics);
+      return statistics.total.statistics.allocationCount;
+    };
+
+    const auto module = CompileSPV(kHeavySpirv, m_device);
+    vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0, 24};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    vk::PipelineLayout busy_layout = nullptr;
+    RequireVk(name, "busy layout",
+              m_device.createPipelineLayout(&layout_info, nullptr, &busy_layout),
+              "vkCreatePipelineLayout");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
+    pipeline_info.stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = busy_layout;
+    vk::Pipeline busy = nullptr;
+    RequireVk(name, "busy pipeline",
+              m_device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &busy),
+              "vkCreateComputePipelines");
+    auto busy_source = CreateStorageBuffer(name, {}, busy_count, true);
+    auto busy_target = CreateStorageBuffer(name, {}, busy_count, true);
+    // Binds a physical-storage-address shader: MoltenVK makes every live cache entry resident.
+    const auto record_busy = [&](vk::CommandBuffer command, uint32_t iterations) {
+      struct {
+        uint64_t source;
+        uint64_t target;
+        uint32_t iterations;
+        uint32_t count;
+      } push{busy_source.device_address, busy_target.device_address, iterations, busy_count};
+      command.bindPipeline(vk::PipelineBindPoint::eCompute, busy);
+      command.pushConstants(busy_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                            &push);
+      command.dispatch(busy_count / 64, 1, 1);
+    };
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+
+      // A. DeleteBuffer retires an entry at T0; T0+1 and T0+2 bind the busy shader while the entry
+      // is still alive. The retire runs as early as the scheduler allows, like the renderer polling
+      // at each draw, and the entry must still be destroyed in the end.
+      for (int i = 0; i < delete_iterations; i++) {
+        const uint64_t address = base + static_cast<uint64_t>(i % 32) * 0x10000;
+        const auto before = live_allocations();
+        const auto id = cache.FindBuffer(address, entry_size);
+        const auto created = live_allocations();
+        Require(name, "delete entry",
+                BufferCacheTestAccess::IsBufferAllocated(cache, id) && created > before,
+                "the cache entry was not allocated");
+        record_busy(scheduler.Current().Handle(), 1);
+        const auto retire_tick = scheduler.CurrentTick();
+        BufferCacheTestAccess::DeleteBuffer(cache, id);
+        scheduler.Flush();
+        record_busy(scheduler.Current().Handle(), busy_iterations);
+        scheduler.Flush();
+        record_busy(scheduler.Current().Handle(), busy_iterations);
+        scheduler.Flush();
+        const auto last_tick = scheduler.CurrentTick() - 1;
+        Require(name, "later submissions", last_tick == retire_tick + 2,
+                "the later submissions did not follow the retire tick");
+        const auto deadline = Clock::now() + std::chrono::seconds(5);
+        while (BufferCacheTestAccess::IsBufferAllocated(cache, id) && Clock::now() < deadline) {
+          scheduler.PopPendingOperations();
+        }
+        Require(name, "delete release",
+                !BufferCacheTestAccess::IsBufferAllocated(cache, id) && live_allocations() < created,
+                "the retired entry was never destroyed");
+        Require(name, "delete order", scheduler.IsFree(last_tick),
+                "the retired entry was destroyed before its later submissions finished");
+      }
+
+      // B. Aggressive garbage collection retires a dirty entry: it downloads the entry in the current
+      // submission, which also binds the busy shader, waits for it and destroys the entry.
+      for (int i = 0; i < dirty_iterations; i++) {
+        const uint64_t address = base + 0x200000 + static_cast<uint64_t>(i % 16) * 0x10000;
+        const auto dirty = cache.ObtainBuffer(address, entry_size, true);
+        const auto id = cache.FindBuffer(address, entry_size);
+        Require(name, "dirty entry",
+                dirty.first != nullptr && BufferCacheTestAccess::IsBufferAllocated(cache, id) &&
+                    cache.IsRegionGpuModified(address, entry_size),
+                "the dirty cache entry was not allocated");
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(
+            cache, std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+        for (int tick = 0; tick < 161; tick++) {
+          cache.RunGarbageCollector();
+        }
+        record_busy(scheduler.Current().Handle(), busy_iterations);
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+        cache.RunGarbageCollector();
+        Require(name, "dirty release", !BufferCacheTestAccess::IsBufferAllocated(cache, id),
+                "garbage collection did not destroy the dirty entry");
+      }
+
+      // Teardown must not race the oracle: every submission completes before shutdown.
+      RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    DestroyBuffer(&busy_source);
+    DestroyBuffer(&busy_target);
+    m_device.destroyPipeline(busy, nullptr);
+    m_device.destroyPipelineLayout(busy_layout, nullptr);
+    m_device.destroyShaderModule(module, nullptr);
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok (delete %d, dirty GC %d)\n", name, delete_iterations,
+                dirty_iterations);
+
+    CheckSubmissionRelease();
   }
 
   void CheckRenderExecutorColorDiscovery() {
@@ -21162,6 +21587,12 @@ private:
         m_physical_device.getImageFormatProperties2(block_texel_view_info);
     m_runtime_context.supports_block_texel_view =
         block_texel_view_props.result == vk::Result::eSuccess;
+
+    vk::PhysicalDeviceDriverProperties driver{};
+    vk::PhysicalDeviceProperties2 driver_query{};
+    driver_query.pNext = &driver;
+    m_physical_device.getProperties2(&driver_query);
+    SetReleasePolicy(m_runtime_context, driver.driverID);
 
     VmaVulkanFunctions functions{};
     functions.vkGetInstanceProcAddr =
@@ -50703,6 +51134,21 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--reference-clock-only") == 0) {
     CheckReferenceClockScale();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--submission-release-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckSubmissionRelease();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-retire-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckBufferCacheDeviceAddressRetire();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scheduler-runtime-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckSchedulerTimeline();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
