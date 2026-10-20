@@ -3751,6 +3751,7 @@ private:
 		     (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u);
 		const auto mip = dynamic_mip ? ImageMipMode::Dynamic : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
+		const bool implicit = op == ValueOpcode::ImageSampleRaw && m_program.stage == ShaderType::Pixel && memory.image_sample_flags == 0u;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
@@ -3758,6 +3759,8 @@ private:
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
+				image.min_lod_sampler_exact &= (memory.image_sample_flags & Decoder::ImageSampleFlagUnnormalized) == 0;
+				image.implicit_only = image.implicit_only && implicit;
 				return i;
 			}
 		}
@@ -3773,7 +3776,9 @@ private:
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
 		image.atomic64       = atomic64;
+		image.implicit_only  = implicit;
 		Merge(image, op, pc);
+		image.min_lod_sampler_exact &= (memory.image_sample_flags & Decoder::ImageSampleFlagUnnormalized) == 0;
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
@@ -3787,6 +3792,7 @@ private:
 		image.written      = image.written || write;
 		image.atomic       = image.atomic || atomic;
 		image.unfiltered_access_only &= op == ValueOpcode::ImageRead || op == ValueOpcode::ImageWrite;
+		image.min_lod_sampler_exact &= op == ValueOpcode::ImageSampleRaw || op == ValueOpcode::ImageQueryDimensions;
 	}
 
 	uint32_t AddSampler(uint32_t source, uint32_t pc) {

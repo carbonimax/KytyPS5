@@ -32,8 +32,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -374,6 +376,19 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	if (descriptor.MinLod() > base_lod) {
 		view.min_lod = descriptor.MinLod() - base_lod;
 	}
+	if (resource.sample_min_lod != 0u) {
+		// The shader clamps the LOD, so the view must not need VK_EXT_image_view_min_lod.
+		EXIT_IF(storage || resource.sample_min_lod != view.min_lod);
+		view.min_lod = 0;
+	}
+	if (resource.view_min_level != 0u) {
+		// Unmipmapped samplers read the level the minimum LOD selects: start the view there.
+		EXIT_IF(storage || resource.view_min_level >= view.level_count ||
+		        resource.view_min_level != view.min_lod / 256u);
+		view.base_level += resource.view_min_level;
+		view.level_count -= resource.view_min_level;
+		view.min_lod = 0;
+	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
 	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
@@ -612,7 +627,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
-	desc.view_info.base_level = view_base;
+	desc.view_info.base_level = view_base + resource.view_min_level;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
@@ -633,13 +648,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	return binding;
 }
 
-static vk::Sampler NativeSampler(RenderContext&                       context,
-                                 const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t index,
-                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+static vk::Sampler NativeSampler(RenderContext& context, const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
 	const auto& sampler = program.info.samplers[index];
 	if (!sampler.depth_compare) {

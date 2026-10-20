@@ -292,6 +292,10 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
     result = fixture->Emit(access, {image, address, Value(true)}, flags);
   } else if (access == ValueOpcode::ImageQueryDimensions) {
     result = fixture->Emit(access, {image, address}, flags);
+  } else if (access == ValueOpcode::ImageQueryLod) {
+    result = fixture->Emit(access, {image, sampler, address}, flags);
+  } else if (access == ValueOpcode::ImageGatherRaw) {
+    result = fixture->Emit(access, {image, sampler, address, Value(0u), Value(0u), Value(0u), Value(0u), Value(true)}, flags);
   } else if (access == ValueOpcode::ImageAtomicIAdd32) {
     result = fixture->Emit(access, {image, address, Value(1u), Value(true)}, flags);
   } else {
@@ -501,6 +505,74 @@ void TestBoundedImageViewEligibility() {
   plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "explicitly selected incompatible descriptor was silently normalized to null");
+}
+
+void TestImageSamplerMinLodEligibility() {
+  for (const auto other : {ValueOpcode::ImageSampleRaw, ValueOpcode::ImageQueryDimensions,
+                           ValueOpcode::ImageRead, ValueOpcode::ImageQueryLod, ValueOpcode::ImageGatherRaw}) {
+    auto fixture = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageSampleRaw, true);
+    const auto sample = std::ranges::find_if(*fixture->block, [](const Inst &inst) { return inst.GetOpcode() == ValueOpcode::ImageSampleRaw; });
+    const auto image = sample->Arg(0), sampler = sample->Arg(1), address = sample->Arg(2);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto flags = fixture->AddMemory(memory, 0x1100);
+    if (other == ValueOpcode::ImageQueryDimensions) fixture->Emit(other, {image, address}, flags);
+    else if (other == ValueOpcode::ImageRead) fixture->Emit(other, {image, address, Value(true)}, flags);
+    else if (other == ValueOpcode::ImageQueryLod) fixture->Emit(other, {image, sampler, address}, flags);
+    else if (other == ValueOpcode::ImageGatherRaw) fixture->Emit(other, {image, sampler, address, Value(0u), Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+    else fixture->Emit(other, {image, sampler, address, Value(true)}, flags);
+    fixture->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture->program);
+    const bool exact = other == ValueOpcode::ImageSampleRaw || other == ValueOpcode::ImageQueryDimensions;
+    Check(plan.info.images.size() == 1 && plan.info.images[0].min_lod_sampler_exact == exact,
+          "merged sample/query/fetch/gather uses lost the minLod eligibility proof");
+  }
+  auto unnormalized = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageSampleRaw, true);
+  unnormalized->program.memory_info.back().image_sample_flags |= Decoder::ImageSampleFlagUnnormalized;
+  unnormalized->PlanAndTrack();
+  Check(!unnormalized->program.info.images[0].min_lod_sampler_exact,
+        "an unnormalized sample retained the normalized minLod proof");
+  for (bool first_unnormalized : {false, true}) {
+    auto merged = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageSampleRaw, true);
+    if (first_unnormalized) merged->program.memory_info.back().image_sample_flags |= Decoder::ImageSampleFlagUnnormalized;
+    const auto first = std::ranges::find_if(*merged->block, [](const Inst &inst) { return inst.GetOpcode() == ValueOpcode::ImageSampleRaw; });
+    const auto flags = merged->AddMemory({.kind = ResourceKind::Image, .image_sample_flags = first_unnormalized ? 0u : Decoder::ImageSampleFlagUnnormalized,
+        .image_dimension = Decoder::ImageDimension::Dim2D}, 0x1100);
+    merged->Emit(ValueOpcode::ImageSampleRaw, {first->Arg(0), first->Arg(1), first->Arg(2), Value(true)}, flags);
+    merged->PlanAndTrack();
+    const auto plan = ExtractResourcePlan(merged->program);
+    Check(plan.info.images.size() == 1 && !plan.info.images[0].min_lod_sampler_exact,
+          "merged normalized/unnormalized samples promoted an ineligible image in either order");
+  }
+  auto gather = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageGatherRaw, true);
+  gather->PlanAndTrack();
+  Check(!gather->program.info.images[0].min_lod_sampler_exact, "gather-only image admitted sampler minLod fallback");
+  auto dimensions = MakeIndirectImageFixture(false, 32u, 0u, 0u, false, ValueOpcode::ImageQueryDimensions, true);
+  dimensions->PlanAndTrack();
+  Check(dimensions->program.info.images[0].min_lod_sampler_exact && dimensions->program.info.sampled_pairs.empty(),
+        "dimensions-only image invented a sampling pair to own its minimum");
+  for (const auto stage : {ShaderType::Pixel, ShaderType::Vertex, ShaderType::Compute}) {
+    for (const uint32_t sample_flags : {0u, uint32_t(Decoder::ImageSampleFlagLod), uint32_t(Decoder::ImageSampleFlagBias), uint32_t(Decoder::ImageSampleFlagDerivative), uint32_t(Decoder::ImageSampleFlagLevelZero), uint32_t(Decoder::ImageSampleFlagUnnormalized)}) {
+      for (const bool flagged_first : {false, true}) {
+        Fixture fixture(stage);
+        const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+        const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+        const auto address = fixture.ImageAddress();
+        for (uint32_t use = 0; use < 2u; ++use) {
+          MemoryInfo memory;
+          memory.kind = ResourceKind::Image;
+          memory.image_dimension = Decoder::ImageDimension::Dim2D;
+          memory.image_sample_flags = ((use == 0u) == flagged_first) ? sample_flags : 0u;
+          fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address, Value(true)}, fixture.AddMemory(memory, use * 4u));
+        }
+        fixture.PlanAndTrack();
+        const auto plan = ExtractResourcePlan(fixture.program);
+        Check(plan.info.images.size() == 1 && plan.info.images[0].implicit_only == (stage == ShaderType::Pixel && sample_flags == 0u),
+              "A170 implicit-only proof ignored a stage, sample flag or merged use order");
+      }
+    }
+  }
 }
 
 void TestExactUnfilteredImageCandidates() {
@@ -8271,6 +8343,29 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestSharedSamplerLayout() {
+  Program program;
+  program.resource_tracking_complete = true;
+  ResourceSpecialization specialization;
+  program.info.samplers.push_back({.source = 7});
+  specialization.samplers.resize(1);
+  program.info.images.resize(ShaderInfo::MaxSamplers + 1u);
+  specialization.images.resize(program.info.images.size());
+  for (uint32_t image = 0; image < program.info.images.size(); ++image) {
+    program.info.sampled_pairs.push_back({image, 0});
+    program.info.images[image].resource_class = ImageResourceClass::Sampled;
+    specialization.images[image].dimension = Decoder::ImageDimension::Dim2D;
+    specialization.images[image].numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+    specialization.images[image].sample_min_lod = image * 256u;
+  }
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.samplers.size() == 1, "image shader minima duplicated a shared sampler");
+  for (const auto &pair : program.info.sampled_pairs)
+    Check(pair.sampler == 0 && program.info.samplers[0].snapshot_index == 0 && program.info.samplers[0].source == 7 &&
+              program.info.images[pair.image].sample_min_lod == pair.image * 256u,
+          "shared sampler layout lost source provenance or per-image shader minima");
+}
+
 } // namespace
 
 int main() {
@@ -8287,6 +8382,7 @@ int main() {
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("shared sampler layout", TestSharedSamplerLayout);
     Run("independent image/sampler pairs", TestIndependentImageSamplerPairs);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
@@ -8296,6 +8392,7 @@ int main() {
     Run("unbounded material image keys", [] { TestInvariantIndirectImageMaterialization(false); });
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
+    Run("image sampler minLod eligibility", TestImageSamplerMinLodEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);

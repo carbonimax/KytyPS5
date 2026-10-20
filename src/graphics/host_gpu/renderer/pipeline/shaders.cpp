@@ -196,14 +196,21 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t descriptor_count = 0;
 	uint64_t storage_buffers = 0;
-	std::array<uint64_t, 32> stage_buffers {}, stage_resources {};
+	uint64_t samplers = 0;
+	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
 		if (storage) storage_buffers += binding.descriptorCount;
+		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
+		if (sampler) samplers += binding.descriptorCount;
 		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
 			const auto stage = std::countr_zero(stages);
 			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (sampler) stage_samplers[stage] += binding.descriptorCount;
+			if (stage_samplers[stage] > limits.maxPerStageDescriptorSamplers) {
+				EXIT("native sampler stage %u exceeds device limit: %" PRIu64 "/%u\n", stage, stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+			}
 			if (binding.descriptorType != vk::DescriptorType::eSampler)
 				stage_resources[stage] += binding.descriptorCount;
 			if (stage_buffers[stage] > limits.maxPerStageDescriptorStorageBuffers ||
@@ -213,6 +220,9 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources);
 			}
 		}
+	}
+	if (samplers > limits.maxDescriptorSetSamplers) {
+		EXIT("native sampler descriptors exceed device limit: %" PRIu64 "/%u\n", samplers, limits.maxDescriptorSetSamplers);
 	}
 	if (storage_buffers > limits.maxDescriptorSetStorageBuffers) {
 		EXIT("native storage-buffer descriptors exceed device limit: %" PRIu64 "/%u\n",

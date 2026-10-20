@@ -682,6 +682,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
+	device_features.shaderResourceMinLod = supported_features2.features.shaderResourceMinLod;
+	graphics.shader_resource_min_lod_enabled = device_features.shaderResourceMinLod == VK_TRUE;
 	device_features.shaderCullDistance                   = supported_features2.features.shaderCullDistance;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;

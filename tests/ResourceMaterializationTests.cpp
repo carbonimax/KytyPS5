@@ -1207,6 +1207,253 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+void TestImageMinimumLodSpecialization() {
+  using namespace Libs::Graphics;
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto make_program = [](bool mixed) {
+    auto program = MixedSamplerProgram();
+    program.user_data_count = 24;
+    auto &block = *program.blocks[0];
+    for (uint32_t source = 0, reg = 0; source < program.descriptor_sources.size(); ++source) {
+      for (uint32_t word = 0; word < program.descriptor_sources[source].dword_count; ++word, ++reg)
+        program.descriptor_sources[source].dwords[word] = Value(&block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(reg))}));
+    }
+    program.info.samplers.resize(mixed ? 2 : 1);
+    program.info.sampled_pairs = {{0, 0}, {1, 0}};
+    if (mixed) program.info.sampled_pairs.push_back({0, 1});
+    return program;
+  };
+  auto program = make_program(false);
+  const auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 24> data{};
+  for (uint32_t image = 0; image < 2; ++image) {
+    data[image * 8] = 0x1000u + image * 0x100u;
+    data[image * 8 + 1] = (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) | ((image == 0 ? 768u : 256u) << 8u);
+    data[image * 8 + 3] = (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u) | (6u << 16u) | DstSel(4, 5, 6, 7);
+  }
+  data[17] = data[21] = 4095u << 12u;
+  data[18] = data[22] = 2u << 26u;
+  const SrtRuntime runtime{.user_data = data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization native, shader;
+  Check(MaterializeResources(plan, runtime, snapshot, native), "native image minimum LOD materialization failed");
+  const auto samplers = snapshot.samplers;
+  Check(MaterializeResources(plan, runtime, snapshot, shader, true) && shader != native &&
+            shader.images[0].sample_min_lod == 768 && shader.images[1].sample_min_lod == 256 && snapshot.samplers == samplers,
+        "distinct image shader clamps changed the shared sampler or lost specialization identity");
+  const auto original = shader;
+  data[1] = (data[1] & ~0xfff00u) | (384u << 8u);
+  data[3] |= 1u << 12u;
+  Check(MaterializeResources(plan, runtime, snapshot, shader, true) && shader != original && shader.images[0].sample_min_lod == 128,
+        "base-relative fractional shader minimum did not change specialization");
+  data[1] = (data[1] & ~0xfff00u) | (768u << 8u);
+  data[3] &= ~(0xfu << 12u);
+  Check(MaterializeResources(plan, runtime, snapshot, shader, true) && shader == original, "returning to the original minima lost its specialization");
+  ApplyResourceSpecialization(program, shader);
+  Check(program.info.samplers.size() == 1 && program.info.sampled_pairs[0].sampler == program.info.sampled_pairs[1].sampler &&
+            program.info.images[0].sample_min_lod == 768 && program.info.images[1].sample_min_lod == 256,
+        "applying historical shader minima duplicated a sampler or lost image constants");
+  data[17] = 0;
+  Check(!MaterializeResources(plan, runtime, snapshot, shader, true), "sampler maximum below image minimum was accepted");
+  data[17] = 4095u << 12u;
+  data[18] |= 1u << 20u;
+  Check(!MaterializeResources(plan, runtime, snapshot, shader, true), "unequal mag/min filters were accepted");
+  for (uint32_t filter : {2u, 3u}) {
+    data[18] = (2u << 26u) | (filter << 20u) | (filter << 22u);
+    Check(MaterializeResources(plan, runtime, snapshot, shader, true) && shader == original, "ratio-one anisotropic filter enum was rejected or changed image minima");
+    data[16] = 1u << 9u;
+    Check(!MaterializeResources(plan, runtime, snapshot, shader, true), "anisotropic filtering above ratio one was accepted");
+    data[16] = 0;
+  }
+  data[18] = 2u << 26u;
+  data[16] = 1u << 15u;
+  Check(!MaterializeResources(plan, runtime, snapshot, shader, true), "unnormalized sampler coordinates were accepted");
+  Check(MaterializeResources(plan, runtime, snapshot, native), "native minimum LOD inherited shader-only restrictions");
+  data[16] = 0;
+  auto dynamic_program = make_program(false);
+  auto dynamic_plan = ExtractResourcePlan(dynamic_program);
+  dynamic_plan.info.images[0].mip_mode = ImageMipMode::Dynamic;
+  dynamic_plan.info.images[0].min_lod_sampler_exact = false;
+  data[9] &= ~0xfff00u;
+  Check(MaterializeResources(dynamic_plan, runtime, snapshot, shader, true) && shader.images[0].mip_count == 7 &&
+            shader.images[0].sample_min_lod == 0 && shader.images[0].view_min_level == 0,
+        "the existing per-mip shader path acquired a second historical minimum clamp");
+  data[18] = 0;
+  data[1] = (data[1] & ~0xfff00u) | (320u << 8u);
+  data[9] = (data[9] & ~0xfff00u) | (448u << 8u);
+  Check(MaterializeResources(plan, runtime, snapshot, shader, true) && shader.images[0].view_min_level == 1 &&
+            shader.images[1].view_min_level == 1 && shader.images[0].sample_min_lod == 0 && shader.images[1].sample_min_lod == 0,
+        "unmipmapped views did not floor their historical minimum level");
+  auto mixed_program = make_program(true);
+  const auto mixed_plan = ExtractResourcePlan(mixed_program);
+  data[18] = 2u << 26u;
+  data[22] = 0;
+  data[1] = (data[1] & ~0xfff00u) | (768u << 8u);
+  Check(MaterializeResources(mixed_plan, runtime, snapshot, shader, true) && shader.images[0].view_min_level == 3 && shader.images[0].sample_min_lod == 0,
+        "mixed samplers did not share the historical integral view shift");
+  ApplyResourceSpecialization(mixed_program, shader);
+  Check(mixed_program.info.images[0].view_min_level == 3, "view minimum was not propagated to native IR");
+  data[1] = (data[1] & ~0xfff00u) | (896u << 8u);
+  Check(!MaterializeResources(mixed_plan, runtime, snapshot, shader, true), "mixed samplers accepted a fractional view shift");
+
+  // E24/A170 uses the historical T# and S# of pixel shader 0xc924afb0821b68c8.
+  const std::array<uint32_t, 24> e24 = {
+      0x70d1e300u, 0xcb640000u, 0x01ffc1ffu, 0x909b0facu, 0x00000000u, 0x000000b0u, 0x0000002fu, 0x00000000u,
+      0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+      0x00007800u, 0x00fff000u, 0x0af00000u, 0x00000000u};
+  const auto materialize = [&](const std::array<uint32_t, 24> &words, ResourceSpecialization &specialization, ShaderType stage = ShaderType::Pixel, bool implicit = true, bool dynamic_mips = false, bool mixed = false) {
+    auto current = make_program(mixed);
+    current.stage = stage;
+    current.info.images[0].implicit_only = implicit;
+    if (dynamic_mips) current.info.images[0].mip_mode = ImageMipMode::Dynamic;
+    const auto current_plan = ExtractResourcePlan(current);
+    ResourceSnapshot current_snapshot;
+    return MaterializeResources(current_plan, {.user_data = words}, current_snapshot, specialization, true);
+  };
+  Check(materialize(e24, shader) && shader.images[0].sample_min_lod == 1024u && shader.images[0].view_min_level == 0u,
+        "E24 implicit pixel sample did not keep MIN_LOD 4.0 as its MinLod operand");
+  const auto refused = [&](const std::array<uint32_t, 24> &words, const char *message, ShaderType stage = ShaderType::Pixel, bool implicit = true) {
+    ResourceSpecialization specialization;
+    Check(!materialize(words, specialization, stage, implicit), message);
+  };
+  refused(e24, "E24 sampler admitted for a non-implicit use", ShaderType::Pixel, false);
+  refused(e24, "E24 sampler admitted in a vertex shader", ShaderType::Vertex);
+  refused(e24, "E24 sampler admitted in a compute shader", ShaderType::Compute);
+  auto words = e24;
+  words[18] |= 0x100u;
+  refused(words, "E24 sampler admitted with a LOD bias");
+  words = e24;
+  words[18] |= 1u << 14u;
+  refused(words, "E24 sampler admitted with a secondary LOD bias");
+  words = e24;
+  words[18] = (words[18] & ~(3u << 20u)) | (2u << 20u);
+  refused(words, "E24 sampler admitted with mag != min filters");
+  words = e24;
+  words[17] = (words[17] & ~(0xfffu << 12u)) | (1023u << 12u);
+  refused(words, "E24 sampler admitted with MAX_LOD below MIN_LOD 4.0");
+  words = e24;
+  words[16] |= 1u << 15u;
+  refused(words, "E24 sampler admitted with unnormalized coordinates");
+  words = e24;
+  words[18] |= 1u << 26u;
+  refused(words, "E24 sampler admitted with an unsupported mip filter");
+  words = e24;
+  words[17] = (1024u << 12u) | 1025u;
+  refused(words, "E24 sampler admitted with inverted sampler clamps");
+  words = e24;
+  words[18] &= ~(3u << 26u);
+  refused(words, "E24 anisotropic sampler admitted without mipmapping");
+  Check(!materialize(e24, shader, ShaderType::Pixel, true, false, true), "E24 anisotropic sampler admitted with an unmipmapped companion");
+  Check(materialize(e24, shader, ShaderType::Pixel, true, true) && shader.images[0].sample_min_lod == 0u && shader.images[0].view_min_level == 0u,
+        "E24 dynamic mip path acquired the implicit pixel exception");
+}
+
+void TestSamplerVariantRemaps(bool compact) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using N = Libs::Graphics::Prospero::TextureNumericClass;
+  using D = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  Program program;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const uint32_t root = compact ? 1u : 0u, direct = root + 2u;
+  program.info.images.resize(direct + 1u);
+  ResourceSpecialization specialization;
+  specialization.images.resize(program.info.images.size());
+  if (compact) specialization.images[0].fmask = true;
+  for (uint32_t image = root; image <= direct; ++image) {
+    program.info.images[image].resource_class = ImageResourceClass::Sampled;
+    auto &type = specialization.images[image];
+    type.numeric_class = image == root + 1u ? N::Uint : N::Float;
+    type.dimension = D::Dim2D;
+    if (image != direct) type.indirect_root = root;
+    type.indirect_mapping_offset = 19;
+    type.indirect_search_iterations = 2;
+  }
+  program.info.samplers = {{.source = 20}, {.source = 21}};
+  specialization.samplers.resize(2);
+  for (auto &sampler : specialization.samplers) {
+    sampler.indirect_root = 0;
+    sampler.indirect_mapping_offset = 37;
+    sampler.indirect_search_iterations = 3;
+  }
+  program.info.sampled_pairs = {{root, 0}, {direct, 0}};
+  std::vector<Inst *> handles;
+  for (const auto image : {root, direct}) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetImageResource, {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    handle.SetFlags(image);
+    handles.push_back(&handle);
+    const auto memory_index = static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = image, .sampler = 0});
+    auto &sampler = block.AppendNewInst(ValueOpcode::GetSamplerResource, {Value(0u), Value(0u), Value(0u), Value(0u)});
+    auto &address = block.AppendNewInst(ValueOpcode::MakeImageAddress, {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+    auto &sample = block.AppendNewInst(ValueOpcode::ImageSampleRaw, {Value(&handle), Value(&sampler), Value(&address), Value(true)});
+    sample.SetFlags(MemoryFlags{.index = memory_index});
+  }
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.images.size() == 3 && program.info.samplers.size() == 4u,
+        "typed variants exceeded the required structural set");
+  for (uint32_t pair_index = 0; pair_index < 2; ++pair_index) {
+    const auto &pair = program.info.sampled_pairs[pair_index];
+    const auto &memory = program.memory_info[pair_index];
+    Check(pair.image == (pair_index == 0 ? 0u : 2u) && handles[pair_index]->Flags<uint32_t>() == pair.image &&
+              memory.resource == pair.image && memory.sampler == pair.sampler,
+          "instruction and sampled-pair remaps disagree after image compaction");
+    const auto &sampler = program.info.samplers[pair.sampler];
+    Check(sampler.snapshot_index == 0 &&
+              sampler.indirect_root != SamplerResource::NoIndirectSampler && sampler.indirect_resources.size() == 2 &&
+              sampler.indirect_mapping_offset == 37 && sampler.indirect_search_iterations == 3,
+          "indirect sampler root lost selector provenance or candidates");
+  }
+  for (const auto &sampler : program.info.samplers) {
+    Check(sampler.source == 20u + sampler.snapshot_index && sampler.force_point_filtering == sampler.integer_border,
+          "typed sampler cloning lost source provenance");
+    for (const auto candidate : sampler.indirect_resources) {
+      const auto &child = program.info.samplers[candidate];
+      Check(child.integer_border == sampler.integer_border &&
+                child.indirect_root != SamplerResource::NoIndirectSampler &&
+                child.indirect_mapping_offset == sampler.indirect_mapping_offset && child.indirect_search_iterations == sampler.indirect_search_iterations,
+            "typed indirect candidate lost selector provenance");
+    }
+  }
+  Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
+            program.info.images[0].indirect_mapping_offset == 19,
+        "image compaction changed candidate ordinals or SRT mapping");
+}
+
+void TestSharedSamplerCandidateProvenance() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.resource_tracking_complete = true;
+  program.info.images.resize(2);
+  program.info.samplers = {{.source = 20}, {.source = 21}, {.source = 22}};
+  program.info.samplers[1].indirect_resources = {1, 2};
+  program.info.sampled_pairs = {{0, 0}, {1, 1}};
+  ResourceSpecialization specialization;
+  specialization.images.resize(2);
+  specialization.samplers.resize(3);
+  for (uint32_t image = 0; image < 2; ++image) {
+    program.info.images[image].resource_class = ImageResourceClass::Sampled;
+    specialization.images[image].dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    specialization.images[image].numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+  }
+  for (const auto source : {0u, 2u}) {
+    specialization.samplers[source].indirect_root = 0;
+    specialization.samplers[source].indirect_mapping_offset = 37;
+    specialization.samplers[source].indirect_search_iterations = 3;
+  }
+  ApplyResourceSpecialization(program, specialization);
+  Check(program.info.samplers.size() == 3, "shared candidate added an unnecessary sampler variant");
+  for (const auto &pair : program.info.sampled_pairs) {
+    const auto &root = program.info.samplers[pair.sampler];
+    Check(root.indirect_resources.size() == 2, "shared candidate changed selector ordinals");
+    const auto &candidate = program.info.samplers[root.indirect_resources[1]];
+    Check(candidate.snapshot_index == 2 && candidate.source == 22 &&
+              candidate.indirect_root != SamplerResource::NoIndirectSampler &&
+              candidate.indirect_mapping_offset == 37 && candidate.indirect_search_iterations == 3,
+          "shared candidate lost retained selector provenance");
+  }
+}
+
 void TestSignedStorageSpecialization() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using F = Libs::Graphics::Prospero::BufferFormat;
@@ -1326,7 +1573,7 @@ void TestNullDescriptorFallbackTransitions() {
   Check(program.info.images[0].null_fallback && program.info.buffers[0].null_fallback, "fallback state was not propagated to native IR");
 }
 
-void TestIndirectImageSamplerClasses(bool mixed) {
+void TestIndirectImageSamplerClasses(bool mixed, bool min_lod_exact) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::Prospero::BufferFormat;
   using Libs::Graphics::Prospero::TextureNumericClass;
@@ -1343,6 +1590,7 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1, 0};
   program.info.images.resize(1);
   program.info.images[0].source = static_cast<uint32_t>(program.descriptor_sources.size());
+  program.info.images[0].min_lod_sampler_exact = min_lod_exact;
   program.descriptor_sources.push_back(root);
   program.info.samplers.resize(1);
   program.info.sampled_pairs.resize(1);
@@ -1370,9 +1618,14 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   Check(program.info.images[0].indirect_resources == std::vector<uint32_t>({0, 1}) &&
             snapshot.samplers.size() == 1 && program.info.samplers.size() == (mixed ? 2u : 1u),
         "indirect images lost candidates or created unnecessary sampler variants");
+  Check(plan.info.images[0].min_lod_sampler_exact == min_lod_exact &&
+            std::ranges::all_of(program.info.images, [&](const auto &image) { return image.min_lod_sampler_exact == min_lod_exact; }),
+        "minLod eligibility changed during extraction, candidate expansion or duplicate compaction");
   user_data[0] = 0x33333333u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed image sampler refresh failed");
+  Check(std::ranges::all_of(program.info.images, [&](const auto &image) { return image.min_lod_sampler_exact == min_lod_exact; }),
+        "descriptor refresh lost the candidate minLod eligibility proof");
   for (uint32_t index = 0; index < program.info.samplers.size(); ++index) {
     const auto &sampler = program.info.samplers[index];
     Check(sampler.snapshot_index == 0u && sampler.source == plan.info.samplers[0].source &&
@@ -1627,9 +1880,14 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestImageMinimumLodSpecialization();
+  TestSharedSamplerCandidateProvenance();
+  for (const bool compact : {false, true}) TestSamplerVariantRemaps(compact);
   TestSignedStorageSpecialization();
   TestNullDescriptorFallbackTransitions();
-  for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  for (const bool mixed : {false, true}) {
+    for (const bool exact : {false, true}) TestIndirectImageSamplerClasses(mixed, exact);
+  }
   TestUnconditionalEdgesKeepProvenReachability();
   TestUndecidedNullReadEndsOnlyThatPath();
   TestWalkerNullPageBoundary();

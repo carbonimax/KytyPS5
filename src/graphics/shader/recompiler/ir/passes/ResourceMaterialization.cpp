@@ -817,7 +817,7 @@ private:
 	uint32_t                                    count = 0;
 };
 
-static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool null_descriptor_supported) {
+static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool null_descriptor_supported, bool emulate_image_min_lod) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -1003,6 +1003,91 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
+			}
+		}
+	}
+	// Without VK_EXT_image_view_min_lod, a sampled image's minimum LOD becomes a shader clamp.
+	if (emulate_image_min_lod) {
+		for (uint32_t i = 0; i < specialization.images.size(); i++) {
+			const auto& value = snapshot.images[i];
+			if (NullImageDescriptor(value)) continue;
+			ShaderTextureResource texture {};
+			std::copy_n(value.dwords.begin(), 8, texture.fields);
+			const auto base_lod = texture.BaseLevel() * 256u;
+			if (texture.MinLod() <= base_lod) continue;
+			auto& image = specialization.images[i];
+			const auto base_index = i < program.info.images.size() ? i : image.indirect_root;
+			// Dynamic per-mip views already apply the descriptor minimum in the existing shader path.
+			if (program.info.images[base_index].mip_mode == ImageMipMode::Dynamic) continue;
+			if (image.indirect_root != ImageResource::NoIndirectImage ||
+			    i >= program.info.images.size() ||
+			    program.info.images[i].resource_class != ImageResourceClass::Sampled ||
+			    image.conversion_format != Prospero::BufferFormat::kInvalid || image.fmask ||
+			    !program.info.images[i].min_lod_sampler_exact || texture.CornerSample() ||
+			    texture.MinLod() > texture.LastLevel() * 256u) {
+				return SpecializationFail(
+				    fmt::format("image {} cannot emulate its minimum LOD", i));
+			}
+			const auto relative_lod = texture.MinLod() - base_lod;
+			bool       mipmapped    = false;
+			bool       unmipmapped  = false;
+			bool       anisotropic = false;
+			for (const auto& pair: program.info.sampled_pairs) {
+				if (pair.image != i) continue;
+				if (pair.sampler >= snapshot.samplers.size() ||
+				    specialization.samplers[pair.sampler].indirect_root != SamplerResource::NoIndirectSampler) {
+					return SpecializationFail("minimum LOD sample has no sampler");
+				}
+				ShaderSamplerResource sampler {};
+				std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), 4, sampler.fields);
+				const bool aniso = sampler.XyMinFilter() >= 2u && sampler.MaxAnisoRatio() != 0u;
+				const bool aniso_min_lod = aniso && program.stage == ShaderType::Pixel && program.info.images[i].implicit_only &&
+				    program.info.images[i].mip_mode != ImageMipMode::Dynamic && sampler.LodBias() == 0u && sampler.LodBiasSec() == 0u;
+				anisotropic = anisotropic || aniso;
+				if (sampler.ForceUnormCoords() || sampler.XyMagFilter() != sampler.XyMinFilter() ||
+				    (aniso && !aniso_min_lod) || sampler.MipFilter() > 2u ||
+				    (sampler.MipFilter() != 0u && sampler.MinLod() > sampler.MaxLod())) {
+					return SpecializationFail(fmt::format("image {} minimum LOD has unsupported sampler {} state (unorm={} mag={} min={} aniso={} mip={} min_lod={} max_lod={})", i, pair.sampler, sampler.ForceUnormCoords(), sampler.XyMagFilter(), sampler.XyMinFilter(), sampler.MaxAnisoRatio(), sampler.MipFilter(), sampler.MinLod(), sampler.MaxLod()));
+				}
+				(sampler.MipFilter() == static_cast<uint8_t>(Prospero::SamplerMipFilter::kNone)
+				     ? unmipmapped
+				     : mipmapped) = true;
+			}
+			if (unmipmapped) {
+				// A170 keeps the original view; mixed samplers would shift its anisotropic footprint.
+				if (anisotropic) return SpecializationFail(fmt::format("image {} minimum LOD cannot shift an anisotropic sampler view", i));
+				if (mipmapped && relative_lod % 256u != 0u) {
+					return SpecializationFail(
+					    fmt::format("image {} mixes mipmapped and unmipmapped samplers at "
+					                "fractional minimum LOD {}",
+					                i, relative_lod));
+				}
+				// Unmipmapped sampling selects floor(MIN_LOD); mixed samplers require an integral view shift.
+				image.view_min_level = relative_lod / 256u;
+				continue;
+			}
+			image.sample_min_lod = relative_lod;
+			for (const auto& pair: program.info.sampled_pairs) {
+				if (pair.image != i) continue;
+				ShaderSamplerResource sampler {};
+				std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), 4, sampler.fields);
+				const bool aniso = sampler.XyMinFilter() >= 2u && sampler.MaxAnisoRatio() != 0u;
+				// A170 joins an unbiased implicit MinLod operand and the sampler minimum in one max().
+				const bool aniso_min_lod = aniso && program.stage == ShaderType::Pixel && program.info.images[i].implicit_only &&
+				    program.info.images[i].mip_mode != ImageMipMode::Dynamic && sampler.LodBias() == 0u && sampler.LodBiasSec() == 0u;
+				if (sampler.ForceUnormCoords() || sampler.XyMagFilter() != sampler.XyMinFilter() ||
+				    (aniso && !aniso_min_lod) ||
+				    sampler.MipFilter() ==
+				        static_cast<uint8_t>(Prospero::SamplerMipFilter::kNone) ||
+				    sampler.MaxLod() < image.sample_min_lod) {
+					return SpecializationFail(fmt::format(
+					    "image {} minimum LOD {} cannot be moved before sampler {} "
+					    "clamp/filter selection (unorm={} mag={} min={} aniso={} mip={} "
+					    "max_lod={})",
+					    i, image.sample_min_lod, pair.sampler, sampler.ForceUnormCoords(),
+					    sampler.XyMagFilter(), sampler.XyMinFilter(), sampler.MaxAnisoRatio(),
+					    sampler.MipFilter(), sampler.MaxLod()));
+				}
 			}
 		}
 	}
@@ -1475,8 +1560,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool emulate_image_min_lod) {
 	for (auto& keys: program.selector_keys) keys.resolved = false;
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
@@ -1689,7 +1773,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported);
+	return BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported, emulate_image_min_lod);
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
@@ -1743,6 +1827,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.sample_min_lod             = source.sample_min_lod;
+		image.view_min_level             = source.view_min_level;
 		image.null_fallback              = source.null_fallback;
 		image.indirect_resources.clear();
 	}
