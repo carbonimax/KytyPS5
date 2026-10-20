@@ -225,6 +225,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, maintenance8_enabled);
+	state.resource_min_lod = host_features.resource_min_lod;
 	if (!host_features.buffer_int64_atomics && program.info.buffer_int64_atomics) {
 		Fail(program,
 		     "shader requires shaderBufferInt64Atomics, which is not enabled on the host GPU");

@@ -57,6 +57,7 @@ struct ShaderHostFeatures {
 	uint32_t subgroup_size    = 64;
 	// Subgroup builtins in vertex functions (MoltenVK: no, SPIRV-Cross rejects them).
 	bool vertex_subgroups     = true;
+	bool resource_min_lod = true;
 };
 
 struct ShaderStageRuntime {

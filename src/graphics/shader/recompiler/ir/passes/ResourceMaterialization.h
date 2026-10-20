@@ -32,6 +32,8 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_search_iterations = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		uint32_t                      sample_min_lod             = 0;
+		uint32_t                      view_min_level             = 0;
 		bool                          null_fallback              = false;
 		bool                          operator==(const Image&) const = default;
 	};
@@ -55,8 +57,7 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool emulate_image_min_lod = false);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

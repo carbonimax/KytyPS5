@@ -252,10 +252,9 @@ struct PipelineCache::ProgramCache {
 		}
 
 		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                             uint32_t push_data_cursor) {
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime, uint32_t push_data_cursor, bool emulate_image_min_lod) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -375,9 +374,9 @@ struct PipelineCache::ProgramCache {
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
+				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -419,7 +418,7 @@ struct PipelineCache::ProgramCache {
 		options.input_info  = stage_input;
 		options.host_features = {graphics.shader_buffer_int64_atomics_enabled,
 		                         graphics.shader_cull_distance_enabled, graphics.subgroup_size,
-		                         graphics.vertex_subgroups_supported};
+		                         graphics.vertex_subgroups_supported, graphics.shader_resource_min_lod_enabled};
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -453,10 +452,10 @@ struct PipelineCache::ProgramCache {
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			    entry->second.specialization, !graphics.image_view_min_lod_enabled));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
+			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;

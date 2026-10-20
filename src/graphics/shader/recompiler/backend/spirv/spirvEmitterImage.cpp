@@ -862,6 +862,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
 	const auto& image   = state.program.info.images.at(mem.resource);
+	if ((image.sample_min_lod != 0u || image.view_min_level != 0u) &&
+	    op != IR::ValueOpcode::ImageSampleRaw && op != IR::ValueOpcode::ImageQueryDimensions) {
+		ctx.Fail(inst, "image minimum LOD emulation only supports sampling and dimension queries");
+		return;
+	}
 	if (image.null_fallback && image.indirect_root != mem.resource) {
 		if (inst.GetType() != IR::Type::Void) ctx.Define(inst, state.builder.Constant(spv::OpConstantNull, TypeId(state, inst.GetType())));
 		return;
@@ -1057,7 +1062,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
-		std::array<uint32_t, 4> operands {};
+		std::array<uint32_t, 5> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operands[0] = spv::ImageOperandsGradMask;
@@ -1091,6 +1096,21 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operand_count = std::max(size_t{1}, sample_operand_count);
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
+			}
+			if (candidate.sample_min_lod != 0u) {
+				const auto clamp = ConstantF32Value(state, static_cast<float>(candidate.sample_min_lod) / 256.0f);
+				if ((sample_operands[0] & spv::ImageOperandsLodMask) != 0u) {
+					sample_operands[1] = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, sample_operands[1], clamp);
+				} else {
+					if (!state.resource_min_lod) {
+						ctx.Fail(inst, "image minimum LOD emulation requires shaderResourceMinLod");
+						return 0u;
+					}
+					state.builder.RequireCapability(spv::CapabilityMinLod);
+					sample_operands[0] |= spv::ImageOperandsMinLodMask;
+					sample_operand_count = std::max(size_t{1}, sample_operand_count);
+					sample_operands[sample_operand_count++] = clamp;
+				}
 			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
