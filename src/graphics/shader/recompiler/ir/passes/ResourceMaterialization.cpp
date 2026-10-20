@@ -1029,6 +1029,30 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				    fmt::format("image {} cannot emulate its minimum LOD", i));
 			}
 			const auto relative_lod = texture.MinLod() - base_lod;
+			// Shift the view base to preserve the historical biased minimum-LOD path.
+			const auto level = relative_lod / 256u;
+			bool biased_aniso = false;
+			bool shift_safe = program.stage == ShaderType::Pixel && program.info.images[i].implicit_only && image.dimension == Decoder::ImageDimension::Dim2D && !image.cube && level != 0u && relative_lod % 256u == 0u;
+			for (const auto& pair: program.info.sampled_pairs) {
+				if (pair.image != i) continue;
+				if (pair.sampler >= snapshot.samplers.size() || specialization.samplers[pair.sampler].indirect_root != SamplerResource::NoIndirectSampler) {
+					shift_safe = false;
+					continue;
+				}
+				ShaderSamplerResource sampler {};
+				std::copy_n(snapshot.samplers[pair.sampler].dwords.begin(), 4, sampler.fields);
+				const int32_t bias = (static_cast<int32_t>(sampler.LodBias()) ^ 0x2000) - 0x2000;
+				biased_aniso = biased_aniso || (sampler.XyMinFilter() >= 2u && sampler.MaxAnisoRatio() != 0u && sampler.LodBias() != 0u);
+				shift_safe = shift_safe && !sampler.ForceUnormCoords() && sampler.XyMagFilter() == sampler.XyMinFilter() && sampler.LodBiasSec() == 0u && bias >= -512 && bias <= 512 && sampler.MipFilter() != 0u && sampler.MipFilter() <= 2u && sampler.MinLod() == 0u && sampler.MaxLod() >= (texture.LastLevel() - texture.BaseLevel()) * 256u;
+			}
+			const auto halves = [&](uint32_t size) {
+				const auto base_size = size >> texture.BaseLevel();
+				return base_size >= (1u << level) && (base_size & ((1u << level) - 1u)) == 0u;
+			};
+			if (biased_aniso && shift_safe && halves(texture.Width5() + 1u) && halves(texture.Height5() + 1u)) {
+				image.view_min_level = level;
+				continue;
+			}
 			bool       mipmapped    = false;
 			bool       unmipmapped  = false;
 			bool       anisotropic = false;
