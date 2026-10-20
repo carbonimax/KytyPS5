@@ -278,7 +278,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	m_download_images.erase(id);
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
