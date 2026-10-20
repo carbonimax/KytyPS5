@@ -8,16 +8,21 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/aliasedColorPassPolicy.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -262,6 +267,56 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
+}
+
+std::string CheckAliasedColorPasses(std::span<const RenderColorInfo>   colors,
+                                    const RenderDepthInfo&             depth,
+                                    std::span<PreparedBindings* const> stages,
+                                    std::span<const GuestRange>        fixed_reads) {
+	EXIT_IF(colors.empty());
+	const auto& target = colors.front();
+	for (const auto& color: colors) {
+		if (color.image_id != target.image_id || !(color.desc.view_info == target.desc.view_info) ||
+		    color.desc.info.samples != 1) {
+			return fmt::format("V1 slot {} does not resolve to the single-sample view of slot {}",
+			                   color.target_slot, target.target_slot);
+		}
+	}
+	if (depth.image_id && depth.AttachmentWriteAspects()) {
+		return "V2 the draw writes depth or stencil";
+	}
+	const auto& surface  = target.desc.info.data;
+	const auto  overlaps = [&](uint64_t address, uint64_t size) {
+		return size != 0 && address < surface.End() && surface.address < address + size;
+	};
+	for (const auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		const auto  write =
+		    AliasedPassStageWrite(program.info, program.bindings, program.has_address_writes);
+		if (!write.empty()) {
+			return fmt::format("V3 shader stage {} may write memory or GDS: {}",
+			                   static_cast<uint32_t>(program.stage), write);
+		}
+		for (const auto& source: stage->buffer_sources) {
+			if (overlaps(source.address, source.size)) {
+				return fmt::format("V4 shader stage {} reads the target surface through a buffer",
+				                   static_cast<uint32_t>(program.stage));
+			}
+		}
+		for (const auto& image: stage->images) {
+			if (image.image_id == target.image_id ||
+			    overlaps(image.desc.info.data.address, image.desc.info.data.size)) {
+				return fmt::format("V4 shader stage {} reads the target surface through an image",
+				                   static_cast<uint32_t>(program.stage));
+			}
+		}
+	}
+	for (const auto& range: fixed_reads) {
+		if (overlaps(range.address, range.size)) {
+			return "V4 a vertex or index fetch reads the target surface";
+		}
+	}
+	return {};
 }
 
 } // namespace Libs::Graphics

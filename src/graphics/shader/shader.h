@@ -223,6 +223,10 @@ struct ShaderPixelInputInfo {
 	bool                                           object_primitive_id          = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
+	// Aliased exports carry their physical components through the primary export index.
+	uint8_t target_merge_slot[8] = {};
+	uint8_t target_merge_mask[8] = {};
+	bool target_merge_alpha_source = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;

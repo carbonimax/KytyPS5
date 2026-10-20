@@ -468,6 +468,62 @@ uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	return result;
 }
 
+// An aliased target stores only the components it owns in the attachment it shares. With a
+// second blend source, each owned component also carries the export's own logical alpha.
+void EmitMergedMrtExport(ValueEmitContext& ctx, const IR::Inst& inst, const IR::ExportInfo& exp) {
+	auto&       state       = ctx.state;
+	const auto& pixel       = *state.input_info.pixel;
+	const auto  slot        = pixel.target_merge_slot[exp.index];
+	const bool  uint_output = MrtOutputMode(state, exp) == 7u;
+	const auto  scalar      = uint_output ? TypeU32(state) : TypeF32(state);
+	const auto  vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+	auto        value       = ExportVector(ctx, ctx.Arg(inst, 0), exp, uint_output);
+	const auto  mapping     = pixel.target_export_mapping[exp.index];
+	if (!mapping.IsIdentity()) {
+		const auto mapped = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVectorShuffle, vector_type, mapped, value, value,
+		                          mapping.Map(0), mapping.Map(1), mapping.Map(2), mapping.Map(3));
+		value = mapped;
+	}
+	const auto extract = [&](uint32_t component) {
+		const auto id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, scalar, id, value, component);
+		return id;
+	};
+	const auto store = [&](uint32_t variable, uint32_t component, uint32_t data) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain,
+		                          TypePointer(state, spv::StorageClassOutput, scalar), pointer,
+		                          variable, ConstantU32(state, component));
+		state.builder.AddFunction(spv::OpStore, pointer, data);
+	};
+	const auto output =
+	    OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = slot});
+	const auto blend_source =
+	    pixel.target_merge_alpha_source
+	        ? OutputVariableForExport(state, {.kind = IR::ExportTargetKind::Mrt, .index = 1})
+	        : 0u;
+	EXIT_IF(output == 0 || (pixel.target_merge_alpha_source && blend_source == 0));
+	// The plan keeps logical alpha in place, so component 3 is this export's alpha.
+	const auto alpha = blend_source != 0 ? extract(3) : 0u;
+	uint32_t   owned = 0;
+	for (uint32_t index = 0; index < std::size(pixel.target_merge_mask); index++) {
+		owned |= pixel.target_merge_slot[index] == slot ? pixel.target_merge_mask[index] : 0u;
+	}
+	for (uint32_t component = 0; component < 4u; component++) {
+		if ((pixel.target_merge_mask[exp.index] & (1u << component)) != 0) {
+			store(output, component, extract(component));
+			if (blend_source != 0) {
+				store(blend_source, component, alpha);
+			}
+		} else if (blend_source != 0 && exp.index == slot && (owned & (1u << component)) == 0) {
+			// Unowned components are outside the write mask; keep the second source defined.
+			store(blend_source, component,
+			      uint_output ? ConstantU32(state, 0) : ConstantF32(state, 0));
+		}
+	}
+}
+
 void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&       state = ctx.state;
 	const auto& exp   = ctx.Export(inst);
@@ -480,6 +536,12 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable, value);
 	}
 	if (exp.kind == IR::ExportTargetKind::Null || exp.en == 0u) {
+		return;
+	}
+	if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
+	    exp.index < std::size(state.input_info.pixel->target_merge_mask) &&
+	    state.input_info.pixel->target_merge_mask[exp.index] != 0) {
+		EmitIfCondition(state, exec, [&]() { EmitMergedMrtExport(ctx, inst, exp); });
 		return;
 	}
 	// Skip dormant color exports after their valid mask; MRT1 is reserved for logical alpha.

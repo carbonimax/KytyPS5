@@ -10606,6 +10606,8 @@ public:
         vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
         nullptr);
     scheduler.Finish();
+    // MoltenVK exposes the timeline value before Metal completes the command buffer.
+    RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
     auto result = ReadBuffer(name, probe, bytes / 4);
     DestroyBuffer(&probe);
     return result;
@@ -20571,9 +20573,536 @@ public:
                 case_index, format_cases);
   }
 
+  enum class AliasedMrtCase { Control, Remap, Direct, Incompatible };
+
+  // MRT0 and MRT1 export distinct colors and alphas into two slots with disjoint write masks.
+  // Control binds two surfaces. The other cases bind one surface to both slots, which the
+  // renderer must merge into a single attachment; Incompatible must stop with a diagnostic.
+  // Expected texels follow each slot's own blend on its own export, computed on the CPU.
+  void CheckAliasedRenderTargets(AliasedMrtCase mode) {
+    vk::PhysicalDeviceFeatures features{};
+    m_physical_device.getFeatures(&features);
+    Require("AliasedMrt", "dual-source blend", features.dualSrcBlend == true, "dual-source blending is not supported");
+    const char *name = mode == AliasedMrtCase::Control  ? "AliasedMrtControl"
+                       : mode == AliasedMrtCase::Remap  ? "AliasedMrtSourceAlpha"
+                       : mode == AliasedMrtCase::Direct ? "AliasedMrtDirect"
+                                                        : "AliasedMrtIncompatible";
+    constexpr uint32_t extent = 16;
+    constexpr uintptr_t base = 0x0000000204c00000ull;
+    constexpr uint64_t surface_stride = 0x10000;
+    constexpr uint64_t allocation_size = 0x40000;
+    using F = Prospero::BlendFactor;
+    using Op = Prospero::BlendOp;
+    const auto half = [&](float value) {
+      const auto bits = std::bit_cast<u32>(value);
+      const auto exponent = static_cast<int32_t>((bits >> 23u) & 0xffu) - 127 + 15;
+      Require(name, "exact fp16 value",
+              value == 0.0f || (exponent > 0 && exponent < 31 && (bits & 0x1fffu) == 0),
+              "test value is not exactly representable in fp16");
+      return value == 0.0f ? u32{0}
+                           : ((bits >> 16u) & 0x8000u) | (static_cast<u32>(exponent) << 10u) |
+                                 ((bits >> 13u) & 0x3ffu);
+    };
+    struct Slot {
+      std::array<float, 4> source;
+      u32 mask;
+      HW::BlendControl blend;
+    };
+    const auto control = [](F src, F dst, Op op, F alpha_src, F alpha_dst, Op alpha_op) {
+      HW::BlendControl blend{};
+      blend.color_srcblend = static_cast<uint8_t>(src);
+      blend.color_destblend = static_cast<uint8_t>(dst);
+      blend.color_comb_fcn = static_cast<uint8_t>(op);
+      blend.alpha_srcblend = static_cast<uint8_t>(alpha_src);
+      blend.alpha_destblend = static_cast<uint8_t>(alpha_dst);
+      blend.alpha_comb_fcn = static_cast<uint8_t>(alpha_op);
+      blend.separate_alpha_blend = true;
+      blend.enable = true;
+      return blend;
+    };
+    const std::array<float, 4> destination{0.5f, 0.25f, 0.75f, 0.25f};
+    const std::array<float, 4> constant{0.25f, 0.5f, 0.5f, 0.75f};
+    std::array<Slot, 2> slots{};
+    if (mode == AliasedMrtCase::Direct) {
+      // Interleaved owners with per-channel factors only; the alpha owner blends its own alpha.
+      slots[0] = {{0.5f, 0.625f, 0.25f, 0.125f}, 0x5,
+                  control(F::kConstantColor, F::kOneMinusSrcColor, Op::kAdd, F::kZero,
+                          F::kZero, Op::kAdd)};
+      slots[1] = {{0.375f, 0.25f, 0.875f, 0.5f}, 0xa,
+                  control(F::kConstantColor, F::kOneMinusSrcColor, Op::kAdd, F::kSrcAlpha,
+                          F::kOneMinusSrcAlpha, Op::kAdd)};
+    } else {
+      // Astro shape: RG blends with MRT0 alpha while B and A blend with MRT1 alpha.
+      // Incompatible: RG read the destination alpha that MRT1 writes, so neither one attachment
+      // nor ordered passes reproduce the original targets.
+      slots[0] = {{0.5f, 0.25f, 0.125f, 0.75f}, 0x3,
+                  control(mode == AliasedMrtCase::Incompatible ? F::kDstAlpha : F::kSrcAlpha,
+                          F::kOne, Op::kAdd, F::kOne, F::kZero, Op::kAdd)};
+      slots[1] = {{0.375f, 0.625f, 0.25f, 0.5f}, 0xc,
+                  control(F::kSrcAlpha, F::kOne, Op::kAdd, F::kSrcAlpha,
+                          F::kOneMinusSrcAlpha, Op::kAdd)};
+    }
+    // Each slot blends its own channels with its own export, as the CB does per target.
+    const auto blend_channel = [&](const Slot &slot, uint32_t channel) {
+      const bool alpha = channel == 3;
+      const auto &s = slot.source;
+      const auto &d = destination;
+      const auto factor = [&](uint8_t value) -> float {
+        switch (static_cast<F>(value)) {
+          case F::kZero: return 0.0f;
+          case F::kOne: return 1.0f;
+          case F::kSrcColor: return s[channel];
+          case F::kOneMinusSrcColor: return 1.0f - s[channel];
+          case F::kSrcAlpha: return s[3];
+          case F::kOneMinusSrcAlpha: return 1.0f - s[3];
+          case F::kDstAlpha: return d[3];
+          case F::kOneMinusDstAlpha: return 1.0f - d[3];
+          case F::kDstColor: return d[channel];
+          case F::kOneMinusDstColor: return 1.0f - d[channel];
+          case F::kConstantColor: return constant[channel];
+          case F::kOneMinusConstantColor: return 1.0f - constant[channel];
+          case F::kConstantAlpha: return constant[3];
+          case F::kOneMinusConstantAlpha: return 1.0f - constant[3];
+          default:
+            Require(name, "expected blend", false, "factor outside the test model");
+            return 0.0f;
+        }
+      };
+      const auto &b = slot.blend;
+      const auto src = factor(alpha ? b.alpha_srcblend : b.color_srcblend) * s[channel];
+      const auto dst = factor(alpha ? b.alpha_destblend : b.color_destblend) * d[channel];
+      switch (static_cast<Op>(alpha ? b.alpha_comb_fcn : b.color_comb_fcn)) {
+        case Op::kAdd: return src + dst;
+        case Op::kSubtract: return src - dst;
+        case Op::kReverseSubtract: return dst - src;
+        case Op::kMin: return std::min(s[channel], d[channel]);
+        case Op::kMax: return std::max(s[channel], d[channel]);
+      }
+      return 0.0f;
+    };
+    const bool aliased = mode != AliasedMrtCase::Control;
+    std::array<std::array<u32, 4>, 2> expected{};
+    for (uint32_t surface = 0; surface < 2; surface++) {
+      for (uint32_t channel = 0; channel < 4; channel++) {
+        float value = destination[channel];
+        for (uint32_t slot = 0; slot < 2; slot++) {
+          const bool same_surface = aliased ? surface == 0 : surface == slot;
+          if (same_surface && (slots[slot].mask & (1u << channel)) != 0) {
+            value = blend_channel(slots[slot], channel);
+          }
+        }
+        expected[surface][channel] = half(value);
+      }
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "color direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "color fixed mapping failed");
+    const std::array<u32, 2> destination_words{
+        half(destination[0]) | (half(destination[1]) << 16u),
+        half(destination[2]) | (half(destination[3]) << 16u)};
+    auto *words = static_cast<u32 *>(mapped);
+    for (uint64_t i = 0; i < allocation_size / sizeof(u32); i++) {
+      words[i] = destination_words[i % 2];
+    }
+
+    static const std::vector<u32> vertex_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 1, 0xbf800000u);
+      AppendVMovLiteral(&code, 2, 0x40400000u);
+      code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+      code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+      code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+      code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, 0x3f800000u);
+      code.push_back(EncodeExp0(0x0c, 0xf));
+      code.push_back(EncodeExp1(3, 4, 0, 6));
+      AppendEnd(&code);
+      return code;
+    }();
+    std::vector<u32> pixel_code;
+    for (uint32_t slot = 0; slot < 2; slot++) {
+      for (uint32_t channel = 0; channel < 4; channel++) {
+        AppendVMovLiteral(&pixel_code, slot * 4 + channel,
+                          std::bit_cast<u32>(slots[slot].source[channel]));
+      }
+    }
+    pixel_code.push_back(EncodeExp0(0x00, 0xf, false));
+    pixel_code.push_back(EncodeExp1(0, 1, 2, 3));
+    pixel_code.push_back(EncodeExp0(0x01, 0xf));
+    pixel_code.push_back(EncodeExp1(4, 5, 6, 7));
+    AppendEnd(&pixel_code);
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    const auto pixel_address = reinterpret_cast<uint64_t>(pixel_code.data());
+    ShaderMapUserData(vertex_address,
+        {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_user_data,
+         .code_size_bytes = static_cast<u32>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<u32>(pixel_code.size() * sizeof(u32))});
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(slots[0].mask | (slots[1].mask << 4u));
+      registers.SetShaderMask(0xff);
+      registers.SetPsInControl(0x8000);
+      registers.SetBlendColor({constant[0], constant[1], constant[2], constant[3]});
+      for (uint32_t slot = 0; slot < 2; slot++) {
+        registers.SetColorBase(slot, {.addr = base + (aliased ? 0 : slot * surface_stride)});
+        registers.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                                      .channel_type = Prospero::ChannelType::kFloat,
+                                      .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+        registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kLinear,
+                                         .dimension = 1});
+        registers.SetTargetOutputMode(slot, 9);
+        registers.SetBlendControl(slot, slots[slot].blend);
+      }
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      Require(name, "incompatible aliasing diagnostic", mode != AliasedMrtCase::Incompatible,
+              "an inexact aliased-target merge was not diagnosed");
+      // Record the objects each slot resolves to; aliased slots must share image and view.
+      std::array<vk::ImageView, 2> views{};
+      std::array<ImageId, 2> images{};
+      for (uint32_t slot = 0; slot < 2; slot++) {
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                           slot);
+        auto &cache = context.GetTextureCache();
+        views[slot] = cache.FindRenderTarget(color.image_id, color.desc);
+        images[slot] = color.image_id;
+        const auto &view = color.desc.view_info;
+        std::printf("[gpu]     %s slot=%u image=%u VkImage=%p VkImageView=%p format=%u "
+                    "mip=%u+%u layer=%u+%u samples=%u\n",
+                    name, slot, color.image_id.index,
+                    static_cast<void *>(static_cast<VkImage>(
+                        cache.GetImage(color.image_id).backing.image)),
+                    static_cast<void *>(static_cast<VkImageView>(views[slot])),
+                    static_cast<u32>(view.format), view.base_level, view.level_count,
+                    view.base_layer, view.layer_count, color.desc.info.samples);
+      }
+      Require(name, "effective alias",
+              (images[0] == images[1] && views[0] == views[1]) == aliased,
+              "slot objects do not match the aliasing of their registers");
+      for (uint32_t surface = 0; surface < (aliased ? 1u : 2u); surface++) {
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                           surface);
+        const auto texels =
+            ReadCachedTexel(name, context, color.image_id, {}, {extent, extent, 1});
+        for (size_t texel = 0; texel < texels.size() / 2; texel++) {
+          for (uint32_t channel = 0; channel < 4; channel++) {
+            const auto actual =
+                (texels[texel * 2 + channel / 2] >> ((channel % 2) * 16u)) & 0xffffu;
+            if (actual != expected[surface][channel]) {
+              std::printf("[gpu]     %s surface=%u texel=%zu channel=%u actual=0x%04x "
+                          "expected=0x%04x\n",
+                          name, surface, texel, channel, actual, expected[surface][channel]);
+            }
+            Require(name, "per-slot blend result", actual == expected[surface][channel],
+                    "a merged channel used another slot's export, alpha or equation");
+          }
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
+    }
+    Require(name, "release color memory",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                   allocation_size) == 0,
+            "color mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+
+  enum class AliasedPassCase { Astro, AstroControl, PerVertex, PerVertexControl, SideEffect };
+
+  // Aliased color draw regression: one 1024x1024 RGBA16F render-target surface bound to MRT0
+  // (RG, SRC_ALPHA/ONE blend with MRT0 alpha) and MRT1 (BA, no blend), FP16 exports, CMASK fast
+  // clear, triangle strip, stencil enabled without a depth target. The renderer draws one pass per
+  // slot. Control binds two surfaces; PerVertex reads the triangle corners through V_INTERP_MOV.
+  void CheckAliasedRenderTargetPasses(AliasedPassCase mode) {
+    const bool side_effect = mode == AliasedPassCase::SideEffect;
+    const bool aliased = mode == AliasedPassCase::Astro || mode == AliasedPassCase::PerVertex ||
+                         side_effect;
+    const bool per_vertex =
+        mode == AliasedPassCase::PerVertex || mode == AliasedPassCase::PerVertexControl;
+    const char *name = mode == AliasedPassCase::Astro          ? "AliasedMrtPassesAstro"
+                       : mode == AliasedPassCase::AstroControl ? "AliasedMrtPassesControl"
+                       : mode == AliasedPassCase::PerVertex    ? "AliasedMrtPassesPerVertex"
+                       : side_effect                           ? "AliasedMrtPassesSideEffect"
+                                                               : "AliasedMrtPassesPerVertexControl";
+    constexpr uint32_t extent = 1024;
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t surface_stride = 0x1000000;
+    constexpr uint64_t cmask_base = base + 2 * surface_stride;
+    constexpr uint64_t cmask_stride = 0x100000;
+    constexpr uint64_t allocation_size = 0x2400000;
+    if (per_vertex) {
+      Require(name, "fragment barycentric", m_barycentric_supported,
+              "the device does not expose per-vertex fragment inputs");
+    }
+    const auto half = [&](float value) {
+      const auto bits = std::bit_cast<u32>(value);
+      const auto exponent = static_cast<int32_t>((bits >> 23u) & 0xffu) - 127 + 15;
+      Require(name, "exact fp16 value",
+              value == 0.0f || (exponent > 0 && exponent < 31 && (bits & 0x1fffu) == 0),
+              "test value is not exactly representable in fp16");
+      return value == 0.0f ? u32{0}
+                           : ((bits >> 16u) & 0x8000u) | (static_cast<u32>(exponent) << 10u) |
+                                 ((bits >> 13u) & 0x3ffu);
+    };
+    // Astro registers: CMASK clear words decode to RGBA (0.5, 0.5, 101, 0).
+    constexpr u32 clear_word0 = 0x38003800u;
+    constexpr u32 clear_word1 = 0x00005650u;
+    const std::array<float, 4> destination{0.5f, 0.5f, 101.0f, 0.0f};
+    HW::BlendControl blended{};
+    blended.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlpha);
+    blended.color_destblend = static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+    blended.separate_alpha_blend = true;
+    blended.enable = true;
+    HW::BlendControl unblended{};
+    unblended.separate_alpha_blend = true;
+    // The triangle corners are (-1,-1), (3,-1), (-1,3); P10 and P20 are differences from P0.
+    const std::array<std::array<float, 4>, 2> sources =
+        per_vertex ? std::array<std::array<float, 4>, 2>{{{-1.0f, 4.0f, 0.375f, 0.75f},
+                                                          {0.625f, 0.875f, 4.0f, -1.0f}}}
+                   : std::array<std::array<float, 4>, 2>{{{0.5f, 0.25f, 0.375f, 0.75f},
+                                                          {0.625f, 0.875f, 0.125f, 0.625f}}};
+    // Independent oracle: RG take MRT0 * MRT0.a + destination, BA take MRT1 unchanged.
+    std::array<std::array<u32, 4>, 2> expected{};
+    for (uint32_t surface = 0; surface < 2; surface++) {
+      for (uint32_t channel = 0; channel < 4; channel++) {
+        const bool rg = channel < 2;
+        const bool written = aliased || (rg ? surface == 0 : surface == 1);
+        const float value = !written ? destination[channel]
+                            : rg     ? sources[0][3] * sources[0][channel] + destination[channel]
+                                     : sources[1][channel];
+        expected[surface][channel] = half(value);
+      }
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x200000, 0, &direct_offset) == 0,
+            "color direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, 0x200000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "color fixed mapping failed");
+    // Zero CMASK codes request Astro's register clear. Kyty does not decode the 64-bit clear of
+    // this format, so the surfaces hold the clear color in memory instead.
+    std::memset(mapped, 0, allocation_size);
+    const std::array<u32, 2> destination_words{
+        half(destination[0]) | (half(destination[1]) << 16u),
+        half(destination[2]) | (half(destination[3]) << 16u)};
+    auto *words = static_cast<u32 *>(mapped);
+    for (uint64_t i = 0; i < 2 * surface_stride / sizeof(u32); i++) {
+      words[i] = destination_words[i % 2];
+    }
+
+    static const std::vector<u32> vertex_code = [] {
+      std::vector<u32> code;
+      AppendVMovLiteral(&code, 1, 0xbf800000u);
+      AppendVMovLiteral(&code, 2, 0x40400000u);
+      code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+      code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+      code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+      code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+      AppendVMovU32(&code, 0, 0);
+      AppendVMovLiteral(&code, 6, 0x3f800000u);
+      code.push_back(EncodeExp0(0x0c, 0xf, false));
+      code.push_back(EncodeExp1(3, 4, 0, 6));
+      code.push_back(EncodeExp0(0x20, 0xf));
+      code.push_back(EncodeExp1(3, 4, 0, 6));
+      AppendEnd(&code);
+      return code;
+    }();
+    std::vector<u32> pixel_code;
+    for (uint32_t slot = 0; slot < 2; slot++) {
+      for (uint32_t channel = 0; channel < 4; channel++) {
+        AppendVMovLiteral(&pixel_code, slot * 4 + channel,
+                          std::bit_cast<u32>(sources[slot][channel]));
+      }
+    }
+    if (per_vertex) {
+      // V_INTERP_MOV modes: 2 = P0, 0 = P10, 1 = P20.
+      pixel_code.push_back(EncodeVintrp(0x02, 0, 0, 0, 2));
+      pixel_code.push_back(EncodeVintrp(0x02, 1, 0, 0, 0));
+      pixel_code.push_back(EncodeVintrp(0x02, 6, 0, 1, 1));
+      pixel_code.push_back(EncodeVintrp(0x02, 7, 0, 1, 2));
+    }
+    if (side_effect) {
+      // A GDS append would run once per pass; the renderer must refuse to repeat it.
+      AppendSMovLiteral(&pixel_code, 124, 8);
+      pixel_code.push_back(EncodeDs0(0x3e, 0, true));
+      pixel_code.push_back(EncodeDs1(12, 0, 0));
+    }
+    for (uint32_t pair = 0; pair < 4; pair++) {
+      pixel_code.push_back(EncodeVop2(0x2f, 8 + pair, Vgpr(pair * 2), pair * 2 + 1));
+    }
+    pixel_code.push_back(EncodeExp0(0x00, 0xf, false, true));
+    pixel_code.push_back(EncodeExp1(8, 9, 0, 0));
+    pixel_code.push_back(EncodeExp0(0x01, 0xf, true, true));
+    pixel_code.push_back(EncodeExp1(10, 11, 0, 0));
+    AppendEnd(&pixel_code);
+    static ShaderUserData vertex_user_data{};
+    const auto vertex_address = reinterpret_cast<uint64_t>(vertex_code.data());
+    const auto pixel_address = reinterpret_cast<uint64_t>(pixel_code.data());
+    ShaderMapUserData(vertex_address,
+        {.type = Prospero::ShaderBinaryType::kGs, .user_data = &vertex_user_data,
+         .code_size_bytes = static_cast<u32>(vertex_code.size() * sizeof(u32))});
+    ShaderMapUserData(pixel_address,
+        {.type = Prospero::ShaderBinaryType::kPs,
+         .code_size_bytes = static_cast<u32>(pixel_code.size() * sizeof(u32))});
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      auto &executor = context.GetRenderExecutor();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetViewportTransformControl(0x300);
+      registers.SetViewportScaleOffset(0, extent / 2, extent / 2, extent / 2, extent / 2, 1, 0);
+      registers.SetViewportZMax(0, 1);
+      registers.SetScreenScissor(0, 0, extent, extent);
+      registers.SetWindowScissor(0, 0, extent, extent, false);
+      registers.SetGenericScissor(0, 0, extent, extent, false);
+      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetRenderTargetMask(0xc3);
+      registers.SetShaderMask(0xff);
+      registers.SetPsInControl(per_vertex ? 0x8001 : 0x8000);
+      if (per_vertex) {
+        registers.SetPsInputSettings(0, 0);
+        registers.SetPsInputEna(2);
+        registers.SetPsInputAddr(2);
+      }
+      registers.SetDepthControl({.stencil_enable = true, .z_write_enable = true, .zfunc = 3,
+                                 .backface_enable = true, .stencilfunc = 7,
+                                 .stencilfunc_bf = 7});
+      for (uint32_t slot = 0; slot < 2; slot++) {
+        const auto surface = aliased ? 0u : slot;
+        registers.SetColorBase(slot, {.addr = base + surface * surface_stride});
+        registers.SetColorInfo(slot, {.cmask_fast_clear_enable = true,
+                                      .round_mode = true,
+                                      .format = Prospero::ChannelLayout::k16_16_16_16,
+                                      .channel_type = Prospero::ChannelType::kFloat,
+                                      .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+        registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                         .dimension = 1, .metadata_pipe_aligned = true});
+        registers.SetColorCmask(slot, {.addr = cmask_base + surface * cmask_stride});
+        registers.SetColorClearWord0(slot, {.word0 = clear_word0});
+        registers.SetColorClearWord1(slot, {.word1 = clear_word1});
+        registers.SetTargetOutputMode(slot, 4);
+        registers.SetBlendControl(slot, slot == 0 ? blended : unblended);
+      }
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriStrip);
+      shaders.SetEsShaderBase(vertex_address);
+      shaders.SetPsShaderBase(pixel_address);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                         {.vertex_count = 3, .instance_count = 1});
+      Require(name, "side-effect diagnostic", !side_effect,
+              "a pixel shader with a GDS append was repeated per pass");
+      std::array<vk::ImageView, 2> views{};
+      std::array<ImageId, 2> images{};
+      for (uint32_t slot = 0; slot < 2; slot++) {
+        RenderColorInfo color{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(), color,
+                                                           slot);
+        auto &cache = context.GetTextureCache();
+        views[slot] = cache.FindRenderTarget(color.image_id, color.desc);
+        images[slot] = color.image_id;
+        const auto &view = color.desc.view_info;
+        std::printf("[gpu]     %s slot=%u image=%u VkImage=%p VkImageView=%p format=%u "
+                    "mip=%u+%u layer=%u+%u samples=%u\n",
+                    name, slot, color.image_id.index,
+                    static_cast<void *>(static_cast<VkImage>(
+                        cache.GetImage(color.image_id).backing.image)),
+                    static_cast<void *>(static_cast<VkImageView>(views[slot])),
+                    static_cast<u32>(view.format), view.base_level, view.level_count,
+                    view.base_layer, view.layer_count, color.desc.info.samples);
+      }
+      Require(name, "effective alias",
+              (images[0] == images[1] && views[0] == views[1]) == aliased,
+              "slot objects do not match the aliasing of their registers");
+      for (uint32_t surface = 0; surface < (aliased ? 1u : 2u); surface++) {
+        const auto texels =
+            ReadCachedTexel(name, context, images[surface], {}, {extent, extent, 1});
+        uint32_t mismatches = 0;
+        for (size_t texel = 0; texel < texels.size() / 2; texel++) {
+          for (uint32_t channel = 0; channel < 4; channel++) {
+            const auto actual =
+                (texels[texel * 2 + channel / 2] >> ((channel % 2) * 16u)) & 0xffffu;
+            if (actual != expected[surface][channel] && mismatches++ < 8) {
+              std::printf("[gpu]     %s surface=%u texel=%zu channel=%u actual=0x%04x "
+                          "expected=0x%04x\n",
+                          name, surface, texel, channel, actual, expected[surface][channel]);
+            }
+          }
+        }
+        // RG keep the first pass through the second; BA hold MRT1 rather than the clear.
+        Require(name, "per-slot pass result", mismatches == 0,
+                "a pass lost the other pass's channels, blended the unblended slot or used "
+                "another slot's export");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
+    }
+    Require(name, "release color memory",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                                   allocation_size) == 0,
+            "color mapping or allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+
 private:
   Mode m_mode = Mode::Full;
   bool m_rasterization_supported = true;
+  bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
   u32   m_skipped_cases          = 0;
@@ -20748,6 +21277,12 @@ private:
                 : "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
+    const char *pervertex = std::getenv("KYTY_PERVERTEX_EXPERIMENTAL");
+    if (portable_graphics && pervertex != nullptr && std::strcmp(pervertex, "1") == 0) {
+      const auto enable = loader.getProcAddress<void (*)(VkPhysicalDevice)>("mvkEnableTESFixtureDevice");
+      Require("VulkanHarness", "dispatch", enable != nullptr, "PerVertex experimental requires the candidate MoltenVK");
+      enable(static_cast<VkPhysicalDevice>(m_physical_device));
+    }
     vk::PhysicalDeviceFeatures available_features{};
     m_physical_device.getFeatures(&available_features);
     vk::PhysicalDeviceVulkan11Features available_features11{};
@@ -20781,8 +21316,17 @@ private:
     available_robustness2.pNext = &available_maintenance8;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_robustness2;
+    vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
+    available_barycentric.pNext = &available_robustness2;
+    available_features2.pNext = &available_barycentric;
     m_physical_device.getFeatures2(&available_features2);
+    uint32_t extension_count = 0;
+    RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
+    std::vector<vk::ExtensionProperties> extensions(extension_count);
+    RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, extensions.data()), "vkEnumerateDeviceExtensionProperties");
+    m_barycentric_supported = portable_graphics && available_barycentric.fragmentShaderBarycentric && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
+      return std::strcmp(extension.extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
+    });
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
     Require("VulkanHarness", "dispatch",
@@ -20799,6 +21343,7 @@ private:
     if (portable_graphics) {
       Require("VulkanHarness", "dispatch", available_features.fragmentStoresAndAtomics == true, "fragment stores and atomics are not supported");
     }
+    if (portable_graphics) Require("VulkanHarness", "timeline", available_features12.timelineSemaphore == true, "timeline semaphores are not supported");
     if (min_lod_fallback) {
       Require("ImageMinLodFallback", "device", available_features.sampleRateShading == true, "missing GPU qualification: sample-rate shading is not supported");
       Require("ImageMinLodFallback", "device", available_features12.timelineSemaphore == true, "missing GPU qualification: timeline semaphores are not supported");
@@ -20885,17 +21430,17 @@ private:
     if (!full) {
       device_features12 = {};
       device_features12.bufferDeviceAddress = true;
-      device_features12.timelineSemaphore = min_lod_fallback;
+      device_features12.timelineSemaphore = min_lod_fallback || portable_graphics;
     }
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
-    barycentric.fragmentShaderBarycentric = full;
+    barycentric.fragmentShaderBarycentric = full || m_barycentric_supported;
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
     device_features13.pNext =
-        full ? static_cast<void *>(&barycentric)
+        full || m_barycentric_supported ? static_cast<void *>(&barycentric)
              : static_cast<void *>(&device_features12);
     device_features13.dynamicRendering = full || portable_graphics || min_lod_fallback;
     device_features13.synchronization2 = full || portable_graphics || min_lod_fallback;
@@ -20947,6 +21492,7 @@ private:
     Require("ImageMinLodFallback", "device", !min_lod_fallback || m_resource_min_lod_enabled, "shaderResourceMinLod is not supported");
     device_features.shaderInt64 = true;
     device_features.fragmentStoresAndAtomics = portable_graphics;
+    device_features.dualSrcBlend = portable_graphics && available_features.dualSrcBlend;
     device_features.shaderFloat64 = full && available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
@@ -20976,6 +21522,7 @@ private:
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
+    if (m_barycentric_supported) device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.data();
@@ -49357,6 +49904,48 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-control-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckAliasedRenderTargets(VulkanHarness::AliasedMrtCase::Control);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    for (const auto mode : {VulkanHarness::AliasedMrtCase::Control,
+                            VulkanHarness::AliasedMrtCase::Remap,
+                            VulkanHarness::AliasedMrtCase::Direct}) {
+      vulkan.CheckAliasedRenderTargets(mode);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-incompatible-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckAliasedRenderTargets(VulkanHarness::AliasedMrtCase::Incompatible);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-passes-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    for (const auto mode : {VulkanHarness::AliasedPassCase::AstroControl,
+                            VulkanHarness::AliasedPassCase::Astro}) {
+      vulkan.CheckAliasedRenderTargetPasses(mode);
+    }
+    return 0;
+  }
+  // Needs per-vertex fragment inputs (KYTY_PERVERTEX_EXPERIMENTAL=1 on the candidate MoltenVK).
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-passes-pervertex-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    for (const auto mode : {VulkanHarness::AliasedPassCase::PerVertexControl,
+                            VulkanHarness::AliasedPassCase::PerVertex}) {
+      vulkan.CheckAliasedRenderTargetPasses(mode);
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--aliased-mrt-passes-side-effect-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    vulkan.CheckAliasedRenderTargetPasses(VulkanHarness::AliasedPassCase::SideEffect);
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--null-descriptor-spirv-only") == 0) {
     CheckNullDescriptorFallbackSpirv();
     CheckNullBufferFallbackSpirv();

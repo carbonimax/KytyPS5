@@ -477,6 +477,11 @@ add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
+add_executable(aliased_color_pass_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AliasedColorPassPolicyTests.cpp"
+)
+target_include_directories(aliased_color_pass_policy_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -680,6 +685,13 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
+	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
+	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
+	add_test(NAME aliased_mrt_incompatible COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-incompatible-only)
+	set_tests_properties(aliased_mrt_incompatible PROPERTIES PASS_REGULAR_EXPRESSION "per-target passes: P4 ")
+	add_test(NAME aliased_mrt_passes_side_effect COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-side-effect-only)
+	set_tests_properties(aliased_mrt_passes_side_effect PROPERTIES PASS_REGULAR_EXPRESSION "per-target passes: V3 ")
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
@@ -763,6 +775,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		aliased_color_pass_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

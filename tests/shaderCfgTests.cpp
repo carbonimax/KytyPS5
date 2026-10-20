@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -14592,6 +14593,301 @@ void TestLogicalAlphaBlendExport() {
         "guest dual-source export was replaced by synthetic alpha");
 }
 
+void TestAliasedColorTargetPlan() {
+  using F = Prospero::BlendFactor;
+  const auto blend = [](F src, F dst, F alpha_src, F alpha_dst, bool enable = true) {
+    HW::BlendControl control{};
+    control.color_srcblend = static_cast<uint8_t>(src);
+    control.color_destblend = static_cast<uint8_t>(dst);
+    control.alpha_srcblend = static_cast<uint8_t>(alpha_src);
+    control.alpha_destblend = static_cast<uint8_t>(alpha_dst);
+    control.separate_alpha_blend = true;
+    control.enable = enable;
+    return control;
+  };
+  struct Setup {
+    uint32_t target_mask;
+    std::array<HW::BlendControl, 3> blends;
+    uint32_t active = 0x3;
+    std::array<uint64_t, 3> bases{0x10000, 0x10000, 0x20000};
+    std::array<uint8_t, 3> modes{9, 9, 9};
+  };
+  const auto plan = [](const Setup &setup, AliasedColorTargets &result) {
+    HW::Context ctx{};
+    ctx.SetRenderTargetMask(setup.target_mask);
+    ctx.SetShaderMask(0xfff);
+    for (uint32_t slot = 0; slot < 3; slot++) {
+      ctx.SetColorBase(slot, {.addr = setup.bases[slot]});
+      ctx.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                              .channel_type = Prospero::ChannelType::kFloat,
+                              .channel_order = Prospero::ChannelOrder::kStandard});
+      ctx.SetColorAttrib2(slot, {.height = 15, .width = 15});
+      ctx.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      ctx.SetTargetOutputMode(slot, setup.modes[slot]);
+      ctx.SetBlendControl(slot, setup.blends[slot]);
+    }
+    return PlanAliasedColorTargets(ctx, setup.active, result);
+  };
+  const auto rejects = [&](const Setup &setup, const char *rule) {
+    AliasedColorTargets result;
+    const auto reason = plan(setup, result);
+    return reason.rfind(rule, 0) == 0;
+  };
+  const auto additive = blend(F::kSrcAlpha, F::kOne, F::kOne, F::kZero);
+  const auto alpha_over = blend(F::kSrcAlpha, F::kOne, F::kSrcAlpha, F::kOneMinusSrcAlpha);
+
+  AliasedColorTargets result;
+  // Astro: RG blends with MRT0 alpha, B and A with MRT1 alpha.
+  Check(plan({0xc3, {additive, alpha_over, additive}}, result).empty() && result.alpha_source &&
+            result.slot[1] == 0 && result.component_mask[0] == 0x3 &&
+            result.component_mask[1] == 0xc && result.write_mask[0] == 0xf &&
+            result.blend_enable[0] && result.blend[0].color_srcblend == 4 &&
+            result.blend[0].color_destblend == 1 && result.blend[0].alpha_srcblend == 4 &&
+            result.blend[0].alpha_destblend == 5,
+        "RG/BA aliasing did not take per-component source alpha from the second source");
+  const auto per_channel = blend(F::kConstantColor, F::kOneMinusSrcColor, F::kSrcAlpha,
+                                 F::kOneMinusSrcAlpha);
+  Check(plan({0xa5, {per_channel, per_channel, additive}}, result).empty() &&
+            !result.alpha_source && result.component_mask[0] == 0x5 &&
+            result.component_mask[1] == 0xa,
+        "interleaved per-channel aliasing needed the second blend source");
+  const auto off = blend(F::kOne, F::kZero, F::kOne, F::kZero, false);
+  Check(plan({0xc3, {off, off, off}}, result).empty() && !result.blend_enable[0] &&
+            result.write_mask[0] == 0xf,
+        "unblended aliasing was not merged");
+  Check(plan({0xc3, {additive, alpha_over, additive}, 0x3, {0x10000, 0x20000, 0x30000}},
+             result).empty() && !result.Active(),
+        "distinct surfaces were merged");
+
+  Check(rejects({0x63, {additive, additive, additive}}, "E1"),
+        "aliased targets writing the same component were accepted");
+  Check(rejects({0xc3, {additive, alpha_over, additive}, 0x3, {0x10000, 0x10000, 0x20000},
+                 {9, 4, 9}}, "E2"),
+        "aliased targets with different export formats were accepted");
+  Check(rejects({0xc3, {additive, off, additive}}, "E4"),
+        "mixed blend enables were accepted");
+  Check(rejects({0xc3, {additive, blend(F::kOne, F::kOne, F::kOne, F::kZero), additive}}, "E5"),
+        "different color equations were accepted");
+  const auto saturate = blend(F::kSrcAlphaSaturate, F::kOne, F::kOne, F::kZero);
+  Check(rejects({0x43, {saturate, saturate, additive}}, "E7"),
+        "alpha saturation across targets was accepted");
+  const auto destination_alpha = blend(F::kDstAlpha, F::kOne, F::kOne, F::kZero);
+  Check(rejects({0xc3, {destination_alpha, destination_alpha, additive}}, "E8"),
+        "destination alpha written by another target was accepted");
+  Check(rejects({0xc3, {blend(F::kSrc1Alpha, F::kOne, F::kOne, F::kZero),
+                        blend(F::kSrc1Alpha, F::kOne, F::kOne, F::kZero), additive}}, "E10"),
+        "guest dual-source blending was merged");
+  Check(rejects({0xc3, {additive, alpha_over, additive}, 0x7}, "E6"),
+        "the second blend source was planned beside another attachment");
+  Check(rejects({0xc30, {additive, additive, alpha_over}, 0x6, {0x30000, 0x10000, 0x10000}},
+                "E6"),
+        "the second blend source was planned away from attachment 0");
+  HW::Context shifted{};
+  shifted.SetShaderMask(0x0f0f0000);
+  shifted.SetRenderTargetMask(0x0c030000);
+  for (uint32_t slot : {4u, 6u}) {
+    shifted.SetColorBase(slot, {.addr = 0x10000});
+    shifted.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k16_16_16_16, .channel_type = Prospero::ChannelType::kFloat});
+    shifted.SetBlendControl(slot, off);
+  }
+  shifted.SetTargetOutputMode(0, 9);
+  shifted.SetTargetOutputMode(1, 4);
+  Check(PlanAliasedColorTargets(shifted, 0x50, result).rfind("E2", 0) == 0, "compacted exports used target slots as format indices");
+  shifted.SetTargetOutputMode(1, 9);
+  Check(PlanAliasedColorTargets(shifted, 0x50, result).empty() && result.slot[6] == 4 && result.write_mask[4] == 0xf, "noncontiguous targets did not merge with their export formats");
+}
+
+void TestAliasedColorPassPlan() {
+  using F = Prospero::BlendFactor;
+  const auto blend = [](F src, F dst, bool enable) {
+    HW::BlendControl control{};
+    control.color_srcblend = static_cast<uint8_t>(src);
+    control.color_destblend = static_cast<uint8_t>(dst);
+    control.separate_alpha_blend = true;
+    control.enable = enable;
+    return control;
+  };
+  struct Setup {
+    uint32_t target_mask;
+    std::array<HW::BlendControl, 3> blends;
+    uint32_t active = 0x3;
+    uint32_t samples = 0;
+    std::array<uint64_t, 3> bases{0x10000, 0x10000, 0x20000};
+  };
+  const auto plan = [](const Setup &setup, uint32_t &group) {
+    HW::Context ctx{};
+    ctx.SetRenderTargetMask(setup.target_mask);
+    ctx.SetShaderMask(0xfff);
+    for (uint32_t slot = 0; slot < 3; slot++) {
+      ctx.SetColorBase(slot, {.addr = setup.bases[slot]});
+      ctx.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k16_16_16_16,
+                              .channel_type = Prospero::ChannelType::kFloat,
+                              .channel_order = Prospero::ChannelOrder::kStandard});
+      ctx.SetColorAttrib(slot, {.num_samples = setup.samples, .num_fragments = setup.samples});
+      ctx.SetColorAttrib2(slot, {.height = 15, .width = 15});
+      ctx.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kRenderTarget, .dimension = 1});
+      ctx.SetTargetOutputMode(slot, 4);
+      ctx.SetBlendControl(slot, setup.blends[slot]);
+    }
+    return PlanAliasedColorPasses(ctx, setup.active, group);
+  };
+  const auto rejects = [&](const Setup &setup, const char *rule) {
+    uint32_t group = 0;
+    return plan(setup, group).rfind(rule, 0) == 0;
+  };
+  // Astro: RG blended with MRT0 alpha, BA unblended.
+  const auto rg = blend(F::kSrcAlpha, F::kOne, true);
+  const auto off = blend(F::kOne, F::kZero, false);
+  uint32_t group = 0;
+  Check(plan({0xc3, {rg, off, rg}}, group).empty() && group == 0x3,
+        "Astro's RG-blended / BA-unblended draw was not split into ordered passes");
+  Check(rejects({0x63, {rg, off, rg}}, "P2"), "overlapping per-target passes were accepted");
+  Check(rejects({0xc3, {rg, off, rg}, 0x7}, "P1"),
+        "per-target passes repeated a non-aliased attachment");
+  Check(rejects({0xc3, {rg, off, rg}, 0x3, 1}, "P3"), "multisampled per-target passes were accepted");
+  Check(rejects({0xc3, {blend(F::kDstAlpha, F::kOne, true), off, rg}}, "P4"),
+        "a pass read destination alpha written by another pass");
+  Check(rejects({0xc3, {blend(F::kSrc1Alpha, F::kOne, true), off, rg}}, "P4"),
+        "a pass blended with another export as second source");
+  Check(plan({0xc3, {rg, blend(F::kDstAlpha, F::kOne, true), rg}}, group).empty(),
+        "the alpha owner reading its own destination alpha was rejected");
+}
+
+void TestAliasedColorPassChecks() {
+  using namespace ShaderRecompiler::IR;
+  constexpr uint64_t surface = 0x100000;
+  std::array<RenderColorInfo, 2> colors{};
+  for (uint32_t slot = 0; slot < 2; slot++) {
+    colors[slot].target_slot = slot;
+    colors[slot].image_id = ImageId{3};
+    colors[slot].desc.info.data = {surface, 0x8000};
+    colors[slot].desc.info.samples = 1;
+  }
+  CompiledShaderInfo vertex{};
+  vertex.stage = ShaderType::Vertex;
+  vertex.info.buffers.push_back({.read = true});
+  CompiledShaderInfo pixel{};
+  pixel.stage = ShaderType::Pixel;
+  ShaderStageRuntime vertex_runtime{.program = &vertex};
+  ShaderStageRuntime pixel_runtime{.program = &pixel};
+  PreparedBindings vertex_bindings{};
+  vertex_bindings.runtime = &vertex_runtime;
+  vertex_bindings.buffer_sources.push_back({.address = surface + 0x10000, .size = 0x100});
+  PreparedBindings pixel_bindings{};
+  pixel_bindings.runtime = &pixel_runtime;
+  std::array<PreparedBindings *, 2> stages{&vertex_bindings, &pixel_bindings};
+  RenderDepthInfo depth{};
+  const std::array<GuestRange, 1> vertex_fetch{{{surface + 0x20000, 0x40}}};
+  const auto check = [&] { return CheckAliasedColorPasses(colors, depth, stages, vertex_fetch); };
+  const auto rejects = [&](const char *rule) { return check().rfind(rule, 0) == 0; };
+  Check(check().empty(), "a side-effect-free draw away from its surface was rejected");
+
+  colors[1].desc.view_info.base_layer = 1;
+  Check(rejects("V1"), "passes over different subresources were accepted");
+  colors[1].desc.view_info.base_layer = 0;
+
+  depth.image_id = ImageId{4};
+  depth.desc.view_info.format = vk::Format::eD32Sfloat;
+  depth.depth_write_enable = true;
+  Check(rejects("V2"), "repeated depth writes were accepted");
+  depth = {};
+
+  pixel.info.images.push_back({.written = true});
+  Check(rejects("V3"), "a pixel image store was repeated");
+  pixel.info.images.clear();
+  vertex.info.buffers[0].atomic = true;
+  Check(rejects("V3"), "a vertex buffer atomic was repeated");
+  vertex.info.buffers[0].atomic = false;
+  pixel.bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Gds)] = 1;
+  pixel.bindings.descriptor_mask |= uint64_t{1} << static_cast<size_t>(DescriptorBindingKind::Gds);
+  Check(rejects("V3"), "GDS access was repeated");
+  pixel.bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Gds)] = 0;
+  pixel.bindings.descriptor_mask &= ~(uint64_t{1} << static_cast<size_t>(DescriptorBindingKind::Gds));
+  pixel.info.uses_dma = true;
+  Check(check().empty(), "read-only address access refused per-target passes");
+  pixel.has_address_writes = true;
+  Check(rejects("V3"), "address stores were repeated");
+  pixel.has_address_writes = false;
+  pixel.info.uses_dma = false;
+
+  vertex_bindings.buffer_sources[0].address = surface + 0x7f00;
+  Check(rejects("V4"), "a vertex buffer overlapping the surface was accepted");
+  vertex_bindings.buffer_sources[0].address = surface + 0x10000;
+  pixel_bindings.images.push_back({.image_id = ImageId{3}});
+  Check(rejects("V4"), "sampling the target image was accepted");
+  pixel_bindings.images.clear();
+  Check(CheckAliasedColorPasses(colors, depth, stages,
+                                std::array<GuestRange, 1>{{{surface + 0x40, 0x10}}})
+                .rfind("V4", 0) == 0,
+        "a vertex fetch from the surface was accepted");
+  Check(CheckAliasedColorPasses(colors, depth, stages, std::array<GuestRange, 1>{{{surface + 0x20, 3}}}).rfind("V4", 0) == 0, "a guest index fetch from the surface was accepted");
+}
+
+void TestAliasedMrtExport() {
+  ShaderPixelInputInfo pixel{};
+  pixel.target_output_mode[0] = pixel.target_output_mode[1] = 9;
+  const auto unmerged_key = MakeStageStaticKey(pixel);
+  pixel.target_merge_slot[1] = 0;
+  pixel.target_merge_mask[0] = 0x3;
+  pixel.target_merge_mask[1] = 0xc;
+  const auto direct_key = MakeStageStaticKey(pixel);
+  pixel.target_merge_alpha_source = true;
+  pixel.dual_source_blending = true;
+  const auto alpha_key = MakeStageStaticKey(pixel);
+  Check(unmerged_key != direct_key && direct_key != alpha_key,
+        "aliased-target merges share a shader cache key with other exports");
+
+  const uint32_t shader[] = {
+      EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(1, 0xf), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &pixel;
+  const auto merged = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(merged.spirv);
+  const auto source = DisassembleSpirvBinary(merged.spirv);
+  Check(source.find("OpDecorate %out_mrt_0 Location 0") != std::string::npos &&
+            source.find("OpDecorate %out_mrt_1 Location 0") != std::string::npos &&
+            source.find("OpDecorate %out_mrt_1 Index 1") != std::string::npos &&
+            CountSourceOccurrences(source, "OpStore %out_mrt_0 ") == 0 &&
+            CountSourceOccurrences(source, "OpStore %out_mrt_1 ") == 0 &&
+            CountSourceOccurrences(source, "OpAccessChain") >= 8,
+        "aliased exports were not stored per component into the shared attachment");
+
+  pixel.target_merge_alpha_source = false;
+  pixel.dual_source_blending = false;
+  const auto direct = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(direct.spirv);
+  const auto direct_source = DisassembleSpirvBinary(direct.spirv);
+  Check(direct_source.find("out_mrt_1") == std::string::npos &&
+            CountSourceOccurrences(direct_source, "OpAccessChain") >= 4,
+        "a direct aliased merge kept a second output");
+  pixel.target_shader_mask = 0x0f0f0000;
+  const auto remapped = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(remapped.spirv);
+  const auto remapped_source = DisassembleSpirvBinary(remapped.spirv);
+  Check(remapped_source.find("OpDecorate %out_mrt_0 Location 4") != std::string::npos && remapped_source.find("out_mrt_1") == std::string::npos, "a merged attachment lost the compacted export location");
+  pixel.target_merge_mask[0] = pixel.target_merge_mask[1] = 0;
+  const auto separate = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(separate.spirv);
+  const auto separate_source = DisassembleSpirvBinary(separate.spirv);
+  Check(separate_source.find("OpDecorate %out_mrt_0 Location 4") != std::string::npos && separate_source.find("OpDecorate %out_mrt_1 Location 6") != std::string::npos, "non-aliased compacted exports changed location");
+  const uint32_t three_exports[] = {
+      EncodeExp0(0, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(1, 0xf, false), EncodeExp1(4, 5, 6, 7),
+      EncodeExp0(2, 0xf), EncodeExp1(8, 9, 10, 11), EncodeSopp(0x01),
+  };
+  pixel.target_shader_mask = 0xfff00000;
+  pixel.target_output_mode[2] = 9;
+  pixel.target_merge_mask[1] = 0x3;
+  pixel.target_merge_mask[2] = 0xc;
+  pixel.target_merge_slot[1] = pixel.target_merge_slot[2] = 1;
+  const auto mixed = RecompileForTest(three_exports, options);
+  CheckSpirvBinaryValidates(mixed.spirv);
+  const auto mixed_source = DisassembleSpirvBinary(mixed.spirv);
+  Check(mixed_source.find("OpDecorate %out_mrt_0 Location 5") != std::string::npos && mixed_source.find("OpDecorate %out_mrt_1 Location 6") != std::string::npos && mixed_source.find("out_mrt_2") == std::string::npos, "a merged export displaced the separate attachment");
+}
+
 void TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled() {
   constexpr uint32_t ExecutionModeEarlyFragmentTests = 9;
 
@@ -17202,6 +17498,10 @@ int main(int argc, char **argv) {
   TestAutomaticObjectPrimitiveId();
   TestRenderTargetReverseExportMapping();
   TestBlendMappingClassification();
+  TestAliasedColorTargetPlan();
+  TestAliasedColorPassPlan();
+  TestAliasedColorPassChecks();
+  TestAliasedMrtExport();
   TestLogicalAlphaBlendExport();
   TestNewShaderRecompilerEarlyZDisabledWhenPixelKillEnabled();
   TestTypedDescriptorRealWideMoveTranslation();

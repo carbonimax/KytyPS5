@@ -250,15 +250,18 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 			if (alpha_remap && export_info.index != 0) {
 				break;
 			}
+			const bool merged = export_info.index < 8u &&
+			                    input_info.pixel->target_merge_mask[export_info.index] != 0;
+			const auto index = merged ? input_info.pixel->target_merge_slot[export_info.index]
+			                          : export_info.index;
 			const auto slot = input_info.pixel->dual_source_blending
 			                      ? 0u : ShaderPixelExportTarget(input_info.pixel->target_shader_mask,
-			                                                    export_info.index);
+			                                                    index);
 			if (slot >= 8) {
 				break;
 			}
-			AddOutput(info, StageOutputKind::Mrt, export_info.index, slot,
-			          fmt::format("out_mrt_{}", export_info.index));
-			if (alpha_remap) {
+			AddOutput(info, StageOutputKind::Mrt, index, slot, fmt::format("out_mrt_{}", index));
+			if (alpha_remap || (merged && input_info.pixel->target_merge_alpha_source)) {
 				AddOutput(info, StageOutputKind::Mrt, 1, 0, "out_mrt_1");
 			}
 			break;
@@ -585,9 +588,19 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
 	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
 	InputUsage inputs;
+	uint32_t merged_exports = 0;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
+			if (program.stage == ShaderType::Pixel && inst.GetOpcode() == ValueOpcode::SetAttribute) {
+				const auto& exp = program.export_info[inst.Flags<ExportFlags>().index];
+				if (exp.kind == ExportTargetKind::Mrt && exp.en != 0 && exp.index < 8u) merged_exports |= 1u << exp.index;
+			}
+		}
+	}
+	for (uint32_t index = 0; program.stage == ShaderType::Pixel && index < 8u; index++) {
+		if (input_info.pixel->target_merge_mask[index] != 0 && (merged_exports & (1u << index)) == 0) {
+			return Fail(fmt::format("aliased color target {} has no export", index));
 		}
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
