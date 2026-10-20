@@ -43693,6 +43693,206 @@ void RunSwizzleHelperQuadCase(VulkanHarness *vulkan) {
   std::printf("[graphics] GraphicsSwizzleHelperQuad ok\n");
 }
 
+enum class WaterfallKeys { Unique, Pairs, Shifted };
+
+// The D6 waterfall shape: WQM, then readfirstlane picks a key and the lanes carrying it
+// retire. The loop stops after 16 passes. Emitted up to the loop exit, EXEC back on the WQM
+// mask: v2 = lane, v3 = tag 0x40 | lane, v6 = pending, v7 = key taken, v9 = pass that took
+// it, s20 = passes run, s[68:69] = live, s[70:71] = wqm, s[72:73] = helpers, s74 = first
+// helper lane, s19 = its tag read before the loop. With `position`, v16 and v17 also hold
+// the lane's pixel, from FragCoord in v2 and v3.
+std::vector<u32> WqmWaterfallCode(WaterfallKeys keys, bool position = false) {
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x04, 68, 126));             // s_mov_b64 s[68:69], exec
+  code.push_back(EncodeSop1(0x0a, 126, 126));            // s_wqm_b64 exec, exec
+  code.push_back(EncodeSop1(0x04, 70, 126));             // s_mov_b64 s[70:71], exec
+  if (position) {
+    code.push_back(EncodeVop1(0x07, 16, Vgpr(2))); // v_cvt_u32_f32 v16, FragCoord.x
+    code.push_back(EncodeVop1(0x07, 17, Vgpr(3))); // v_cvt_u32_f32 v17, FragCoord.y
+  }
+  code.push_back(EncodeSop2(0x15, 72, 70, 68));          // helpers = wqm & ~live
+  code.push_back(EncodeSop1(0x14, 74, 72));              // s74 = first helper lane
+  AppendVop3(&code, 0x365, 2, 193u, InlineU32(0));       // v2 = lane
+  code.push_back(EncodeVop2(0x1c, 3, InlineU32(64), 2)); // v3 = tag 0x40 | lane
+  if (keys == WaterfallKeys::Unique) {
+    code.push_back(EncodeVop2(0x1c, 4, 255u, 2));
+  } else {
+    if (keys == WaterfallKeys::Shifted) {
+      code.push_back(EncodeVop2(0x25, 5, InlineU32(1), 2));
+      code.push_back(EncodeVop2(0x16, 5, InlineU32(1), 5));
+    } else {
+      code.push_back(EncodeVop2(0x16, 5, InlineU32(1), 2));
+    }
+    code.push_back(EncodeVop2(0x1c, 4, 255u, 5));
+  }
+  code.push_back(0xa0u);                     // v4 = key
+  AppendVop3(&code, 0x360, 19, Vgpr(3), 74); // helper tag before the loop
+  AppendVMovU32(&code, 6, 1);                // pending
+  AppendVMovU32(&code, 7, 0);                // key taken
+  AppendVMovU32(&code, 9, 0);                // pass that took it
+  code.push_back(EncodeSMovB32(20, InlineU32(0)));
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+  code.push_back(EncodeSopc(0x08, 20, InlineU32(16)));
+  const auto bound_exit = code.size();
+  code.push_back(0);                                     // s_cbranch_scc1 exit
+  code.push_back(EncodeVopc(0xd5, InlineU32(0), 6));     // v_cmpx_ne_u32 0, v6
+  const auto drained_exit = code.size();
+  code.push_back(0);                                     // s_cbranch_execz exit
+  code.push_back(EncodeVop1(0x02, 21, Vgpr(4)));         // v_readfirstlane_b32 s21, v4
+  code.push_back(EncodeSop1(0x04, 60, 126));
+  code.push_back(EncodeVopc(0xd2, 21, 4));               // v_cmpx_eq_u32 s21, v4
+  const auto skip = code.size();
+  code.push_back(0);                                     // s_cbranch_execz restore
+  AppendVMovU32(&code, 6, 0);
+  code.push_back(EncodeVop1(0x01, 7, 21));
+  code.push_back(EncodeVop1(0x01, 9, 20));
+  const auto restore = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 60));
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(loop - code.size() - 1)));
+  const auto exit = code.size();
+  code[bound_exit] = EncodeSopp(0x05, static_cast<u32>(exit - bound_exit - 1));
+  code[drained_exit] = EncodeSopp(0x08, static_cast<u32>(exit - drained_exit - 1));
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(restore - skip - 1));
+  code.push_back(EncodeSop1(0x04, 126, 70)); // back to the WQM mask
+  return code;
+}
+
+void AppendSAndLiteral(std::vector<u32> *code, u32 dst, u32 src, u32 mask) {
+  code->push_back(EncodeSop2(0x0e, dst, src, 255u));
+  code->push_back(mask);
+}
+
+void AppendSOrShifted(std::vector<u32> *code, u32 acc, u32 shift) { // acc |= s27 << shift
+  code->push_back(EncodeSop2(0x1e, 27, 27, InlineU32(shift)));
+  code->push_back(EncodeSop2(0x10, acc, acc, 27));
+}
+
+// v14 = own lane | pending << 6 | pass that took the key << 7 | key taken << 15.
+void AppendWaterfallLanePacket(std::vector<u32> *code) {
+  const auto vor_shifted = [&](u32 src, u32 mask, u32 shift) { // v14 |= (src & mask) << shift
+    code->push_back(EncodeVop2(0x1b, 15, 255u, src));
+    code->push_back(mask);
+    code->push_back(EncodeVop2(0x1a, 15, InlineU32(shift), 15));
+    code->push_back(EncodeVop2(0x1c, 14, Vgpr(15), 14));
+  };
+  code->push_back(EncodeVop2(0x1b, 14, InlineU32(63), 2));
+  vor_shifted(6, 1, 6);
+  vor_shifted(9, 0xff, 7);
+  vor_shifted(7, 0xff, 15);
+}
+
+// With unique keys the helper's key is absent from the live lanes; with paired keys
+// (lane >> 1) its quad neighbour carries it. The helper's state is read back through
+// v_readlane once every lane has left the loop.
+GraphicsCase GraphicsWqmWaterfallHelper(bool shared_keys) {
+  using O = ShaderOpcode;
+  auto code = WqmWaterfallCode(shared_keys ? WaterfallKeys::Pairs : WaterfallKeys::Unique);
+  code.push_back(EncodeVop1(0x01, 10, 20)); // v10 = passes this lane ran
+  AppendVop3(&code, 0x360, 22, Vgpr(3), 74);
+  AppendVop3(&code, 0x360, 23, Vgpr(10), 74);
+  AppendVop3(&code, 0x360, 24, Vgpr(6), 74);
+  AppendVop3(&code, 0x360, 25, Vgpr(7), 74);
+  code.push_back(EncodeSop1(0x04, 126, 68));
+  // R: helper tag after the loop | live << 8 | wqm << 16.
+  AppendSAndLiteral(&code, 26, 22, 0xff);
+  AppendSAndLiteral(&code, 27, 68, 0xff);
+  AppendSOrShifted(&code, 26, 8);
+  AppendSAndLiteral(&code, 27, 70, 0xff);
+  AppendSOrShifted(&code, 26, 16);
+  // G: helper passes | pending << 8 | key taken << 9 | tag before the loop << 17.
+  AppendSAndLiteral(&code, 28, 23, 0xff);
+  AppendSAndLiteral(&code, 27, 24, 1);
+  AppendSOrShifted(&code, 28, 8);
+  AppendSAndLiteral(&code, 27, 25, 0xff);
+  AppendSOrShifted(&code, 28, 9);
+  AppendSAndLiteral(&code, 27, 19, 0x7f);
+  AppendSOrShifted(&code, 28, 17);
+  AppendWaterfallLanePacket(&code); // B
+  code.push_back(EncodeVop1(0x06, 12, 26));
+  code.push_back(EncodeVop1(0x06, 13, 28));
+  code.push_back(EncodeVop1(0x06, 14, Vgpr(14)));
+  AppendVMovLiteral(&code, 11, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(12, 13, 14, 11));
+  AppendEnd(&code);
+  auto test = GraphicsDsAppendHelperQuad();
+  test.name = shared_keys ? "GraphicsWqmWaterfallSharedKey" : "GraphicsWqmWaterfallUniqueKey";
+  test.gds_initial.clear();
+  test.expected_gds.clear();
+  test.fragment_code = std::move(code);
+  test.opcodes = {O::S_MOV_B64, O::S_WQM_B64, O::S_ANDN2_B64, O::S_FF1_I32_B64,
+                  O::V_MBCNT_LO_U32_B32, O::V_OR_B32, O::V_LSHRREV_B32, O::V_READLANE_B32,
+                  O::V_MOV_B32, O::S_MOV_B32, O::S_ADD_U32, O::S_CMP_GT_U32,
+                  O::S_CBRANCH_SCC1, O::V_CMPX_NE_U32, O::S_CBRANCH_EXECZ,
+                  O::V_READFIRSTLANE_B32, O::V_CMPX_EQ_U32, O::S_BRANCH, O::S_AND_B32,
+                  O::S_LSHL_B32, O::S_OR_B32, O::V_AND_B32, O::V_LSHLREV_B32,
+                  O::V_CVT_F32_U32, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
+enum class WaterfallHelper { Drained, Stuck, LateMatch, Unsound };
+
+// GCN semantics, independent of Kyty: once WQM puts the helper in EXEC, every lane of the
+// quad retires with its own key within K + 1 passes, K being the number of distinct keys.
+WaterfallHelper RunWqmWaterfallHelperCase(VulkanHarness *vulkan, bool shared_keys) {
+  const auto test = GraphicsWqmWaterfallHelper(shared_keys);
+  const auto actual = vulkan->RenderFragment(test, CompileFragmentCase(test));
+  const auto key = [&](u32 lane) { return 0xa0u | (shared_keys ? lane >> 1u : lane); };
+  u32 covered = 0, lanes = 0, r = 0, g = 0;
+  bool uniform = true, live_ok = true;
+  std::vector<std::array<u32, 4>> live;
+  for (u32 i = 0; i < 4; ++i) {
+    const auto *w = &actual.pixels[i * 4];
+    if (w[3] != 0x3f800000u) continue;
+    const auto pr = static_cast<u32>(std::bit_cast<float>(w[0]));
+    const auto pg = static_cast<u32>(std::bit_cast<float>(w[1]));
+    const auto pb = static_cast<u32>(std::bit_cast<float>(w[2]));
+    uniform = uniform && (covered == 0 || (pr == r && pg == g));
+    r = pr;
+    g = pg;
+    live.push_back({pb & 0x3fu, (pb >> 6u) & 1u, (pb >> 7u) & 0xffu, (pb >> 15u) & 0xffu});
+    std::printf("[graphics] %s pixel(%u,%u) lane=%u pending=%u pass=%u key=%s\n", test.name,
+                i % 2, i / 2, live.back()[0], live.back()[1], live.back()[2],
+                Hex(live.back()[3]).c_str());
+    lanes |= live.back()[0] < 8 ? 1u << live.back()[0] : 0x100u;
+    covered++;
+  }
+  const u32 tag = r & 0xffu, live_mask = (r >> 8u) & 0xffu, wqm = (r >> 16u) & 0xffu;
+  const u32 passes = g & 0xffu, pending = (g >> 8u) & 1u, taken = (g >> 9u) & 0xffu;
+  const u32 tag_before = (g >> 17u) & 0x7fu;
+  u32 quads = 0;
+  for (u32 q = 0; q < 8; q += 4) quads |= (live_mask >> q) & 0xfu ? 0xfu << q : 0u;
+  const u32 helpers = wqm & ~live_mask;
+  const u32 helper = helpers != 0 ? static_cast<u32>(std::countr_zero(helpers)) : 0xffu;
+  std::vector<u32> keys;
+  for (u32 lane = 0; lane < 8; ++lane) {
+    if ((wqm >> lane) & 1u && std::ranges::find(keys, key(lane)) == keys.end()) keys.push_back(key(lane));
+  }
+  const auto k = static_cast<u32>(keys.size());
+  for (const auto &lane: live) {
+    live_ok = live_ok && lane[1] == 0 && lane[3] == key(lane[0]) && lane[2] >= 1 && lane[2] <= k;
+  }
+  std::printf("[graphics] %s live=%s wqm=%s helper_lane=%u tag_before=%s tag_after=%s "
+              "helper_passes=%u helper_pending=%u helper_key=%s expected_key=%s K=%u\n",
+              test.name, Hex(live_mask).c_str(), Hex(wqm).c_str(), helper,
+              Hex(tag_before).c_str(), Hex(tag).c_str(), passes, pending, Hex(taken).c_str(),
+              Hex(key(helper)).c_str(), k);
+  const bool sound = covered == 3 && uniform && lanes == live_mask && std::popcount(live_mask) == 3 &&
+                     wqm == quads && std::popcount(helpers) == 1 && tag == (0x40u | helper) && live_ok;
+  auto verdict = WaterfallHelper::Unsound;
+  if (sound && pending == 0 && taken == key(helper) && passes <= k + 1) {
+    verdict = WaterfallHelper::Drained;
+  } else if (sound && pending == 1 && passes == 17) {
+    verdict = WaterfallHelper::Stuck;
+  } else if (sound && pending == 0 && taken == key(helper) && passes <= 16) {
+    verdict = WaterfallHelper::LateMatch;
+  }
+  static constexpr const char *names[] = {"drained", "stuck", "late-match", "unsound"};
+  std::printf("[graphics] %s verdict=%s\n", test.name, names[static_cast<u32>(verdict)]);
+  return verdict;
+}
+
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
 
@@ -50434,6 +50634,34 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--swizzle-helper-quad-only") == 0) {
     VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
     RunSwizzleHelperQuadCase(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wqm-helper-host-only") == 0) {
+    for (const bool shared : {true, false}) {
+      const auto test = GraphicsWqmWaterfallHelper(shared);
+      const auto fragment = CompileFragmentCase(test);
+      std::string text;
+      Require(test.name, "disassembly", spvtools::SpirvTools(SPV_ENV_VULKAN_1_2).Disassemble(fragment.spirv, &text), "failed to disassemble waterfall");
+      std::printf("[host] %s SPIR-V words=%zu\n%s\n", test.name, fragment.spirv.size(), text.c_str());
+    }
+    CheckWave64WholeWaveResults();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wqm-helper-waterfall-only") == 0) {
+    {
+      VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+      for (const bool shared : {true, false}) {
+        const auto name = shared ? "GraphicsWqmWaterfallSharedKey" : "GraphicsWqmWaterfallUniqueKey";
+        Require(name, "graphics", RunWqmWaterfallHelperCase(&vulkan, shared) == WaterfallHelper::Drained, "helper must retire with its own key within K + 1 passes");
+        std::printf("[case] %s PASS\n", name);
+      }
+    }
+    {
+      VulkanHarness vulkan(VulkanHarness::Mode::PortableCompute);
+      Require("Wave64CrossHalfLaneAndLds", "subgroup", vulkan.SubgroupSize() == 32, "this targeted run requires emulated wave64 halves on a 32-lane host");
+      RunCase(&vulkan, Wave64CrossHalfLaneAndLds());
+      std::printf("[case] Wave64CrossHalfLaneAndLds PASS\n");
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
