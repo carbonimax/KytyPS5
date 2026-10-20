@@ -1448,6 +1448,8 @@ void TestShaderFeatureCollection() {
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
+  program.info.images.push_back({.resource_class = ImageResourceClass::Sampled, .read = true});
+  program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 0});
   program.memory_info.push_back({.kind = ResourceKind::Lds});
   program.export_info.push_back({.vm = true});
 
@@ -1459,7 +1461,7 @@ void TestShaderFeatureCollection() {
                         Value(0u), Value(0u), Value(0u), Value(true)});
   auto &shared = block->AppendNewInst(ValueOpcode::LoadSharedU32,
                                       {Value(0u), Value(true)});
-  shared.SetFlags(MemoryFlags{.index = 0});
+  shared.SetFlags(MemoryFlags{.index = 1});
   auto &export_value =
       block->AppendNewInst(ValueOpcode::SetAttribute, {Value(0u), Value(true)});
   export_value.SetFlags(ExportFlags{.index = 0});
@@ -1485,7 +1487,7 @@ void TestShaderFeatureCollection() {
   ExpectFatal(
       [&] {
         program.stage = ShaderType::Pixel;
-        shared.SetFlags(MemoryFlags{.index = 1});
+        shared.SetFlags(MemoryFlags{.index = 2});
         program.shader_info_complete = false;
         CollectShaderInfo(program, {.pixel = &pixel_info});
       },
