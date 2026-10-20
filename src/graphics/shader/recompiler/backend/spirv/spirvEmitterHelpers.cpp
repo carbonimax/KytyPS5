@@ -210,6 +210,9 @@ bool UnlaunchedLaneReadsNeeded(const EmitterState& state) {
 	if (!UnlaunchedLaneReadsEnabled()) {
 		return false;
 	}
+	if (state.program.stage == ShaderType::Compute && state.lane_count == 2) {
+		return false;
+	}
 	// A compute workgroup whose size is a multiple of the host subgroup it runs in launches every
 	// lane of every subgroup, so no lane needs redirecting.
 	if (state.program.stage != ShaderType::Compute || state.input_info.compute == nullptr) {
