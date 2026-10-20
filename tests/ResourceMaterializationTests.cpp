@@ -1312,6 +1312,93 @@ void TestImageMinimumLodSpecialization() {
   };
   Check(materialize(e24, shader) && shader.images[0].sample_min_lod == 1024u && shader.images[0].view_min_level == 0u,
         "E24 implicit pixel sample did not keep MIN_LOD 4.0 as its MinLod operand");
+  // Integral minimum LOD with a negative anisotropic sampler bias.
+  const std::array<uint32_t, 24> biased_image = {
+      0x71b12c00u, 0xcb610000u, 0x03ffc3ffu, 0x909c03acu, 0x00000000u, 0x000000c0u, 0x00000000u, 0x00000000u,
+      0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,
+      0x00007800u, 0x00fff000u, 0x0af03fccu, 0x00000000u};
+  const auto materialize_biased_image = [&](const std::array<uint32_t, 24> &input, ResourceSpecialization &specialization, ShaderType stage = ShaderType::Pixel, bool implicit = true, bool emulate = true, bool dynamic = false, bool mixed = false) {
+    auto current = make_program(mixed);
+    current.shader_hash = 0xcb9ba1c87080e9d9ull;
+    current.stage = stage;
+    const auto captured = current.info.images[0];
+    current.info.images[0] = current.info.images[1];
+    current.info.images.resize(7, current.info.images[1]);
+    current.info.images[6] = captured;
+    current.info.images[6].first_use_pc = 0xaf4u;
+    current.info.images[6].implicit_only = implicit;
+    current.info.images[6].mip_mode = dynamic ? ImageMipMode::Dynamic : ImageMipMode::None;
+    current.info.sampled_pairs = {{6, 0, 0xaf4u}};
+    if (mixed) current.info.sampled_pairs.push_back({6, 1, 0xaf4u});
+    const auto current_plan = ExtractResourcePlan(current);
+    ResourceSnapshot current_snapshot;
+    const bool ok = MaterializeResources(current_plan, {.user_data = input}, current_snapshot, specialization, emulate);
+    if (ok) {
+      Check(std::equal(input.begin(), input.begin() + 8, current_snapshot.images[6].dwords.begin()) &&
+                std::equal(input.begin() + 16, input.begin() + 20, current_snapshot.samplers[0].dwords.begin()),
+            "biased_image minimum LOD changed the captured image or sampler descriptor");
+      ApplyResourceSpecialization(current, specialization);
+      Check(current.info.images[6].view_min_level == specialization.images[6].view_min_level &&
+                current.info.images[6].sample_min_lod == specialization.images[6].sample_min_lod &&
+                current.info.samplers[0].snapshot_index == 0u && current.info.sampled_pairs[0].image == 6u,
+            "biased_image view shift or sampler identity did not reach native IR");
+    }
+    return ok;
+  };
+  Check(materialize_biased_image(biased_image, shader) && shader.images[6].view_min_level == 1u && shader.images[6].sample_min_lod == 0u && shader.images[6].mip_count == 1u,
+        "captured biased anisotropic biased_image sampler did not select the exact level-1 view");
+  const auto shifted_biased_image = shader;
+  Check(materialize_biased_image(biased_image, native, ShaderType::Pixel, true, false) && native.images[6].view_min_level == 0u && native.images[6].sample_min_lod == 0u && native != shifted_biased_image,
+        "native image minimum LOD inherited the emulated shifted view");
+  Check(materialize_biased_image(biased_image, shader, ShaderType::Pixel, true, true, true) && shader.images[6].mip_count == 13u && shader.images[6].view_min_level == 0u && shader.images[6].sample_min_lod == 0u,
+        "biased_image dynamic per-mip path acquired a second minimum LOD emulation");
+  const auto biased_image_refused = [&](const std::array<uint32_t, 24> &input, const char *message, ShaderType stage = ShaderType::Pixel, bool implicit = true) {
+    ResourceSpecialization rejected;
+    Check(!materialize_biased_image(input, rejected, stage, implicit), message);
+  };
+  biased_image_refused(biased_image, "biased biased_image sampler admitted for an explicit or mixed image use", ShaderType::Pixel, false);
+  biased_image_refused(biased_image, "biased biased_image sampler admitted in a vertex shader", ShaderType::Vertex);
+  biased_image_refused(biased_image, "biased biased_image sampler admitted in a compute shader", ShaderType::Compute);
+  auto biased_image_words = biased_image;
+  biased_image_words[18] |= 1u << 14u;
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with a secondary bias");
+  biased_image_words = biased_image;
+  biased_image_words[18] = (biased_image_words[18] & ~0x3fffu) | 513u;
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted beyond the guaranteed native bias range");
+  biased_image_words = biased_image;
+  biased_image_words[1] = (biased_image_words[1] & ~0xfff00u) | (384u << 8u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with a fractional minimum LOD");
+  biased_image_words = biased_image;
+  biased_image_words[1] &= ~(1u << 30u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with a width that does not halve exactly");
+  biased_image_words = biased_image;
+  biased_image_words[2] = (biased_image_words[2] & ~(0x3fffu << 14u)) | (4094u << 14u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with a height that does not halve exactly");
+  biased_image_words = biased_image;
+  biased_image_words[17] = (3071u << 12u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with MAX_LOD below the original last level");
+  biased_image_words = biased_image;
+  biased_image_words[17] |= 1u;
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with a nonzero sampler minimum");
+  biased_image_words = biased_image;
+  biased_image_words[16] |= 1u << 15u;
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with unnormalized coordinates");
+  biased_image_words = biased_image;
+  biased_image_words[18] = (biased_image_words[18] & ~(3u << 20u)) | (2u << 20u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with unequal mag/min filters");
+  biased_image_words = biased_image;
+  biased_image_words[18] |= 1u << 26u;
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted with an unsupported mip filter");
+  biased_image_words = biased_image;
+  biased_image_words[18] &= ~(3u << 26u);
+  biased_image_refused(biased_image_words, "biased biased_image sampler admitted without mipmapping");
+  biased_image_words = biased_image;
+  std::copy_n(biased_image.begin() + 16, 4, biased_image_words.begin() + 20);
+  biased_image_words[22] &= ~(3u << 26u);
+  Check(!materialize_biased_image(biased_image_words, shader, ShaderType::Pixel, true, true, false, true),
+        "biased biased_image image admitted an unmipmapped companion sampler");
+  Check(materialize_biased_image(biased_image, shader) && shader == shifted_biased_image,
+        "captured biased_image view specialization did not survive rematerialization after refusals");
   const auto refused = [&](const std::array<uint32_t, 24> &words, const char *message, ShaderType stage = ShaderType::Pixel, bool implicit = true) {
     ResourceSpecialization specialization;
     Check(!materialize(words, specialization, stage, implicit), message);
@@ -1321,7 +1408,8 @@ void TestImageMinimumLodSpecialization() {
   refused(e24, "E24 sampler admitted in a compute shader", ShaderType::Compute);
   auto words = e24;
   words[18] |= 0x100u;
-  refused(words, "E24 sampler admitted with a LOD bias");
+  Check(materialize(words, shader) && shader.images[0].view_min_level == 4u && shader.images[0].sample_min_lod == 0u,
+        "E24 biased implicit pixel sample did not shift its view to level 4");
   words = e24;
   words[18] |= 1u << 14u;
   refused(words, "E24 sampler admitted with a secondary LOD bias");
