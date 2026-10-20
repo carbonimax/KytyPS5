@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -34,11 +35,14 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Waits for submitted work through tick, including Metal completion on MoltenVK.
+	void                      WaitRetired(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -82,9 +86,17 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	struct SubmittedFence {
+		uint64_t  tick = 0;
+		vk::Fence fence = nullptr;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void QueueOperation(std::queue<PendingOperation>& queue, Common::UniqueFunction<void>&& operation);
+	void PopReady(std::queue<PendingOperation>& queue, uint64_t retired_tick);
+	vk::Fence AcquireFence();
+	uint64_t RetireFences(uint64_t wait_tick);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -94,6 +106,7 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
+	std::queue<PendingOperation> m_pending_releases;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
@@ -101,6 +114,11 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	const bool                   m_release_waits_for_fence;
+	std::mutex                   m_fence_mutex;
+	std::deque<SubmittedFence>    m_submitted_fences;
+	std::vector<vk::Fence>        m_free_fences;
+	uint64_t                     m_retired_tick = 0;
 };
 
 } // namespace Libs::Graphics

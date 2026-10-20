@@ -723,6 +723,15 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-only)
+	add_test(NAME command_scheduler_runtime
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scheduler-runtime-only)
+	add_test(NAME submission_release
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --submission-release-only)
+	add_test(NAME buffer_cache_device_address_retire
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-retire-only)
+	set_tests_properties(buffer_cache_device_address_retire PROPERTIES
+		ENVIRONMENT "MTL_DEBUG_LAYER=1;MTL_DEBUG_LAYER_ERROR_MODE=assert"
+		PASS_REGULAR_EXPRESSION "BufferCacheDeviceAddressRetire +ok")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane

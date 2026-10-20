@@ -97,10 +97,15 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }),
+      m_release_waits_for_fence(graphics.release_waits_for_submission_fence) {}
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	RetireFences(UINT64_MAX);
+	for (const auto fence: m_free_fences) {
+		m_graphics.device.destroyFence(fence, nullptr);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -127,6 +132,9 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	if (m_release_waits_for_fence) {
+		RetireFences(UINT64_MAX);
+	}
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -136,8 +144,8 @@ void CommandScheduler::Shutdown() {
 	}
 	{
 		std::lock_guard lock(m_operation_mutex);
-		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
-		        m_priority_active);
+		EXIT_IF(!m_pending_operations.empty() || !m_pending_releases.empty() ||
+		        !m_priority_operations.empty() || m_priority_active);
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
@@ -208,18 +216,32 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
+void CommandScheduler::WaitRetired(uint64_t tick) {
+	m_master.Wait(tick);
+	if (m_release_waits_for_fence) {
+		EXIT_IF(RetireFences(tick) < tick);
+	}
+}
+
 void CommandScheduler::PopPendingOperations() {
 	m_master.Refresh();
+	PopReady(m_pending_operations, UINT64_MAX);
+	if (m_release_waits_for_fence) {
+		PopReady(m_pending_releases, RetireFences(0));
+	}
+}
+
+void CommandScheduler::PopReady(std::queue<PendingOperation>& queue, uint64_t retired_tick) {
 	for (;;) {
 		PendingOperation operation;
 		{
 			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			if (queue.empty() || !m_master.IsFree(queue.front().tick) ||
+			    queue.front().tick > retired_tick) {
 				return;
 			}
-			operation = std::move(m_pending_operations.front());
-			m_pending_operations.pop();
+			operation = std::move(queue.front());
+			queue.pop();
 		}
 		WaitPriorityOperations(operation.tick);
 		RunOperation(std::move(operation.callback));
@@ -227,19 +249,23 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), false);
+	QueueOperation(m_pending_operations, std::move(operation));
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(m_release_waits_for_fence ? m_pending_releases : m_pending_operations, std::move(operation));
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
+	QueueOperation(m_priority_operations, std::move(operation));
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::QueueOperation(std::queue<PendingOperation>& queue, Common::UniqueFunction<void>&& operation) {
+	const bool priority = &queue == &m_priority_operations;
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
 		queue.push({std::move(operation), CurrentTick()});
 		lock.unlock();
 		if (priority) {
@@ -314,6 +340,41 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	g_deferred_callback_scheduler = previous;
 }
 
+// Record completion in submission order before resetting or recycling each fence.
+uint64_t CommandScheduler::RetireFences(uint64_t wait_tick) {
+	std::lock_guard lock(m_fence_mutex);
+	while (!m_submitted_fences.empty()) {
+		auto&      front = m_submitted_fences.front();
+		const auto result =
+		    front.tick <= wait_tick
+		        ? m_graphics.device.waitForFences(1, &front.fence, VK_TRUE, UINT64_MAX)
+		        : m_graphics.device.getFenceStatus(front.fence);
+		if (result == vk::Result::eNotReady) {
+			break;
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+		m_retired_tick = front.tick;
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &front.fence) != vk::Result::eSuccess);
+		m_free_fences.push_back(front.fence);
+		m_submitted_fences.pop_front();
+	}
+	return m_retired_tick;
+}
+
+vk::Fence CommandScheduler::AcquireFence() {
+	RetireFences(0);
+	std::lock_guard lock(m_fence_mutex);
+	if (!m_free_fences.empty()) {
+		const auto fence = m_free_fences.back();
+		m_free_fences.pop_back();
+		return fence;
+	}
+	vk::FenceCreateInfo create {};
+	vk::Fence           fence = nullptr;
+	EXIT_NOT_IMPLEMENTED(m_graphics.device.createFence(&create, nullptr, &fence) != vk::Result::eSuccess);
+	return fence;
+}
+
 bool CommandScheduler::IsFree(uint64_t tick) {
 	if (m_master.IsFree(tick)) {
 		return true;
@@ -351,6 +412,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	vk::Result result;
 	uint64_t   tick;
+	const auto fence = m_release_waits_for_fence ? AcquireFence() : vk::Fence{};
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
@@ -372,7 +434,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = graphics.queue.submit(1, &submit_info, fence);
+		if (fence != nullptr && result == vk::Result::eSuccess) {
+			std::lock_guard fences(m_fence_mutex);
+			m_submitted_fences.push_back({tick, fence});
+		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 

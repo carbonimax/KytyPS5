@@ -44,7 +44,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	write(temporary->Mapped().data(), 0);
 	temporary->Flush(0, size);
 	auto* buffer = temporary.get();
-	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	scheduler.DeferRelease([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
 }
 
@@ -155,10 +155,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] {
 			if (m_graphics.device_address_destruction_waits_for_queue) {
-				// Every command buffer submitted so far may reference this device-address buffer.
+				// Every submitted command buffer may reference this address until Metal completes.
 				// ponytail: drains the queue per deletion batch; a per-buffer retire tick would
 				// need the driver to stop referencing buffers the work does not use.
-				m_scheduler.GetMasterSemaphore().Wait(m_scheduler.CurrentTick() - 1);
+				m_scheduler.WaitRetired(m_scheduler.CurrentTick() - 1);
 			}
 			m_slot_buffers.erase(id);
 		});
@@ -197,7 +197,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	} else {
 		m_download_buffer.Commit();
 	}
-	const auto& download = temporary ? *temporary : m_download_buffer;
+	auto& download = temporary ? *temporary : m_download_buffer;
 	for (auto& copy: copies) {
 		copy.dstOffset += offset;
 	}
@@ -229,9 +229,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
-	                copies = std::move(copies), owner = std::move(temporary)] {
-		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+	if (temporary) {
+		m_scheduler.DeferRelease([owner = std::move(temporary)]() mutable { owner.reset(); });
+	}
+	auto publish = [mapped, offset, total_size, buffer_address, download = &download, copies = std::move(copies)] {
+		download->Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
@@ -690,6 +692,7 @@ void BufferCache::RunGarbageCollector() {
 	// Publish all queued downloads before releasing their tracked pages and owners.
 	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(completion_tick);
+	m_scheduler.WaitRetired(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
