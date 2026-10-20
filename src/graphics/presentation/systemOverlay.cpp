@@ -1867,6 +1867,9 @@ struct SystemOverlay::Impl {
 		command.beginRendering(rendering);
 		{
 			Common::LockGuard queue_lock(graphics.queue_mutex);
+#if defined(__APPLE__)
+			RequireVulkanSuccess(graphics.queue.waitIdle(), "retire overlay buffers");
+#endif
 			ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(),
 			                                static_cast<VkCommandBuffer>(command));
 		}
