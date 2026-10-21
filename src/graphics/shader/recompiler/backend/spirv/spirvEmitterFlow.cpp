@@ -843,7 +843,7 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	uint32_t   result   = shuffled;
 	if (!flags.fetch_inactive) {
 		uint32_t source_exec = ctx.Shuffle(inst, 3, launched);
-		if (UnlaunchedLaneReadsEnabled()) {
+		if (UnlaunchedLaneReadsNeeded(state)) {
 			// A lane the host did not launch is active if the guest switched it on, which only
 			// the scalar EXEC copy records.
 			const auto in_high = state.builder.AllocateId();

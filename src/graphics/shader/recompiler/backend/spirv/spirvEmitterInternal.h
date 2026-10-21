@@ -324,6 +324,9 @@ uint32_t EmitGuestBallot(EmitterState& state, uint32_t ballot);
 // Port of BryKytyPS5 067e8826. KYTY_PS_UNLAUNCHED_LANES=0 restores the raw shuffle.
 uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane);
 bool     UnlaunchedLaneReadsEnabled();
+// False when the program cannot have unlaunched lanes (a compute workgroup that fills whole host
+// subgroups), so lane reads stay plain shuffles.
+bool     UnlaunchedLaneReadsNeeded(const EmitterState& state);
 // Graphics stages cannot require a 32-lane subgroup where the driver only takes a required size
 // for compute (amdvlk: requiredSubgroupSizeStages 0x20), so a wave32 shader may run in a 64-lane
 // subgroup. Packing runs it as two guest waves per host subgroup (lane ids, ballots and shuffles
