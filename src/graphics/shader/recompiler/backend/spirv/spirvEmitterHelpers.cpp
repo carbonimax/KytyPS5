@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -205,8 +206,25 @@ bool PackedVertexWave32Enabled() {
 	return enabled;
 }
 
-uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
+bool UnlaunchedLaneReadsNeeded(const EmitterState& state) {
 	if (!UnlaunchedLaneReadsEnabled()) {
+		return false;
+	}
+	// A compute workgroup whose size is a multiple of the host subgroup it runs in launches every
+	// lane of every subgroup, so no lane needs redirecting.
+	if (state.program.stage != ShaderType::Compute || state.input_info.compute == nullptr) {
+		return true;
+	}
+	const auto& compute = *state.input_info.compute;
+	const auto  threads = std::max(compute.threads_num[0], 1u) *
+	                     std::max(compute.threads_num[1], 1u) *
+	                     std::max(compute.threads_num[2], 1u);
+	const auto  lanes   = state.packed_wave32 ? 64u : state.program.wave_size;
+	return lanes == 0u || threads % lanes != 0u;
+}
+
+uint32_t EmitLaunchedLaneAtOrBelow(EmitterState& state, uint32_t lane) {
+	if (!UnlaunchedLaneReadsNeeded(state)) {
 		return lane;
 	}
 	const auto host_ballot = state.builder.AllocateId();
