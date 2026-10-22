@@ -80,6 +80,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// stores one sample per color fragment, matching the depth target such games bind. The extra
 	// coverage samples are dropped.
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
+	// Upstream approximates the 4-coverage/2-fragment case with 2x MSAA; the fork accepts every
+	// EQAA layout the same way (one host sample per color fragment). Warn once either way.
+	const bool approximate_eqaa = rt.attrib.num_samples > rt.attrib.num_fragments;
+	if (approximate_eqaa) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(
+			    "Warning: approximating EQAA with one host sample per color fragment.\n");
+		}
+	}
 	if (samples == 0 || rt.attrib.num_fragments > rt.attrib.num_samples) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);

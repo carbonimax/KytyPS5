@@ -208,7 +208,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 } // namespace
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword, bool maintenance8_enabled,
+                                  uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info, ShaderHostFeatures host_features) {
 	using namespace Emitter;
 
@@ -224,7 +224,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	}
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
-	EmitterState state(program, input_info, maintenance8_enabled);
+	EmitterState state(program, input_info, profile);
 	state.resource_min_lod = host_features.resource_min_lod;
 	if (!host_features.buffer_int64_atomics && program.info.buffer_int64_atomics) {
 		Fail(program,
@@ -262,8 +262,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
-	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
-	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
+	ValidateNativeProgram(program,
+	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);

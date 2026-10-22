@@ -919,6 +919,13 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+bool IsVirtualAddressKnown(uint64_t vaddr) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+
+	VirtualRanges::Range range {};
+	return g_virtual_ranges->Query(vaddr, 0, &range);
+}
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
