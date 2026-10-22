@@ -285,6 +285,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		bool                                       skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -326,7 +327,7 @@ struct PipelineCache::ProgramCache {
 			     result.program.info.subgroup_local_invocation_id ? 1 : 0);
 		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
-		                         options.maintenance8_enabled)) {
+		                         options.profile->maintenance8)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -381,6 +382,7 @@ struct PipelineCache::ProgramCache {
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
+			if (cached.skip_dispatch) return {};
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
@@ -417,7 +419,7 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
-		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.profile     = &profile;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
@@ -443,6 +445,14 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		if (source.unsupported_call_pc != UINT32_MAX) {
+			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
+			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
+			                 params.hash, source.unsupported_call_pc);
+			programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan{}, nullptr)
+			    .first->second.skip_dispatch = true;
+			return {};
+		}
 		auto* current = entry == programs.end() ? &source : entry->second.call_source.get();
 		ShaderRecompiler::TranslateResult translated;
 		if (current != nullptr) {
@@ -494,7 +504,14 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(GraphicContext& graphics): graphics(graphics), device(graphics.device) {
+	explicit ProgramCache(GraphicContext& graphics)
+	    : graphics(graphics),
+	      device(graphics.device),
+	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	      profile {.maintenance8 = graphics.maintenance8_enabled,
+		           .native_float_min_max =
+		               graphics.physical_device_properties.vendorID == 0x1002u} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -510,6 +527,7 @@ struct PipelineCache::ProgramCache {
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	vk::Device                                                  device;
+	const ShaderRecompiler::Spirv::Profile                      profile;
 	uint64_t                                                    next_shader_id = 0;
 };
 
@@ -821,10 +839,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	vertex_info[0].pixel_input = mesh_active && pixel_active ? &pixel_info : nullptr;
-	if (context.GetClipControl().clip_disable) {
+	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
+	const auto& clip_control = context.GetClipControl();
+	if (clip_control.clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
 		const auto& limits   = m_graphics.GetPhysicalDeviceProperties().limits;
-		auto&       clip     = vertex_info[tess_active ? 2u : 0u].clip_space;
+		auto&       clip     = last_stage.clip_space;
 		clip.scale[0]        = viewport.xscale;
 		clip.scale[1]        = viewport.yscale;
 		clip.offset[0]       = viewport.xoffset;
@@ -834,9 +854,33 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		clip.half_extent[1] =
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
+	} else if (clip_control.user_clip_planes != 0) {
+		// CLIP_DISABLE also disables user planes. How they combine with shader clip and cull
+		// distances is unverified; draw push constants only reach VS/mesh and PS, and the
+		// generated RECTLIST stages do not forward clip distances.
+		// Draws whose plane setup is not emulated are drawn unclipped (extra geometry may show)
+		// instead of aborting, as before user planes were emulated.
+		const bool unsupported = (last_stage.pa_cl_vs_out_cntl & 0xffffu) != 0 || tess_active ||
+		                         Prospero::IsRectList(user_config.GetPrimType()) ||
+		                         clip_control.user_clip_plane_mode != 0 ||
+		                         clip_control.user_clip_plane_negate_y ||
+		                         clip_control.user_clip_plane_cull_only;
+		if (!unsupported) {
+			last_stage.user_clip_planes = clip_control.user_clip_planes;
+		} else {
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Warning: user clip planes not emulated for this draw; drawing unclipped "
+				     "(UCP_ENA=0x%02x mode=%u negate_y=%d cull_only=%d tess=%d)\n",
+				     static_cast<unsigned>(clip_control.user_clip_planes),
+				     static_cast<unsigned>(clip_control.user_clip_plane_mode),
+				     clip_control.user_clip_plane_negate_y ? 1 : 0,
+				     clip_control.user_clip_plane_cull_only ? 1 : 0, tess_active ? 1 : 0);
+			}
+		}
 	}
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
-	    mesh_active, object_primitive_id);
+	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
@@ -1037,6 +1081,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
+	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;

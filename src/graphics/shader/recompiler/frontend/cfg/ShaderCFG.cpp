@@ -469,8 +469,10 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
 		return false;
 	}
+	// Code-table loads are not translated, so a selector that is also the load destination
+	// keeps its scaled index at the branch.
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
@@ -1651,6 +1653,32 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
+	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
+		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
+		})) {
+		// Linked leaf bodies follow the caller in native PC order. Visit them in
+		// execution order so returning to the caller does not manufacture goto loops.
+		std::vector<bool> visited(graph.blocks.size(), false);
+		std::vector<std::pair<uint32_t, bool>> pending {{graph.entry_block, false}};
+		std::vector<BasicBlock> ordered;
+		ordered.reserve(graph.blocks.size());
+		while (!pending.empty()) {
+			const auto [id, finished] = pending.back();
+			pending.pop_back();
+			if (finished) {
+				ordered.push_back(std::move(graph.blocks[id]));
+				continue;
+			}
+			if (visited[id]) continue;
+			visited[id] = true;
+			pending.emplace_back(id, true);
+			for (const auto successor: graph.blocks[id].successors)
+				pending.emplace_back(successor, false);
+		}
+		std::ranges::reverse(ordered);
+		ApplyBlockOrder(graph, std::move(ordered));
+	}
+
 	RecomputeAnalyses(graph);
 
 	if (indirect_setpc) {
@@ -1682,10 +1710,16 @@ Graph Structurize(const Graph& graph) {
 }
 
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
-	uint32_t destination = UINT32_MAX;
-	// Scalar ALU pair widths are not all decoded. The typed producer must confirm this word.
-	return InstructionWritesScalarCode(inst, code) ||
-	       (ScalarOperandCode(inst.dst, destination) && code == destination + 1u);
+	// Vector comparisons and carry results can write a scalar pair in wave64.
+	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
+	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
+	    inst.family == Decoder::Family::VOP3P) {
+		uint32_t destination = 0;
+		for (const auto* operand: {&inst.dst, &inst.dst2})
+			if (ScalarOperandCode(*operand, destination) && code >= destination && code <= destination + 1u)
+				return true;
+	}
+	return InstructionWritesScalarCode(inst, code);
 }
 
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,

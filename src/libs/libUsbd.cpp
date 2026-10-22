@@ -33,6 +33,19 @@ static int KYTY_SYSV_ABI UsbdHandleEventsTimeout() {
 	return OK;
 }
 
+static int64_t KYTY_SYSV_ABI UsbdGetDeviceList(void*** list) {
+	PRINT_NAME();
+
+	static void* empty_list[] = {nullptr};
+	*list                     = empty_list;
+
+	return 0;
+}
+
+static void KYTY_SYSV_ABI UsbdFreeDeviceList(void** /*list*/, int /*unref_devices*/) {
+	PRINT_NAME();
+}
+
 } // namespace Usbd
 
 LIB_DEFINE(InitUsbd_1) {

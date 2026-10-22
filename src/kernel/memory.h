@@ -138,6 +138,8 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but returns 0 instead of exiting when vaddr is not mapped.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
+// True when vaddr lies in a guest virtual range, committed or only reserved (sparse PRT hole).
+[[nodiscard]] bool IsVirtualAddressKnown(uint64_t vaddr);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

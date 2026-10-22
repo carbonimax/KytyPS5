@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -203,6 +204,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
 			     Config::GetGpuIndex());
 		}
+	} else if (vk::PhysicalDevice headset; Vr::OpenXrPhysicalDevice(instance, headset)) {
+		devices = {headset}; // The headset runtime renders on this GPU.
 	}
 
 	vk::PhysicalDevice  best_device       = nullptr;
@@ -377,6 +380,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		check_feature(device_features2.features.independentBlend, "independentBlend");
 		check_feature(device_features2.features.tessellationShader, "tessellationShader");
+		check_feature(device_features2.features.drawIndirectFirstInstance,
+		              "drawIndirectFirstInstance");
+		check_feature(device_features2.features.multiDrawIndirect, "multiDrawIndirect");
 
 		if (!skip_device) {
 			EXIT_NOT_IMPLEMENTED(available_extensions.empty());
@@ -559,6 +565,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (conditional_rendering_extension) {
+		conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &conditional_rendering;
+	}
 	const bool barycentric_extension =
 	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_barycentric {};
@@ -649,6 +662,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.attachment_feedback_loop_enabled && feedback_dynamic_extension &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState == VK_TRUE;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s (dynamic state: %s)\n",
@@ -679,6 +694,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
+	device_features.drawIndirectFirstInstance            = VK_TRUE;
+	device_features.multiDrawIndirect                    = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
@@ -757,6 +774,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &conditional_rendering;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -966,8 +987,11 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
+	Vr::OpenXrInit();
+
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
+	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1146,7 +1170,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
@@ -1158,6 +1183,7 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 			}
 		}
+		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1175,6 +1201,7 @@ void WindowContext::CreateVulkan() {
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
 	presenter = std::make_unique<Presenter>(*this);
+	Vr::OpenXrStartSession(graphic_ctx);
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {
@@ -1197,6 +1224,7 @@ void WindowContext::RecreateSurface() {
 }
 
 WindowContext::~WindowContext() {
+	Vr::OpenXrShutdown();
 	ShutdownSystemOverlayInput();
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
