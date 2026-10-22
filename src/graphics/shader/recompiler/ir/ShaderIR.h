@@ -642,8 +642,12 @@ struct CompiledShaderInfo {
 
 struct UniformFillPlan {
 	UniformFill          fill;
-	std::array<Value, 4> values;
+	// Values the store can write. An analyzed fill lists every candidate (value_count) and is
+	// uniform only when all evaluate equal; a recognized pattern lists one value per word.
+	std::array<Value, 8> values;
+	uint32_t             value_count = 0;
 	Value                pattern_size;
+	// Runtime element bound guarding the store, empty when the dispatch extent bounds it.
 	Value                element_count;
 };
 

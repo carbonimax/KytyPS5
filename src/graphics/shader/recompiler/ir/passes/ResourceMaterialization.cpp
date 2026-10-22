@@ -13,6 +13,7 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -1321,6 +1322,88 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	    });
 }
 
+// Largest value an unsigned selector can take, when the expression bounds it.
+static std::optional<uint32_t> SelectorUpperBound(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32 ? std::optional(value.U32()) : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 16) return {};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::BitwiseAnd32: {
+			const auto left  = SelectorUpperBound(inst->Arg(0), depth + 1);
+			const auto right = SelectorUpperBound(inst->Arg(1), depth + 1);
+			if (left && right) return std::min(*left, *right);
+			return left ? left : right;
+		}
+		case ValueOpcode::ReadFirstLane: return SelectorUpperBound(inst->Arg(0), depth + 1);
+		case ValueOpcode::SelectU32: {
+			const auto left  = SelectorUpperBound(inst->Arg(1), depth + 1);
+			const auto right = SelectorUpperBound(inst->Arg(2), depth + 1);
+			if (!left || !right) return {};
+			return std::max(*left, *right);
+		}
+		default: return {};
+	}
+}
+
+// Collects a superset of the values a store can write. Selects are followed on both sides except
+// equality tests against constants their selector cannot reach (dynamic register indexing), and
+// Phis contribute every incoming value. Fails when the set outgrows the plan capacity.
+static bool CollectStoredValues(Value value, std::unordered_set<const Inst*>& visited,
+                                std::vector<Value>& leaves, uint32_t depth = 0) {
+	value = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (depth > 64) return false;
+	if (inst != nullptr && (inst->GetOpcode() == ValueOpcode::SelectU32 ||
+	                        inst->GetOpcode() == ValueOpcode::Phi)) {
+		if (!visited.insert(inst).second) return true;
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			for (size_t i = 0; i < inst->NumArgs(); ++i) {
+				if (!CollectStoredValues(inst->Arg(i), visited, leaves, depth + 1)) return false;
+			}
+			return true;
+		}
+		const auto* test = inst->Arg(0).Resolve().TryInstruction();
+		if (test != nullptr && test->GetOpcode() == ValueOpcode::IEqual32) {
+			for (uint32_t side = 0; side < 2; ++side) {
+				const auto constant = test->Arg(side).Resolve();
+				const auto bound    = SelectorUpperBound(test->Arg(1 - side));
+				if (constant.IsImmediate() && bound && constant.U32() > *bound) {
+					return CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
+				}
+			}
+		}
+		return CollectStoredValues(inst->Arg(1), visited, leaves, depth + 1) &&
+		       CollectStoredValues(inst->Arg(2), visited, leaves, depth + 1);
+	}
+	if (std::ranges::find(leaves, value) == leaves.end()) leaves.push_back(value);
+	return leaves.size() <= std::tuple_size_v<decltype(UniformFillPlan::values)>;
+}
+
+// True when the branch condition is "some lane has guard set", so the not-taken side is a skip
+// over a region in which no lane is active.
+static bool IsAnyLaneCondition(Value condition, Value& guard) {
+	condition        = condition.Resolve();
+	const auto* inst = condition.TryInstruction();
+	if (inst == nullptr) return false;
+	if (inst->GetOpcode() == ValueOpcode::ConditionRef &&
+	    inst->Flags<CFG::BranchCondition>() == CFG::BranchCondition::ExecNonZero) {
+		guard = inst->Arg(0).Resolve();
+		return true;
+	}
+	if (inst->GetOpcode() != ValueOpcode::LogicalNot) return false;
+	const auto* ref = inst->Arg(0).Resolve().TryInstruction();
+	if (ref == nullptr || ref->GetOpcode() != ValueOpcode::ConditionRef ||
+	    ref->Flags<CFG::BranchCondition>() != CFG::BranchCondition::ExecZero)
+		return false;
+	const auto* negated = ref->Arg(0).Resolve().TryInstruction();
+	if (negated == nullptr || negated->GetOpcode() != ValueOpcode::LogicalNot) return false;
+	guard = negated->Arg(0).Resolve();
+	return true;
+}
+
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty()) {
@@ -1329,11 +1412,16 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	std::unordered_set<const Block*> visited;
 	const auto*                      block = program.blocks.front();
 	const Inst*                      store = nullptr;
+	// Guards of wave-level skips, taken only when no lane has the guard set; the store must use
+	// the same guard.
+	std::vector<Value> skip_guards;
 	for (;;) {
 		if (block == nullptr || !visited.insert(block).second) return {};
 		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
+			// Condition references only keep branch conditions alive.
+			if (inst.GetOpcode() == ValueOpcode::Reference) continue;
 			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
 			                         inst.GetOpcode() != ValueOpcode::ImageWrite))
 				return {};
@@ -1341,7 +1429,24 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		}
 		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
-		if (term.kind != CFG::TerminatorKind::Branch) return {};
+		if (term.kind == CFG::TerminatorKind::Branch) {
+			block = term.true_block;
+			continue;
+		}
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch) return {};
+		// A loop latch: its body was walked already and holds no store (a store repeated in a
+		// loop would write the same address with values of the same collected set).
+		if (term.true_block != nullptr && visited.contains(term.true_block) &&
+		    term.false_block != nullptr && !visited.contains(term.false_block)) {
+			block = term.false_block;
+			continue;
+		}
+		// A forward skip to the merge block, taken when no lane would store.
+		Value guard;
+		if (store != nullptr || term.false_block == nullptr ||
+		    term.false_block != term.merge_block || !IsAnyLaneCondition(block->condition, guard))
+			return {};
+		skip_guards.push_back(guard);
 		block = term.true_block;
 	}
 	if (store == nullptr || visited.size() != program.blocks.size()) return {};
@@ -1378,6 +1483,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.kind  = UniformFillKind::Image;
 		result.fill.words = 1;
 		data = values->Arg(0);
+		if (!skip_guards.empty()) return {};
 	} else {
 		if (!program.info.images.empty()) return {};
 		const auto           op = store->GetOpcode();
@@ -1388,7 +1494,26 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		    store->Arg(3).Resolve() != Value(0u))
 			return {};
 		guard = store->Arg(5).Resolve();
-		if (!IsFullDispatchPredicate(guard)) return {};
+		if (!IsFullDispatchPredicate(guard)) {
+			// The store is bounded by its own element index: index < count, a runtime value.
+			const auto* compare = guard.TryInstruction();
+			if (compare == nullptr) return {};
+			Value index;
+			Value count;
+			if (compare->GetOpcode() == ValueOpcode::ULessThan32) {
+				index = compare->Arg(0).Resolve();
+				count = compare->Arg(1).Resolve();
+			} else if (compare->GetOpcode() == ValueOpcode::UGreaterThan32) {
+				index = compare->Arg(1).Resolve();
+				count = compare->Arg(0).Resolve();
+			} else {
+				return {};
+			}
+			if (index != store->Arg(1).Resolve() || count.GetType() != Type::U32 ||
+			    !ValidateRuntimeValue(program, count, RuntimeValueType::Integer))
+				return {};
+			result.element_count = count;
+		}
 		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
@@ -1400,6 +1525,9 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.words = memory.data_dwords;
 		data = store->Arg(4);
 	}
+	for (const auto& skip: skip_guards) {
+		if (skip != guard) return {};
+	}
 	data = ResolveActiveU32(data, guard);
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
@@ -1408,12 +1536,17 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (result.fill.words > 1 &&
 	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
 		return {};
+	std::unordered_set<const Inst*> visited_values;
+	std::vector<Value>              leaves;
 	for (uint32_t i = 0; i < result.fill.words; ++i) {
 		const auto word = ResolveActiveU32(result.fill.words == 1 ? data : vector->Arg(i), guard);
+		if (word.IsEmpty() || !CollectStoredValues(word, visited_values, leaves)) return {};
+	}
+	for (const auto& word: leaves) {
 		if (word.GetType() != Type::U32 ||
 		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
 			return {};
-		result.values[i] = word;
+		result.values[result.value_count++] = word;
 	}
 	return result;
 }
@@ -1683,14 +1816,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
+	std::array<uint32_t, std::tuple_size_v<decltype(fill.values)>> stored {};
 	bool uniform_fill = words != 0;
 	if (uniform_fill && !fill.pattern_size.IsEmpty())
 		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
 	uint32_t elements = 0;
 	if (uniform_fill && !fill.element_count.IsEmpty())
 		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
+	// An analyzed fill lists every value the store can write; a recognized pattern one per word.
+	const uint32_t count = fill.value_count != 0 ? fill.value_count : words;
+	for (uint32_t i = 0; i < count && uniform_fill; ++i) {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {

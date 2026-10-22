@@ -5175,6 +5175,131 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+// A pattern fill selecting its dword from four user-data registers through a readfirstlane
+// waterfall (dynamic register indexing), bounded by a runtime element count and skipped by
+// waves without active lanes.
+void TestComputeBufferPatternFill() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Valid, SkipMismatch, Unbounded, Unreachable };
+  const auto Run = [](Variant variant, std::array<uint32_t, 4> pattern, bool expected) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *prepare = fixture.AddBlock();
+    auto *header = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *tail = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    std::array<Value, 4> words{fixture.UserData(4), fixture.UserData(5),
+                               fixture.UserData(6), fixture.UserData(7)};
+    const auto count = fixture.UserData(8);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(6u)}), local});
+    const auto guard = fixture.Emit(ValueOpcode::UGreaterThan32, {count, index});
+    const auto skip_guard = variant == Variant::SkipMismatch
+        ? fixture.Emit(ValueOpcode::INotEqual32, {local, Value(7u)}) : guard;
+    entry->condition = fixture.Emit(
+        ValueOpcode::LogicalNot,
+        {fixture.Emit(ValueOpcode::ConditionRef,
+                      {fixture.Emit(ValueOpcode::LogicalNot, {skip_guard})},
+                      CFG::BranchCondition::ExecZero)});
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = prepare, .false_block = exit, .merge_block = exit};
+    const auto lane = variant == Variant::Unreachable
+        ? fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(7u), index}, 0, prepare)
+        : fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(3u), index}, 0, prepare);
+    const auto selector =
+        fixture.Emit(ValueOpcode::SelectU32, {guard, lane, Value(0u)}, 0, prepare);
+    prepare->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = header};
+    auto &active = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    auto &previous = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    header->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = latch,
+                          .merge_block = tail, .continue_block = latch, .loop_header = true};
+    const auto first =
+        fixture.Emit(ValueOpcode::ReadFirstLane, {selector, Value(&active)}, 0, latch);
+    const auto match = fixture.Emit(
+        ValueOpcode::LogicalAnd,
+        {Value(&active), fixture.Emit(ValueOpcode::IEqual32, {first, selector}, 0, latch)}, 0,
+        latch);
+    const auto key = fixture.Emit(ValueOpcode::BitwiseAnd32, {first, Value(0xffu)}, 0, latch);
+    Value chosen = words[0];
+    for (uint32_t i = 1; i < 4; ++i) {
+      chosen = fixture.Emit(
+          ValueOpcode::SelectU32,
+          {fixture.Emit(ValueOpcode::IEqual32, {key, Value(i)}, 0, latch), words[i], chosen}, 0,
+          latch);
+    }
+    // Registers past the four pattern words, reachable only with a wider selector.
+    chosen = fixture.Emit(
+        ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::IEqual32, {key, Value(4u)}, 0, latch), index, chosen}, 0,
+        latch);
+    const auto value =
+        fixture.Emit(ValueOpcode::SelectU32, {match, chosen, Value(&previous)}, 0, latch);
+    const auto remaining = fixture.Emit(
+        ValueOpcode::LogicalAnd,
+        {Value(&active), fixture.Emit(ValueOpcode::LogicalNot, {match}, 0, latch)}, 0, latch);
+    active.AddPhiOperand(prepare, guard);
+    active.AddPhiOperand(latch, remaining);
+    previous.AddPhiOperand(prepare, Value(0u));
+    previous.AddPhiOperand(latch, value);
+    latch->condition = fixture.Emit(
+        ValueOpcode::ConditionRef, {remaining}, CFG::BranchCondition::ExecNonZero, latch);
+    latch->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = header, .false_block = tail};
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    const auto flags = fixture.AddMemory(store, 16);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {buffer, index, Value(0u), Value(0u), value,
+                  variant == Variant::Unbounded ? Value(true) : guard},
+                 flags, tail);
+    tail->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = exit};
+    exit->terminator = {.kind = CFG::TerminatorKind::Return};
+    entry->AddBranch(prepare);
+    entry->AddBranch(exit);
+    prepare->AddBranch(header);
+    header->AddBranch(latch);
+    latch->AddBranch(header);
+    latch->AddBranch(tail);
+    tail->AddBranch(exit);
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 9> userdata{0x200000u, 4u << 16, 0x4000u, 0x14204u,
+                                     pattern[0], pattern[1], pattern[2], pattern[3], 0x3f00u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+          "pattern fill fixture did not materialize");
+    Check((snapshot.uniform_fill.words != 0) == expected,
+          "pattern fill proof accepted an unsafe store or missed a uniform pattern");
+    if (expected) {
+      Check(snapshot.uniform_fill.words == 1 && snapshot.uniform_fill.group_stride[0] == 64 &&
+                snapshot.uniform_fill.value == pattern[0] &&
+                snapshot.uniform_fill.bounded_elements == 0x3f00u,
+            "pattern fill proof lost its value or element bound");
+    }
+  };
+  // The waterfall's initial value is a stored candidate, so only zero patterns are uniform.
+  Run(Variant::Valid, {0u, 0u, 0u, 0u}, true);
+  Run(Variant::Valid, {5u, 5u, 5u, 5u}, false);
+  Run(Variant::Valid, {0u, 0u, 1u, 0u}, false);
+  Run(Variant::SkipMismatch, {0u, 0u, 0u, 0u}, false);
+  Run(Variant::Unbounded, {0u, 0u, 0u, 0u}, false);
+  Run(Variant::Unreachable, {0u, 0u, 0u, 0u}, false);
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -8902,6 +9027,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("compute buffer pattern fill", TestComputeBufferPatternFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

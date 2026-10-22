@@ -115,8 +115,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
 	const auto elements = descriptor.NumRecords();
+	// Invocations whose element index reaches the bound do not store.
 	const bool covered = fill.bounded_elements != 0
-	                         ? fill.bounded_elements == elements && invocations >= elements
+	                         ? std::min<uint64_t>(invocations, fill.bounded_elements) == elements
 	                         : invocations == elements;
 	if (!covered || invocations > uint64_t {UINT32_MAX} + 1 || size == 0 || size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&

@@ -15501,6 +15501,11 @@ void TestPatternFill() {
       auto translated = ShaderRecompiler::TranslateProgram(code, options);
       return ExtractResourcePlan(translated.program);
     };
+    // Output of the pattern recognizer alone; the generic uniform-fill analysis may still prove a
+    // modified shader when every value it can store is equal.
+    const auto Recognized = [&](std::span<const uint32_t> code) {
+      return ShaderRecompiler::TranslateProgram(code, options).program.uniform_fill.fill.kind;
+    };
     auto plan = Build(shader);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
@@ -15544,10 +15549,10 @@ void TestPatternFill() {
     Materialize(true);
     std::vector<uint32_t> changed(shader.begin(), shader.end());
     changed.push_back(0xdeadcafeu); // Non-executable metadata does not change identity.
-    Check(Build(changed).uniform_fill.fill.kind == UniformFillKind::Buffer,
+    Check(Recognized(changed) == UniformFillKind::Buffer,
           "pattern recognition included bytes after S_ENDPGM");
     changed[literal_word] ^= 0x00800000u;
-    Check(Build(changed).uniform_fill.fill.kind == UniformFillKind::None,
+    Check(Recognized(changed) == UniformFillKind::None,
           "pattern recognition accepted modified executable instructions");
     for (const uint32_t invalid_input : {0u, 1u, 2u, 3u}) {
       // Both wave sizes are covered above for this executable.
@@ -15558,7 +15563,7 @@ void TestPatternFill() {
       if (invalid_input == 1) options.wave_size = wave_size == 64 ? 32 : 64;
       if (invalid_input == 2) compute.dispatch_thread_dimensions = bounded;
       if (invalid_input == 3) compute.float_mode ^= 1u;
-      Check(Build(shader).uniform_fill.fill.kind == UniformFillKind::None,
+      Check(Recognized(shader) == UniformFillKind::None,
             "pattern recognition accepted different shader launch inputs");
       compute = saved_compute;
       options.wave_size = saved_wave;
