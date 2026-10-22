@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -29,6 +31,23 @@
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
+
+// KYTY_PRESENT_DOWNSCALE=0 disables the mip chain used to shrink frames larger than the window.
+static bool PresentDownscaleEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PRESENT_DOWNSCALE");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+static uint32_t PresentMipLevels(vk::Extent2D extent) {
+	uint32_t levels = 1;
+	while ((std::max(extent.width, extent.height) >> levels) != 0) {
+		levels++;
+	}
+	return levels;
+}
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -184,7 +203,12 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = {extent.width, extent.height, 1};
-	create.mipLevels     = 1;
+	// A mip chain lets the presentation shrink frames larger than the window by 2:1 box steps
+	// instead of one bilinear blit that skips source texels (shimmering fine detail).
+	create.mipLevels =
+	    PresentDownscaleEnabled() && (features & vk::FormatFeatureFlagBits::eBlitDst)
+	        ? PresentMipLevels(extent)
+	        : 1;
 	create.arrayLayers   = 1;
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
@@ -271,6 +295,7 @@ public:
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
+	uint32_t DownscaleSource(vk::CommandBuffer command, Presenter::Frame& source);
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
 	uint64_t Submit(CommandScheduler& scheduler);
@@ -766,6 +791,69 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	command.endRendering();
 }
 
+// Builds the source mip levels down to the smallest one still covering the window with 2:1
+// linear blits (2x2 box filter) and returns it. The frame is in transfer-source layout on entry
+// and every level is left in that layout.
+uint32_t Swapchain::DownscaleSource(vk::CommandBuffer command, Presenter::Frame& source) {
+	auto& image = source.image;
+	if (image.mip_levels <= 1) {
+		return 0;
+	}
+	uint32_t level = 0;
+	while (level + 1 < image.mip_levels &&
+	       (image.extent.width >> (level + 1)) >= m_extent.width &&
+	       (image.extent.height >> (level + 1)) >= m_extent.height) {
+		level++;
+	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+		std::printf("Present: downscale %ux%u -> %ux%u from mip %u\n", image.extent.width,
+		            image.extent.height, m_extent.width, m_extent.height, level);
+	}
+	const auto barrier = [&](uint32_t base, uint32_t count, vk::ImageLayout from,
+	                         vk::ImageLayout to, vk::AccessFlags2 src_access,
+	                         vk::AccessFlags2 dst_access) {
+		vk::ImageMemoryBarrier2 b {};
+		b.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		b.srcAccessMask       = src_access;
+		b.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		b.dstAccessMask       = dst_access;
+		b.oldLayout           = from;
+		b.newLayout           = to;
+		b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		b.image               = image.image;
+		b.subresourceRange    = {vk::ImageAspectFlagBits::eColor, base, count, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &b;
+		command.pipelineBarrier2(dependency);
+	};
+	for (uint32_t i = 1; i <= level; i++) {
+		barrier(i, 1, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+		        vk::AccessFlagBits2::eNone, vk::AccessFlagBits2::eTransferWrite);
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, i - 1, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, i, 0, 1};
+		blit.srcOffsets[1]  = vk::Offset3D {static_cast<int>(std::max(1u, image.extent.width >> (i - 1))),
+		                                   static_cast<int>(std::max(1u, image.extent.height >> (i - 1))), 1};
+		blit.dstOffsets[1]  = vk::Offset3D {static_cast<int>(std::max(1u, image.extent.width >> i)),
+		                                   static_cast<int>(std::max(1u, image.extent.height >> i)), 1};
+		command.blitImage(image.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+		barrier(i, 1, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
+		        vk::AccessFlagBits2::eTransferWrite, vk::AccessFlagBits2::eTransferRead);
+	}
+	if (level + 1 < image.mip_levels) {
+		// Unused levels join the frame's uniform layout.
+		barrier(level + 1, image.mip_levels - level - 1, vk::ImageLayout::eUndefined,
+		        vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eNone,
+		        vk::AccessFlagBits2::eTransferRead);
+	}
+	image.state.access_mask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
+	return level;
+}
+
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
@@ -800,13 +888,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
 	if (source != nullptr) {
-		vk::ImageBlit region {};
+		const uint32_t level = DownscaleSource(vk_command, *source);
+		vk::ImageBlit  region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-		region.srcSubresource.mipLevel       = 0;
+		region.srcSubresource.mipLevel       = level;
 		region.srcSubresource.baseArrayLayer = 0;
 		region.srcSubresource.layerCount     = 1;
-		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
-		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
+		region.srcOffsets[1].x = static_cast<int>(std::max(1u, source->image.extent.width >> level));
+		region.srcOffsets[1].y = static_cast<int>(std::max(1u, source->image.extent.height >> level));
 		region.srcOffsets[1].z               = 1;
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.dstSubresource.mipLevel       = 0;
