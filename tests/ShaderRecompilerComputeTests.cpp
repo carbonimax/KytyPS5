@@ -1,6 +1,7 @@
 #define SPV_ENABLE_UTILITY_CODE
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -404,14 +405,14 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
-  static void DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
-    executor.DrawIndex(0, command, args);
+    return executor.DrawIndex(0, command, args);
   }
 
-  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+  static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    executor.DrawAuto(0, command, args);
+    return executor.DrawAuto(0, command, args);
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -10769,6 +10770,32 @@ public:
                   ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
                       std::vector<u32>{0x5a5a5a5a},
               "clearing one volume slice changed untouched slice contents");
+      // A GPU writer clears slice 9's metadata; its bind selects the clear on the GPU.
+      auto [writer, writer_offset] = resources.GetBufferCache().ObtainBuffer(
+          dcc_address + 9 * metadata_slice_size, metadata_slice_size, true);
+      writer->Fill(writer_offset, metadata_slice_size, 0);
+      Common::DebugCounters::SetEnabled(true);
+      const auto readbacks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
+      const auto checks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetColorView(0, {.base_array_slice_index = 9, .last_array_slice_index = 9});
+      RenderColorInfo gpu_slice{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), gpu_slice, 0);
+      Common::DebugCounters::SetEnabled(false);
+      Require(name, "GPU-written volume metadata clears on the GPU",
+              gpu_slice.image_id == color.image_id &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataChecks) == checks + 1 &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 9}) ==
+                      std::vector<u32>{0} &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "a volume slice's GPU-written metadata was read back or cleared other slices");
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;
       storage_desc.info.metadata = {};
@@ -13083,10 +13110,47 @@ public:
         Require(name, "already GPU-owned metadata stays ordered",
                 resources.GetBufferCache().HasGpuDirtyBytes(dcc_address, metadata_size),
                 "a fill discarded pending native writes to its metadata pages");
+        Common::DebugCounters::SetEnabled(true);
+        const auto readbacks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
         bind();
         Require(name, "same-value raw native re-clear",
                 read_texel() == expected,
                 "a repeated metadata fill did not clear an already drawn target");
+        const auto checks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+        bind();
+        Require(name, "checked metadata skips rebinding",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataChecks) == checks,
+                "rebinding unwritten GPU-checked metadata repeated its clear check");
+        check_expanded_metadata();
+        paint();
+        fill_metadata(metadata_words - 1, true);
+        bind();
+        Require(name, "partial raw native metadata fill", retains_painted_texel(),
+                "a nonuniform GPU-written metadata slice cleared the whole target");
+        fill_metadata(metadata_words, true);
+        bind();
+        Require(name, "complete raw native fill after partial fill", read_texel() == expected,
+                "completing a GPU-written metadata fill did not restore its clear");
+        if (layout == Prospero::ChannelLayout::k16_16_16_16 && !fill_case.cmask &&
+            !fill_case.reuse_unorm) {
+          auto video = color.desc;
+          video.type = BindingType::VideoOut;
+          paint();
+          fill_metadata(metadata_words, true);
+          const bool cleared =
+              texture_cache.FindImage(video) == color.image_id && read_texel() == expected;
+          std::vector<uint32_t> keys(metadata_words);
+          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
+          Require(name, "video-out clear keeps its metadata keys",
+                  cleared &&
+                      LibKernel::Memory::TryReadBacking(dcc_address, keys.data(), metadata_size) &&
+                      std::ranges::all_of(keys,
+                                          [&](uint32_t word) { return word == fill_case.fill; }),
+                  "a video-out bind skipped its clear or expanded the flip's metadata keys");
+        }
         paint();
         WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
         fill_metadata(metadata_words - 1);
@@ -13095,15 +13159,15 @@ public:
                 retains_painted_texel(),
                 "a nonuniform metadata allocation cleared the whole target");
         fill_metadata(metadata_words);
-        if (fill_case.goat) {
-          Require(name, "repeated Goat fill stays CPU-owned",
-                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
-                  "re-clearing expanded metadata required another GPU readback");
-        }
         bind();
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+        Common::DebugCounters::SetEnabled(false);
+        Require(name, "GPU-written metadata stays on the GPU",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks,
+                "binding GPU-written color metadata read it back");
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
@@ -19412,6 +19476,97 @@ public:
         }
       }
 
+      // Indirect records come from the GPU copy; the CPU backing holds zeros. In each pair the
+      // first record draws nothing and the second covers the target, through vertex offset 7
+      // for embedded fetches.
+      {
+        constexpr uint64_t vertices_address = depth_address + 0x38000;
+        constexpr uint64_t args_address = vertices_address + 0x100;
+        std::array<float, 40> positions{};
+        constexpr std::array<float, 12> triangle{-1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1};
+        std::ranges::copy(triangle, positions.begin() + 28);
+        std::memcpy(reinterpret_cast<void *>(vertices_address), positions.data(),
+                    sizeof(positions));
+        constexpr uint32_t stride = 32;
+        const vk::DrawIndexedIndirectCommand indexed_records[]{
+            {3, 1, 0, 0, 5}, {3, 1, 0, 7, 5}, {0, 1, 0, 0, 0}, {3, 1, 0, 0, 0}};
+        const vk::DrawIndirectCommand auto_records[]{{3, 1, 0, 5}, {3, 1, 7, 5}, {0, 1, 0, 0},
+                                                     {3, 1, 0, 0}};
+        for (u32 i = 0; i < 4; i++) {
+          std::memcpy(reinterpret_cast<void *>(args_address + i * stride), &indexed_records[i],
+                      sizeof(indexed_records[i]));
+          std::memcpy(reinterpret_cast<void *>(args_address + (4 + i) * stride), &auto_records[i],
+                      sizeof(auto_records[i]));
+        }
+        // Larger than a caching page, so the arguments are cached instead of streamed.
+        (void)context.GetBufferCache().ObtainBuffer(
+            vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
+        const std::array<u32, 8 * stride / 4> zeros{};
+        Require("GpuIndirectDraw", "CPU backing",
+                LibKernel::Memory::TryWriteBacking(args_address, zeros.data(), sizeof(zeros)),
+                "the CPU copy of the arguments could not be cleared");
+        static const auto fetch_vertex = [] {
+          std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                                EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                                EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                                EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12)};
+          code.insert(code.end(), std::ranges::find(native_vertex, EncodeExp0(0x20, 0xf)),
+                      native_vertex.end());
+          return code;
+        }();
+        static std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+            fetch_offsets;
+        fetch_offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        static ShaderUserData fetch_user_data{
+            .direct_resource_offset = fetch_offsets.data(),
+            .direct_resource_count = static_cast<uint16_t>(fetch_offsets.size())};
+        static ShaderSemantic semantic{.hardware_mapping = 9, .size_in_elements = 4};
+        static const uint32_t vertex_buffer[]{
+            static_cast<u32>(vertices_address),
+            static_cast<u32>(vertices_address >> 32u) | (16u << 16u), 10,
+            DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 12u)};
+        static const uint32_t attribute =
+            static_cast<u32>(Prospero::VertexAttribFormat::k32_32_32_32Float) << 5u;
+        const auto fetch_vs = reinterpret_cast<uint64_t>(fetch_vertex.data());
+        ShaderMapUserData(fetch_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &fetch_user_data,
+             .input_semantics = &semantic, .num_input_semantics = 1,
+             .code_size_bytes = static_cast<uint32_t>(fetch_vertex.size() * sizeof(u32))});
+        const uint64_t tables[]{reinterpret_cast<uint64_t>(vertex_buffer),
+                                reinterpret_cast<uint64_t>(&attribute)};
+        shaders.SetGsShaderResource2({.user_sgpr = 4});
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)),
+                                HW::UserSgprType::Unknown);
+        }
+        const auto check = [&](const char *step, uint64_t vertex_shader, bool indexed, u32 first) {
+          shaders.SetEsShaderBase(vertex_shader);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const DrawIndirectArgs records{args_address + first * stride, 2, stride};
+          const bool drawn = indexed
+              ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                    {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                     .index_type_and_size = 1, .indirect = records})
+              : RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                   {.indirect = records});
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            Require("GpuIndirectDraw", step,
+                    drawn && pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the draw did not take every record, offsets included, from the GPU");
+          }
+        };
+        check("indexed embedded fetch", fetch_vs, true, 0);
+        check("auto embedded fetch", fetch_vs, false, 4);
+        check("indexed native fetch", vertex_address, true, 2);
+        check("auto native fetch", vertex_address, false, 6);
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -21831,6 +21986,7 @@ private:
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
+  bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -21870,6 +22026,7 @@ private:
     // Only the full mode requires and enables minLod, together with maintenance8.
     m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
     m_runtime_context.shader_resource_min_lod_enabled = m_resource_min_lod_enabled;
+    m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_enabled;
     if (m_mode == Mode::MinLodFallback) {
       m_runtime_context.sample_rate_shading_enabled = true;
       m_runtime_context.subgroup_size = SubgroupSize();
@@ -22049,13 +22206,18 @@ private:
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
-    available_barycentric.pNext = &available_robustness2;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional_rendering{};
+    available_conditional_rendering.pNext = &available_robustness2;
+    available_barycentric.pNext = &available_conditional_rendering;
     available_features2.pNext = &available_barycentric;
     m_physical_device.getFeatures2(&available_features2);
     uint32_t extension_count = 0;
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
     std::vector<vk::ExtensionProperties> extensions(extension_count);
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, extensions.data()), "vkEnumerateDeviceExtensionProperties");
+    m_conditional_rendering_enabled = full && available_conditional_rendering.conditionalRendering && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
+      return std::strcmp(extension.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
+    });
     m_barycentric_supported = portable_graphics && available_barycentric.fragmentShaderBarycentric && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
     });
@@ -22125,6 +22287,8 @@ private:
     }
     m_rasterization_supported = full && available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
+                                available_features.drawIndirectFirstInstance &&
+                                available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
@@ -22210,11 +22374,18 @@ private:
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
     robustness2.pNext = &maintenance8;
+    // Conditional rendering is optional in production (graphics.conditional_rendering_enabled):
+    // the full mode enables it only where the device reports it.
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+    conditional_rendering.conditionalRendering = true;
+    conditional_rendering.pNext = &robustness2;
     device_info.pNext = portable_compute
                             ? static_cast<const void *>(&device_features12)
                             : !full
                                   ? static_cast<const void *>(&device_features13)
-                                  : static_cast<const void *>(&robustness2);
+                                  : m_conditional_rendering_enabled
+                                        ? static_cast<const void *>(&conditional_rendering)
+                                        : static_cast<const void *>(&robustness2);
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = full;
     device_features.shaderImageGatherExtended = full;
@@ -22228,6 +22399,8 @@ private:
     device_features.shaderFloat64 = full && available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
+    device_features.drawIndirectFirstInstance = m_rasterization_supported;
+    device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
@@ -22239,6 +22412,9 @@ private:
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (m_conditional_rendering_enabled) {
+      device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    }
     if (!full) {
       device_extensions.clear();
       if (portable_graphics || min_lod_fallback) {

@@ -662,10 +662,11 @@ bool RenderExecutor::ConsumeMetadataColorOperation(CommandBuffer& buffer,
 	       mode == static_cast<uint8_t>(CbColorMode::DccDecompress);
 }
 
+// vertex_offset is the first vertex of non-indexed draws.
 struct DrawEmitInfo {
-	int32_t  vertex_offset = 0;
-	uint32_t first_vertex  = 0;
-	uint32_t first_instance = 0;
+	int32_t          vertex_offset  = 0;
+	uint32_t         first_instance = 0;
+	DrawIndirectArgs indirect;
 };
 
 struct DrawIndexBufferSource {
@@ -1199,8 +1200,8 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      emit.first_instance);
 			} else {
-				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
-				               emit.first_instance);
+				vk_buffer.draw(draw.index_count, draw.instance_count,
+				               static_cast<uint32_t>(emit.vertex_offset), emit.first_instance);
 			}
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
@@ -1210,7 +1211,8 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 					vk_buffer.drawIndexed(4, draw.instance_count, i, emit.vertex_offset,
 					                      emit.first_instance);
 				} else {
-					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
+					vk_buffer.draw(4, draw.instance_count,
+					               i + static_cast<uint32_t>(emit.vertex_offset),
 					               emit.first_instance);
 				}
 			}
@@ -1231,7 +1233,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().maintenance8_enabled ||
 	                     !Prospero::IsRectList(ucfg.GetPrimType()) ||
 	                     draw.IsIndexed() || draw.index_count != 3 || draw.instance_count != 1 ||
-	                     emit.first_vertex != 0 || emit.first_instance != 0 ||
+	                     emit.vertex_offset != 0 || emit.first_instance != 0 ||
 	                     state.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
 	                     color.desc.info.samples != 1 ||
 	                     depth.desc.info.extent.width != color.Extent().width ||
@@ -1358,6 +1360,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	std::pair<Buffer*, uint64_t> args_buffer {};
+	uint64_t                     args_size = 0;
+	if (emit.indirect.address != 0) {
+		args_size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+		            (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+		                              : sizeof(vk::DrawIndirectCommand));
+		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
+		EXIT_IF((args_buffer.second & 3u) != 0);
+	}
 	// Without the dynamic loop state the loop is a pipeline property: find out before the pipeline.
 	bool depth_feedback = false;
 	if (state.depth_info.image_id && !m_context.GetGraphics().attachment_feedback_loop_dynamic &&
@@ -1380,7 +1391,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Aliased targets without an exact shared attachment draw one pass each, in slot order.
 	const bool passes = state.aliased_passes != 0;
 	if (passes) {
-		std::array<GuestRange, ShaderVertexInputInfo::RES_MAX + 1> fixed_reads {};
+		std::array<GuestRange, ShaderVertexInputInfo::RES_MAX + 2> fixed_reads {};
 		uint32_t                                                   fixed_count = 0;
 		const auto& vertex_input = state.vertex_info[0];
 		for (int i = 0; !mesh_active && i < vertex_input.buffers_num; i++) {
@@ -1390,6 +1401,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// The mesh shader fetches the guest indices by address even when 8-bit ones were expanded.
 		if (draw.IsIndexed() && (index_source.host_data == nullptr || mesh_active)) {
 			fixed_reads[fixed_count++] = {index_source.address, index_source.size};
+		}
+		// Every pass reads the indirect draw records again.
+		if (args_size != 0) {
+			fixed_reads[fixed_count++] = {emit.indirect.address, args_size};
 		}
 		const auto reason =
 		    CheckAliasedColorPasses({state.color_info, state.color_count}, state.depth_info, stages,
@@ -1449,7 +1464,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (mesh_active) {
 				draw_data = {
 				    draw.index_count,
-				    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
+				    static_cast<uint32_t>(emit.vertex_offset),
 				    emit.first_instance, index_source.guest_element_size,
 				    static_cast<uint32_t>(index_source.address),
 				    static_cast<uint32_t>(index_source.address >> 32u)};
@@ -1493,8 +1508,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-		} else {
+		} else if (args_buffer.first == nullptr) {
 			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		} else if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                              emit.indirect.count, emit.indirect.stride);
+		} else {
+			vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
+			                       emit.indirect.count, emit.indirect.stride);
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
@@ -1513,7 +1534,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
+// Vulkan offsets for a prepared draw, or nullopt when its indirect records need CPU counts, as
+// mesh and quad-list draws do. Indirect records carry their own offsets.
+static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
+                                                   const ShaderVertexInputInfo& vs,
+                                                   DrawOffsetSource             source,
+                                                   int32_t                      first_vertex,
+                                                   uint32_t                     first_instance,
+                                                   const DrawIndirectArgs&      indirect) {
+	if (indirect.address != 0) {
+		if (vs.stage.program->stage == ShaderType::Mesh ||
+		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+			return std::nullopt;
+		}
+		return DrawEmitInfo {.indirect = indirect};
+	}
+	if (source == DrawOffsetSource::IndirectArgs) {
+		// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
+		return vs.fetch_embedded ? DrawEmitInfo {first_vertex, first_instance} : DrawEmitInfo {};
+	}
+	const auto [vertex_offset, instance_offset] = ResolveDrawOffsets(ucfg.GetIndexOffset(), vs);
+	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
+}
+
+bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1528,19 +1572,19 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
-		return;
+	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1566,7 +1610,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
-		return;
+		return true;
 	}
 
 	DrawIndexBufferSource index_source {};
@@ -1605,30 +1649,23 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
-
-	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
-	const auto [vertex_offset, instance_offset] =
-	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
-
-	DrawEmitInfo emit {};
-	// Native fetches consume the patched SGPRs; rewritten fetches need Vulkan offsets.
-	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
-	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
-	emit.first_instance = native_indirect ? 0 : instance_offset;
-
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart);
+	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+	                                  args.base_vertex, args.first_instance, args.indirect);
+	if (emit) {
+		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, *emit, index_source,
+		                    primitive_restart);
+	}
 	ResetBindings();
+	return emit.has_value();
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1642,19 +1679,19 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
-		return;
+	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
+		return true;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return;
+		return true;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1680,12 +1717,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
@@ -1699,24 +1736,18 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
 		}
 		ResetBindings();
-		return;
+		return true;
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
-
-	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
-	const auto [vertex_offset, instance_offset] =
-	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
-	DrawEmitInfo emit {};
-	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
-	emit.first_vertex = native_indirect ? 0 :
-	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = native_indirect ? 0 : instance_offset;
-
-	DrawIndexBufferSource index_source {};
-	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
+	                                  args.indirect);
+	if (emit) {
+		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, *emit, {}, false);
+	}
 	ResetBindings();
+	return emit.has_value();
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

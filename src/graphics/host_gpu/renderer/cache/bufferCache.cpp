@@ -182,6 +182,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    ForgetColorMetadataChecks(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
@@ -539,6 +540,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -641,6 +643,29 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	}
 	const auto& [address, id] = *std::prev(candidate);
 	return address + m_slot_buffers[id].Size() > vaddr;
+}
+
+void BufferCache::MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0) {
+			m_checked_color_metadata[slot].Add(vaddr, size);
+		}
+	}
+}
+
+bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0 && !m_checked_color_metadata[slot].Contains(vaddr, size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	for (auto& checked: m_checked_color_metadata) {
+		checked.Subtract(vaddr, size);
+	}
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
