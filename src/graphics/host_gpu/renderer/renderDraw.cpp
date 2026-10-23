@@ -39,6 +39,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -461,6 +462,14 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+static bool KeepDepthAttachmentLayout() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_LAYOUT_KEEP");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -575,6 +584,18 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		auto layout = depth_attachment_layout(depth);
+		// KYTY_DEPTH_LAYOUT_KEEP=0 disables. Consecutive draws toggle depth or stencil writes, and
+		// each toggle changed the attachment layout: a barrier and a rendering restart. A draw that
+		// does not sample the target keeps its current attachment layout when that layout lets the
+		// attachment write every aspect this draw writes.
+		if (!sampled_aspects && KeepDepthAttachmentLayout() &&
+		    image.backing.subresource_states.empty()) {
+			const auto current  = DepthAttachmentWritableAspects(image.backing.state.layout);
+			const auto required = DepthAttachmentWritableAspects(layout);
+			if (current && required && (*required & ~*current) == vk::ImageAspectFlags {}) {
+				layout = image.backing.state.layout;
+			}
+		}
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {
 			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
 			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT

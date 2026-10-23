@@ -118,6 +118,13 @@ public:
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Buffer-cache upload batches: the trailing barrier of an upload is deferred. Every Handle()
+	// use first records it, so nothing else is ever recorded between an upload and its barrier;
+	// HandleForUpload() is for the next upload of the same batch only.
+	[[nodiscard]] vk::CommandBuffer HandleForUpload() const;
+	[[nodiscard]] bool UploadPostPending() const noexcept { return m_upload_post_pending; }
+	void               DeferUploadPost() const noexcept { m_upload_post_pending = true; }
+	void               FlushUploadPost() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -147,6 +154,7 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	mutable bool        m_upload_post_pending = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

@@ -14,6 +14,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -104,6 +106,28 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 	}
 }
 
+// KYTY_RO_DEPTH_ELIDE=0 disables. In a read-only depth/stencil layout nothing writes the image:
+// depth targets sampled by the draw that also tests against them toggled their access between
+// attachment-only and attachment+shader-read every draw, and each toggle recorded a barrier and
+// restarted rendering. Without writes since the layout was entered, such accesses need no barrier;
+// the state keeps the union of stages and accesses for the next real transition.
+bool ElideReadOnlyDepthBarrier(const VulkanImageState& state, vk::ImageLayout destination_layout,
+                               vk::AccessFlags2 write_access) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RO_DEPTH_ELIDE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled || state.layout != destination_layout || (state.access_mask & write_access)) {
+		return false;
+	}
+	switch (destination_layout) {
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal: return true;
+		default: return false;
+	}
+}
+
 } // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
@@ -157,6 +181,12 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
+				if (ElideReadOnlyDepthBarrier(subresource_state, destination_layout, write_access)) {
+					subresource_state = {subresource_state.pl_stage | destination_stage,
+					                     subresource_state.access_mask | destination_access,
+					                     destination_layout};
+					continue;
+				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -190,6 +220,11 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
 		if (state.layout == destination_layout && state.access_mask == destination_access &&
 		    !repeated_write) {
+			return {};
+		}
+		if (ElideReadOnlyDepthBarrier(state, destination_layout, write_access)) {
+			state = {state.pl_stage | destination_stage, state.access_mask | destination_access,
+			         destination_layout};
 			return {};
 		}
 

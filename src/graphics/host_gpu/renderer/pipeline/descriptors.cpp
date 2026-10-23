@@ -731,6 +731,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
+	BufferCache::UploadBatch upload_batch(cache);
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
