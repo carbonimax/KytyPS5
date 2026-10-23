@@ -140,8 +140,19 @@ private:
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void BeginUploadBatch() noexcept;
 	void EndUploadBatch();
+	// `may_defer`: a read-only synchronization, whose bytes may be copied later (see
+	// BeginDeferredUploads).
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-	                                      uint64_t total_size);
+	                                      uint64_t total_size, bool may_defer = false);
+	// KYTY_PROTECT_COALESCE (default 1, 0 disables; GPU thread, SynchronizeBda): between Begin
+	// and End, the upload re-protections of all synchronized buffers are applied together in
+	// merged runs (PageManager::BeginDeferredProtect), and the guest bytes of those uploads are
+	// copied into the (coherent) staging memory only after them: at End, or before any
+	// submission. Begin returns false (nothing deferred) when the switch is off or staging is
+	// not coherent.
+	[[nodiscard]] bool BeginDeferredUploads();
+	void               FlushDeferredUploads();
+	void               EndDeferredUploads();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -169,6 +180,13 @@ private:
 	};
 	uint32_t                m_upload_batch_depth = 0;
 	std::vector<BatchRange> m_batch_ranges; // destinations copied since the batch's leading barrier
+	struct DeferredCopy {
+		uint64_t address;
+		uint8_t* destination;
+		uint64_t size;
+	};
+	bool                                              m_deferring_uploads = false;
+	std::vector<DeferredCopy>                         m_deferred_copies;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;

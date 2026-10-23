@@ -434,6 +434,62 @@ void TestRegionMaskWatcherRanges() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// KYTY_PROTECT_COALESCE: captured protections wait for the flush, merge across compatible gaps and
+// follow the pages' state at flush time.
+void TestDeferredProtectCoalesces() {
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  constexpr auto region_size = TRACKER_REGION_SIZE;
+  auto *memory = Allocate(region_size * 2);
+  const auto allocation_base = reinterpret_cast<uint64_t>(memory);
+  const auto base = (allocation_base + region_size - 1) & ~(region_size - 1);
+  const auto page = [&](uint64_t i) { return base + i * page_size; };
+  const auto ptr = [&](uint64_t i) { return reinterpret_cast<void *>(page(i)); };
+
+  manager.UpdatePageWatchers<true>(page(3), page_size); // already protected gap
+  PageManager::BeginDeferredProtect();
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  {
+    PageManager::DeferCapture capture;
+    manager.UpdatePageWatchers<true>(page(1), page_size);
+    manager.UpdatePageWatchers<true>(page(2), page_size);
+    manager.UpdatePageWatchers<true>(page(4), page_size);
+    manager.UpdatePageWatchers<true>(page(20), page_size);
+  }
+  Check(g_protection_calls == 0 && IsWritable(ptr(1)) && IsWritable(ptr(4)),
+        "captured protections were applied before the flush");
+  manager.UpdatePageWatchers<true>(page(40), page_size);
+  Check(g_protection_calls == 1 && Protection(ptr(40)) == PAGE_READONLY,
+        "protection outside the capture scope was deferred");
+  // Another owner releases page 20 before the flush: it must stay writable.
+  manager.UpdatePageWatchers<false>(page(20), page_size);
+  g_protection_calls = 0;
+  g_protection_ranges.clear();
+  PageManager::FlushDeferredProtect();
+  Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
+            g_protection_ranges[0].address == page(1) &&
+            g_protection_ranges[0].size == page_size * 4,
+        "deferred protections were not merged across the protected gap");
+  Check(Protection(ptr(1)) == PAGE_READONLY && Protection(ptr(2)) == PAGE_READONLY &&
+            Protection(ptr(4)) == PAGE_READONLY && IsWritable(ptr(5)) &&
+            IsWritable(ptr(20)),
+        "deferred flush installed incorrect protections");
+  {
+    PageManager::DeferCapture capture;
+    manager.UpdatePageWatchers<true>(page(30), page_size);
+  }
+  PageManager::EndDeferredProtect();
+  Check(Protection(ptr(30)) == PAGE_READONLY && !PageManager::DeferringProtect(),
+        "ending the deferral did not apply the pending protection");
+  manager.UpdatePageWatchers<true>(page(31), page_size);
+  Check(Protection(ptr(31)) == PAGE_READONLY, "protection deferred after the end");
+  for (const uint64_t i : {1, 2, 3, 4, 30, 31, 40}) {
+    manager.UpdatePageWatchers<false>(page(i), page_size);
+  }
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -702,6 +758,7 @@ int main(int argc, char **argv) {
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
   TestRegionMaskWatcherRanges();
+  TestDeferredProtectCoalesces();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();

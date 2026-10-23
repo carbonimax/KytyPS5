@@ -84,6 +84,22 @@ private:
 	std::atomic_flag& m_lock;
 };
 
+struct DeferredSpan {
+	void*                       impl; // PageManager::Impl
+	uint64_t                    begin;
+	uint64_t                    end;
+	Common::VirtualMemory::Mode mode;
+};
+
+struct DeferredProtect {
+	bool                      active  = false;
+	bool                      capture = false;
+	std::vector<DeferredSpan> spans;
+	std::vector<DeferredSpan> scratch;
+};
+
+thread_local DeferredProtect t_deferred;
+
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		Fatal("invalid range vaddr=0x%016" PRIx64 ", size=0x%016" PRIx64, vaddr, size);
@@ -203,6 +219,17 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		if (t_deferred.capture && t_deferred.active &&
+		    mode != Common::VirtualMemory::Mode::ReadWrite) [[unlikely]] {
+			auto& spans = t_deferred.spans;
+			if (!spans.empty() && spans.back().impl == this && spans.back().mode == mode &&
+			    spans.back().end == vaddr) {
+				spans.back().end = vaddr + size;
+			} else {
+				spans.push_back({this, vaddr, vaddr + size, mode});
+			}
+			return;
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -258,6 +285,31 @@ struct PageManager::Impl {
 		}
 
 		release_pending();
+	}
+
+	// Applies `mode` to the pages of [begin, end) whose state asks for it (KYTY_PROTECT_COALESCE).
+	void ApplyDeferred(uint64_t begin, uint64_t end, Common::VirtualMemory::Mode mode) noexcept {
+		for (auto chunk_begin = begin; chunk_begin < end;) {
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
+			auto*      region      = FindRegion(chunk_begin);
+			if (region != nullptr) {
+				const auto first = static_cast<size_t>((chunk_begin - region_base) / PAGE_SIZE);
+				const auto last  = static_cast<size_t>((chunk_end - region_base) / PAGE_SIZE);
+				SpinGuard  lock(region->lock);
+				size_t     run = last;
+				for (size_t page = first; page <= last; page++) {
+					const bool wanted = page < last && region->pages[page].Perms() == mode;
+					if (wanted && run == last) {
+						run = page;
+					} else if (!wanted && run != last) {
+						Protect(region_base + run * PAGE_SIZE, (page - run) * PAGE_SIZE, mode);
+						run = last;
+					}
+				}
+			}
+			chunk_begin = chunk_end;
+		}
 	}
 
 	template <bool track, bool is_read>
@@ -336,6 +388,58 @@ void PageManager::RestoreProtection(uint64_t vaddr, uint64_t size) noexcept {
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
+
+void PageManager::BeginDeferredProtect() noexcept {
+	t_deferred.active = true;
+}
+
+PageManager::DeferCapture::DeferCapture() noexcept: m_previous(t_deferred.capture) {
+	t_deferred.capture = true;
+}
+
+PageManager::DeferCapture::~DeferCapture() {
+	t_deferred.capture = m_previous;
+}
+
+bool PageManager::DeferringProtect() noexcept {
+	return t_deferred.active;
+}
+
+void PageManager::FlushDeferredProtect() noexcept {
+	if (!t_deferred.active || t_deferred.spans.empty()) {
+		return;
+	}
+	constexpr uint64_t MaxGap = 16 * PAGE_SIZE;
+	auto&              spans  = t_deferred.scratch;
+	spans.clear();
+	std::swap(spans, t_deferred.spans);
+	// Inactive while applying: ApplyDeferred's protections are made at once.
+	t_deferred.active = false;
+	std::sort(spans.begin(), spans.end(), [](const DeferredSpan& a, const DeferredSpan& b) {
+		return a.impl != b.impl ? a.impl < b.impl : a.begin < b.begin;
+	});
+	for (size_t i = 0; i < spans.size();) {
+		auto   merged = spans[i];
+		size_t j      = i + 1;
+		for (; j < spans.size(); j++) {
+			const auto& next = spans[j];
+			if (next.impl != merged.impl || next.mode != merged.mode ||
+			    next.begin > merged.end + MaxGap) {
+				break;
+			}
+			merged.end = std::max(merged.end, next.end);
+		}
+		static_cast<Impl*>(merged.impl)->ApplyDeferred(merged.begin, merged.end, merged.mode);
+		i = j;
+	}
+	spans.clear();
+	t_deferred.active = true;
+}
+
+void PageManager::EndDeferredProtect() noexcept {
+	FlushDeferredProtect();
+	t_deferred.active = false;
+}
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
