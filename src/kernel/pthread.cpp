@@ -1,4 +1,7 @@
 #include "kernel/pthread.h"
+#include "kernel/syncTrace.h"
+
+#include <optional>
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1291,6 +1294,13 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		return ETIMEDOUT;
 	}
 
+	std::optional<SyncTrace::Wait> trace;
+	if (SyncTrace::Enabled()) {
+		trace.emplace(SyncTrace::Kind::Mutex, mutex, mutex->name.c_str(),
+		              reinterpret_cast<uint64_t>(mutex->owner),
+		              timeout_us == nullptr ? -1 : static_cast<int64_t>(*timeout_us));
+	}
+
 	// Guest mutex waits are not cancellation points, unlike the host condition wait.
 	int previous_cancel_state = 0;
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous_cancel_state);
@@ -1313,6 +1323,7 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 		if (now >= deadline) {
 			NativeMutexRemoveWaiter(mutex, &waiter);
 			result = ETIMEDOUT;
+			if (trace) trace->SetResult(1);
 			break;
 		}
 		waiter.cv.wait_until(lock, std::min(deadline, now +
@@ -2746,6 +2757,8 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
 	std::lock_guard lock((*cond)->m);
+	SyncTrace::Wake(SyncTrace::Kind::Cond, *cond, (*cond)->name.c_str(), 1,
+	                static_cast<int>((*cond)->waiters.size()));
 	for (auto* thread: (*cond)->waiters) {
 		thread->cond_sequence++;
 		thread->cond_cv.notify_one();
@@ -2836,6 +2849,8 @@ int KYTY_SYSV_ABI PthreadCondSignal(PthreadCond* cond) {
 	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
 
 	std::lock_guard lock((*cond)->m);
+	SyncTrace::Wake(SyncTrace::Kind::Cond, *cond, (*cond)->name.c_str(), 0,
+	                static_cast<int>((*cond)->waiters.size()));
 	CondWakeWaiter(*cond, nullptr);
 	return OK;
 }
@@ -2898,6 +2913,11 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	std::optional<SyncTrace::Wait> trace;
+	if (usec != 0 && SyncTrace::Enabled()) {
+		trace.emplace(SyncTrace::Kind::Cond, cond_value, cond_value->name.c_str(),
+		              reinterpret_cast<uint64_t>(mutex_value), static_cast<int64_t>(usec));
+	}
 
 	if (usec == 0) {
 		result = ETIMEDOUT;
@@ -2923,8 +2943,10 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 		}
 
 		result = (ready() ? OK : ETIMEDOUT);
+		if (trace && result != OK) trace->SetResult(1);
 	}
 	CondRemoveWaiter(cond_value, thread);
+	trace.reset();
 	cond_lock.unlock();
 
 	int lock_result = NativeMutexLockRecurse(mutex_value, recurse);
@@ -3062,6 +3084,11 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
+	std::optional<SyncTrace::Wait> trace;
+	if (SyncTrace::Enabled()) {
+		trace.emplace(SyncTrace::Kind::Cond, cond_value, cond_value->name.c_str(),
+		              reinterpret_cast<uint64_t>(mutex_value), -1);
+	}
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
@@ -3072,6 +3099,7 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		}
 	}
 	CondRemoveWaiter(cond_value, thread);
+	trace.reset();
 	cond_lock.unlock();
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);

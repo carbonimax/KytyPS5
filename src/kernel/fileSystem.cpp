@@ -1,4 +1,5 @@
 #include "kernel/fileSystem.h"
+#include "kernel/syncTrace.h"
 #include "graphics/host_gpu/renderer/mipStats.h"
 
 #include <functional>
@@ -545,6 +546,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 
 			LOGF_COLOR(result ? Log::Color::Green : Log::Color::Red, "\tOpen: %s, %s\n",
 			           Common::PathToString(file->real_name).c_str(), result ? "[ok]" : "[fail]");
+			if (SyncTrace::Enabled()) {
+				const auto name = Common::PathToString(file->real_name);
+				SyncTrace::Note("OPEN %s %s", result ? "ok" : "fail", name.c_str());
+			}
 		}
 
 		if (result && trunc) {
@@ -687,6 +692,12 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		Graphics::MipStats::NoteRepeatedFileRead(
 		    std::hash<std::string> {}(Common::PathToString(file->real_name)),
 		    static_cast<uint64_t>(pos), bytes_read);
+	}
+	if (SyncTrace::Enabled()) {
+		const auto name = Common::PathToString(file->real_name);
+		SyncTrace::Note("READ fd=%d want=%llu got=%u pos=%lld %s", d,
+		                static_cast<unsigned long long>(nbytes), bytes_read,
+		                static_cast<long long>(pos), name.c_str());
 	}
 
 	return bytes_read;

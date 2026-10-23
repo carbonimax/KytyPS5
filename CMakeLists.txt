@@ -598,6 +598,7 @@ add_kyty_full_emulator_test(http_uri_parse_tests
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/syncTrace.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
