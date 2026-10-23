@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -688,11 +689,7 @@ void PipelineCache::Save() {
 	const bool flushed = !file.IsInvalid() && file.Flush();
 	file.Close();
 	const bool written = prefix_written == prefix.size() && payload_written == payload.size() && flushed;
-	std::error_code error;
-	if (written) {
-		std::filesystem::rename(temp_path, m_driver_cache_path, error);
-	}
-	if (!written || error) {
+	if (!written || !DriverCachePolicy::ReplaceCacheFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
 		return;
