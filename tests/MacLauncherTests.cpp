@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
 	changed.mac_extra_environment += "\nLAUNCHER_TEST_LITERAL=$(echo nope)";
 	changed.basedir = temporary.filePath("fake game directory");
 	QProcess process;
-	launcher.RunInterpreter(&process, changed);
+	launcher.RunInterpreter(&process, changed, false);
 	if (process.state() != QProcess::NotRunning) {
 		Check(process.waitForFinished(5000), "fake launch terminates");
 	}
