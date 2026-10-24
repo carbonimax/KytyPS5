@@ -25,6 +25,12 @@ struct SrtRuntime {
 	// block whose reachability is not proven it ends that path; the GPU would fault there.
 	bool null_reads_end_speculation = false;
 	bool null_descriptor_supported  = true;
+	// Emulator opt-in: a flattened SRT slot whose value is directly a scalar DWORD read of an
+	// address for which defer_flat_read returns true is not read. The slot stays 0 and
+	// (slot, address) is appended to *gpu_flat_reads: the caller fills it on the GPU. No other
+	// evaluation (control flow, descriptors, specialization) uses a deferred value.
+	bool (*defer_flat_read)(uint64_t address)                 = nullptr;
+	std::vector<std::pair<uint32_t, uint64_t>>* gpu_flat_reads = nullptr;
 };
 
 class SrtReadCapture {
@@ -128,6 +134,10 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	enum class RawReadKind { Unknown, Constant, Memory };
+	// Address of a raw read, or its value when it reads no memory (Constant).
+	RawReadKind RawReadAddress(const Inst& inst, uint64_t& address, uint64_t& constant);
+	bool DeferFlatRead(const Inst& inst, uint32_t flat_offset, std::vector<uint32_t>& flat);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;

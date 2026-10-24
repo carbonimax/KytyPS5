@@ -154,6 +154,23 @@ private:
 	std::array<Entry, 16> m_entries;
 };
 
+// KYTY_SRT_GPU_FLAT_READS=0 disables. A compute program whose SRT walk read GPU-written dwords
+// downloaded them first, draining the GPU. A flattened SRT slot whose value is directly such a
+// scalar dword read is now left out of the walk (see SrtRuntime::defer_flat_read) and copied on
+// the GPU into the dispatch's flattened SRT. Every other use of GPU-written data (control flow,
+// descriptors, specialization) still drains.
+bool SrtGpuFlatReadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_GPU_FLAT_READS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool IsGpuDirtyDword(uint64_t address) {
+	return Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(uint32_t));
+}
+
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (userdata != nullptr && static_cast<SrtBlockCache*>(userdata)->Read(address, values)) {
 		return true;
@@ -327,7 +344,14 @@ struct PipelineCache::ProgramCache {
 		}
 
 		template <bool HasCalls>
-		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime, uint32_t push_data_cursor, bool emulate_image_min_lod) {
+		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& source_runtime,
+		                             uint32_t push_data_cursor, bool emulate_image_min_lod,
+		                             bool gpu_flat_reads = false) {
+			auto runtime = source_runtime;
+			if (gpu_flat_reads && !HasCalls && SrtGpuFlatReadsEnabled()) {
+				runtime.defer_flat_read = IsGpuDirtyDword;
+				runtime.gpu_flat_reads  = &resources.gpu_flat_reads;
+			}
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
 			for (auto& candidate: permutations) {
@@ -458,7 +482,9 @@ struct PipelineCache::ProgramCache {
 				source_changed = cached.RefreshCallSource(runtime);
 				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
+				permutation = cached.FindPermutation<false>(runtime, push_data_cursor,
+				                                            !graphics.image_view_min_lod_enabled,
+				                                            stage == ShaderType::Compute);
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
