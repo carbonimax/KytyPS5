@@ -650,6 +650,14 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static bool SrtBackingReadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_BACKING_READS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -672,6 +680,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (access != GpuAccess::Execute &&
 		    Libs::LibKernel::Memory::WaitBackingRemap(info->access_violation_vaddr)) {
 			return true;
+		}
+		// A guest load of the SRT walker on the GPU thread that hits a tracker-protected page reads
+		// the backing (synchronizing only GPU-written bytes it covers) instead of publishing the
+		// page, which would wait for the GPU. KYTY_SRT_BACKING_READS=0 disables.
+		if (access == GpuAccess::Read && SrtBackingReadsEnabled()) {
+			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+			        info->exception_address)) {
+				uint32_t value = 0;
+				if (Libs::LibKernel::Memory::TryReadBufferBacking(
+				        Loader::X64InstructionEmulator::LoadBaseR10(info->native_context), &value,
+				        sizeof(value))) {
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+					return true;
+				}
+			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
