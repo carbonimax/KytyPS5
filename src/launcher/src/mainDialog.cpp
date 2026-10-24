@@ -309,6 +309,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (!info.addons_dir.isEmpty()) {
 		args << "--addcont-dir" << info.addons_dir;
 	}
+	for (const auto& entry: info.addcont) {
+		args << "--addcont" << entry;
+	}
 
 	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
