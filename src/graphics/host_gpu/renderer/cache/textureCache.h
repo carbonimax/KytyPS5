@@ -132,6 +132,9 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	// FindImagesInRegion(address, size, false) through a small cache of recent results, valid
+	// while no image is (un)registered (m_image_index_epoch). Caller holds m_lock.
+	[[nodiscard]] const std::vector<ImageId>& FindImageCandidates(uint64_t address, uint64_t size);
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -185,6 +188,14 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_image_index_epoch      = 1;
+	struct CandidateCacheEntry {
+		uint64_t             address = 0;
+		uint64_t             size    = 0;
+		uint64_t             epoch   = 0;
+		std::vector<ImageId> ids;
+	};
+	std::array<CandidateCacheEntry, 64> m_candidate_cache;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 

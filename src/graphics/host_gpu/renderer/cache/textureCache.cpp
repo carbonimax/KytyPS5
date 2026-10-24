@@ -229,6 +229,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	m_image_index_epoch++;
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -243,6 +244,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
+	m_image_index_epoch++;
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
@@ -466,6 +468,26 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 		});
 	});
 	return result;
+}
+
+// FindImage enumerated the owners of every 1 MiB page of the requested range on each lookup,
+// which showed up in GPU-thread profiles. The candidate list of a
+// range only changes when an image is registered or unregistered (or a registered record's range
+// is rewritten), so recent lists are reused while none of that happened; the candidates are then
+// examined exactly as before.
+const std::vector<ImageId>& TextureCache::FindImageCandidates(uint64_t address, uint64_t size) {
+	const auto hash  = (address >> 8u) * 0x9E3779B97F4A7C15ull ^ size * 0xC2B2AE3D27D4EB4Full;
+	auto&      entry = m_candidate_cache[(hash >> 58u) & (m_candidate_cache.size() - 1)];
+	if (entry.epoch != m_image_index_epoch || entry.address != address || entry.size != size) {
+		entry.ids.clear();
+		for (const auto id: FindImagesInRegion(address, size, false)) {
+			entry.ids.push_back(id);
+		}
+		entry.address = address;
+		entry.size    = size;
+		entry.epoch   = m_image_index_epoch;
+	}
+	return entry.ids;
 }
 
 void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
@@ -1261,6 +1283,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		m_image_index_epoch++;
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1281,8 +1304,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		// Stays valid below: only FindImage (not reentrant, m_lock) rewrites cached lists.
+		const auto& candidates =
+		    FindImageCandidates(desc.info.data.address, desc.info.data.size);
 		bool block_alias = false;
 
 		for (const auto id: candidates) {

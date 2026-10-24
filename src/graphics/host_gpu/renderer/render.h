@@ -230,6 +230,12 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	struct WrittenRange {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		bool     image   = false;
+	};
+	std::vector<WrittenRange>             m_written_ranges; // CommitBindings scratch
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 
