@@ -153,6 +153,7 @@ private:
 	void Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                    bool mix);
 	void FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void V_FRACT(const Decoder::Instruction& inst, IR::Type type);
 	void FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);

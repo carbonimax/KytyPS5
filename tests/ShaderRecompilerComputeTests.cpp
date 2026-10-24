@@ -29157,16 +29157,16 @@ TestCase VectorSpecialF16Ops() {
 TestCase VectorFractF16CapturedAndEdges() {
   using O = ShaderOpcode;
 
-  // RDNA2 section 12.8: x - floor(x), rounded to half precision.
+  // x - floor(x) rounded to half precision, clamped to 0x3bff below one.
   // Load at runtime to exercise the emitted operation, including half subnormals.
   const std::array<u32, 18> inputs{
       0x3d00u, 0xbd00u, 0x0000u, 0x8000u, 0x0001u, 0x8001u,
       0x03ffu, 0x83ffu, 0x7bffu, 0xfbffu, 0x3800u, 0xb800u,
       0x8c00u, 0x8c01u, 0x7c00u, 0xfc00u, 0x7e55u, 0x7d01u};
   const std::array<u32, 18> fractions{
-      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3c00u,
-      0x03ffu, 0x3c00u, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
-      0x3c00u, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
+      0x3400u, 0x3a00u, 0x0000u, 0x0000u, 0x0001u, 0x3bffu,
+      0x03ffu, 0x3bffu, 0x0000u, 0x0000u, 0x3800u, 0x3800u,
+      0x3bffu, 0x3bffu, 0x7e00u, 0x7e00u, 0x7e00u, 0x7e00u};
   TestCase test;
   test.name = "VectorFractF16CapturedAndEdges";
   for (u32 bits : inputs) {
@@ -29194,6 +29194,37 @@ TestCase VectorFractF16CapturedAndEdges() {
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
   test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
+  return test;
+}
+
+// V_FRACT_F32 clamps to 0x3f7fffff where x - floor(x) rounds to 1.0, before output modifiers.
+TestCase VectorFractF32Edges() {
+  using O = ShaderOpcode;
+
+  constexpr std::array<std::array<u32, 3>, 4> cases{{
+      {0xb3800000u, 0, 0x3f7fffffu},   // -2^-24: exact
+      {0xb3000000u, 0, 0x3f7fffffu},   // -2^-25: the tie rounds to 1.0
+      {0xb3000000u, 1, 0x3fffffffu},   // omod *2 applies after the clamp
+      {0x7fc00001u, 0, 0x7fc00000u}}}; // Quiet NaN class
+  TestCase test;
+  test.name = "VectorFractF32Edges";
+  for (const auto &[source, omod, expected] : cases) test.initial.push_back(source);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 7, 30);
+    AppendVop3(&code, 0x1a0, 9, Vgpr(7), 0, 0, 0, 0, false, cases[i][1]);
+    if (i + 1u == cases.size()) {
+      code.push_back(EncodeVop2(0x1b, 9, 255u, 9));
+      code.push_back(0x7fc00000u);
+    }
+    AppendStoreVgpr(&code, 9, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(cases[i][2]);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FRACT_F32,
+                  O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -31115,7 +31146,7 @@ TestCase VectorFractF64CapturedAndEdges() {
       {0x4320000000000001ull, 0x3fe0000000000000ull}, // 2^51 + .5
       {0, 0}, {0x8000000000000000ull, 0},
       {0x401c000000000000ull, 0}, {0xc01c000000000000ull, 0},
-      {1, 1}, {0x8000000000000001ull, 0x3ff0000000000000ull},
+      {1, 1}, {0x8000000000000001ull, 0x3fefffffffffffffull}, // Clamped below one.
       {0x000fffffffffffffull, 0x000fffffffffffffull},
       {0x7fefffffffffffffull, 0},
       {0x7ff0000000000000ull, 0x7ff8000000000000ull},
@@ -46374,6 +46405,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
+  AddCase(VectorFractF32Edges);
   AddCase(VectorFractF16Modifiers);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
   AddCase(VectorSinF16SdwaAndEdges);
@@ -52832,6 +52864,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--fract-f16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorFractF16CapturedAndEdges());
+    RunCase(&vulkan, VectorFractF32Edges());
+    RunCase(&vulkan, VectorFractF64CapturedAndEdges());
     RunCase(&vulkan, VectorFractF16Modifiers());
     RunCase(&vulkan, NativeAndSdwa16BitDestinationWrites());
     RunCase(&vulkan, VectorSpecialF16Ops());
