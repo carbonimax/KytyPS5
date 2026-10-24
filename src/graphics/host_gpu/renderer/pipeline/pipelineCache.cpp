@@ -171,9 +171,21 @@ bool IsGpuDirtyDword(uint64_t address) {
 	return Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(uint32_t));
 }
 
+// Memo replays (SrtMaterializationMemo) of a lookup that may defer flat reads fail on GPU-written
+// bytes instead of synchronizing them: the fresh walk that follows can defer them.
+thread_local bool t_refuse_gpu_dirty_reads = false;
+
+bool RefusesGpuDirtyRead(uint64_t address, std::span<uint32_t> values) {
+	return t_refuse_gpu_dirty_reads &&
+	       Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, values.size_bytes());
+}
+
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (userdata != nullptr && static_cast<SrtBlockCache*>(userdata)->Read(address, values)) {
 		return true;
+	}
+	if (RefusesGpuDirtyRead(address, values)) {
+		return false;
 	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -192,6 +204,9 @@ bool ReadShaderGuestMemoryOrdinary(void* userdata, uint64_t address, std::span<u
 	if (userdata != nullptr && static_cast<SrtBlockCache*>(userdata)->Read(address, values)) {
 		return true;
 	}
+	if (RefusesGpuDirtyRead(address, values)) {
+		return false;
+	}
 	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
 	                                                   values.size_bytes())) {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
@@ -206,6 +221,111 @@ bool SrtBackingReadsEnabled() {
 	}();
 	return enabled;
 }
+
+// KYTY_SRT_MEMO=0 disables. Resource materialization of a cached program is a pure function of
+// its user data, shader base, workgroup counts, indirect argument address and of the guest words
+// its walk reads, in the order it reads them. The memo records those reads (address, width,
+// success, words) through the runtime readers. When the next lookup brings the same inputs, the
+// recorded reads are replayed through the same readers, in order: if every one returns the same
+// result, the walk would issue exactly the same reads and produce the same snapshot and
+// specialization, which are still in place.
+bool SrtMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_MEMO");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+class SrtMaterializationMemo {
+public:
+	[[nodiscard]] static bool Supported(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		return runtime.read_memory != nullptr && runtime.read_specialization_memory != nullptr;
+	}
+
+	[[nodiscard]] bool Replays(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		if (!m_valid || m_shader_base != runtime.shader_base ||
+		    m_indirect_args_address != runtime.indirect_args_address ||
+		    !std::ranges::equal(m_user_data, runtime.user_data) ||
+		    !std::ranges::equal(m_workgroup_counts, runtime.workgroup_counts)) {
+			return false;
+		}
+		for (const auto& read: m_reads) {
+			m_scratch.resize(read.count);
+			const auto reader =
+			    read.specialization ? runtime.read_specialization_memory : runtime.read_memory;
+			const bool ok = reader(runtime.userdata, read.address, m_scratch);
+			if (ok != read.ok || (ok && !std::equal(m_scratch.begin(), m_scratch.end(),
+			                                        m_values.begin() + read.offset))) {
+				m_valid = false;
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// Returns the runtime to materialize with; Commit() validates the recording afterwards.
+	[[nodiscard]] ShaderRecompiler::IR::SrtRuntime Record(const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		m_valid                 = false;
+		m_shader_base           = runtime.shader_base;
+		m_indirect_args_address = runtime.indirect_args_address;
+		m_user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+		m_workgroup_counts.assign(runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
+		m_reads.clear();
+		m_values.clear();
+		m_ordinary       = runtime.read_memory;
+		m_specialization = runtime.read_specialization_memory;
+		m_userdata       = runtime.userdata;
+		auto recorded                       = runtime;
+		recorded.userdata                   = this;
+		recorded.read_memory                = ReadOrdinary;
+		recorded.read_specialization_memory = ReadSpecialization;
+		return recorded;
+	}
+
+	void Commit() { m_valid = true; }
+	void Invalidate() { m_valid = false; }
+
+private:
+	struct Read {
+		uint64_t address        = 0;
+		uint32_t offset         = 0;
+		uint32_t count          = 0;
+		bool     specialization = false;
+		bool     ok             = false;
+	};
+
+	static bool Capture(void* userdata, uint64_t address, std::span<uint32_t> values,
+	                    bool specialization) {
+		auto&      memo   = *static_cast<SrtMaterializationMemo*>(userdata);
+		const auto reader = specialization ? memo.m_specialization : memo.m_ordinary;
+		const bool ok     = reader(memo.m_userdata, address, values);
+		memo.m_reads.push_back({address, static_cast<uint32_t>(memo.m_values.size()),
+		                        static_cast<uint32_t>(values.size()), specialization, ok});
+		if (ok) {
+			memo.m_values.insert(memo.m_values.end(), values.begin(), values.end());
+		}
+		return ok;
+	}
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		return Capture(userdata, address, values, false);
+	}
+	static bool ReadSpecialization(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		return Capture(userdata, address, values, true);
+	}
+
+	bool                                  m_valid                 = false;
+	uint64_t                              m_shader_base           = 0;
+	uint64_t                              m_indirect_args_address = 0;
+	std::vector<uint32_t>                 m_user_data;
+	std::vector<uint32_t>                 m_workgroup_counts;
+	std::vector<Read>                     m_reads;
+	std::vector<uint32_t>                 m_values;
+	std::vector<uint32_t>                 m_scratch;
+	ShaderRecompiler::IR::SrtMemoryReader m_ordinary       = nullptr;
+	ShaderRecompiler::IR::SrtMemoryReader m_specialization = nullptr;
+	void*                                 m_userdata       = nullptr;
+};
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
@@ -352,8 +472,23 @@ struct PipelineCache::ProgramCache {
 				runtime.defer_flat_read = IsGpuDirtyDword;
 				runtime.gpu_flat_reads  = &resources.gpu_flat_reads;
 			}
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
+			// Programs with calls refresh their source reads per lookup; they are not memoized.
+			if (!HasCalls && SrtMemoEnabled() && SrtMaterializationMemo::Supported(runtime)) {
+				t_refuse_gpu_dirty_reads = runtime.defer_flat_read != nullptr;
+				const bool replayed      = srt_memo.Replays(runtime);
+				t_refuse_gpu_dirty_reads = false;
+				if (!replayed) {
+					EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+					    resource_plan, srt_memo.Record(runtime), resources, specialization,
+					    emulate_image_min_lod));
+					srt_memo.Commit();
+				}
+			} else {
+				srt_memo.Invalidate();
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    resource_plan, runtime, resources, specialization,
+				    emulate_image_min_lod));
+			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -375,6 +510,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                       skip_dispatch = false;
+		SrtMaterializationMemo                      srt_memo;
 	};
 
 	struct ProgramKeyHash {
