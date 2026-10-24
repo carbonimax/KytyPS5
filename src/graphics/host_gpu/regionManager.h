@@ -98,6 +98,14 @@ public:
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
+	// Bytes of [offset, offset + size) before the first page modified by `source`.
+	template <DirtySource source>
+	[[nodiscard]] uint64_t UnmodifiedPrefix(uint64_t offset, uint64_t size) const {
+		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto first        = std::min<uint64_t>(GetBits<source>().FirstRangeFrom(start).first, end);
+		return first > start ? (first - start) * TRACKER_PAGE_SIZE : 0;
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);

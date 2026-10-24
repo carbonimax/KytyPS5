@@ -78,6 +78,30 @@ RangeSet MemoryTracker::TakeBdaSync() {
 	return std::exchange(m_bda_sync, RangeSet {});
 }
 
+uint64_t MemoryTracker::ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcept {
+	CheckNotInUploadCallback();
+	if (vaddr % TRACKER_PAGE_SIZE != 0 || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	size = std::min(size, TRACKER_REGION_SIZE - vaddr % TRACKER_REGION_SIZE);
+	auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (manager == nullptr) {
+		return 0;
+	}
+	uint64_t marked = 0;
+	{
+		std::scoped_lock lock(manager->lock);
+		marked = manager->UnmodifiedPrefix<DirtySource::Gpu>(vaddr % TRACKER_REGION_SIZE, size);
+		if (marked != 0) {
+			manager->ChangeState<DirtySource::Cpu, true>(vaddr, marked);
+		}
+	}
+	if (marked != 0) {
+		QueueBdaSync(vaddr, marked);
+	}
+	return marked;
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {

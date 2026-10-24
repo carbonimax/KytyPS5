@@ -39,6 +39,9 @@ public:
 	// before the dirty pages it describes become visible.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
+	// the first GPU-modified page and at the region end. Returns the bytes marked.
+	uint64_t ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcept;
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
