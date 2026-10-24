@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "common/uniqueFunction.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
@@ -12,7 +13,10 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <condition_variable>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -22,12 +26,16 @@ namespace Libs::Graphics {
 struct GraphicContext;
 class CommandScheduler;
 class TextureCache;
+class ReadbackQueue;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
+	// KYTY_ASYNC_READBACK (default 1): guest-thread fault readbacks do not stall the GPU thread.
+	[[nodiscard]] static bool AsyncFaultReadbacks();
+
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
@@ -125,6 +133,61 @@ private:
 
 	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
+	// A guest-fault readback whose copy was submitted without waiting on the GPU thread: the
+	// priority-operation thread publishes it and releases the page protection.
+	struct ReadbackCompletion {
+		std::mutex              mutex;
+		std::condition_variable signal;
+		bool                    done = false;
+		// Readback-queue copy: the faulting thread waits for `side_tick` and runs `side_publish`.
+		uint64_t                     side_tick = 0;
+		Common::UniqueFunction<void> side_publish;
+		void Signal() {
+			{
+				std::lock_guard lock(mutex);
+				done = true;
+			}
+			signal.notify_all();
+		}
+		void Wait() {
+			std::unique_lock lock(mutex);
+			signal.wait(lock, [this] { return done; });
+		}
+	};
+	struct PendingPublish {
+		uint64_t                            begin = 0;
+		uint64_t                            end   = 0;
+		uint64_t                            tick  = 0;
+		std::shared_ptr<ReadbackCompletion> done;
+		bool                                side = false; // published by the faulting thread
+	};
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion> FindPendingPublish(uint64_t vaddr,
+	                                                                     uint64_t size);
+	// GPU thread: waits until no queued fault readback covers the range (its publication
+	// releases the page protection, which must not race new GPU ownership of the pages).
+	void WaitPendingPublishes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool RecordDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                  Common::UniqueFunction<void>& publish);
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion> DownloadForFault(Buffer& buffer, uint64_t vaddr,
+	                                                                   uint64_t size,
+	                                                                   bool side_ok = false);
+	// KYTY_READBACK_QUEUE (GPU thread): makes a write recorded now wait for readback-queue copies
+	// of the same bytes, and notes the command-buffer tick that may write each 64 KiB of guest
+	// memory through a cached buffer (not for CPU-data uploads, see the definition).
+	void NoteBufferWrite(uint64_t vaddr, uint64_t size, bool cpu_upload = false);
+	// Submitted main-queue command buffers not yet complete.
+	[[nodiscard]] uint64_t MainQueueBacklog();
+	// True when every such write to the range has completed on the GPU.
+	[[nodiscard]] bool WritesComplete(uint64_t vaddr, uint64_t size);
+	void CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
+	void RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,
+	                     Common::UniqueFunction<void>& publish);
+	[[nodiscard]] std::shared_ptr<ReadbackCompletion>
+	DownloadCollected(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                  std::vector<vk::BufferCopy> copies, uint64_t total_size,
+	                  std::shared_ptr<ReadbackCompletion> done);
+
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -187,6 +250,15 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	std::mutex                                        m_pending_mutex;
+	std::vector<PendingPublish>                       m_pending_publishes;
+	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
+	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_write_ticks;
+	struct SideCopy {
+		uint64_t begin = 0, end = 0, tick = 0;
+	};
+	std::vector<SideCopy> m_side_copies; // readback-queue copies that may still run (GPU thread)
+	uint64_t              m_side_completed = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	struct BatchRange {

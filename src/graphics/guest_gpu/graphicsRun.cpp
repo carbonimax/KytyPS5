@@ -171,6 +171,54 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+// KYTY_COMPUTE_PREEMPT: "1" = every compute queue, "0" = off, or a comma-separated list of
+// compute queue interrupt ids (0x20 = first queue of the first pipe). Bit i = compute queue i.
+// Default: every queue when fault readbacks are asynchronous. With synchronous readbacks the
+// guest threads wait far longer on faults when compute runs earlier (in one title -30 % frames).
+static uint64_t ComputePreemptMask() {
+	static const uint64_t mask = [] {
+		const char* value = std::getenv("KYTY_COMPUTE_PREEMPT");
+		if (value == nullptr) {
+			return BufferCache::AsyncFaultReadbacks() ? ~uint64_t {0} : uint64_t {0};
+		}
+		uint64_t result = 0;
+		for (const char* p = value; *p != '\0';) {
+			char*      end = nullptr;
+			const auto id  = std::strtoul(p, &end, 0);
+			if (end == p) {
+				break;
+			}
+			if (id == 1) {
+				result = ~uint64_t {0};
+			} else if (id >= 0x20 && id < 0x20 + 64) {
+				result |= uint64_t {1} << (id - 0x20);
+			}
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return result;
+	}();
+	return mask;
+}
+
+static bool ComputePreemptionEnabled() {
+	return ComputePreemptMask() != 0;
+}
+
+bool GuestGpu::ShouldYieldToCompute(uint64_t& seen) const {
+	// Async compute runs beside graphics on the real GPU. Games may pace their simulation on
+	// compute end-of-pipe interrupts (one tick per interrupt), so a compute submission must not
+	// wait behind a whole graphics command buffer.
+	if (!ComputePreemptionEnabled()) {
+		return false;
+	}
+	const auto enqueued = m_compute_enqueued.load(std::memory_order_acquire);
+	if (enqueued == seen) {
+		return false;
+	}
+	seen = enqueued;
+	return true;
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
@@ -424,6 +472,10 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	if (submission.type == SubmissionType::Compute && submission.queue_id - 1 < 64 &&
+	    ((ComputePreemptMask() >> (submission.queue_id - 1)) & 1u) != 0) {
+		m_compute_enqueued.fetch_add(1, std::memory_order_release);
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
@@ -519,7 +571,9 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
-			submission.blocked = true;
+			// A yielded submission can resume as soon as the compute queues were served.
+			submission.blocked = !submission.yielded;
+			submission.yielded = false;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -571,7 +625,9 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 				progressed |= round_progress;
 				complete = submission.command_complete && submission.constant_complete;
-				if (complete || !round_progress) {
+				submission.yielded = submission.command_execution.Yielded() ||
+				                     submission.constant_execution.Yielded();
+				if (complete || !round_progress || submission.yielded) {
 					break;
 				}
 			}
@@ -627,6 +683,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	execution.m_yielded       = false;
 
 	struct ExecutionScope {
 		ExecutionScope(CommandProcessor& processor, Pm4Execution& execution)
@@ -660,6 +717,24 @@ void CommandProcessor::SuspendPm4() {
 	g_current_execution->m_suspended = true;
 }
 
+static bool IsYieldPoint(uint32_t packet_header, uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_WAIT_REG_MEM:
+		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_EVENT_WRITE:
+		case Pm4::IT_EVENT_WRITE_EOP:
+		case Pm4::IT_EVENT_WRITE_EOS:
+		case Pm4::IT_RELEASE_MEM:
+		case Pm4::IT_ACQUIRE_MEM: return true;
+		case Pm4::IT_NOP: {
+			const auto r = KYTY_PM4_R(packet_header);
+			// Acquire-memory requests are standard IT_ACQUIRE_MEM packets (no custom NOP form).
+			return r == Pm4::R_RELEASE_MEM;
+		}
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
@@ -678,6 +753,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        packet_header = packet[0];
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
+
+		// Graphics yields to queued compute work only before synchronization packets, where
+		// the guest itself expects other queues to make progress.
+		if (m_interrupt_event_id == 0 && execution.m_made_progress && g_gpu_state != nullptr &&
+		    IsYieldPoint(packet_header, opcode) &&
+		    g_gpu_state->ShouldYieldToCompute(m_compute_seen)) {
+			execution.m_yielded = true;
+			return;
+		}
 
 		if (packet_header == 0x80000000u || Pm4::PacketSizeDw(packet_header) == 1u) {
 			cursor.offset_dw++;

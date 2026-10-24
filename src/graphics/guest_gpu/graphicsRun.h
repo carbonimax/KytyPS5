@@ -66,6 +66,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		bool                      yielded           = false;
 	};
 
 	void              Enqueue(Submission submission);
@@ -73,6 +74,8 @@ private:
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// Graphics processing yields at a packet boundary when compute work was queued since `seen`.
+	bool ShouldYieldToCompute(uint64_t& seen) const;
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;
@@ -82,6 +85,7 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	std::atomic_uint64_t                           m_compute_enqueued {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
