@@ -29548,6 +29548,7 @@ TestCase VectorPermlane16InactiveSource(u32 op_sel, u32 wave_size) {
   test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,  O::S_MOV_B32,
                   O::V_PERMLANE16_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
+  test.forbidden_spirv = {"OpCopyObject"};
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
