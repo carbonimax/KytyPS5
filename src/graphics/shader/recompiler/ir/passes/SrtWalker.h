@@ -194,6 +194,11 @@ private:
 	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
 	const SrtWalker*                m_session;
 	uint8_t                         m_read_policy;
+	// KYTY_SRT_FAST_CONTEXTS, top walker of a session: the contexts the session holds.
+	// UINT32_MAX: not listed (switch off or list full), the session scans every context.
+	// Declared before m_context, which is acquired during construction.
+	mutable uint32_t                                         m_owned_count = 0;
+	mutable std::array<ResourcePlan::EvaluationContext*, 32> m_owned {};
 	ResourcePlan::EvaluationContext& m_context;
 	bool                            m_null_read = false;
 };

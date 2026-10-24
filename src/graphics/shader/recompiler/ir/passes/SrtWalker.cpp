@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -548,6 +549,10 @@ SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
+	if (m_owned_count <= m_owned.size()) {
+		for (uint32_t index = 0; index < m_owned_count; ++index) m_owned[index]->session = nullptr;
+		return;
+	}
 	for (auto& context: m_program.evaluation_contexts)
 		if (context.session == this) context.session = nullptr;
 }
@@ -561,7 +566,47 @@ bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	return true;
 }
 
+// KYTY_SRT_FAST_CONTEXTS (default 1; 0 disables). Every walker (and every ReadFirstLane /
+// LogicalAnd child walker) acquired its evaluation context by scanning all contexts of the plan
+// for one of its session with the same EXEC mask and read policy. The session's top walker now
+// lists the contexts its session holds: a walker searches that list, and otherwise takes the
+// first free context. The contexts a session holds are exactly the listed ones, and a context
+// taken free is reset (new generation, no unknowns) either way. Past 32 contexts the session
+// falls back to the full scan.
+static bool FastContextsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_FAST_CONTEXTS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
+	auto& owner = *m_session;
+	if (FastContextsEnabled() && owner.m_owned_count < owner.m_owned.size()) {
+		for (uint32_t index = 0; index < owner.m_owned_count; ++index) {
+			auto& context = *owner.m_owned[index];
+			if (context.active_mask == m_active_mask && context.read_policy == m_read_policy)
+				return context;
+		}
+		ResourcePlan::EvaluationContext* unused = nullptr;
+		for (auto& context: m_program.evaluation_contexts) {
+			if (context.session == nullptr) {
+				unused = &context;
+				break;
+			}
+		}
+		auto& context = unused != nullptr ? *unused : m_program.evaluation_contexts.emplace_back();
+		context.session     = m_session;
+		context.active_mask = m_active_mask;
+		context.read_policy = m_read_policy;
+		context.generation += 4;
+		context.unknowns.clear();
+		owner.m_owned[owner.m_owned_count++] = &context;
+		return context;
+	}
+	// The list is full (or unused): from now on this session scans every context.
+	owner.m_owned_count = UINT32_MAX;
 	ResourcePlan::EvaluationContext* unused = nullptr;
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session == m_session && context.active_mask == m_active_mask &&
@@ -578,6 +623,19 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 }
 
 void SrtWalker::ResetUnknowns() {
+	const auto& owner = *m_session;
+	if (owner.m_owned_count <= owner.m_owned.size()) {
+		for (uint32_t index = 0; index < owner.m_owned_count; ++index) {
+			auto& context = *owner.m_owned[index];
+			for (const auto entry_index: context.unknowns) {
+				auto& entry = context.values[entry_index];
+				if (entry.generation == (context.generation | 2u) ||
+				    entry.generation == (context.generation | 3u)) entry.generation = 0;
+			}
+			context.unknowns.clear();
+		}
+		return;
+	}
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session != m_session) continue;
 		for (const auto index: context.unknowns) {
