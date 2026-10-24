@@ -115,6 +115,18 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	return EmitInputComponentU32(state, kind, component);
 }
 
+// Whether EXEC enables a source lane within the caller's 32-lane half.
+uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lane) {
+	auto&      state  = ctx.state;
+	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
+	const auto ballot = EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(state, scope, exec);
+	if (ctx.half != 0) {
+		lane = EmitAndConstant(state, lane, 31);
+	}
+	return EmitNative<spv::OpGroupNonUniformBallotBitExtract, IR::Type::U1>(state, scope, ballot,
+	                                                                        lane);
+}
+
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
                                uint32_t exec) {
 	auto&    state    = ctx.state;
@@ -950,8 +962,10 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, row_value, index);
 	const auto launched = EmitLaunchedLaneAtOrBelow(state, target);
 	const auto shuffled = ctx.Shuffle(inst, 0, launched);
-	uint32_t   result   = shuffled;
-	if (!flags.fetch_inactive) {
+	if (flags.fetch_inactive) {
+		return shuffled;
+	}
+	{
 		uint32_t source_exec = ctx.Shuffle(inst, 3, launched);
 		if (UnlaunchedLaneReadsNeeded(state)) {
 			// A lane the host did not launch is active if the guest switched it on, which only
@@ -980,11 +994,9 @@ uint32_t EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    Binary(state, spv::OpINotEqual, TypeBool(state), exec_bit, ConstantU32(state, 0)));
 			source_exec = selected;
 		}
-		result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, source_exec, shuffled,
-		                          ConstantU32(state, 0));
+		// An EXEC-disabled source keeps the old destination (or zero with BOUND_CTRL).
+		return Select(state, TypeU32(state), source_exec, shuffled, ctx.Arg(inst, 6));
 	}
-	return result;
 }
 
 uint32_t EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {

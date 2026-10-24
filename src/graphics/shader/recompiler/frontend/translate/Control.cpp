@@ -465,11 +465,15 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	// The scalar EXEC copy also holds the bits of lanes the host did not launch.
-	const auto result = ir.Emit(IR::ValueOpcode::Permlane16U32,
-	                            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2),
-	                             ir.GetExec(), ir.GetExecLo(), ir.GetExecHi()},
-	                            flags);
+	// The scalar EXEC copy also holds the bits of lanes the host did not launch. An EXEC-disabled
+	// source lane without FI disables the write unless BOUND_CTRL reads zero.
+	const auto inactive = flags.fetch_inactive || flags.bound_control
+	                          ? IR::U32(IR::Value(0u))
+	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
+	const auto result   = ir.Emit(IR::ValueOpcode::Permlane16U32,
+	                              {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2),
+	                               ir.GetExec(), ir.GetExecLo(), ir.GetExecHi(), inactive},
+	                              flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

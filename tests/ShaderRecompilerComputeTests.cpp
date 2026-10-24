@@ -29504,56 +29504,52 @@ TestCase VectorPermlanex16() {
   return test;
 }
 
-TestCase VectorPermlane16FetchInactiveZero() {
+TestCase VectorPermlane16InactiveSource(u32 op_sel, u32 wave_size) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code = {
-      EncodeVop1(0x01, 1, 0),
-      EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeVopc(0xc2, InlineU32(0), 0),
-      EncodeSop1(0x04, 126, 106),
-      EncodeSMovB32(0, InlineU32(1)),
-      EncodeSMovB32(1, InlineU32(0)),
-  };
-  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1);
-  AppendStoreVgpr(&code, 2, 0);
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  // Each lane reads its pair neighbour; the halves differ, so each needs its own EXEC.
+  // OP_SEL is 0 (keep the destination), 1 (FI) or 2 (BOUND_CTRL).
+  const u32 masks[] = {0x5f5ff5f5u, 0xf5f55f5fu};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendSMovLiteral(&code, 0, 0x67452301u);
+  AppendSMovLiteral(&code, 1, 0xefcdab89u);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
+  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, op_sel);
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "VectorPermlane16FetchInactiveZero";
-  test.code = code;
-  test.expected = {0};
-  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
-                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  return test;
-}
-
-TestCase VectorPermlane16FetchInactiveFi() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code = {
-      EncodeVop1(0x01, 1, Vgpr(0)),      EncodeVop2(0x25, 1, InlineU32(10), 1),
-      EncodeVopc(0xc2, InlineU32(0), 0), EncodeSop1(0x04, 126, 106),
-      EncodeSMovB32(0, InlineU32(1)),    EncodeSMovB32(1, InlineU32(0)),
-  };
-  AppendVop3(&code, 0x377, 2, Vgpr(1), 0, 1, 0, 1);
-  AppendStoreVgpr(&code, 2, 0);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorPermlane16FetchInactiveFi";
-  test.code = code;
-  test.expected = {11};
-  test.opcodes = {O::V_MOV_B32,          O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
-                  O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
+  const char *names[3][2] = {
+      {"VectorPermlane16InactiveSourceKeepsWave32",
+       "VectorPermlane16InactiveSourceKeepsWave64"},
+      {"VectorPermlane16InactiveSourceFiWave32",
+       "VectorPermlane16InactiveSourceFiWave64"},
+      {"VectorPermlane16InactiveSourceZeroWave32",
+       "VectorPermlane16InactiveSourceZeroWave64"}};
+  test.name = names[op_sel][wave_size == 64];
+  test.code = std::move(code);
+  test.expected.resize(wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) continue;
+    const u32 source = lane ^ 1u;
+    if (op_sel == 1 || (mask & (1u << (source % 32u))) != 0) {
+      test.expected[lane] = 100u + source;
+    } else if (op_sel == 2) {
+      test.expected[lane] = 0;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,        O::V_ADD_NC_U32,  O::S_MOV_B32,
+                  O::V_PERMLANE16_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -46414,8 +46410,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
-  AddCase(VectorPermlane16FetchInactiveZero);
-  AddCase(VectorPermlane16FetchInactiveFi);
+  for (const u32 op_sel : {0u, 1u, 2u})
+    for (const u32 wave_size : {32u, 64u})
+      cases.push_back(VectorPermlane16InactiveSource(op_sel, wave_size));
   cases.push_back(VectorDpp8Captured(false));
   for (const u32 wave_size : {32u, 64u})
     for (const bool fi : {false, true})
@@ -52701,6 +52698,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    for (const u32 op_sel : {0u, 1u, 2u})
+      for (const u32 wave_size : {32u, 64u})
+        RunCase(&vulkan, VectorPermlane16InactiveSource(op_sel, wave_size));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
