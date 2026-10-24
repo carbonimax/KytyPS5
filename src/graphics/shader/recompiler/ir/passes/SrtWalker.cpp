@@ -501,6 +501,25 @@ void CompileSrtWalker(ResourcePlan& program) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+bool SrtPlanInputs(const ResourcePlan& program, std::vector<uint32_t>& user_data,
+                   bool& workgroup_counts) {
+	user_data.clear();
+	workgroup_counts = false;
+	for (const auto& inst: program.value_storage) {
+		if (inst.GetOpcode() != ValueOpcode::GetUserData) continue;
+		if (inst.NumArgs() < 1 || inst.Arg(0).GetType() != Type::ScalarReg) return false;
+		const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+		// Registers below the base are refused without reading any user data.
+		if (reg >= program.user_data_base) user_data.push_back(reg - program.user_data_base);
+	}
+	std::ranges::sort(user_data);
+	user_data.erase(std::unique(user_data.begin(), user_data.end()), user_data.end());
+	for (const auto& source: program.descriptor_sources)
+		if (source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX)
+			workgroup_counts = true;
+	return true;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
     : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
