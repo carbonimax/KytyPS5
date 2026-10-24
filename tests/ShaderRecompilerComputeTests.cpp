@@ -35685,6 +35685,8 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
        {0xc0003c00u, 0xdead3800u}, {0xc0003c00u, 0x00003800u}, 2, 0x86u},
       {"BufferStoreFormatD16XyzUint8", F::k8_8_8_8UInt,
        {0x00020001u, 0xdead0003u}, {0x00030201u}, 1, 0x86u},
+      {"BufferStoreFormatD16XyzFloat11_11_10", F::k11_11_10Float,
+       {0xc0003c7fu, 0xdead7bffu}, {0xf7c003c7u}, 1, 0x86u},
   };
   constexpr O formats[] = {O::BUFFER_STORE_FORMAT_D16_X, O::BUFFER_STORE_FORMAT_D16_XY,
                            O::BUFFER_STORE_FORMAT_D16_XYZ, O::BUFFER_STORE_FORMAT_D16_XYZW};
@@ -35813,6 +35815,16 @@ std::vector<TestCase> FormattedStoreConversionCases() {
        F::k8_8_8_8UScaled, 4, {nan, inf, -inf, -0.0f}, 0x0000ff00u},
       {{"BufferStoreSscaled8SpecialValues", "TBufferStoreSscaled8SpecialValues"},
        F::k8_8_8_8SScaled, 4, {nan, inf, -inf, -0.0f}, 0x00807f00u},
+      // Unsigned 11/10-bit floats truncate, clamp finite values and store negatives and NaN as 0.
+      {{"BufferStoreFloat11_11_10Truncates", "TBufferStoreFloat11_11_10Truncates"},
+       F::k11_11_10Float, 3, {1.0f, std::bit_cast<float>(0x3f87ffffu), 65520.0f}, 0xf7de1bc0u},
+      {{"BufferStoreFloat11_11_10Clamps", "TBufferStoreFloat11_11_10Clamps"},
+       F::k11_11_10Float, 3, {1e10f, -1.0f, inf}, 0xf80007bfu},
+      {{"BufferStoreFloat11_11_10Denormals", "TBufferStoreFloat11_11_10Denormals"},
+       F::k11_11_10Float, 3,
+       {nan, std::bit_cast<float>(0x35800000u), std::bit_cast<float>(0x38400000u)}, 0x06000800u},
+      {{"BufferStoreFloat10_11_11Truncates", "TBufferStoreFloat10_11_11Truncates"},
+       F::k10_11_11Float, 3, {std::bit_cast<float>(0x3f87ffffu), 1.0f, 65520.0f}, 0xf7ef01e1u},
   };
   constexpr O store_opcodes[2][4] = {
       {O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
