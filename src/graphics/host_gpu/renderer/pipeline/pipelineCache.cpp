@@ -912,6 +912,8 @@ struct PipelineCache::ProgramCache {
 		options.profile     = &profile;
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
+		LOGF("%s program: hash=0x%016" PRIx64 " base=0x%016" PRIx64 "\n", label, params.hash,
+		     params.Base());
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
