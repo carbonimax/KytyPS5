@@ -4,72 +4,49 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
-#include <array>
 #include <span>
-#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-class Value;
-
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
-// Clean 64-byte guest blocks served to the walker inline (emulator opt-in, KYTY_SRT_FAST_READS).
-// A block is clean when both runtime readers would return exactly its bytes; for such a block a
-// read needs no reader call. `fill` loads an entry (and lets the caller record it); an entry is
-// current only for the epoch it was filled in. Reads of a block that is not clean go through the
-// runtime readers.
-struct SrtGuestBlocks {
-	static constexpr uint64_t BlockBytes = 64;
-	static constexpr uint32_t NoRecord   = UINT32_MAX;
-	struct Entry {
-		uint64_t                 block  = UINT64_MAX;
-		uint32_t                 epoch  = 0;
-		uint32_t                 record = NoRecord; // caller's record of this fill
-		uint16_t                 mask   = 0;        // dwords read since the fill
-		bool                     valid  = false;    // clean: `words` are what both readers return
-		std::array<uint32_t, 16> words {};
-	};
-	std::array<Entry, 16> entries {};
-	uint32_t              epoch = 1;
-	void (*fill)(void* userdata, Entry& entry, uint64_t block) = nullptr;
-	void* fill_userdata = nullptr;
+// Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
+// root selects by GPU-computed byte offset. The host keeps them resident instead of
+// materializing them.
+struct ImageHeapRequest {
+	uint64_t             base  = 0;
+	uint64_t             size  = 0;
+	uint64_t             step  = 0;
+	uint64_t             first = 0;
+	uint64_t             count = 0;
+	const ImageResource* root  = nullptr;
+};
 
-	// `address` is dword aligned.
-	bool Read(uint64_t address, uint32_t& word) {
-		const uint64_t block = address & ~(BlockBytes - 1u);
-		auto&          entry = entries[(block / BlockBytes) % entries.size()];
-		if (entry.block != block || entry.epoch != epoch) [[unlikely]] fill(fill_userdata, entry, block);
-		if (!entry.valid) return false;
-		const auto index = static_cast<uint32_t>(address % BlockBytes) / 4u;
-		entry.mask = static_cast<uint16_t>(entry.mask | (1u << index));
-		word       = entry.words[index];
-		return true;
-	}
+struct ImageHeapView {
+	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
+	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
+	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
+};
+
+class ImageHeapSource {
+public:
+	// False when the host does not keep the table resident.
+	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+
+protected:
+	~ImageHeapSource() = default;
 };
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
-	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
-	// Emulator opt-in: a scalar read below NullPageEnd (0x10000) is refused instead of read. In a
-	// block whose reachability is not proven it ends that path; the GPU would fault there.
-	bool null_reads_end_speculation = false;
-	bool null_descriptor_supported  = true;
-	// Emulator opt-in: a flattened SRT slot whose value is directly a scalar DWORD read of an
-	// address for which defer_flat_read returns true is not read. The slot stays 0 and
-	// (slot, address) is appended to *gpu_flat_reads: the caller fills it on the GPU. No other
-	// evaluation (control flow, descriptors, specialization) uses a deferred value.
-	bool (*defer_flat_read)(uint64_t address)                 = nullptr;
-	std::vector<std::pair<uint32_t, uint64_t>>* gpu_flat_reads = nullptr;
-	// Only set together with both readers, which it must agree with (SrtGuestBlocks).
-	SrtGuestBlocks* blocks = nullptr;
-	// Set by SrtReadCapture: reads served from `blocks` are captured here like reader reads.
-	std::vector<std::pair<uint64_t, uint64_t>>* captured_ranges = nullptr;
+	ImageHeapSource*          image_heap            = nullptr;
+	// False when the host has no null descriptors: null buffers and images get a fallback.
+	bool                      null_descriptor_supported = true;
 };
 
 class SrtReadCapture {
@@ -79,18 +56,10 @@ public:
 	SrtRuntime ObservedRuntime();
 
 private:
-	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values);
-	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values);
+	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 	SrtRuntime                                  m_source;
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
-};
-
-// Retained reads no longer need the guest instruction PC. A clean read evaluates
-// its address and bounds through the strict reader as well as the final DWORD.
-struct SrtReadFlags {
-	uint32_t index = 0;
-	uint32_t clean = 0;
 };
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
@@ -100,15 +69,20 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-void CompileSrtWalker(ResourcePlan& program);
-// Inputs a materialization of `program` can read besides guest memory, the shader base and the
-// indirect argument address: the user data dwords (indices relative to user_data_base) of every
-// GetUserData value the plan owns, and whether any indirect descriptor reads workgroup counts.
-// Returns false when the set cannot be bounded (a user data operand that is not a register).
-bool SrtPlanInputs(const ResourcePlan& program, std::vector<uint32_t>& user_data,
-                   bool& workgroup_counts);
-// Uses the strict reader for values that affect shader specialization.
-SrtRuntime CleanRuntime(SrtRuntime runtime);
+// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
+// only evaluates the values, with every block reachable.
+void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
+// Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
+// one DWORD range per guest load. False when a reachable read is unknown.
+bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
+             std::vector<std::pair<uint64_t, uint64_t>>* reads);
+// Results of the last walk; false when unknown.
+bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
+bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
+bool WalkedActive(const ResourcePlan& plan, uint32_t source);
+// Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
+// The exception handler completes such a load as a zero read.
+uint32_t SrtWalkerLoadLength(uint64_t rip);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
@@ -151,57 +125,6 @@ std::optional<std::array<uint64_t, Size>> AffineIndex(
 	}
 	return left;
 }
-
-// One memoized evaluation session shared by the entire shader resource refresh.
-class SrtWalker {
-public:
-	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-	          SrtWalker* clean_evaluator = nullptr);
-	~SrtWalker();
-	SrtWalker(const SrtWalker&)            = delete;
-	SrtWalker& operator=(const SrtWalker&) = delete;
-
-	bool Evaluate(Value value, uint32_t& result);
-	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
-	// Refreshes reachable scalar reads and active descriptor sources in one walk.
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
-	// True once since the last call if an evaluation stopped at a guest null page read.
-	bool TakeNullRead() { return std::exchange(m_null_read, false); }
-
-private:
-	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
-	          SrtWalker* clean_evaluator = nullptr);
-	ResourcePlan::EvaluationContext& AcquireContext();
-	void ResetUnknowns();
-	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
-	bool Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
-	// One guest dword through `blocks` when it is clean, else through the runtime reader.
-	bool ReadWord(bool vector, uint64_t address, uint32_t& word);
-	enum class RawReadKind { Unknown, Constant, Memory };
-	// Address of a raw read, or its value when it reads no memory (Constant).
-	RawReadKind RawReadAddress(const Inst& inst, uint64_t& address, uint64_t& constant);
-	bool DeferFlatRead(const Inst& inst, uint32_t flat_offset, std::vector<uint32_t>& flat);
-	bool EvaluateInst(const Inst& inst, uint64_t& result);
-
-	const ResourcePlan&              m_program;
-	SrtRuntime                      m_runtime;
-	SrtWalker*                      m_clean_evaluator = nullptr;
-	Value                           m_active_mask;
-	const std::vector<uint8_t>*      m_reachable_blocks = nullptr;
-	const SrtWalker*                m_session;
-	uint8_t                         m_read_policy;
-	// KYTY_SRT_FAST_CONTEXTS, top walker of a session: the contexts the session holds.
-	// UINT32_MAX: not listed (switch off or list full), the session scans every context.
-	// Declared before m_context, which is acquired during construction.
-	mutable uint32_t                                         m_owned_count = 0;
-	mutable std::array<ResourcePlan::EvaluationContext*, 32> m_owned {};
-	ResourcePlan::EvaluationContext& m_context;
-	bool                            m_null_read = false;
-};
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

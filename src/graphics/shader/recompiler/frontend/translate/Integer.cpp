@@ -221,8 +221,17 @@ void Translator::V_XOR3_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb) {
+void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb,
+                              bool sign) {
 	auto source = ReadU32Pair(inst.src0);
+	if (sign) {
+		// A signed source sign-extends a literal; then bits equal to the sign become zero.
+		if (inst.src0.kind == Decoder::OperandKind::LiteralConstant) {
+			source[1] = ir.ShiftRightArithmetic(source[0], IR::U32(IR::Value(31u)));
+		}
+		const auto mask = ir.ShiftRightArithmetic(source[1], IR::U32(IR::Value(31u)));
+		source          = {ir.BitwiseXor(source[0], mask), ir.BitwiseXor(source[1], mask)};
+	}
 	for (auto& word: source) {
 		word = find_zero ? ir.BitwiseNot(word) : word;
 	}
@@ -240,12 +249,19 @@ void Translator::S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, 
 
 void Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 	const auto source = ReadU32(inst.src0);
-	const auto value  = sign ? ir.BitwiseXor(
-	                              source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
-	                         : source;
-	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {value}));
+	if (sign) {
+		// Bits equal to the sign become zero; FindILsb of the reversed bits is ~0 when none.
+		const auto bits =
+		    ir.BitwiseXor(source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))));
+		const auto reversed = ir.Emit(IR::ValueOpcode::BitReverse32, {bits});
+		WriteOperand(DestinationOperand(inst),
+		             IR::U32(ir.Emit(IR::ValueOpcode::FindILsb32, {reversed})));
+		return;
+	}
+	// ResourceTracking matches this 31 - FindUMsb32 form.
+	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {source}));
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
-	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
+	const auto result   = ir.Select(ir.INotEqual(source, IR::U32(IR::Value(0u))), position,
 	                                IR::U32(IR::Value(0xffffffffu)));
 	WriteOperand(DestinationOperand(inst), result);
 }

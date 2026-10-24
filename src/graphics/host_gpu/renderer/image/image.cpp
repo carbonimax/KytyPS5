@@ -92,7 +92,8 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
-	if (info.samples == 1) {
+	if (graphics.GetPhysicalDeviceProperties().limits.storageImageSampleCounts &
+	    static_cast<vk::SampleCountFlagBits>(info.samples)) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return usage;
@@ -246,6 +247,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
+	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
+		    return barrier.oldLayout == ReadLayout() &&
+		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+	    })) {
+		HeapChanged();
+	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
