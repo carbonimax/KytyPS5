@@ -29785,25 +29785,56 @@ TestCase VectorDppBankMaskPreservesDestination() {
   return test;
 }
 
-TestCase VectorDppBoundsControlZeroPreservesDestination() {
+TestCase VectorDppInactiveSource(bool row_shift, bool bound_ctrl, u32 wave_size) {
   using O = ShaderOpcode;
-
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  // Each half mixes active, EXEC-disabled and (for row_shr:1) vacated sources.
+  const u32 masks[] = {0x5f5ff5f5u, 0xf5f55f5fu};
   std::vector<u32> code;
-  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
   AppendVMovU32(&code, 1, 100);
-  code.push_back(EncodeVop2(0x25, 2, 250, 1));
-  code.push_back(EncodeVop2Dpp(0, 0x111));
-  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
-  AppendBufferStoreDword(&code, 2, 3);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  AppendVMovU32(&code, 7, 1000);
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
+  // v_add_nc_u32_dpp v2, v1, v7 with row_shr:1 or quad_perm:[3,2,1,0]; bit 19 is BOUND_CTRL.
+  code.push_back(EncodeVop2(0x25, 2, 250, 7));
+  code.push_back(EncodeVop2Dpp(1, row_shift ? 0x111u : 0x01bu) |
+                 (bound_ctrl ? 1u << 19 : 0u));
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "VectorDppBoundsControlZeroPreservesDestination";
-  test.code = code;
-  test.expected = {0xaaaaaaaau, 100, 101, 102, 103, 104, 105, 106};
-  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 8;
+  const char *names[2][2][2] = {
+      {{"VectorDppQuadPermInactiveSourceKeepsWave32",
+        "VectorDppQuadPermInactiveSourceKeepsWave64"},
+       {"VectorDppQuadPermInactiveSourceZeroWave32",
+        "VectorDppQuadPermInactiveSourceZeroWave64"}},
+      {{"VectorDppRowShrInactiveSourceKeepsWave32",
+        "VectorDppRowShrInactiveSourceKeepsWave64"},
+       {"VectorDppRowShrInactiveSourceZeroWave32",
+        "VectorDppRowShrInactiveSourceZeroWave64"}}};
+  test.name = names[row_shift][bound_ctrl][wave_size == 64];
+  test.code = std::move(code);
+  test.expected.resize(wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) continue;
+    const bool vacated = row_shift && lane % 16u == 0;
+    const u32 source = row_shift ? lane - 1u : (lane & ~3u) | (3u - (lane & 3u));
+    if (!vacated && (mask & (1u << (source % 32u))) != 0) {
+      test.expected[lane] = 1100u + source + lane;
+    } else if (bound_ctrl) {
+      test.expected[lane] = 1000u + lane;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,     O::V_ADD_NC_U32,       O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -46428,7 +46459,10 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ComputeWave64Minimum(false));
   cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
-  AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  for (const bool row_shift : {false, true})
+    for (const bool bound_ctrl : {false, true})
+      for (const u32 wave_size : {32u, 64u})
+        cases.push_back(VectorDppInactiveSource(row_shift, bound_ctrl, wave_size));
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(VectorMadF32RoundsProduct);
   AddCase(VectorMadF32FlushesDenorms);
@@ -52697,7 +52731,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(32));
     RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
-    RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    for (const bool row_shift : {false, true})
+      for (const bool bound_ctrl : {false, true})
+        for (const u32 wave_size : {32u, 64u})
+          RunCase(&vulkan, VectorDppInactiveSource(row_shift, bound_ctrl, wave_size));
     for (const u32 op_sel : {0u, 1u, 2u})
       for (const u32 wave_size : {32u, 64u})
         RunCase(&vulkan, VectorPermlane16InactiveSource(op_sel, wave_size));
