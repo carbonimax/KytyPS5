@@ -1948,8 +1948,72 @@ void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
+// KYTY_SRT_FAST_READS: a clean block serves the walker's read without a reader call and with the
+// value the reader returns; a block that is not clean falls back to the reader. Captured reads
+// and the snapshot are the same with and without blocks.
+void TestGuestBlocksServeCleanReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  struct Memory {
+    SrtGuestBlocks *blocks = nullptr;
+    uint32_t calls = 0;
+    uint32_t fills = 0;
+    bool clean = true;
+  };
+  const auto read = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    ++static_cast<Memory *>(data)->calls;
+    words[0] = static_cast<uint32_t>(address * 3u + 1u);
+    return true;
+  };
+  const auto fill = +[](void *data, SrtGuestBlocks::Entry &entry, uint64_t block) {
+    auto &memory = *static_cast<Memory *>(data);
+    ++memory.fills;
+    entry.block = block;
+    entry.epoch = memory.blocks->epoch;
+    entry.mask = 0;
+    entry.valid = memory.clean;
+    for (uint32_t i = 0; i < entry.words.size(); ++i)
+      entry.words[i] = static_cast<uint32_t>((block + 4u * i) * 3u + 1u);
+  };
+  for (const bool capture : {false, true}) {
+    for (const bool clean : {true, false}) {
+      auto plan = ExtractResourcePlan(SrtProgram(0x10044u));
+      plan.capture_specialization_reads = capture;
+      Memory reference_memory;
+      const SrtRuntime reference_runtime{.read_memory = read, .userdata = &reference_memory,
+                                         .read_specialization_memory = read};
+      ResourceSnapshot reference;
+      ResourceSpecialization reference_specialization;
+      Check(MaterializeResources(plan, reference_runtime, reference, reference_specialization) &&
+                reference.flattened_srt == std::vector<uint32_t>{0x10044u * 3u + 1u} &&
+                reference_memory.calls == 1u,
+            "reader-only materialization of the block test plan failed");
+      SrtGuestBlocks blocks;
+      Memory memory{.blocks = &blocks, .clean = clean};
+      blocks.fill = fill;
+      blocks.fill_userdata = &memory;
+      SrtRuntime runtime{.read_memory = read, .userdata = &memory,
+                         .read_specialization_memory = read};
+      runtime.blocks = &blocks;
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "materialization with guest blocks failed");
+      Check(snapshot.flattened_srt == reference.flattened_srt &&
+                snapshot.specialization_reads == reference.specialization_reads &&
+                snapshot.buffers == reference.buffers && specialization == reference_specialization,
+            "guest blocks changed the materialized resources or the captured reads");
+      Check(memory.fills == 1u && memory.calls == (clean ? 0u : 1u),
+            "a clean block called the reader, or a block that is not clean did not");
+      const auto &entry = blocks.entries[(0x10040u / SrtGuestBlocks::BlockBytes) % blocks.entries.size()];
+      Check(entry.block == 0x10040u && entry.mask == (clean ? 1u << 1u : 0u),
+            "the block did not record the dword the walk read");
+    }
+  }
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestGuestBlocksServeCleanReads();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesRetainReadPolicy();

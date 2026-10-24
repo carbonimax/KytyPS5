@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -132,18 +133,23 @@ public:
 		if (values.size() != 1 || (address & 3u) != 0u) {
 			return false;
 		}
-		const uint64_t block = address & ~uint64_t {BlockBytes - 1};
-		auto&          entry = m_entries[(block / BlockBytes) % m_entries.size()];
+		const auto* words = Block(address & ~uint64_t {BlockBytes - 1});
+		if (words == nullptr) {
+			return false;
+		}
+		values[0] = words[(address % BlockBytes) / sizeof(uint32_t)];
+		return true;
+	}
+
+	// The 16 dwords of a clean 64-byte block (what both readers return for it), else null.
+	const uint32_t* Block(uint64_t block) {
+		auto& entry = m_entries[(block / BlockBytes) % m_entries.size()];
 		if (entry.block != block) {
 			entry.block = block;
 			entry.valid = Libs::LibKernel::Memory::TryReadCleanBufferBacking(
 			    block, entry.words.data(), BlockBytes);
 		}
-		if (!entry.valid) {
-			return false;
-		}
-		values[0] = entry.words[(address % BlockBytes) / sizeof(uint32_t)];
-		return true;
+		return entry.valid ? entry.words.data() : nullptr;
 	}
 
 private:
@@ -268,6 +274,46 @@ void SrtVerifyLog(const std::string& line) {
 	std::fflush(file);
 }
 
+// KYTY_SRT_FAST_READS (default 1; 0 disables, 2 also verifies). A recorded walk reads clean 64-byte
+// blocks inline (ShaderRecompiler::IR::SrtGuestBlocks) instead of calling the reader chain per
+// dword (read capture -> memo record -> block cache). The memo records one entry per block fill
+// (the 16 dwords and, at Commit, the mask of dwords the walk read) instead of one per dword; a
+// replay re-reads the block, which must still be clean, and compares the masked dwords. A block
+// that is not clean is read per dword through the readers and recorded per dword as before.
+// Invariant: for a clean block both readers return exactly its backing bytes, so a walk returns
+// the same values in the same order with or without the blocks; a replay accepts a recording
+// only when every value the walk read is unchanged. With 2, every fresh walk is made again
+// through the readers alone (with the same GPU-dirty decisions for deferred flat reads) and every
+// hit is materialized again from scratch; both must be identical (results in srt_verify.txt).
+int SrtFastReadsMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_SRT_FAST_READS");
+		return value == nullptr ? 1 : std::atoi(value);
+	}();
+	return mode;
+}
+
+// KYTY_SRT_FAST_READS=2: the deferred flat read decisions of a recorded walk, replayed for the
+// verification walk so that both see the same GPU-dirty state.
+thread_local std::vector<std::pair<uint64_t, bool>> t_defer_log;
+thread_local size_t                                 t_defer_index    = 0;
+thread_local bool                                   t_defer_replay   = false;
+thread_local bool                                   t_defer_diverged = false;
+
+bool VerifiedGpuDirtyDword(uint64_t address) {
+	if (t_defer_replay) {
+		if (!t_defer_diverged && t_defer_index < t_defer_log.size() &&
+		    t_defer_log[t_defer_index].first == address) {
+			return t_defer_log[t_defer_index++].second;
+		}
+		t_defer_diverged = true;
+		return IsGpuDirtyDword(address);
+	}
+	const bool dirty = IsGpuDirtyDword(address);
+	t_defer_log.emplace_back(address, dirty);
+	return dirty;
+}
+
 struct SrtMemoInputs {
 	std::vector<uint32_t> user_data; // indices into SrtRuntime::user_data
 	bool                  workgroup_counts = false;
@@ -300,6 +346,21 @@ public:
 			return false;
 		}
 		for (const auto& read: m_reads) {
+			if (read.block) {
+				// A fill that was not clean holds no value: the walk read those dwords per dword.
+				if (!read.ok || read.mask == 0u) continue;
+				const uint32_t* words = static_cast<SrtBlockCache*>(runtime.userdata)->Block(read.address);
+				bool            same  = words != nullptr;
+				for (uint32_t bits = read.mask; same && bits != 0u; bits &= bits - 1u) {
+					const auto index = std::countr_zero(bits);
+					same             = words[index] == m_values[read.offset + index];
+				}
+				if (!same) {
+					m_valid = false;
+					return false;
+				}
+				continue;
+			}
 			m_scratch.resize(read.count);
 			const auto reader =
 			    read.specialization ? runtime.read_specialization_memory : runtime.read_memory;
@@ -329,10 +390,28 @@ public:
 		recorded.userdata                   = this;
 		recorded.read_memory                = ReadOrdinary;
 		recorded.read_specialization_memory = ReadSpecialization;
+		m_blocks_on = SrtFastReadsMode() != 0 && runtime.userdata != nullptr;
+		if (m_blocks_on) {
+			// Entries of earlier recordings (other epochs) are refilled, hence recorded, on use.
+			if (++m_blocks.epoch == 0u) {
+				m_blocks.entries = {};
+				m_blocks.epoch   = 1u;
+			}
+			m_blocks.fill          = FillBlock;
+			m_blocks.fill_userdata = this;
+			recorded.blocks        = &m_blocks;
+		}
 		return recorded;
 	}
 
-	void Commit() { m_valid = true; }
+	void Commit() {
+		// Stores the read masks of the blocks still cached into their records.
+		if (m_blocks_on) {
+			for (auto& entry: m_blocks.entries) CloseBlock(entry);
+		}
+		m_valid = true;
+	}
+	[[nodiscard]] bool HasBlockReads() const { return m_blocks_on; }
 	void Invalidate() { m_valid = false; }
 
 private:
@@ -342,7 +421,35 @@ private:
 		uint32_t count          = 0;
 		bool     specialization = false;
 		bool     ok             = false;
+		bool     block          = false; // KYTY_SRT_FAST_READS fill of a 64-byte block
+		uint16_t mask           = 0;     // block: dwords the walk read
 	};
+
+	using BlockEntry = ShaderRecompiler::IR::SrtGuestBlocks::Entry;
+
+	void CloseBlock(BlockEntry& entry) {
+		if (entry.epoch == m_blocks.epoch && entry.record < m_reads.size())
+			m_reads[entry.record].mask = entry.mask;
+		entry.record = ShaderRecompiler::IR::SrtGuestBlocks::NoRecord;
+	}
+
+	static void FillBlock(void* userdata, BlockEntry& entry, uint64_t block) {
+		auto& memo = *static_cast<SrtMaterializationMemo*>(userdata);
+		memo.CloseBlock(entry);
+		entry.block           = block;
+		entry.epoch           = memo.m_blocks.epoch;
+		entry.mask            = 0;
+		const uint32_t* words = static_cast<SrtBlockCache*>(memo.m_userdata)->Block(block);
+		entry.valid           = words != nullptr;
+		if (entry.valid) std::copy_n(words, entry.words.size(), entry.words.begin());
+		entry.record = static_cast<uint32_t>(memo.m_reads.size());
+		memo.m_reads.push_back({.address = block,
+		                        .offset  = static_cast<uint32_t>(memo.m_values.size()),
+		                        .count   = static_cast<uint32_t>(entry.words.size()),
+		                        .ok      = entry.valid,
+		                        .block   = true});
+		if (entry.valid) memo.m_values.insert(memo.m_values.end(), entry.words.begin(), entry.words.end());
+	}
 
 	static bool Capture(void* userdata, uint64_t address, std::span<uint32_t> values,
 	                    bool specialization) {
@@ -374,6 +481,8 @@ private:
 	ShaderRecompiler::IR::SrtMemoryReader m_ordinary       = nullptr;
 	ShaderRecompiler::IR::SrtMemoryReader m_specialization = nullptr;
 	void*                                 m_userdata       = nullptr;
+	bool                                  m_blocks_on      = false;
+	ShaderRecompiler::IR::SrtGuestBlocks  m_blocks;
 };
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -518,7 +627,7 @@ struct PipelineCache::ProgramCache {
 		                             bool gpu_flat_reads = false) {
 			auto runtime = source_runtime;
 			if (gpu_flat_reads && !HasCalls && SrtGpuFlatReadsEnabled()) {
-				runtime.defer_flat_read = IsGpuDirtyDword;
+				runtime.defer_flat_read = SrtFastReadsMode() == 2 ? VerifiedGpuDirtyDword : IsGpuDirtyDword;
 				runtime.gpu_flat_reads  = &resources.gpu_flat_reads;
 			}
 			// Programs with calls refresh their source reads per lookup; they are not memoized.
@@ -532,17 +641,25 @@ struct PipelineCache::ProgramCache {
 					resources.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 					if (SrtMemoKeyMode() == 2) VerifyKeyedHit(runtime, emulate_image_min_lod);
 				}
+				if (replayed && SrtFastReadsMode() == 2 && srt_memo.HasBlockReads()) {
+					t_defer_log.clear();
+					VerifyFast(runtime, true, emulate_image_min_lod);
+				}
 				if (!replayed) {
+					t_defer_log.clear();
 					EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 					    resource_plan, srt_memo.Record(runtime), resources, specialization,
 					    emulate_image_min_lod));
 					srt_memo.Commit();
+					if (SrtFastReadsMode() == 2 && srt_memo.HasBlockReads()) VerifyFast(runtime, false, emulate_image_min_lod);
 				}
+				t_defer_log.clear();
 			} else {
 				srt_memo.Invalidate();
 				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 				    resource_plan, runtime, resources, specialization,
 				    emulate_image_min_lod));
+				t_defer_log.clear();
 			}
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
@@ -572,7 +689,7 @@ struct PipelineCache::ProgramCache {
 		// KYTY_SRT_MEMO_KEY=2: a keyed hit must equal a fresh materialization.
 		void VerifyKeyedHit(const ShaderRecompiler::IR::SrtRuntime& runtime, bool emulate_image_min_lod) {
 			static std::atomic<uint64_t> checked {0}, mismatched {0};
-			const auto bad = CompareWithFresh(runtime, emulate_image_min_lod);
+			const auto bad = CompareWithFresh(runtime, false, emulate_image_min_lod);
 			const auto n   = checked.fetch_add(1) + 1;
 			const auto m   = mismatched.fetch_add(bad.empty() ? 0 : 1) + (bad.empty() ? 0 : 1);
 			if ((!bad.empty() && m <= 1000) || (n & (n - 1)) == 0 || n % 65536 == 0) {
@@ -582,18 +699,43 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// KYTY_SRT_FAST_READS=2: a hit, or a fresh walk made with SrtGuestBlocks, must equal a
+		// materialization through the readers alone (`runtime` has no blocks).
+		void VerifyFast(const ShaderRecompiler::IR::SrtRuntime& runtime, bool hit,
+		                bool emulate_image_min_lod) {
+			static std::atomic<uint64_t> checked[2] {}, mismatched[2] {};
+			const auto bad = CompareWithFresh(runtime, !hit, emulate_image_min_lod);
+			const auto n   = checked[hit].fetch_add(1) + 1;
+			const auto m   = mismatched[hit].fetch_add(bad.empty() ? 0 : 1) + (bad.empty() ? 0 : 1);
+			if ((!bad.empty() && m <= 1000) || (n & (n - 1)) == 0 || n % 65536 == 0) {
+				SrtVerifyLog(fmt::format("srt-fast verify {}: hash=0x{:016x} {}{} checked={} mismatched={}",
+				                         hit ? "hit" : "walk", resource_plan.shader_hash,
+				                         bad.empty() ? "same" : "DIFFERENT:", bad, n, m));
+			}
+		}
+
 		// Materializes `runtime` again from scratch and compares with the current result. On a
-		// difference the fresh result is kept and the memo records again.
-		std::string CompareWithFresh(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		// difference the fresh result is kept and the memo records again. `replay_defer`: the
+		// GPU-dirty decisions logged by the walk that made the current result are replayed.
+		std::string CompareWithFresh(const ShaderRecompiler::IR::SrtRuntime& runtime, bool replay_defer,
 		                             bool emulate_image_min_lod) {
 			ShaderRecompiler::IR::ResourceSnapshot       fresh;
 			ShaderRecompiler::IR::ResourceSpecialization fresh_specialization;
 			const auto                                   active = resource_plan.active_sources;
 			auto                                         source = runtime;
 			if (source.gpu_flat_reads != nullptr) source.gpu_flat_reads = &fresh.gpu_flat_reads;
+			if (replay_defer) {
+				t_defer_replay   = true;
+				t_defer_index    = 0;
+				t_defer_diverged = false;
+			}
 			const bool ok = ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, source, fresh, fresh_specialization, emulate_image_min_lod);
 			std::string bad;
+			if (replay_defer) {
+				t_defer_replay = false;
+				if (t_defer_diverged || t_defer_index != t_defer_log.size()) bad += " defer_sequence";
+			}
 			if (!ok) bad += " materialize";
 			if (fresh.buffers != resources.buffers) bad += " buffers";
 			if (fresh.images != resources.images) bad += " images";
