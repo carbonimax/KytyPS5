@@ -25,8 +25,7 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	const auto rhs    = ReadU16AsU32(inst.src1, true);
 	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
 	if (inst.dst.clamp) {
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {result, IR::Value(0xffff8000u)}));
-		result = IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {result, IR::Value(0x7fffu)}));
+		result = Saturate16(result, true);
 	}
 	Write16Bits(DestinationOperand(inst), result);
 }
