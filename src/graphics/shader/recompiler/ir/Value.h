@@ -185,4 +185,76 @@ private:
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
+// Hot accessors of the resource-plan evaluators (SRT walks run per draw): inline.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return num_args == PhiArity ? phi_args.size() : num_args;
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Value Value::Resolve() const {
+	Value value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	const Value value = Resolve();
+	EXIT_IF(value.type != Type::Opaque);
+	return value.inst;
+}
+
+inline bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

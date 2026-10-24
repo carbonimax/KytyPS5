@@ -372,6 +372,15 @@ private:
 };
 
 
+// A reachability pass of RefreshFlatBuffer is repeated with the reachability it found until that
+// stops changing. Only control phis read the reachability: successful ones stay memoized, failed
+// ones are retried. When every predecessor of each failed control phi keeps its reachability, the
+// next pass would evaluate exactly as this one and find the same blocks, so the fixed point is
+// already reached. These are the predecessor lists of the control phis that failed during the
+// current pass, recorded across the walkers of this thread.
+thread_local std::vector<const std::vector<uint32_t>*> t_failed_control_phis;
+thread_local bool                                      t_record_failed_control_phis = false;
+
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& program) {
@@ -564,15 +573,19 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext() {
 	context.active_mask = m_active_mask;
 	context.read_policy = m_read_policy;
 	context.generation += 4;
+	context.unknowns.clear();
 	return context;
 }
 
 void SrtWalker::ResetUnknowns() {
 	for (auto& context: m_program.evaluation_contexts) {
 		if (context.session != m_session) continue;
-		for (auto& entry: context.values)
+		for (const auto index: context.unknowns) {
+			auto& entry = context.values[index];
 			if (entry.generation == (context.generation | 2u) ||
 			    entry.generation == (context.generation | 3u)) entry.generation = 0;
+		}
+		context.unknowns.clear();
 	}
 }
 
@@ -634,6 +647,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
 		memo.generation = m_context.generation | (null_read ? 3u : 2u);
+		m_context.unknowns.push_back(index);
 		return false;
 	}
 	memo.value      = out;
@@ -654,10 +668,14 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 			if (m_reachable_blocks != nullptr &&
 			    !m_reachable_blocks->at(control->second[index])) continue;
 			uint64_t incoming = 0;
-			if (!Arg(inst, index, incoming) || (found && incoming != result)) return false;
+			if (!Arg(inst, index, incoming) || (found && incoming != result)) {
+				if (t_record_failed_control_phis) t_failed_control_phis.push_back(&control->second);
+				return false;
+			}
 			result = incoming;
 			found = true;
 		}
+		if (!found && t_record_failed_control_phis) t_failed_control_phis.push_back(&control->second);
 		return found;
 	}
 	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
@@ -1277,6 +1295,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		reachable.assign(m_program.control_flow.size(), 0u);
 		pending.clear();
 		pending.push_back(0u);
+		t_failed_control_phis.clear();
+		t_record_failed_control_phis = true;
 		while (!pending.empty()) {
 			const auto entry = pending.back();
 			pending.pop_back();
@@ -1300,12 +1320,19 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 					pending.push_back(successor | (choice || speculative ? Speculative : 0u));
 			}
 		}
+		t_record_failed_control_phis = false;
 		// Phi evaluation only sees whether a block is reachable, so levels do not need another pass.
 		const bool stable = std::ranges::equal(reachable, visited, [](uint8_t now, uint8_t before) {
 			return (now != 0u) == (before != 0u);
 		});
+		const bool repeats =
+		    std::ranges::all_of(t_failed_control_phis, [&](const auto* predecessors) {
+			    return std::ranges::all_of(*predecessors, [&](uint32_t block) {
+				    return (reachable.at(block) != 0u) == (visited.at(block) != 0u);
+			    });
+		    });
 		visited.swap(reachable);
-		if (stable || m_program.control_phi_predecessors.empty()) break;
+		if (stable || m_program.control_phi_predecessors.empty() || repeats) break;
 		// Only unknown values need another evaluation: successful Phi facts remain
 		// true as their possible predecessors shrink. Keep uniform-read memos stable.
 		ResetUnknowns();

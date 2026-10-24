@@ -667,6 +667,8 @@ struct ResourcePlan {
 		};
 
 		std::vector<Entry> values;
+		// Indices of values that completed unknown in this generation (ResetUnknowns).
+		std::vector<uint32_t> unknowns;
 		uint64_t           generation = 0;
 		const SrtWalker*    session = nullptr;
 		Value              active_mask;
