@@ -9610,6 +9610,28 @@ void TestNativeConstantSamplerSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestPackedZeroHighSamplerTableKey() {
+  // s_pack_ll_b32_b16 with a zero high lane zero-extends a GPU-selected table key, so the
+  // sampler table stays bounded to 64Ki records.
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x0c, 0, true), EncodeMubuf1(1, 3, 0), EncodeSopp(0x0c, 0),
+      EncodeVop1(0x02, 28, 257), EncodeSop2(0x32, 29, 28, 128),
+      EncodeSop2(0x1e, 30, 29, 132),
+      EncodeSmem0(0x0a, 24, 4), 30u << 25u, EncodeSopp(0x0c, 0),
+      EncodeMimg0(0x20, 0x1), EncodeMimg1(0, 4, 6, 2),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data = ImageTestUserData();
+  const auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  const auto& indirect =
+      plan.descriptor_sources[plan.info.samplers.at(0).source].indirect_descriptor;
+  Check(indirect && indirect->table_stride == 16u && indirect->table_maximum == 0xffffu,
+        "a zero-extended sampler table key lost its 16-bit bound");
+}
+
 void TestBoundedMaterialBufferStores(bool scalar_key) {
   // Captured batch search and descriptor waterfall, with deformation arithmetic removed.
   const uint32_t shader[] = {
@@ -17638,6 +17660,7 @@ int main(int argc, char **argv) {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestPackedZeroHighSamplerTableKey();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();

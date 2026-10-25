@@ -135,6 +135,8 @@ void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
 }
 
 IR::U32 Translator::PackU16Lanes(IR::U32 low, IR::U32 high) {
+	// A zero high lane zero-extends; descriptor tracking bounds a mask, not a bitfield insert.
+	if (high == IR::Value(0u)) return ir.BitwiseAnd(low, IR::U32(IR::Value(0xffffu)));
 	return IR::U32(
 	    ir.Emit(IR::ValueOpcode::BitFieldInsert, {low, high, IR::Value(16u), IR::Value(16u)}));
 }
