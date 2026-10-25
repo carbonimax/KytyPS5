@@ -12096,7 +12096,7 @@ public:
     constexpr uintptr_t base = 0x0000000204c00000ull;
     constexpr uint64_t size = 0x10000;
     constexpr auto output = base + 0x2000;
-    constexpr u32 value = 0x80000578u;
+    constexpr u32 value = 0x80000578u, fill = 0xa5a5a5a5u;
     std::array<std::vector<u32>, 2> codes;
     for (u32 scalar = 0; scalar < codes.size(); ++scalar) {
       auto &code = codes[scalar];
@@ -12135,15 +12135,18 @@ public:
       context.MapMemory(base, size);
       auto &cache = context.GetBufferCache();
       auto &shaders = processor.GetShCtx();
-      struct Case { u32 mode, records; bool scalar; u32 expected; };
-      constexpr Case cases[]{{2, 1, false, value}, {2, 0, false, 0},
+      // The first case stores through a NumRecords=0 output, which binds the shared null
+      // buffer; a later NumRecords=0 load must still read zero.
+      struct Case { u32 mode, records; bool scalar; u32 expected; bool null_output = false; };
+      constexpr Case cases[]{{3, 4, false, fill, true},
+                              {2, 1, false, value}, {2, 0, false, 0},
                               {3, 1, false, 0}, {3, 4, false, value},
                               {2, 1, true, 0}, {2, 4, true, value}};
       for (const auto wave : {32u, 64u}) {
         for (const auto prefix : {0u, 8u}) {
           const auto address = base + 0x1000 + prefix;
           for (const auto test : cases) {
-            cache.FillBuffer(output, wave * sizeof(u32), 0xa5a5a5a5u, false);
+            cache.FillBuffer(output, wave * sizeof(u32), fill, false);
             shaders.SetCsShader({
                 .data_addr = reinterpret_cast<uint64_t>(codes[test.scalar].data()),
                 .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
@@ -12155,7 +12158,7 @@ public:
                 (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
                 (test.mode << 28u);
             out.UpdateAddress48(output);
-            out.fields[2] = wave * sizeof(u32);
+            out.fields[2] = test.null_output ? 0u : wave * sizeof(u32);
             out.fields[3] = DstSel(4, 5, 6, 7) |
                 (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
             for (u32 i = 0; i < 4; ++i) {
