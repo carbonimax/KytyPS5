@@ -11,6 +11,10 @@
 #include <utility>
 #include <vector>
 
+namespace Libs::Graphics::CmdRecord {
+void Report(double seconds); // cmdRecord.h (KYTY_CP_RECORD_THREAD)
+} // namespace Libs::Graphics::CmdRecord
+
 namespace Libs::Graphics::PerfStats {
 
 namespace {
@@ -22,6 +26,7 @@ std::array<std::atomic<uint64_t>, CounterCount> g_counters {};
 thread_local bool                               g_gpu_thread = false;
 const auto                                      g_epoch      = std::chrono::steady_clock::now();
 std::atomic<int64_t>                            g_last_flip_arg {0};
+std::atomic<uint64_t>                           g_recent_frame_us {0};
 
 uint64_t NowUs() noexcept {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -76,7 +81,24 @@ void NoteFlipArg(int64_t arg) noexcept {
 	g_last_flip_arg.store(arg, std::memory_order_relaxed);
 }
 
+uint64_t RecentFrameUs() noexcept {
+	return g_recent_frame_us.load(std::memory_order_relaxed);
+}
+
 void NotePresentedFrame() noexcept {
+	{
+		// Smoothed presentation interval (1/8 of each new interval), always kept: the GPU thread reads
+		// it (KYTY_CP_RECORD_MIN_FRAME_MS). Presentation runs on one thread.
+		static uint64_t last_us = 0;
+		const auto      now_us  = NowUs();
+		if (last_us != 0) {
+			const auto interval = now_us - last_us;
+			const auto recent   = g_recent_frame_us.load(std::memory_order_relaxed);
+			g_recent_frame_us.store(recent == 0 ? interval : recent - recent / 8 + interval / 8,
+			                        std::memory_order_relaxed);
+		}
+		last_us = now_us;
+	}
 	struct Recorder {
 		std::FILE*                                file = nullptr;
 		std::vector<std::pair<uint64_t, int64_t>> pending;
@@ -147,6 +169,7 @@ void MaybeReport() noexcept {
 		            seconds, static_cast<double>(walk.ns) / 1e6, walk.walks, walk.backing_reads,
 		            walk.fault_reads);
 	}
+	CmdRecord::Report(seconds);
 	GuestStacks::Report();
 	std::fflush(stdout);
 }

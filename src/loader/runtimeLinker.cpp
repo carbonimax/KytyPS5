@@ -15,6 +15,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -762,6 +763,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		Libs::Graphics::GuestStacks::Describe(info->rsp);
+		Libs::Graphics::CmdRecord::Describe();
 		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies

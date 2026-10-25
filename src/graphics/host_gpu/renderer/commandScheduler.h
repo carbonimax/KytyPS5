@@ -60,6 +60,9 @@ public:
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
+	// The render context's scheduler: its command buffers are the ones KYTY_CP_RECORD_THREAD
+	// records on the recorder thread (see cmdRecord.h).
+	void MarkMainRecorder() noexcept { m_record_main = true; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -127,6 +130,8 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	const bool                   m_release_waits_for_fence;
+	bool                         m_record_main = false;
+	bool                         m_capturing   = false; // the recorder thread takes the current buffer
 	std::mutex                   m_fence_mutex;
 	std::deque<SubmittedFence>    m_submitted_fences;
 	std::vector<vk::Fence>        m_free_fences;

@@ -57,6 +57,8 @@ void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) n
 // simulation ticks gives windows in game progress instead of wall time.
 void NotePresentedFrame() noexcept;
 void NoteFlipArg(int64_t arg) noexcept;
+// Smoothed interval between presented frames in microseconds (0 before the second frame).
+[[nodiscard]] uint64_t RecentFrameUs() noexcept;
 
 class ScopedTimer {
 public:

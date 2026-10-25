@@ -4,11 +4,14 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -29,6 +32,50 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
 }
+
+// KYTY_CP_RECORD_THREAD with KYTY_CP_RECORD_SUBMIT: the main queue submission, run by the recorder
+// thread after the command buffer's recorded calls (CmdRecord::Call copies this record).
+struct DeferredSubmit {
+	GraphicContext*   graphics;
+	vk::CommandBuffer buffer;
+	SubmitInfo        submit;
+	uint64_t          tick;
+	uint32_t          debug_op;
+	uint64_t          debug_submit_id;
+	uint32_t          debug_arg[4];
+	uint64_t          debug_arg4;
+
+	static void Run(void* data) {
+		auto& d = *static_cast<DeferredSubmit*>(data);
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.waitSemaphoreValueCount   = d.submit.num_wait_semaphores;
+		timeline_info.pWaitSemaphoreValues      = d.submit.wait_ticks.data();
+		timeline_info.signalSemaphoreValueCount = d.submit.num_signal_semaphores;
+		timeline_info.pSignalSemaphoreValues    = d.submit.signal_ticks.data();
+
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.waitSemaphoreCount   = d.submit.num_wait_semaphores;
+		submit_info.pWaitSemaphores      = d.submit.wait_semaphores.data();
+		submit_info.pWaitDstStageMask    = d.submit.wait_stages.data();
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &d.buffer;
+		submit_info.signalSemaphoreCount = d.submit.num_signal_semaphores;
+		submit_info.pSignalSemaphores    = d.submit.signal_semaphores.data();
+		vk::Result result;
+		{
+			Common::LockGuard lock(d.graphics->queue_mutex);
+			result = d.graphics->queue.submit(1, &submit_info, nullptr);
+		}
+		if (result != vk::Result::eSuccess) {
+			ReportVulkanFatal("vkQueueSubmit", result, d.tick, d.debug_op, d.debug_submit_id,
+			                  d.debug_arg[0], d.debug_arg[1], d.debug_arg[2], d.debug_arg[3],
+			                  d.debug_arg4);
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
+};
+static_assert(std::is_trivially_copyable_v<DeferredSubmit>);
 
 } // namespace
 
@@ -110,6 +157,9 @@ CommandScheduler::~CommandScheduler() {
 }
 
 void CommandScheduler::Shutdown() {
+	if (m_record_main) {
+		CmdRecord::DrainAll();
+	}
 	{
 		std::unique_lock lock(m_operation_mutex);
 		if (m_operation_state == OperationState::Closed) {
@@ -393,9 +443,30 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+// KYTY_CP_RECORD_MIN_FRAME_MS=M (default 0 = always): the recorder thread takes a command buffer only
+// while presented frames are at least M ms apart on average (PerfStats::RecentFrameUs). At the display
+// rate the GPU thread has time to spare and the hand-off only delays the submission.
+static uint64_t RecordMinFrameUs() {
+	static const uint64_t value = [] {
+		const char* env = std::getenv("KYTY_CP_RECORD_MIN_FRAME_MS");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 0ull;
+	}();
+	return value;
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	if (m_record_main) {
+		const bool capture = PerfStats::RecentFrameUs() >= RecordMinFrameUs();
+		if (m_capturing && !capture) {
+			// The previous buffer's deferred submission reaches the queue before any direct one.
+			CmdRecord::DrainAll();
+		}
+		m_capturing = capture;
+		// Before Begin: with KYTY_CP_RECORD_SUBMIT the recorder thread also begins the buffer.
+		CmdRecord::SetTarget(capture ? m_command.m_buffer : vk::CommandBuffer {});
+	}
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	return m_command;
@@ -421,15 +492,37 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_external_waited = m_external_wait_value;
 	}
-	m_command.End();
+	m_command.End(); // vkEndCommandBuffer drains the recorder thread (KYTY_CP_RECORD_THREAD)
+	if (m_record_main) {
+		CmdRecord::SetTarget(nullptr);
+	}
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	vk::Result result;
 	uint64_t   tick;
+	// Hosts whose releases wait for a submission fence submit directly (the fence belongs to the
+	// submission the GPU thread retires).
 	const auto fence = m_release_waits_for_fence ? AcquireFence() : vk::Fence{};
-	{
+	if (m_capturing && !m_release_waits_for_fence && CmdRecord::DefersSubmit()) {
+		tick = m_master.NextTick();
+		submit.AddSignal(m_master.Handle(), tick);
+		DeferredSubmit deferred {};
+		deferred.graphics        = &graphics;
+		deferred.buffer          = buffer;
+		deferred.submit          = submit;
+		deferred.tick            = tick;
+		deferred.debug_op        = m_command.m_debug_op;
+		deferred.debug_submit_id = m_command.m_debug_submit_id;
+		deferred.debug_arg[0]    = m_command.m_debug_arg0;
+		deferred.debug_arg[1]    = m_command.m_debug_arg1;
+		deferred.debug_arg[2]    = m_command.m_debug_arg2;
+		deferred.debug_arg[3]    = m_command.m_debug_arg3;
+		deferred.debug_arg4      = m_command.m_debug_arg4;
+		CmdRecord::Call(&DeferredSubmit::Run, &deferred, sizeof(deferred));
+		result = vk::Result::eSuccess;
+	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
