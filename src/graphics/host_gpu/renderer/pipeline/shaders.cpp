@@ -28,6 +28,31 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+thread_local PipelineCacheFeedback t_last_feedback;
+
+void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback& feedback,
+                          bool graphics_pipeline) {
+	t_last_feedback = {};
+	if (result != vk::Result::eSuccess ||
+	    !(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid)) {
+		return;
+	}
+	t_last_feedback.valid = true;
+	t_last_feedback.hit   = static_cast<bool>(
+	    feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
+	if (graphics_pipeline) {
+		PerfStats::NoteGraphicsPipelineFeedback(t_last_feedback.hit, feedback.duration);
+	}
+}
+
+} // namespace
+
+PipelineCacheFeedback LastPipelineCacheFeedback() noexcept {
+	return t_last_feedback;
+}
+
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
     static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
@@ -586,12 +611,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
-	if (result == vk::Result::eSuccess &&
-	    (creation_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid)) {
-		const bool hit = static_cast<bool>(
-		    creation_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
-		PerfStats::NoteGraphicsPipelineFeedback(hit, creation_feedback.duration);
-	}
+	NoteCreationFeedback(result, creation_feedback, true);
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -661,6 +681,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	vk::PipelineCreationFeedback           creation_feedback {};
+	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
+	feedback_info.pPipelineCreationFeedback = &creation_feedback;
+	feedback_info.pNext                     = info.pNext;
+	info.pNext                              = &feedback_info;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -668,6 +693,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	     static_cast<void*>(pipeline.pipeline_layout));
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	NoteCreationFeedback(result, creation_feedback, false);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

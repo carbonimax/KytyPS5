@@ -636,6 +636,17 @@ void PipelineCache::CheckpointDriverCache() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	// A pipeline the driver found in the pipeline cache adds nothing to it: only the others make the
+	// next save worth its cost (the driver serializes the whole cache, then it is hashed and
+	// rewritten). KYTY_PIPELINE_CACHE_SAVE_HITS=1 counts every creation.
+	static const bool save_hits = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CACHE_SAVE_HITS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (const auto feedback = LastPipelineCacheFeedback();
+	    !save_hits && feedback.valid && feedback.hit) {
+		return;
+	}
 	m_driver_cache_dirty = true;
 	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
 		Save();
@@ -647,6 +658,12 @@ void PipelineCache::Save() {
 		return;
 	}
 	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
+	const auto save_start    = std::chrono::steady_clock::now();
+	const auto elapsed_ms    = [&save_start] {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+		           std::chrono::steady_clock::now() - save_start)
+		    .count();
+	};
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -671,11 +688,14 @@ void PipelineCache::Save() {
 		return;
 	}
 	payload.resize(size);
+	const auto get_ms       = elapsed_ms();
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	if (payload_hash == m_saved_payload_hash) {
 		// Pipelines that hit the driver cache do not change its data: skip rewriting an identical file.
 		m_driver_cache_dirty = false;
+		PipelineCacheLog("Vulkan pipeline cache: unchanged {:.2f} MB (get {} ms, total {} ms)",
+		                 static_cast<double>(payload.size()) / 1'000'000.0, get_ms, elapsed_ms());
 		return;
 	}
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
@@ -700,9 +720,9 @@ void PipelineCache::Save() {
 		                 Common::PathToString(m_driver_cache_path));
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {}",
+	PipelineCacheLog("Vulkan pipeline cache: saved {:.2f} MB to {} (get {} ms, total {} ms)",
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
-	                 Common::PathToString(m_driver_cache_path));
+	                 Common::PathToString(m_driver_cache_path), get_ms, elapsed_ms());
 	m_saved_payload_hash = payload_hash;
 	m_driver_cache_dirty = false;
 }
