@@ -788,8 +788,15 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    fmt::format("Warning: skipping draws of mesh shaders that exceed host limits "
+					            "(shader=0x{:016x} threads={} vertices={} primitives={} LDS={}).\n",
+					            vertex_params[0].hash, host_threads, mesh.max_vertices,
+					            mesh.max_primitives, mesh.lds_size_dwords));
+			}
+			return;
 		}
 	}
 	ShaderParams pixel_params;

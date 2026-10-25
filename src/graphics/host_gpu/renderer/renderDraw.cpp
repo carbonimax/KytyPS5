@@ -908,7 +908,8 @@ static void RefreshShaders(CommandBuffer& buffer, DrawRenderState& state, bool s
 	state.mrt_mask       = 0;
 	state.aliased_passes = 0;
 	pipeline_cache.GetGraphicsPrograms(buffer, state, single_sample);
-	if (!state.ps_active) {
+	// A skipped vertex program (host mesh limits) leaves the pixel program unselected.
+	if (!state.ps_active || !state.vertex_info[0].stage) {
 		return;
 	}
 	uint32_t exported = 0;
@@ -1024,6 +1025,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		guessed = it->second;
 	}
 	RefreshShaders(buffer, state, guessed);
+	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
+	// compiled.
+	if (!state.vertex_info[0].stage) {
+		return false;
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
