@@ -397,6 +397,9 @@ uint32_t ImageHeap::Allocate() {
 }
 
 void ImageHeap::Retire(View& view) {
+	if (view.released.empty()) return;
+	// A retired index is reused once its tick ends, so no held entry may keep it.
+	std::erase_if(view.held, [&](uint32_t index) { return m_elements[index].refs == 0u; });
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
 	for (const auto index: view.released) m_retired.emplace_back(tick, index);
 	view.released.clear();
@@ -443,6 +446,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
+	const auto serial   = Image::serials.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
@@ -471,6 +475,19 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			mark(index);
 			return true;
 		});
+		// Held elements retry once an image is created, such as a render target of their extent.
+		if (view->held_serial != serial) {
+			view->held_serial = serial;
+			std::erase_if(view->held, [&](uint32_t index) {
+				const auto& element = m_elements[index];
+				if (element.refs == 0u || element.stale) return true;
+				const auto binding = executor.ResolveTexture(
+				    IR::ImageHeapResource(view->profile, element.kind), element.value);
+				if (binding.image_id) mark(index);
+				// An unmapped texture stays null.
+				return binding.image_id || binding.desc.info.data.Empty();
+			});
+		}
 		if (stale) {
 			// A changed image needs a new element; pending draws still read the old one. The new
 			// element keeps the old value, since a view takes table changes only when acquired.
@@ -499,6 +516,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 					view->dcc.push_back(index);
 				}
 				view->away.push_back(index);
+			} else if (!binding.desc.info.data.Empty()) {
+				view->held.push_back(index);
 			}
 			m_elements[index].binding = std::move(binding);
 			m_writes.push_back(index);

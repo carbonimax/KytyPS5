@@ -81,6 +81,7 @@ private:
 		std::vector<uint32_t>   released; // No slot selects them after the next upload.
 		std::vector<uint32_t>   away;     // Not yet moved to the read layout.
 		std::vector<uint32_t>   dcc;      // Color metadata clears apply on each discovery.
+		std::vector<uint32_t>   held;     // Another extent holds their address.
 		std::unique_ptr<Buffer> buffer;
 		size_t                  dirty_begin   = 0; // Slots to upload.
 		size_t                  dirty_end     = 0;
@@ -88,6 +89,7 @@ private:
 		size_t                  changed_end   = 0;
 		uint64_t                resolve_epoch = 0;
 		uint64_t                layout_epoch  = 0;
+		uint64_t                held_serial   = 0; // Image::serials when held was last retried.
 	};
 
 	struct Memory {

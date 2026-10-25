@@ -1333,6 +1333,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					result = overlap.image;
 				}
 			}
+			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
+			// and only one extent at an address holds data, so heap lookups create no second one.
+			if (!result && desc.heap &&
+			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+				    const auto* image = m_slot_images.try_get(id);
+				    return image != nullptr && image->registered &&
+					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+					       image->info.data.address == desc.info.data.address &&
+					       image->info.type == desc.info.type &&
+					       image->info.extent != desc.info.extent;
+			    })) {
+				return {};
+			}
 		} else if (block_alias) {
 			for (const auto candidate: candidates) {
 				const auto& owner = m_slot_images[candidate];

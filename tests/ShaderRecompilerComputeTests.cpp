@@ -5581,6 +5581,65 @@ public:
                   ImageHeapTestAccess::ImageOf(heap, filtered.slots[240]),
               "a reactivated view kept an element whose image slot holds a new image");
 
+      // Dynamic-resolution tables hold a descriptor per extent of one render target, each with
+      // its own pitch. Only the first gets an image; the others wait until an image of their
+      // extent exists.
+      const auto extent = [&](uint32_t width) {
+        auto words = descriptor(50, Format::k8_8_8_8UNorm);
+        words[2] = (width - 1u) | (3u << 14u);
+        return words;
+      };
+      const auto resolve = [&](const auto &root, const auto &words) {
+        return executor.ResolveTexture(root, {.dwords = words, .dword_count = 8u}).image_id;
+      };
+      write(50, extent(64));
+      write(51, extent(128));
+      Require(name, "extents", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "held extent",
+              ImageHeapTestAccess::ImageOf(heap, filtered.slots[400]) &&
+                  !ImageHeapTestAccess::ImageOf(heap, filtered.slots[408]),
+              "a second extent of one address got its own image");
+      // A non-heap lookup, as for a render target, creates the second extent.
+      const auto rendered = resolve(sampled, extent(128));
+      Require(name, "rendered extent", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "held descriptor",
+              rendered && ImageHeapTestAccess::ImageOf(heap, filtered.slots[408]) == rendered,
+              "a held descriptor missed the image made for its extent");
+      // A released held element's index is reused once its tick ends; it is no longer held.
+      write(52, extent(256));
+      Require(name, "third extent", acquire(sampled), "the view was declined");
+      draw();
+      const auto held = filtered.slots[416];
+      write(52, {});
+      Require(name, "released extent", acquire(sampled), "the view was declined");
+      draw();
+      write(53, descriptor(53, Format::k8_8_8_8UNorm));
+      Require(name, "reused element", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "retry", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "reused held element", held != 0u && filtered.slots[424] == held,
+              "a reused element was retried as the held element it replaced");
+      // A 2D view of a heap-pinned volume is another image type, not another extent.
+      auto plane_root = sampled;
+      plane_root.heap = true;
+      auto volume_root = plane_root;
+      volume_root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+      auto volume_words = descriptor(54, Format::k8_8_8_8UNorm);
+      volume_words[3] = DstSel(4, 5, 6, 7) |
+                        (static_cast<uint32_t>(Prospero::ImageType::kColor3D) << 28u);
+      volume_words[4] = 3u;
+      const auto volume = resolve(volume_root, volume_words);
+      Require(name, "volume", static_cast<bool>(volume), "a volume texture was not resolved");
+      auto &volume_refs = textures.GetImage(volume).heap_refs;
+      volume_refs.fetch_add(1u);
+      const auto plane = resolve(plane_root, descriptor(54, Format::k8_8_8_8UNorm));
+      volume_refs.fetch_sub(1u);
+      Require(name, "volume plane", static_cast<bool>(plane),
+              "a 2D view of a pinned volume was held as another extent");
+
       // A table follows its descriptor's size and keeps its elements. Growing probes the new
       // words, shrinking releases them, and a draw sees one size.
       write(table_size / 32u, descriptor(40, Format::k8_8_8_8UNorm));
