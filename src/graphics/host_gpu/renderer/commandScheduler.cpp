@@ -443,13 +443,13 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
-// KYTY_CP_RECORD_MIN_FRAME_MS=M (default 0 = always): the recorder thread takes a command buffer only
+// KYTY_CP_RECORD_MIN_FRAME_MS=M (default 25, 0 = always): the recorder thread takes a command buffer only
 // while presented frames are at least M ms apart on average (PerfStats::RecentFrameUs). At the display
 // rate the GPU thread has time to spare and the hand-off only delays the submission.
 static uint64_t RecordMinFrameUs() {
 	static const uint64_t value = [] {
 		const char* env = std::getenv("KYTY_CP_RECORD_MIN_FRAME_MS");
-		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 0ull;
+		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 25000ull;
 	}();
 	return value;
 }

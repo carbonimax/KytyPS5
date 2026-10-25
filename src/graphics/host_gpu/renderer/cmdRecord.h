@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// KYTY_CP_RECORD_THREAD=N (default 0 = off): Vulkan recording of the main command buffer on a
+// KYTY_CP_RECORD_THREAD=N (default 1; 0 = off): Vulkan recording of the main command buffer on a
 // second thread (pipelined command processor, first stage).
 //
 // The GPU thread (producer) keeps doing everything it does today: PM4 parsing, register state,

@@ -48,7 +48,7 @@ inline uint64_t Ticks() noexcept {
 int ReadMode() {
 	const char* value = std::getenv("KYTY_CP_RECORD_THREAD");
 	if (value == nullptr) {
-		return 0;
+		return 1;
 	}
 	const auto mode = std::strtol(value, nullptr, 10);
 	return mode >= 0 && mode <= 3 ? static_cast<int>(mode) : 0;
