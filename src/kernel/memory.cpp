@@ -913,6 +913,12 @@ bool IsGpuDirtyBufferRange(uint64_t vaddr, uint64_t size) {
 	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
+bool MaybeGpuModifiedPage(uint64_t vaddr) {
+	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	       IsGpuAddressRange(vaddr, sizeof(uint32_t)) &&
+	       GetGpuResources().GetBufferCache().MaybeGpuModifiedPage(vaddr);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

@@ -142,9 +142,10 @@ void MaybeReport() noexcept {
 	            n(Counter::WaitOtherCount), static_cast<double>(n(Counter::Submits)) / seconds);
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
-		            " fault_reads=%" PRIu64 "\n",
+		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64 "\n",
 		            seconds, static_cast<double>(walk.ns) / 1e6, walk.walks, walk.backing_reads,
-		            walk.fault_reads);
+		            walk.fault_reads, walk.protected_calls, static_cast<double>(walk.protected_ns) / 1e6,
+		            walk.protected_synced, walk.protected_evictions);
 	}
 	std::fflush(stdout);
 }

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -173,9 +174,103 @@ std::atomic<uint64_t> g_walk_ns {0};
 std::atomic<uint64_t> g_walk_backing_reads {0};
 std::atomic<uint64_t> g_walk_fault_reads {0};
 
-// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+// Pages where a walker load faulted on a protection of the memory tracker and was completed from
+// the backing (page number + 1; 0 = empty), direct-mapped. A hint only: a stale entry costs a call,
+// a missing one a fault, and both paths read the same bytes.
+constexpr uint32_t                                     ProtectedPageSlots = 4096;
+constexpr uint32_t                                     ProtectedPageShift = 12;
+alignas(64) std::array<std::atomic<uint64_t>, ProtectedPageSlots> g_protected_pages {};
+std::atomic<ProtectedLoadReader>                       g_protected_reader {nullptr};
+std::atomic<uint64_t>                                  g_protected_calls {0};
+std::atomic<uint64_t>                                  g_protected_evictions {0};
+std::atomic<uint64_t>                                  g_protected_ns {0};
+std::atomic<uint64_t>                                  g_protected_synced {0};
+
+bool ProtectedLoadsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_PROTECTED_LOADS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Called by walker code (System V ABI, any register state saved by the caller) for a load from a
+// page listed in g_protected_pages: bit 32 set and the value in the low half when the registered
+// reader completed it, else 0 (the walker then loads directly, through the fault path).
+uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
+	const bool timed = g_walk_stats.load(std::memory_order_relaxed);
+	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto reader = g_protected_reader.load(std::memory_order_acquire);
+	uint32_t   value  = 0;
+	const auto result = reader != nullptr ? reader(address, &value) : ProtectedLoadKeep;
+	if (timed) {
+		g_protected_calls.fetch_add(1, std::memory_order_relaxed);
+		g_protected_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                   std::chrono::steady_clock::now() - start)
+		                                                   .count()),
+		                         std::memory_order_relaxed);
+		if ((result & ProtectedLoadSynced) != 0) {
+			g_protected_synced.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if ((result & ProtectedLoadKeep) == 0) {
+		// The page is no longer protected: later loads from it go direct (and fault again, listing
+		// it again, if it is protected anew).
+		uint64_t page = (address >> ProtectedPageShift) + 1u;
+		g_protected_pages[page & (ProtectedPageSlots - 1u)].compare_exchange_strong(
+		    page, 0, std::memory_order_relaxed);
+		if (g_walk_stats.load(std::memory_order_relaxed)) {
+			g_protected_evictions.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	if ((result & ProtectedLoadValue) == 0) return 0;
+	return (uint64_t {1} << 32u) | value;
+}
+
+// Every direct guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
+// With KYTY_SRT_PROTECTED_LOADS (default 1), loads from pages that faulted on a tracker protection
+// before call ProtectedLoad instead of faulting again (a Windows exception costs microseconds).
+// Free here: rax, rcx, r9, r11; live: rdi, rsi, rdx, r8 and the address in r10.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 	code.lea(code.r10, code.ptr[address]);
+	if (ProtectedLoadsEnabled()) {
+		Xbyak::Label direct, done;
+		code.mov(code.rcx, code.r10);
+		code.shr(code.rcx, ProtectedPageShift);
+		code.inc(code.rcx);
+		code.mov(code.r9d, code.ecx);
+		code.and_(code.r9d, ProtectedPageSlots - 1u);
+		code.mov(code.r11, reinterpret_cast<uint64_t>(g_protected_pages.data()));
+		code.cmp(code.qword[code.r11 + code.r9 * 8], code.rcx);
+		code.jne(direct, Xbyak::CodeGenerator::T_NEAR);
+		code.push(code.rbp);
+		code.mov(code.rbp, code.rsp);
+		code.and_(code.rsp, -16);
+		code.push(code.rdi);
+		code.push(code.rsi);
+		code.push(code.rdx);
+		code.push(code.r8);
+		code.push(code.r10);
+		code.sub(code.rsp, 8);
+		code.mov(code.rdi, code.r10);
+		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProtectedLoad));
+		code.call(code.rax);
+		code.add(code.rsp, 8);
+		code.pop(code.r10);
+		code.pop(code.r8);
+		code.pop(code.rdx);
+		code.pop(code.rsi);
+		code.pop(code.rdi);
+		code.mov(code.rsp, code.rbp);
+		code.pop(code.rbp);
+		code.bt(code.rax, 32);
+		code.jc(done, Xbyak::CodeGenerator::T_NEAR);
+		code.L(direct);
+		code.mov(code.eax, code.dword[code.r10]);
+		code.L(done);
+		code.mov(code.eax, code.eax);
+		return;
+	}
 	code.mov(code.eax, code.dword[code.r10]);
 }
 
@@ -1420,6 +1515,19 @@ void EnableWalkStats() noexcept {
 	g_walk_stats.store(true, std::memory_order_relaxed);
 }
 
+bool WalkStatsEnabled() noexcept {
+	return g_walk_stats.load(std::memory_order_relaxed);
+}
+
+void SetProtectedLoadReader(ProtectedLoadReader reader) noexcept {
+	g_protected_reader.store(reader, std::memory_order_release);
+}
+
+void NoteProtectedLoad(uint64_t address) noexcept {
+	const uint64_t page = (address >> ProtectedPageShift) + 1u;
+	g_protected_pages[page & (ProtectedPageSlots - 1u)].store(page, std::memory_order_relaxed);
+}
+
 void NoteWalkerFaultRead(bool backing) noexcept {
 	if (g_walk_stats.load(std::memory_order_relaxed)) {
 		(backing ? g_walk_backing_reads : g_walk_fault_reads).fetch_add(1, std::memory_order_relaxed);
@@ -1430,7 +1538,11 @@ WalkStats TakeWalkStats() noexcept {
 	return {.walks         = g_walks.exchange(0, std::memory_order_relaxed),
 	        .ns            = g_walk_ns.exchange(0, std::memory_order_relaxed),
 	        .backing_reads = g_walk_backing_reads.exchange(0, std::memory_order_relaxed),
-	        .fault_reads   = g_walk_fault_reads.exchange(0, std::memory_order_relaxed)};
+	        .fault_reads   = g_walk_fault_reads.exchange(0, std::memory_order_relaxed),
+	        .protected_calls = g_protected_calls.exchange(0, std::memory_order_relaxed),
+	        .protected_evictions = g_protected_evictions.exchange(0, std::memory_order_relaxed),
+	        .protected_ns = g_protected_ns.exchange(0, std::memory_order_relaxed),
+	        .protected_synced = g_protected_synced.exchange(0, std::memory_order_relaxed)};
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
