@@ -5581,16 +5581,33 @@ public:
                   ImageHeapTestAccess::ImageOf(heap, filtered.slots[240]),
               "a reactivated view kept an element whose image slot holds a new image");
 
-      // A table whose descriptor grew keeps its old snapshot until a frame passes without it.
+      // A table follows its descriptor's size and keeps its elements. Growing probes the new
+      // words, shrinking releases them, and a draw sees one size.
+      write(table_size / 32u, descriptor(40, Format::k8_8_8_8UNorm));
+      const auto elements = ImageHeapTestAccess::ElementCount(heap);
       const IR::ImageHeapRequest grown{table, table_size * 2u, 32u, 0u, table_size / 16u, &sampled};
-      for (uint32_t frame = 0; frame < 2u; ++frame) {
-        Require(name, "grown table", heap.Acquire(grown, view), "a grown table was declined");
-        draw();
-        heap.RunGarbageCollector();
-        heap.BeginDraw();
-        Require(name, "superseded table", ImageHeapTestAccess::MemoryCount(heap) == 2u - frame,
-                "a snapshot was dropped in a frame that acquired it or kept after one without it");
-      }
+      Require(name, "grown table",
+              heap.Acquire(grown, view) && view.slot_count == table_size / 2u &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 1u,
+              "a grown table was declined or kept apart from its old size");
+      draw();
+      const auto added = ImageHeapTestAccess::ImageOf(heap, filtered.slots[table_size / 4u]);
+      Require(name, "grown descriptor",
+              added && ImageHeapTestAccess::ElementCount(heap) <= elements + 1u,
+              "a grown table missed its new descriptor or interned its old ones again");
+      Require(name, "shrunk table",
+              acquire(sampled) && view.slot_count == table_size / 4u &&
+                  filtered.slots.back() == 0u && textures.GetImage(added).heap_refs.load() == 0u,
+              "a shrunk table kept a descriptor past its end");
+      Require(name, "one size per draw",
+              heap.Acquire(grown, view) && view.slot_count == table_size / 4u,
+              "a draw saw two sizes of one table");
+      draw();
+      Require(name, "regrown table", heap.Acquire(grown, view), "a regrown table was declined");
+      draw();
+      Require(name, "regrown descriptor",
+              ImageHeapTestAccess::ImageOf(heap, filtered.slots[table_size / 4u]) == added,
+              "a table grown again after shrinking missed its descriptor");
 
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",

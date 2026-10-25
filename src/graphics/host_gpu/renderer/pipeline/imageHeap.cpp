@@ -12,6 +12,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -42,6 +43,20 @@ void Widen(size_t& begin, size_t& end, size_t first, size_t last) {
 	const bool empty = begin == end;
 	begin            = empty ? first : std::min(begin, first);
 	end              = empty ? last : std::max(end, last);
+}
+
+// Probes at first + k * step whose first dword lies within a table of size bytes.
+uint64_t Probes(uint64_t size, uint64_t first, uint64_t step) {
+	return size >= first + 4u ? (size - first - 4u) / step + 1u : 0u;
+}
+
+// Tables grow a little on most frames, so their slot words get room to double.
+std::unique_ptr<Buffer> SlotBuffer(RenderContext& context, uint64_t size) {
+	return std::make_unique<Buffer>(
+	    context.GetGraphics(), context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
+	        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	    std::bit_ceil(size + 4u));
 }
 
 // Guest bytes of a table that its tracker pages [begin, end) cover.
@@ -125,22 +140,17 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
 		return false;
 	}
-	auto memory = std::ranges::find_if(m_memories, [&](const auto& candidate) {
-		return candidate->base == request.base && candidate->size == size;
-	});
-	if (memory == m_memories.end()) {
+	auto memory = std::ranges::find_if(
+	    m_memories, [&](const auto& candidate) { return candidate->base == request.base; });
+	// A table follows its descriptor's size, as the first program of a draw acquires it.
+	if (memory == m_memories.end() || ((*memory)->size != size && (*memory)->draw != m_draw)) {
 		if (!m_context.IsMapped(request.base, size)) return false;
-		auto created   = std::make_unique<Memory>();
-		created->base  = request.base;
-		created->size  = size;
-		created->words.resize(size / 4u);
-		created->dead.resize(size / 4u);
-		created->dirty_pages.assign((Common::AlignUp(request.base + size, TRACKER_PAGE_SIZE) -
-		                             Common::AlignDown(request.base, TRACKER_PAGE_SIZE)) /
-		                                TRACKER_PAGE_SIZE,
-		                            uint8_t {1});
-		std::scoped_lock lock {m_mutex};
-		memory = m_memories.insert(m_memories.end(), std::move(created));
+		if (memory == m_memories.end()) {
+			std::scoped_lock lock {m_mutex};
+			memory = m_memories.insert(m_memories.end(),
+			                           std::make_unique<Memory>(Memory {.base = request.base}));
+		}
+		Resize(**memory, size);
 	}
 	// A draw refreshes a table and a view takes its changes once, so all programs of the draw see
 	// one snapshot and one set of kinds.
@@ -149,27 +159,28 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		(*memory)->draw = m_draw;
 	}
 	auto&      views   = (*memory)->views;
+	const auto bytes   = (*memory)->size;
 	const auto profile = IR::ImageHeapResource(*request.root, 0u);
+	const auto probes  = Probes(size, request.first, request.step);
+	const auto limit   = request.count < probes ? request.count : UINT64_MAX;
 	auto       view    = std::ranges::find_if(views, [&](const auto& candidate) {
 		return candidate->step == request.step && candidate->first == request.first &&
-		       candidate->count == request.count && candidate->profile == profile;
+		       candidate->limit == limit && candidate->profile == profile;
 	});
 	if (view == views.end()) {
 		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
+		const auto count   = std::min(limit, Probes(bytes, request.first, request.step));
 		auto       created = std::make_unique<View>(View {.memory        = **memory,
 		                                                  .step          = request.step,
 		                                                  .first         = request.first,
-		                                                  .count         = request.count,
+		                                                  .count         = count,
+		                                                  .limit         = limit,
 		                                                  .profile       = profile,
 		                                                  .resolve_epoch = epoch,
 		                                                  .layout_epoch  = epoch});
-		created->slots.resize(size / 4u + 1u);
-		created->buffer = std::make_unique<Buffer>(
-		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
-		    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
-		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    size + 4u);
-		UpdateProbes(*created, 0u, size);
+		created->slots.resize(bytes / 4u + 1u);
+		created->buffer = SlotBuffer(m_context, bytes);
+		UpdateProbes(*created, 0u, bytes);
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
 		created->dirty_end   = created->slots.size();
@@ -391,6 +402,43 @@ void ImageHeap::Retire(View& view) {
 	view.released.clear();
 }
 
+void ImageHeap::Resize(Memory& memory, uint64_t size) {
+	{
+		std::scoped_lock lock {m_mutex};
+		Unwatch(memory);
+		memory.size = size;
+		// The next refresh rereads the whole table.
+		memory.dirty_pages.assign((Common::AlignUp(memory.base + size, TRACKER_PAGE_SIZE) -
+		                           Common::AlignDown(memory.base, TRACKER_PAGE_SIZE)) /
+		                              TRACKER_PAGE_SIZE,
+		                          uint8_t {1});
+	}
+	memory.words.resize(size / 4u);
+	memory.dead.resize(size / 4u);
+	auto& scheduler = m_context.GetCommandScheduler();
+	for (auto& view: memory.views) {
+		const auto count = std::min(view->limit, Probes(size, view->first, view->step));
+		for (auto probe = count; probe < view->count; ++probe) {
+			Assign(*view, (view->first + probe * view->step) / 4u, 0u);
+		}
+		view->count       = count;
+		const auto slots  = view->slots.size();
+		view->slots.resize(size / 4u + 1u);
+		view->dirty_end   = std::min(view->dirty_end, view->slots.size());
+		view->dirty_begin = std::min(view->dirty_begin, view->dirty_end);
+		if (view->slots.size() * sizeof(uint32_t) > view->buffer->Size()) {
+			if (scheduler.Active()) {
+				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+			}
+			view->buffer = SlotBuffer(m_context, size);
+			Widen(view->dirty_begin, view->dirty_end, 0u, view->slots.size());
+		} else if (slots < view->slots.size()) {
+			// Device words past the old end may hold stale slots.
+			Widen(view->dirty_begin, view->dirty_end, slots, view->slots.size());
+		}
+	}
+}
+
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto&      textures = m_context.GetTextureCache();
@@ -531,46 +579,26 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	} else {
 		m_unmapped.push_back({address, size});
 	}
+	auto&           scheduler = m_context.GetCommandScheduler();
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		if (address >= memory->base + memory->size || memory->base >= address + size) {
 			return false;
 		}
-		Drop(*memory);
+		Unwatch(*memory);
+		for (auto& view: memory->views) {
+			std::erase(m_active, view.get());
+			for (const auto& [value, index]: view->elements) {
+				Unreference(m_elements[index]);
+				view->released.push_back(index);
+			}
+			Retire(*view);
+			if (scheduler.Active()) {
+				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+			}
+		}
 		return true;
 	});
-}
-
-void ImageHeap::RunGarbageCollector() {
-	// A table whose descriptor grew keeps its old snapshot until a frame passes without it.
-	std::scoped_lock      lock {m_mutex};
-	std::vector<uint64_t> acquired;
-	for (const auto& memory: m_memories) {
-		if (memory->draw > m_frame_draw) acquired.push_back(memory->base);
-	}
-	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
-		const bool superseded = memory->draw <= m_frame_draw &&
-		                        std::ranges::find(acquired, memory->base) != acquired.end();
-		if (superseded) Drop(*memory);
-		return superseded;
-	});
-	m_frame_draw = m_draw;
-}
-
-void ImageHeap::Drop(Memory& memory) {
-	auto& scheduler = m_context.GetCommandScheduler();
-	Unwatch(memory);
-	for (auto& view: memory.views) {
-		std::erase(m_active, view.get());
-		for (const auto& [value, index]: view->elements) {
-			Unreference(m_elements[index]);
-			view->released.push_back(index);
-		}
-		Retire(*view);
-		if (scheduler.Active()) {
-			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
-		}
-	}
 }
 
 } // namespace Libs::Graphics

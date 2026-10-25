@@ -22,10 +22,11 @@ class RenderExecutor;
 struct ImageHeapTestAccess;
 
 // Guest image tables that shaders index by GPU-computed offsets, kept resident in one bindless
-// sampled-image array. Each view of a table owns device slot words, one per table dword, that
-// select an array element. CPU writes to a table fault in its snapshot, which each draw refreshes
-// once; a view takes the changes when a draw first acquires it. Changes to the images behind
-// elements bump Image::heap_epoch.
+// sampled-image array. A table is keyed by its base and follows its descriptor's size. Each view
+// of a table owns device slot words, one per table dword, that select an array element. CPU
+// writes to a table fault in its snapshot, which each draw refreshes once; a view takes the
+// changes when a draw first acquires it. Changes to the images behind elements bump
+// Image::heap_epoch.
 class ImageHeap final: public ShaderRecompiler::IR::ImageHeapSource {
 public:
 	ImageHeap(RenderContext& context, PageManager& page_manager);
@@ -46,8 +47,6 @@ public:
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
-	// Frame boundary: drops table snapshots that another at the same base replaced this frame.
-	void RunGarbageCollector();
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
@@ -72,6 +71,7 @@ private:
 		uint64_t                            step  = 0;
 		uint64_t                            first = 0;
 		uint64_t                            count = 0;
+		uint64_t                            limit = 0; // Probes a key domain allows, if fewer.
 		ShaderRecompiler::IR::ImageResource profile;
 		std::vector<uint32_t>               slots; // Plus a trailing null slot.
 		std::vector<uint32_t>               kind_keys;
@@ -115,7 +115,7 @@ private:
 	Image*   ImageOf(const Element& element) const;
 	uint32_t Allocate();
 	void     Retire(View& view);
-	void     Drop(Memory& memory);
+	void     Resize(Memory& memory, uint64_t size);
 	void     WriteDescriptors();
 
 	RenderContext&                       m_context;
@@ -123,8 +123,7 @@ private:
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
-	uint64_t                             m_draw       = 1;
-	uint64_t                             m_frame_draw = 0; // Last draw before this frame.
+	uint64_t                             m_draw = 1;
 	std::vector<Element>                 m_elements;
 	std::vector<uint32_t>                m_free;
 	std::deque<std::pair<uint64_t, uint32_t>> m_retired; // Tick, element.
