@@ -790,11 +790,9 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog(
-				    fmt::format("Warning: skipping draws of mesh shaders that exceed host limits "
-					            "(shader=0x{:016x} threads={} vertices={} primitives={} LDS={}).\n",
-					            vertex_params[0].hash, host_threads, mesh.max_vertices,
-					            mesh.max_primitives, mesh.lds_size_dwords));
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: dropping mesh draws the host does not support (shader 0x{:016x}).\n",
+				    vertex_params[0].hash));
 			}
 			return;
 		}
