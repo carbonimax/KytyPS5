@@ -257,10 +257,12 @@ void ImageHeap::Unwatch(const Memory& memory) {
 void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_mutex};
 	for (auto& memory: m_memories) {
-		const auto begin = std::max(address, memory->base);
-		const auto end   = std::min(address + size, memory->base + memory->size);
-		if (begin >= end) continue;
+		// Watches cover whole pages, so a write next to the table must unwatch its page too.
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
+		const auto begin  = std::max(address, origin);
+		const auto end    = std::min(address + size,
+		                             origin + memory->dirty_pages.size() * TRACKER_PAGE_SIZE);
+		if (begin >= end) continue;
 		MarkDirty(*memory, (begin - origin) / TRACKER_PAGE_SIZE,
 		          (end - 1u - origin) / TRACKER_PAGE_SIZE + 1u);
 	}

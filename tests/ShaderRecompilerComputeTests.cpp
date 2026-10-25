@@ -247,6 +247,10 @@ struct ImageHeapTestAccess {
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
     return Element(heap, entry).binding.image_id;
   }
+  // Whether the newest table no longer watches its last page.
+  static bool TailPageDirty(const ImageHeap &heap) {
+    return heap.m_memories.back()->dirty_pages.back() != 0u;
+  }
 };
 
 struct TextureCacheTestAccess {
@@ -5588,6 +5592,13 @@ public:
               acquire(sampled, idle_table) && view.kinds.empty() &&
                   ImageHeapTestAccess::MemoryCount(heap) == 1u,
               "an all-null table was not kept resident");
+      // A write past a table's end, in its watched tail page, must unwatch the page.
+      constexpr uint64_t unaligned_table = base + 0x1a0800;
+      Require(name, "tail page fault",
+              acquire(sampled, unaligned_table) &&
+                  context.HandleFault(PageFaultAccess::Write, unaligned_table + table_size) &&
+                  ImageHeapTestAccess::TailPageDirty(heap),
+              "a write fault next to a table left its page watched");
       draw();
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
