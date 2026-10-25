@@ -474,11 +474,11 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
-// KYTY_IDLE_SUBMIT=N (default 0 = off): at least N draws/dispatches recorded.
+// KYTY_IDLE_SUBMIT=N (default 8, 0 = off): at least N draws/dispatches recorded.
 static uint64_t IdleSubmitMinWork() {
 	static const uint64_t value = [] {
 		const char* env = std::getenv("KYTY_IDLE_SUBMIT");
-		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 8ull;
 	}();
 	return value;
 }
@@ -496,13 +496,13 @@ static bool IdleSubmitSplitsPasses() {
 	return value;
 }
 
-// KYTY_IDLE_SUBMIT_MIN_FRAME_MS=M (default 0): only while presented frames are at least M ms apart
+// KYTY_IDLE_SUBMIT_MIN_FRAME_MS=M (default 25, 0 = always): only while presented frames are at least M ms apart
 // on average: a slow game is usually held back by the command processor, while a game at the display
 // rate is held back by the GPU or the display, where splitting its passes only adds GPU work.
 static uint64_t IdleSubmitMinFrameUs() {
 	static const uint64_t value = [] {
 		const char* env = std::getenv("KYTY_IDLE_SUBMIT_MIN_FRAME_MS");
-		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 0ull;
+		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 25000ull;
 	}();
 	return value;
 }
