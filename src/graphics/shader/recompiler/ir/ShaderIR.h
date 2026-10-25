@@ -501,9 +501,15 @@ struct Bindings {
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Packed 8-bit binding offsets, then each binding's bound range in bytes: OpArrayLength
+	// reads 0 for ranges of 2 GiB or more on NVIDIA.
+	[[nodiscard]] uint32_t MemorySizeDword() const {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return MemorySizeDword() +
+		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

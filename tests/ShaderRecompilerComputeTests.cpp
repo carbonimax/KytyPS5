@@ -18492,7 +18492,7 @@ public:
   }
 
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
-                              size_t dword_count) {
+                              size_t dword_count, size_t first_dword = 0) {
     if (!buffer.coherent) {
       vk::MappedMemoryRange range{};
       range.sType = vk::StructureType::eMappedMemoryRange;
@@ -18509,7 +18509,7 @@ public:
               m_device.mapMemory(buffer.memory, 0, buffer.size, {}, &data),
               "vkMapMemory");
     std::vector<u32> ret(dword_count, 0);
-    std::memcpy(ret.data(), data, dword_count * sizeof(u32));
+    std::memcpy(ret.data(), static_cast<const u32 *>(data) + first_dword, dword_count * sizeof(u32));
     m_device.unmapMemory(buffer.memory);
     return ret;
   }
@@ -18739,6 +18739,7 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -42097,6 +42098,50 @@ void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
   }
 }
 
+void CheckStorageBufferBindingOver2GiB(VulkanHarness &vulkan) {
+  // OpArrayLength reads 0 for ranges of 2 GiB or more on NVIDIA; bounds use the pushed binding size.
+  constexpr u32 bytes = 0x80000010u, end = bytes / 4u, last = end - 1u;
+  TestCase test;
+  test.name = "StorageBufferBindingOver2GiB";
+  Require(test.name, "device limit",
+          vulkan.RuntimeContext().GetPhysicalDeviceProperties().limits.maxStorageBufferRange >= bytes,
+          "storage buffer range cannot cover 2 GiB");
+  AppendVMovLiteral(&test.code, 4, last * 4u);
+  AppendVMovLiteral(&test.code, 6, end * 4u);
+  test.code.insert(test.code.end(), {EncodeMubuf0(0x0c), EncodeMubuf1(5, 0, 4),
+                                     EncodeMubuf0(0x0c), EncodeMubuf1(7, 0, 6),
+                                     EncodeMubuf0(0x1c), EncodeMubuf1(5, 0, 6), EncodeSopp(0x0c, 0)});
+  AppendStoreVgpr(&test.code, 5, 4);
+  AppendStoreVgpr(&test.code, 7, 5);
+  AppendEnd(&test.code);
+  test.user_data = MakeStructuredStorageBufferData(0, bytes);
+  test.user_data[50] = 1u << 20u;
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.forbidden_spirv = {"OpArrayLength"};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  for (const auto &value : compiled.resources.buffers) {
+    ShaderBufferResource descriptor{};
+    std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+    test.storage_buffer_ranges.emplace_back(descriptor.Base48(), u32(descriptor.GetSize()));
+  }
+  VulkanHarness::Buffer buffer;
+  {
+    std::vector<u32> initial(end + 4u, 0u);
+    initial[5] = 0xdeadbeefu;
+    initial[last] = 0x44444444u;
+    initial[end] = 0xcafebabeu;
+    buffer = vulkan.CreateStorageBuffer(test.name, initial, initial.size());
+  }
+  vulkan.Dispatch(test, compiled, buffer);
+  const auto loads = vulkan.ReadBuffer(test.name, buffer, 2u, 4u);
+  const auto canary = vulkan.ReadBuffer(test.name, buffer, 1u, end);
+  vulkan.DestroyBuffer(&buffer);
+  CompareWords(test, "a load at the last dword, a zero load and a dropped store at the 2 GiB range end",
+               {0x44444444u, 0u, 0xcafebabeu}, {loads[0], loads[1], canary[0]});
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   TestCase test;
@@ -42209,23 +42254,20 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
       test.forbidden_spirv.push_back("OpSwitch");
       std::set<u32> nonuniform;
-      std::vector<u32> accessed_pointers;
+      std::vector<u32> stored_pointers;
       u32 prefix_extracts = 0;
       for (size_t offset = 5; offset < compiled.spirv.size();) {
         const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
         const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
         if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
           nonuniform.insert(words[1]);
-        if (opcode == spv::OpArrayLength) accessed_pointers.push_back(words[3]);
-        if (opcode == spv::OpStore) accessed_pointers.push_back(words[1]);
+        if (opcode == spv::OpStore) stored_pointers.push_back(words[1]);
         if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
         offset += words.size();
       }
       Require(test.name, "shared store and nonuniform pointers",
-              prefix_extracts == 1u && accessed_pointers.size() == 2u &&
-                  std::ranges::all_of(accessed_pointers, [&](u32 pointer) {
-                    return nonuniform.contains(pointer);
-                  }),
+              prefix_extracts == 1u && stored_pointers.size() == 1u &&
+                  nonuniform.contains(stored_pointers.front()),
               "indirect store retained static prefixes, was duplicated or lost a NonUniform pointer decoration");
     } else if (single) {
       test.forbidden_spirv.push_back("OpSwitch");
@@ -53884,6 +53926,7 @@ int main(int argc, char **argv) {
   CheckGuardedWaterfallBufferRecords(vulkan);
   CheckGpuSelectedFormattedRecordStore(vulkan);
   CheckFiniteBufferSelection(vulkan);
+  CheckStorageBufferBindingOver2GiB(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckSharedIndirectBufferLoads(vulkan);
   CheckComputeThreadDimensions(vulkan);
