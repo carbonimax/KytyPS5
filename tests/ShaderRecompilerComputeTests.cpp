@@ -5581,6 +5581,17 @@ public:
                   ImageHeapTestAccess::ImageOf(heap, filtered.slots[240]),
               "a reactivated view kept an element whose image slot holds a new image");
 
+      // A table whose descriptor grew keeps its old snapshot until a frame passes without it.
+      const IR::ImageHeapRequest grown{table, table_size * 2u, 32u, 0u, table_size / 16u, &sampled};
+      for (uint32_t frame = 0; frame < 2u; ++frame) {
+        Require(name, "grown table", heap.Acquire(grown, view), "a grown table was declined");
+        draw();
+        heap.RunGarbageCollector();
+        heap.BeginDraw();
+        Require(name, "superseded table", ImageHeapTestAccess::MemoryCount(heap) == 2u - frame,
+                "a snapshot was dropped in a frame that acquired it or kept after one without it");
+      }
+
       heap.UnmapMemory(table, table_size);
       Require(name, "unmapped table",
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&

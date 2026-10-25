@@ -531,26 +531,46 @@ void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {
 	} else {
 		m_unmapped.push_back({address, size});
 	}
-	auto&           scheduler = m_context.GetCommandScheduler();
 	std::scoped_lock lock {m_mutex};
 	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
 		if (address >= memory->base + memory->size || memory->base >= address + size) {
 			return false;
 		}
-		Unwatch(*memory);
-		for (auto& view: memory->views) {
-			std::erase(m_active, view.get());
-			for (const auto& [value, index]: view->elements) {
-				Unreference(m_elements[index]);
-				view->released.push_back(index);
-			}
-			Retire(*view);
-			if (scheduler.Active()) {
-				scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
-			}
-		}
+		Drop(*memory);
 		return true;
 	});
+}
+
+void ImageHeap::RunGarbageCollector() {
+	// A table whose descriptor grew keeps its old snapshot until a frame passes without it.
+	std::scoped_lock      lock {m_mutex};
+	std::vector<uint64_t> acquired;
+	for (const auto& memory: m_memories) {
+		if (memory->draw > m_frame_draw) acquired.push_back(memory->base);
+	}
+	std::erase_if(m_memories, [&](const std::unique_ptr<Memory>& memory) {
+		const bool superseded = memory->draw <= m_frame_draw &&
+		                        std::ranges::find(acquired, memory->base) != acquired.end();
+		if (superseded) Drop(*memory);
+		return superseded;
+	});
+	m_frame_draw = m_draw;
+}
+
+void ImageHeap::Drop(Memory& memory) {
+	auto& scheduler = m_context.GetCommandScheduler();
+	Unwatch(memory);
+	for (auto& view: memory.views) {
+		std::erase(m_active, view.get());
+		for (const auto& [value, index]: view->elements) {
+			Unreference(m_elements[index]);
+			view->released.push_back(index);
+		}
+		Retire(*view);
+		if (scheduler.Active()) {
+			scheduler.DeferOperation([buffer = std::move(view->buffer)] {});
+		}
+	}
 }
 
 } // namespace Libs::Graphics

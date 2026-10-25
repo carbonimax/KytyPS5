@@ -46,6 +46,8 @@ public:
 	// CPU write fault, on any thread.
 	void InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
+	// Frame boundary: drops table snapshots that another at the same base replaced this frame.
+	void RunGarbageCollector();
 
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
@@ -113,6 +115,7 @@ private:
 	Image*   ImageOf(const Element& element) const;
 	uint32_t Allocate();
 	void     Retire(View& view);
+	void     Drop(Memory& memory);
 	void     WriteDescriptors();
 
 	RenderContext&                       m_context;
@@ -120,7 +123,8 @@ private:
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.
-	uint64_t                             m_draw = 1;
+	uint64_t                             m_draw       = 1;
+	uint64_t                             m_frame_draw = 0; // Last draw before this frame.
 	std::vector<Element>                 m_elements;
 	std::vector<uint32_t>                m_free;
 	std::deque<std::pair<uint64_t, uint32_t>> m_retired; // Tick, element.
