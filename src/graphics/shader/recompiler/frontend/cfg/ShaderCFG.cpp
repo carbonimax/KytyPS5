@@ -1709,21 +1709,24 @@ Graph Structurize(const Graph& graph) {
 	return GotoStructurizer(graph).Run();
 }
 
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
-	// Vector comparisons and carry results can write a scalar pair in wave64.
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
+	// A vector lane mask (comparison or carry) spans wave_size / 32 SGPRs; a lane read writes one.
 	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
 	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
 	    inst.family == Decoder::Family::VOP3P) {
+		const bool lane_read =
+		    inst.opcode == Opcode::V_READLANE_B32 || inst.opcode == Opcode::V_READFIRSTLANE_B32;
+		const uint32_t size = lane_read ? 1u : wave_size / 32u;
 		uint32_t destination = 0;
 		for (const auto* operand: {&inst.dst, &inst.dst2})
-			if (ScalarOperandCode(*operand, destination) && code >= destination && code <= destination + 1u)
+			if (ScalarOperandCode(*operand, destination) && code >= destination && code < destination + size)
 				return true;
 	}
 	return InstructionWritesScalarCode(inst, code);
 }
 
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                             uint32_t before, uint32_t code,
+                                             uint32_t before, uint32_t code, uint32_t wave_size,
                                              std::vector<uint32_t>* crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
@@ -1745,11 +1748,11 @@ std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, co
 			// may accept the crossing and check the linked callee instead. The return address that
 			// the call itself writes is never a resolvable value.
 			if (inst.opcode == Opcode::S_SWAPPC_B64) {
-				if (crossed_calls == nullptr || MayWriteScalarRegister(inst, code)) return std::nullopt;
+				if (crossed_calls == nullptr || MayWriteScalarRegister(inst, code, wave_size)) return std::nullopt;
 				if (std::ranges::find(*crossed_calls, i) == crossed_calls->end()) crossed_calls->push_back(i);
 				continue;
 			}
-			if (MayWriteScalarRegister(inst, code)) {
+			if (MayWriteScalarRegister(inst, code, wave_size)) {
 				reaching = i;
 				break;
 			}
