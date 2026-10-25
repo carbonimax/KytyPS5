@@ -13,6 +13,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/guestStacks.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
@@ -658,6 +659,19 @@ static bool SrtBackingReadsEnabled() {
 	return enabled;
 }
 
+// KYTY_FAULT_MINIDUMP (default 1; written on Windows only, see Common::HostException::WriteMinidump):
+// an unhandled guest fault also writes kyty-fault-<pid>.dmp in the working directory. The process
+// then exits through EXIT, so Windows Error Reporting never sees these faults. Faults the kernel
+// cannot deliver (see graphics/host_gpu/guestStacks.h) never reach this handler: only a WER
+// LocalDumps dump records them.
+static void WriteFaultMinidump(const Common::HostException::ExceptionInfo* info) {
+	const char* enabled = std::getenv("KYTY_FAULT_MINIDUMP");
+	if (enabled != nullptr && std::atoi(enabled) == 0) {
+		return;
+	}
+	(void)Common::HostException::WriteMinidump(*info);
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -720,7 +734,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 		}
 		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
+		std::printf("thread: %s, pc 0x%016" PRIx64 ", access %u at 0x%016" PRIx64 "\n", thread_name,
+		            info->exception_address, static_cast<unsigned>(info->access_violation_type),
+		            info->access_violation_vaddr);
+		std::fflush(stdout);
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -744,6 +761,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		Libs::Graphics::GuestStacks::Describe(info->rsp);
+		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies
 		// the emulator code that called into a driver or system DLL that faulted.
@@ -780,6 +799,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 #endif
 		std::fflush(stdout);
+		WriteFaultMinidump(info);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/guestStacks.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
@@ -229,6 +230,9 @@ struct PageManager::Impl {
 				spans.push_back({this, vaddr, vaddr + size, mode});
 			}
 			return;
+		}
+		if (mode != Common::VirtualMemory::Mode::ReadWrite && GuestStacks::MaybeHit(vaddr, size)) [[unlikely]] {
+			GuestStacks::OnProtect(vaddr, size, mode == Common::VirtualMemory::Mode::NoAccess);
 		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,

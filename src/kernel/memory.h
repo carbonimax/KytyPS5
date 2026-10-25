@@ -146,6 +146,11 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 [[nodiscard]] bool IsVirtualAddressKnown(uint64_t vaddr);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// A guest thread stack or fiber context about to be used (Graphics::GuestStacks): registers it for
+// page-protection forensics and, for memory supplied by the guest (`supplied`), hands it to the GPU
+// tracking as written by the CPU (KYTY_STACK_INVALIDATE, default 1). ReleaseGuestStack: thread exit.
+void                   PrepareGuestStack(uint64_t vaddr, uint64_t size, const char* owner, bool supplied);
+void                   ReleaseGuestStack(uint64_t vaddr);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 // True when `vaddr` lies in a mapping being split by a partial unmap: the caller waited for the
 // surviving part to be mapped again and can retry the faulting access.

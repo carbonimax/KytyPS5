@@ -39,6 +39,12 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Writes kyty-fault-<pid>.dmp in the working directory for the exception being handled (threads,
+// stacks, indirectly referenced memory, data segments) and prints the outcome. Call it from the
+// handler while info.native_context is valid. Windows only (dbghelp.dll from the system, loaded on
+// demand); other hosts return false and print nothing.
+bool WriteMinidump(const ExceptionInfo& info);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif
