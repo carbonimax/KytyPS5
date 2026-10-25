@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -546,6 +547,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
 	pipeline_info.pNext                    = &rendering_info;
+	// Driver cache hit or miss of this creation (core in Vulkan 1.3; drivers may leave it invalid).
+	vk::PipelineCreationFeedback           creation_feedback {};
+	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
+	feedback_info.pPipelineCreationFeedback = &creation_feedback;
+	feedback_info.pNext                     = rendering_info.pNext;
+	rendering_info.pNext                    = &feedback_info;
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;
@@ -579,6 +586,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	if (result == vk::Result::eSuccess &&
+	    (creation_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid)) {
+		const bool hit = static_cast<bool>(
+		    creation_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
+		PerfStats::NoteGraphicsPipelineFeedback(hit, creation_feedback.duration);
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));

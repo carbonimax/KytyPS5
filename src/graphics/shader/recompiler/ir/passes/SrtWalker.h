@@ -80,6 +80,15 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
 bool WalkedActive(const ResourcePlan& plan, uint32_t source);
+// Measurement (KYTY_PERF_STATS): once enabled, walks count their number and wall time, and the
+// fault handler counts walker loads from protected pages (`backing`: completed from the backing,
+// else through the page fault path). Taken (and reset) by the PERF report.
+struct WalkStats {
+	uint64_t walks = 0, ns = 0, backing_reads = 0, fault_reads = 0;
+};
+void      EnableWalkStats() noexcept;
+void      NoteWalkerFaultRead(bool backing) noexcept;
+WalkStats TakeWalkStats() noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

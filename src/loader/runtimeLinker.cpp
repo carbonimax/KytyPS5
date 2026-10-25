@@ -692,12 +692,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				        Loader::X64InstructionEmulator::LoadBaseR10(info->native_context), &value,
 				        sizeof(value))) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true);
 					return true;
 				}
 			}
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0) {
+				Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(false);
+			}
 			return true;
 		}
 		if (const auto length =
