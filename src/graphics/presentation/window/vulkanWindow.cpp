@@ -25,6 +25,7 @@
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -100,6 +101,9 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+	features.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+	features.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+	features.descriptorBindingPartiallyBound              = VK_TRUE;
 	return features;
 }
 
@@ -347,6 +351,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.shaderStorageBufferArrayNonUniformIndexing,
 		              "shaderStorageBufferArrayNonUniformIndexing",
 		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
+		check_feature(features12.descriptorBindingSampledImageUpdateAfterBind,
+		              "descriptorBindingSampledImageUpdateAfterBind",
+		              required_features12.descriptorBindingSampledImageUpdateAfterBind);
+		check_feature(features12.descriptorBindingUpdateUnusedWhilePending,
+		              "descriptorBindingUpdateUnusedWhilePending",
+		              required_features12.descriptorBindingUpdateUnusedWhilePending);
+		check_feature(features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound",
+		              required_features12.descriptorBindingPartiallyBound);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
@@ -602,6 +614,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = supported_features2.pNext;
 		supported_features2.pNext = &maintenance8;
 	}
+	const bool shader_clock_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (shader_clock_extension) {
+		shader_clock.pNext = supported_features2.pNext;
+		supported_features2.pNext = &shader_clock;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -706,6 +725,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.attachment_feedback_loop_enabled && feedback_dynamic_extension &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState == VK_TRUE;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	// The device clock ticks at timestampPeriod nanoseconds.
+	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
+		graphics.device_clock_period_ps = static_cast<uint32_t>(
+		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
+	}
 	graphics.conditional_rendering_enabled =
 	    conditional_rendering_extension && conditional_rendering.conditionalRendering;
 	LOGF("Vulkan maintenance8 support: %s\n",
@@ -734,6 +758,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	device_features.shaderStorageImageMultisample        =
+	    supported_features2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
@@ -750,7 +776,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	// Storage image sample counts beyond 1x require the feature.
+	if (!device_features.shaderStorageImageMultisample) {
+		graphics.physical_device_properties.limits.storageImageSampleCounts =
+		    vk::SampleCountFlagBits::e1;
+	}
 	graphics.sample_rate_shading_enabled                 = true;
+	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	graphics.occlusion_queries_enabled =
+	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;
+	graphics.occlusion_query_precise_enabled =
+	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
+	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
+	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
+	     graphics.occlusion_queries_enabled ? "true" : "false",
+	     graphics.occlusion_query_precise_enabled ? "true" : "false");
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
@@ -818,6 +859,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.maintenance8_enabled) {
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
+	}
+	if (graphics.device_clock_period_ps != 0u) {
+		shader_clock.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &shader_clock;
 	}
 	if (graphics.conditional_rendering_enabled) {
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
@@ -1209,6 +1254,7 @@ void WindowContext::CreateVulkan() {
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+		                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,

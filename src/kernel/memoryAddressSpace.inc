@@ -899,29 +899,12 @@ public:
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
-	// KYTY_SHARED_TRANSIENT_PROTECT=0 restores the exclusive lock. Watch protections only read the
-	// mapping table; they were serialized with each other on the exclusive lock, so guest threads
-	// unprotecting a written page waited for the GPU thread's re-protection syscalls (in one
-	// title: ~2.4 % of a guest thread). Mapping changes still take the lock exclusively, and
-	// protections of one tracker page stay ordered by the page manager's region lock.
-	static bool SharedTransientProtect() {
-		static const bool enabled = [] {
-			const char* value = std::getenv("KYTY_SHARED_TRANSIENT_PROTECT");
-			return value == nullptr || std::strcmp(value, "0") != 0;
-		}();
-		return enabled;
-	}
-
+	// Tracker protections only read m_mapped; the page tracker orders them per page.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
-
-		if (SharedTransientProtect()) {
-			std::shared_lock lock(m_mutex);
-			return ProtectMappedUnlocked(vaddr, size, mode);
-		}
-		std::lock_guard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 

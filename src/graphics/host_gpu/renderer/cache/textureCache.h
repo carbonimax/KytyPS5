@@ -187,7 +187,6 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
-	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_index_epoch      = 1;
 	struct CandidateCacheEntry {
 		uint64_t             address = 0;
@@ -202,6 +201,7 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);

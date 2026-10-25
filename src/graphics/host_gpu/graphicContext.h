@@ -45,6 +45,8 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
+	bool                               occlusion_queries_enabled             = false;
+	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
@@ -55,6 +57,8 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	bool                                      device_address_destruction_waits_for_queue = false;
 	bool                                      release_waits_for_submission_fence = false;
+	uint32_t                           device_clock_period_ps                = 0;
+	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);

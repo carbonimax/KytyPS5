@@ -197,6 +197,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool OcclusionQueriesEnabled() {
+	return g_config->occlusion_queries_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

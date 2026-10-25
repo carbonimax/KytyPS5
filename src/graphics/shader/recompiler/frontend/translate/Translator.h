@@ -182,7 +182,7 @@ private:
 	void V_AND_OR_B32(const Decoder::Instruction& inst);
 	void V_OR3_B32(const Decoder::Instruction& inst);
 	void V_XOR3_B32(const Decoder::Instruction& inst);
-	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb);
+	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb, bool sign);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
 	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);

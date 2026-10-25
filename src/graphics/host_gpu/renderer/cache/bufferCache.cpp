@@ -307,7 +307,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
+		QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -732,6 +732,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -746,6 +747,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 			m_gpu_modified_ranges.Subtract(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, size);
+			QueueBdaSync(vaddr, size);
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
@@ -755,6 +757,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			QueueBdaSync(vaddr, size);
 		}
 	});
 }
@@ -807,6 +810,7 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 		flushed = true;
 		PublishFaultWindow(vaddr, true);
 	});
+	QueueBdaSync(vaddr, 1);
 	// KYTY_WRITE_FAULT_READAHEAD=N (pages, default 15; 0 disables): a guest thread that write-
 	// faults on the page after its previous write fault (a sequential writer, e.g. a constant
 	// ring) also gets the next N CPU-clean pages unprotected and marked CPU-modified, up to the
@@ -829,6 +833,9 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	}
 	const auto marked = m_memory_tracker.ExtendCpuModified((page + 1) * TRACKER_PAGE_SIZE,
 	                                                       readahead * TRACKER_PAGE_SIZE);
+	if (marked != 0) {
+		QueueBdaSync((page + 1) * TRACKER_PAGE_SIZE, marked);
+	}
 	next_page         = page + 1 + marked / TRACKER_PAGE_SIZE;
 }
 
@@ -845,6 +852,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
 				                               TRACKER_PAGE_SIZE);
 				m_memory_tracker.ReleaseUnownedRegion(vaddr, 1);
+				QueueBdaSync(vaddr, 1);
 				return;
 			}
 			auto&      buffer = m_slot_buffers[FindBuffer(vaddr, 1)];
@@ -891,6 +899,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 			m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
 			                               TRACKER_PAGE_SIZE);
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, 1);
+			QueueBdaSync(vaddr, 1);
 			return;
 		}
 		auto&      buffer = m_slot_buffers[FindBuffer(vaddr, 1)];
@@ -907,6 +916,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, 1);
+			QueueBdaSync(vaddr, 1);
 		}
 	});
 }
@@ -1516,7 +1526,7 @@ void BufferCache::ProcessFaultBuffer() {
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	// Take before walking: writes queued during synchronization remain pending.
-	const auto pending = m_memory_tracker.TakeBdaSync();
+	const auto pending = TakeBdaSync();
 	const bool deferred = BeginDeferredUploads();
 	pending.ForEach([&](uint64_t begin, uint64_t end) {
 		mapped.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
@@ -1526,6 +1536,18 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	if (deferred) {
 		EndDeferredUploads();
 	}
+}
+
+void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	std::lock_guard lock(m_bda_sync_mutex);
+	m_bda_sync.Add(begin, end - begin);
+}
+
+RangeSet BufferCache::TakeBdaSync() {
+	std::lock_guard lock(m_bda_sync_mutex);
+	return std::exchange(m_bda_sync, {});
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

@@ -8,7 +8,7 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameContent.h"
-#include "gameListTreeWidget.h"
+#include "gameViews.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
 #include "patchesDialog.h"
@@ -53,7 +53,6 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStyle>
-#include <QStyledItemDelegate>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
@@ -82,15 +81,6 @@ constexpr char CONF_GAME_DIRS[]    = "game_dirs";
 constexpr char CONF_ADDONS_DIR[]   = "addons_dir";
 constexpr char CONF_GLOBAL[]       = "GlobalConfiguration";
 constexpr char SAVE_DATA_DIR[]     = "_SaveData";
-
-constexpr int GAME_NAME_COLUMN             = 0;
-constexpr int GAME_SERIAL_COLUMN           = 1;
-constexpr int GAME_VERSION_COLUMN          = 2;
-constexpr int GAME_FIRMWARE_VERSION_COLUMN = 3;
-constexpr int GAME_SIZE_COLUMN             = 4;
-constexpr int GAME_PATH_COLUMN             = 5;
-constexpr int GAME_STATUS_COLUMN           = 6;
-constexpr int GAME_COMMENT_COLUMN          = 7;
 
 static QString NormalizeGameDirectory(const QString& dir) {
 	const auto trimmed = dir.trimmed();
@@ -151,54 +141,6 @@ static QStringList SettingsStringList(const QVariant& value) {
 	return text.isEmpty() ? QStringList() : QStringList({text});
 }
 
-class GameGridDelegate: public QStyledItemDelegate {
-public:
-	using QStyledItemDelegate::QStyledItemDelegate;
-
-	QSize sizeHint(const QStyleOptionViewItem& option, const QModelIndex&) const override {
-		return option.decorationSize + QSize(16, 24 + option.fontMetrics.lineSpacing() * 2);
-	}
-
-protected:
-	void initStyleOption(QStyleOptionViewItem* option, const QModelIndex& index) const override {
-		const auto image_size = option->decorationSize;
-		QStyledItemDelegate::initStyleOption(option, index);
-		option->decorationSize      = image_size;
-		option->decorationPosition  = QStyleOptionViewItem::Top;
-		option->decorationAlignment = Qt::AlignCenter;
-		option->displayAlignment    = Qt::AlignHCenter | Qt::AlignTop;
-		option->features |= QStyleOptionViewItem::WrapText;
-	}
-};
-
-static void ConfigureGameList(Ui::ConfigurationListWidget* ui) {
-	ui->cfgs_list->setAlternatingRowColors(false);
-	ui->cfgs_list->setAllColumnsShowFocus(true);
-	ui->cfgs_list->setIndentation(0);
-	ui->cfgs_list->setMouseTracking(false);
-	ui->cfgs_list->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_list->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
-	ui->cfgs_list->header()->setDefaultAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-	ui->cfgs_list->header()->setHighlightSections(false);
-	ui->cfgs_list->header()->setStretchLastSection(true);
-
-	// Both presentations use the same items, icons and current game.
-	ui->cfgs_grid->setModel(ui->cfgs_list->model());
-	ui->cfgs_grid->setSelectionModel(ui->cfgs_list->selectionModel());
-	ui->cfgs_grid->setViewMode(QListView::IconMode);
-	ui->cfgs_grid->setMovement(QListView::Static);
-	ui->cfgs_grid->setResizeMode(QListView::Adjust);
-	ui->cfgs_grid->setSelectionMode(QAbstractItemView::SingleSelection);
-	ui->cfgs_grid->setSelectionBehavior(QAbstractItemView::SelectRows);
-	ui->cfgs_grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
-	ui->cfgs_grid->setSpacing(8);
-	ui->cfgs_grid->setUniformItemSizes(true);
-	ui->cfgs_grid->setWordWrap(true);
-	ui->cfgs_grid->setItemDelegate(new GameGridDelegate(ui->cfgs_grid));
-	ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
-}
-
 static void AddSaveDataDir(QStringList* dirs, QSet<QString>* seen, const QString& root,
                            const QString& title_id) {
 	const auto path = QDir(root).filePath(
@@ -255,7 +197,6 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_compatibility = new CompatibilityDatabase(
 	    QCoreApplication::arguments().contains(QStringLiteral("--local")), this);
 	m_ui->setupUi(this);
-	ConfigureGameList(m_ui);
 
 	m_ui->refresh_action->setShortcuts(QKeySequence::Refresh);
 	m_ui->refresh_button->setDefaultAction(m_ui->refresh_action);
@@ -269,8 +210,9 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->edit_button->setEnabled(false);
 
 	m_ui->cfgs_list->setContextMenuPolicy(Qt::CustomContextMenu);
+	m_ui->cfgs_list->setAllColumnsShowFocus(true);
+	m_ui->cfgs_list->setTextElideMode(Qt::ElideMiddle);
 	m_ui->cfgs_list->setIconSize(QSize(48, 48));
-	m_ui->cfgs_list->setRootIsDecorated(false);
 	m_ui->cfgs_list->setUniformRowHeights(true);
 	m_ui->cfgs_list->setSortingEnabled(true);
 	m_ui->cfgs_list->setColumnWidth(GAME_NAME_COLUMN, 320);
@@ -282,6 +224,8 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_STATUS_COLUMN, 150);
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
+	SetupGameGrid(m_ui->cfgs_list, m_ui->cfgs_grid);
+	m_ui->cfgs_grid->setContextMenuPolicy(Qt::CustomContextMenu);
 
 	connect(m_ui->refresh_action, &QAction::triggered, this,
 	        &ConfigurationListWidget::ScanGameDirectory);
@@ -326,16 +270,12 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	connect(m_compatibility, &CompatibilityDatabase::Updated, this,
 	        &ConfigurationListWidget::ApplyCompatibility);
 
-	m_ui->cfgs_list->setDragDropMode(QAbstractItemView::NoDragDrop);
-
 	ReadSettings();
 	m_ui->grid_size_slider->setVisible(m_ui->grid_view_button->isChecked());
-	const auto resize_grid = [this](int width) {
-		m_ui->cfgs_grid->setIconSize(QSize(width, width * 9 / 16));
-	};
-	resize_grid(m_ui->grid_size_slider->value());
-	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this, resize_grid](int width) {
-		resize_grid(width);
+	const int grid_size = m_ui->grid_size_slider->value();
+	m_ui->cfgs_grid->setIconSize(QSize(grid_size, grid_size));
+	connect(m_ui->grid_size_slider, &QSlider::valueChanged, this, [this](int width) {
+		m_ui->cfgs_grid->setIconSize(QSize(width, width));
 		if (!m_ui->grid_size_slider->isSliderDown()) {
 			WriteSettings();
 		}
@@ -1277,7 +1217,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	auto* item = static_cast<ConfigurationItem*>(witem);
 	if (item == nullptr) {
 		m_selected_item = nullptr;
-		m_ui->cfgs_list->SetBackgroundImage({});
+		m_ui->game_views->SetBackgroundImage({});
 		m_ui->edit_button->setEnabled(false);
 		m_ui->delete_button->setEnabled(false);
 		emit Select();
@@ -1288,7 +1228,7 @@ void ConfigurationListWidget::SelectItem(QTreeWidgetItem* witem) {
 	m_ui->edit_button->setEnabled(!item->IsRunning());
 
 	m_selected_item = item;
-	m_ui->cfgs_list->SetBackgroundImage(item->GetInfo().basedir);
+	m_ui->game_views->SetBackgroundImage(item->GetInfo().basedir);
 
 	emit Select();
 }
