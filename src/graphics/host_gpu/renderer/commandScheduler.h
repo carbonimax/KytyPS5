@@ -63,6 +63,13 @@ public:
 	// The render context's scheduler: its command buffers are the ones KYTY_CP_RECORD_THREAD
 	// records on the recorder thread (see cmdRecord.h).
 	void MarkMainRecorder() noexcept { m_record_main = true; }
+	// KYTY_IDLE_SUBMIT=N (default 0 = off; GPU thread, command processor between packets): true when
+	// the command buffer being recorded holds at least N draws or dispatches and the GPU completed
+	// everything submitted before it. The caller then submits it (earlier submission only: same
+	// commands, same order, same interrupts and labels), so an idle GPU starts on recorded work.
+	// KYTY_IDLE_SUBMIT_PASS=0: not while a rendering pass is open (the submission would end it).
+	[[nodiscard]] static bool IdleSubmitEnabled();
+	[[nodiscard]] bool        IdleSubmitDue();
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
@@ -132,6 +139,9 @@ private:
 	const bool                   m_release_waits_for_fence;
 	bool                         m_record_main = false;
 	bool                         m_capturing   = false; // the recorder thread takes the current buffer
+	// KYTY_IDLE_SUBMIT: PerfStats::t_work_recorded at BeginCommand, time of the last semaphore query.
+	uint64_t m_work_at_begin   = 0;
+	uint64_t m_idle_refresh_ns = 0;
 	std::mutex                   m_fence_mutex;
 	std::deque<SubmittedFence>    m_submitted_fences;
 	std::vector<vk::Fence>        m_free_fences;

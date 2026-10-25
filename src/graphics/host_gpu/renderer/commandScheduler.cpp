@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -469,7 +470,67 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
+	m_work_at_begin = PerfStats::t_work_recorded;
 	return m_command;
+}
+
+// KYTY_IDLE_SUBMIT=N (default 0 = off): at least N draws/dispatches recorded.
+static uint64_t IdleSubmitMinWork() {
+	static const uint64_t value = [] {
+		const char* env = std::getenv("KYTY_IDLE_SUBMIT");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+	}();
+	return value;
+}
+
+bool CommandScheduler::IdleSubmitEnabled() {
+	return IdleSubmitMinWork() != 0;
+}
+
+// KYTY_IDLE_SUBMIT_PASS=0: never end an open rendering pass for an idle submission (default 1).
+static bool IdleSubmitSplitsPasses() {
+	static const bool value = [] {
+		const char* env = std::getenv("KYTY_IDLE_SUBMIT_PASS");
+		return env == nullptr || env[0] != '0';
+	}();
+	return value;
+}
+
+// KYTY_IDLE_SUBMIT_MIN_FRAME_MS=M (default 0): only while presented frames are at least M ms apart
+// on average: a slow game is usually held back by the command processor, while a game at the display
+// rate is held back by the GPU or the display, where splitting its passes only adds GPU work.
+static uint64_t IdleSubmitMinFrameUs() {
+	static const uint64_t value = [] {
+		const char* env = std::getenv("KYTY_IDLE_SUBMIT_MIN_FRAME_MS");
+		return env != nullptr ? std::strtoull(env, nullptr, 10) * 1000ull : 0ull;
+	}();
+	return value;
+}
+
+bool CommandScheduler::IdleSubmitDue() {
+	if (m_command.IsInvalid() || PerfStats::t_work_recorded - m_work_at_begin < IdleSubmitMinWork()) {
+		return false;
+	}
+	if (!IdleSubmitSplitsPasses() && m_command.Rendering()) {
+		return false;
+	}
+	if (PerfStats::RecentFrameUs() < IdleSubmitMinFrameUs()) {
+		return false;
+	}
+	const auto submitted = CurrentTick() - 1;
+	if (m_master.KnownGpuTick() >= submitted) {
+		return true;
+	}
+	// At most one semaphore query per 50 us (other waits refresh the known tick too).
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                           std::chrono::steady_clock::now().time_since_epoch())
+	                                           .count());
+	if (now - m_idle_refresh_ns < 50'000ull) {
+		return false;
+	}
+	m_idle_refresh_ns = now;
+	m_master.Refresh();
+	return m_master.KnownGpuTick() >= submitted;
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
