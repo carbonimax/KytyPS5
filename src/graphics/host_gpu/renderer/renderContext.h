@@ -52,6 +52,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	OcclusionQueries&   GetOcclusionQueries() { return m_occlusion_queries; }
 
+	// Resolver behind LibKernel::Memory::HandleGpuFault: Read publishes GPU-written bytes, Write
+	// invalidates the cached copies; Execute/Unknown return false. Takes locks and may wait for the
+	// GPU (not async-signal-safe).
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
