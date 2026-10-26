@@ -115,6 +115,10 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// GPU thread: the tracker page of vaddr may hold GPU-written bytes (page bits only).
+	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
+		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so

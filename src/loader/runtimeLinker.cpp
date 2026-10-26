@@ -651,6 +651,24 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// SRT walker loads from pages listed after a fault (SrtWalker.h, KYTY_SRT_PROTECTED_LOADS): the
+// same backing read the fault path below does, while the page may hold GPU-written bytes (the
+// pages the tracker protects against reads); other pages leave the list and are loaded directly.
+static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
+	using namespace Libs::Graphics::ShaderRecompiler::IR;
+	if (!Libs::LibKernel::Memory::MaybeGpuModifiedPage(address)) {
+		return 0;
+	}
+	const uint32_t synced =
+	    WalkStatsEnabled() && Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value))
+	        ? ProtectedLoadSynced
+	        : 0u;
+	return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value))
+	            ? ProtectedLoadValue | ProtectedLoadKeep
+	            : ProtectedLoadKeep) |
+	       synced;
+}
+
 static bool SrtBackingReadsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_BACKING_READS");
@@ -707,6 +725,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				        sizeof(value))) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true);
+					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);
+					Libs::Graphics::ShaderRecompiler::IR::NoteProtectedLoad(
+					    Loader::X64InstructionEmulator::LoadBaseR10(info->native_context));
 					return true;
 				}
 			}

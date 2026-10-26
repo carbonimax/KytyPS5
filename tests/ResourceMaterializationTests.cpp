@@ -392,6 +392,100 @@ void TestSrtAliasesShareReads() {
         "unreadable pointer did not read as zero");
 }
 
+void TestProtectedPageLoadsCallReader() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = SrtProgram(0x1000u);
+  auto &block = *program.blocks[0];
+  const auto append_read = [&](uint32_t address) {
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                       {Value(address), Value(0u)});
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(0u), Value(0u), Value(true)});
+    // Different reads deliberately share MemoryInfo but have different guest PCs.
+    read.SetFlags(MemoryFlags{.index = 0, .pc = address});
+    const auto slot = static_cast<uint32_t>(program.srt_reads.size());
+    program.srt_reads.push_back({Value(&read), slot});
+    auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+    return Value(&block.AppendNewInst(ValueOpcode::ReadConst,
+                                      {Value(&srt), Value(slot)}));
+  };
+  const auto ordinary = append_read(0x2000u);
+  const auto pointer = append_read(0x3000u);
+  program.srt_reads[0].value.Instruction()->Arg(0).Instruction()->SetArg(0, pointer);
+  auto &mask = block.AppendNewInst(ValueOpcode::INotEqual32, {ordinary, Value(0u)});
+  auto &first = block.AppendNewInst(ValueOpcode::ReadFirstLane,
+                                    {Value(9u), Value(&mask)});
+  program.descriptor_sources.push_back({.dwords = {Value(&first), Value(0u)},
+                                       .dword_count = 2});
+  DescriptorSource indirect;
+  indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
+  program.descriptor_sources.push_back(indirect);
+  auto plan = ExtractResourcePlan(program);
+  for (const auto &inst : plan.value_storage) {
+    Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
+              inst.GetOpcode() != ValueOpcode::GetSrtResource,
+          "retained plan still contains flattened-read aliases");
+  }
+  Check(plan.descriptor_sources[0].dwords[0] == plan.srt_reads[0].value,
+        "alias normalization lost read identity");
+  struct Reads { uint32_t count = 0; bool dirty = false; } reads;
+  FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.count;
+        if (address == 0x1000u) words[0] = 0x1111u;
+        else if (address == 0x2000u) words[0] = 0x2222u;
+        else if (address == 0x3000u && !reads.dirty) words[0] = 0x1000u;
+        else return false;
+        return true;
+      }, &reads);
+  std::vector<uint32_t> flat;
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+            reads.count == 3,
+        "normalized aliases changed nested reads or repeated a shared read");
+  // An unreadable pointer reads as zero, and so does the null table it yields.
+  reads = {.dirty = true};
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0u, 0x2222u, 0u} &&
+            reads.count == 3,
+        "unreadable pointer did not read as zero");
+  // A load from a page listed as protected calls the reader instead of faulting; a failed reader
+  // call falls back to the direct load (here: the fault path).
+  static uint32_t protected_calls = 0;
+  protected_calls = 0;
+  SetProtectedLoadReader(+[](uint64_t address, uint32_t *value) -> uint32_t {
+    ++protected_calls;
+    if (address != 0x2000u) return ProtectedLoadKeep;
+    *value = 0x7777u;
+    return ProtectedLoadValue | ProtectedLoadKeep;
+  });
+  NoteProtectedLoad(0x2000u);
+  NoteProtectedLoad(0x3000u);
+  reads = {};
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x7777u, 0x1000u} &&
+            reads.count == 2 && protected_calls == 2,
+        "protected page loads did not go through the reader");
+  SetProtectedLoadReader(nullptr);
+  reads = {};
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+            reads.count == 3,
+        "protected page loads without a reader did not fall back to the direct load");
+  // A page the reader reports unprotected leaves the list: the next walk loads it directly.
+  protected_calls = 0;
+  SetProtectedLoadReader(+[](uint64_t, uint32_t *) -> uint32_t {
+    ++protected_calls;
+    return 0;
+  });
+  NoteProtectedLoad(0x2000u);
+  reads = {};
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+            protected_calls == 2,
+        "unprotected pages were not read directly");
+  reads = {};
+  Check(WalkSrt(plan, {}, flat, nullptr) && flat == std::vector<uint32_t>{0x1111u, 0x2222u, 0x1000u} &&
+            protected_calls == 2 && reads.count == 3,
+        "unprotected pages stayed listed");
+  SetProtectedLoadReader(nullptr);
+}
+
 void TestUniformVectorDescriptorRead() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -1763,6 +1857,7 @@ int main() {
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
+  TestProtectedPageLoadsCallReader();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();
   TestUnbasedFlatCacheHitMaterializes();

@@ -133,6 +133,9 @@ int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: the tracker page of vaddr may hold GPU-written bytes (the tracker protects such pages
+// against guest reads). False on other threads and outside GPU-tracked memory.
+bool                   MaybeGpuModifiedPage(uint64_t vaddr);
 // TryReadBufferBacking without synchronizing GPU writes: fails when any byte is GPU-dirty.
 bool                   TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: true when a byte of the range holds GPU-written data not yet in the backing.

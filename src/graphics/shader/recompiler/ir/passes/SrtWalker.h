@@ -84,9 +84,23 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 // fault handler counts walker loads from protected pages (`backing`: completed from the backing,
 // else through the page fault path). Taken (and reset) by the PERF report.
 struct WalkStats {
-	uint64_t walks = 0, ns = 0, backing_reads = 0, fault_reads = 0;
+	uint64_t walks = 0, ns = 0, backing_reads = 0, fault_reads = 0, protected_calls = 0,
+	         protected_evictions = 0, protected_ns = 0, protected_synced = 0;
 };
+// KYTY_SRT_PROTECTED_LOADS (default 1): the fault handler lists the page of a walker load it
+// completed from the backing (NoteProtectedLoad); later walker loads from a listed page call the
+// reader (GPU thread: the backing, synchronizing GPU-written bytes) instead of faulting. The reader
+// returns ProtectedLoadValue when it read the value, and ProtectedLoadKeep while the page is still
+// protected; without Keep the page leaves the list, and without Value the walker loads directly
+// (through the fault path when the page is protected after all).
+using ProtectedLoadReader = uint32_t (*)(uint64_t address, uint32_t* value);
+constexpr uint32_t ProtectedLoadValue = 1u;
+constexpr uint32_t ProtectedLoadKeep  = 2u;
+constexpr uint32_t ProtectedLoadSynced = 4u; // measurement: GPU-written bytes were synchronized first
+void SetProtectedLoadReader(ProtectedLoadReader reader) noexcept;
+void NoteProtectedLoad(uint64_t address) noexcept;
 void      EnableWalkStats() noexcept;
+[[nodiscard]] bool WalkStatsEnabled() noexcept;
 void      NoteWalkerFaultRead(bool backing) noexcept;
 WalkStats TakeWalkStats() noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
