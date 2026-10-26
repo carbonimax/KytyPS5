@@ -683,9 +683,15 @@ static bool IsYieldPoint(uint32_t opcode) {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+		}
+		// KYTY_IDLE_SUBMIT: an idle host GPU gets the work recorded so far (earlier submission only).
+		if (idle_submit && GetScheduler().Active() && GetScheduler().IdleSubmitDue()) {
+			PerfStats::Add(PerfStats::Counter::IdleSubmits, 1);
+			BufferFlush();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());

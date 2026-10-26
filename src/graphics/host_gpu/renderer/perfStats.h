@@ -38,6 +38,7 @@ enum class Counter : uint32_t {
 	WaitOtherNs,       // other threads blocked on the host GPU timeline
 	WaitOtherCount,
 	Submits,           // vkQueueSubmit calls
+	IdleSubmits,       // of which KYTY_IDLE_SUBMIT submissions
 	Count
 };
 
@@ -59,6 +60,13 @@ void NotePresentedFrame() noexcept;
 void NoteFlipArg(int64_t arg) noexcept;
 // Smoothed interval between presented frames in microseconds (0 before the second frame).
 [[nodiscard]] uint64_t RecentFrameUs() noexcept;
+
+// Draws and dispatches recorded by the calling thread (GPU thread), always counted: KYTY_IDLE_SUBMIT
+// reads it (CommandScheduler::IdleSubmitDue).
+inline thread_local uint64_t t_work_recorded = 0;
+inline void                  NoteWork() noexcept {
+    ++t_work_recorded;
+}
 
 class ScopedTimer {
 public:
