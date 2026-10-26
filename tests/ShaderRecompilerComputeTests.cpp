@@ -43126,6 +43126,89 @@ void CheckWorkgroupDividedImageTable(VulkanHarness &vulkan) {
   std::printf("[compute] %s ok\n", test.name);
 }
 
+void CheckWaterfallFloorImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u, lanes = 64u, active = 60u;
+  constexpr float scale = 1.0f / 56.0f;
+  TestCase test;
+  test.name = "WaterfallFloorImageTable";
+  test.bda_mappings = {{0u, 0u}};
+  test.initial.resize((base + table_offset + 8u * 32u) / 4u);
+  for (u32 row = 0; row < 8u; ++row) {
+    auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    image[0] = row + 1u;
+    image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+  }
+  test.user_data[0] = base;
+  const auto output = MakeStructuredStorageBufferData(0u, lanes * 4u);
+  std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+  test.has_user_data = test.has_compute_info = true;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.thread_ids_num = 1u;
+  // Lanes below 60 compute row floor(7 - 7 * saturate(lane / 56)); a waterfall loop reads that
+  // row and row min(row + 1, 7).
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, 0u);
+  AppendVMovLiteral(&code, 21, 0u);
+  code.insert(code.end(), {EncodeVopc(0xc4, InlineU32(active), 0), EncodeSop1(0x24, 38, 106)});
+  code.push_back(EncodeVop1(0x06, 1, Vgpr(0)));
+  AppendSMovLiteral(&code, 24, std::bit_cast<u32>(scale));
+  AppendVop3(&code, 0x108, 1, 24, Vgpr(1), 0, 0, 0, true);
+  AppendSMovLiteral(&code, 25, std::bit_cast<u32>(-7.0f));
+  code.insert(code.end(), {EncodeVop2(0x21, 2, 25, 1), std::bit_cast<u32>(7.0f),
+      EncodeVop1(0x0d, 3, Vgpr(2)), EncodeSop1(0x04, 34, 126)});
+  const auto loop = code.size();
+  code.push_back(EncodeSop1(0x14, 4, 34));
+  AppendVop3(&code, 0x360, 5, Vgpr(3), 4);
+  AppendVop3(&code, 0xc2, 36, 5, Vgpr(3));
+  code.insert(code.end(), {EncodeSop1(0x24, 30, 36),
+      EncodeSop2(0x1e, 6, 5, InlineU32(5)), EncodeSop2(0x02, 6, 6, 255), table_offset,
+      EncodeSmem0(0x03, 8), EncodeSmem1(0, 6),
+      EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 2, 10),
+      EncodeSop2(0x02, 7, 5, InlineU32(1)), EncodeSop2(0x06, 7, 7, InlineU32(7)),
+      EncodeSop2(0x1e, 7, 7, InlineU32(5)), EncodeSop2(0x02, 7, 7, 255), table_offset,
+      EncodeSmem0(0x03, 16), EncodeSmem1(0, 7),
+      EncodeMimg0(0x00, 1), EncodeMimg1(5, 20, 4, 10),
+      EncodeSop2(0x15, 34, 34, 36), EncodeSop1(0x04, 126, 30)});
+  code.push_back(EncodeSopp(0x05, loop - code.size() - 1u));
+  code.insert(code.end(), {EncodeVop2(0x20, 6, Vgpr(5), 4), std::bit_cast<u32>(16.0f),
+      EncodeVop2(0x1a, 30, InlineU32(2), 0)});
+  AppendBufferStoreDword(&code, 6, 30);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_GT_U32, O::S_AND_SAVEEXEC_B64, O::V_CVT_F32_U32,
+                  O::S_MOV_B32, O::V_MUL_F32, O::V_MADAK_F32, O::V_CVT_FLR_I32_F32, O::S_MOV_B64,
+                  O::S_FF1_I32_B64, O::V_READLANE_B32, O::V_CMP_EQ_U32, O::S_LSHL_B32,
+                  O::S_ADD_I32, O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::S_MIN_I32, O::S_ANDN2_B64,
+                  O::S_CBRANCH_SCC1, O::V_MADMK_F32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "table rows", compiled.resources.images.size() == 8u,
+          "descriptor planning did not bound the waterfall rows to the table");
+  std::vector<VulkanHarness::Image> images;
+  for (const auto &descriptor : compiled.resources.images)
+    images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled,
+        {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal));
+  auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+  vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+  std::vector<u32> expected;
+  for (u32 lane = 0; lane < active; ++lane) {
+    const float product = -7.0f * std::clamp(static_cast<float>(lane) * scale, 0.0f, 1.0f);
+    const auto row = static_cast<u32>(std::floor(product + 7.0f));
+    const auto next = std::min(row + 1u, 7u);
+    expected.push_back(std::bit_cast<u32>(static_cast<float>(row + 1u + 16u * (next + 1u))));
+  }
+  expected.resize(lanes);
+  CompareWords(test, "waterfall rows", expected,
+               vulkan.ReadBuffer(test.name, buffer, expected.size()));
+  vulkan.DestroyBuffer(&buffer);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %s ok\n", test.name);
+}
+
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -54207,6 +54290,7 @@ int main(int argc, char **argv) {
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
     CheckWorkgroupDividedImageTable(vulkan);
+    CheckWaterfallFloorImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54386,6 +54470,7 @@ int main(int argc, char **argv) {
   CheckCountedRowImageSelector(vulkan);
   CheckPointerImageTable(vulkan);
   CheckWorkgroupDividedImageTable(vulkan);
+  CheckWaterfallFloorImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
