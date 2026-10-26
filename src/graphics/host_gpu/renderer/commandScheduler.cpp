@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -456,6 +457,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	PerfStats::Add(PerfStats::Counter::Submits, 1);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,

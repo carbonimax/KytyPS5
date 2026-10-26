@@ -7,7 +7,9 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -164,6 +166,12 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+
+std::atomic<bool>     g_walk_stats {false};
+std::atomic<uint64_t> g_walks {0};
+std::atomic<uint64_t> g_walk_ns {0};
+std::atomic<uint64_t> g_walk_backing_reads {0};
+std::atomic<uint64_t> g_walk_fault_reads {0};
 
 // Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
@@ -1348,10 +1356,19 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	const bool timed = g_walk_stats.load(std::memory_order_relaxed);
+	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	if (timed) {
+		g_walks.fetch_add(1, std::memory_order_relaxed);
+		g_walk_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                              std::chrono::steady_clock::now() - start)
+		                                              .count()),
+		                    std::memory_order_relaxed);
+	}
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
@@ -1397,6 +1414,23 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+}
+
+void EnableWalkStats() noexcept {
+	g_walk_stats.store(true, std::memory_order_relaxed);
+}
+
+void NoteWalkerFaultRead(bool backing) noexcept {
+	if (g_walk_stats.load(std::memory_order_relaxed)) {
+		(backing ? g_walk_backing_reads : g_walk_fault_reads).fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+WalkStats TakeWalkStats() noexcept {
+	return {.walks         = g_walks.exchange(0, std::memory_order_relaxed),
+	        .ns            = g_walk_ns.exchange(0, std::memory_order_relaxed),
+	        .backing_reads = g_walk_backing_reads.exchange(0, std::memory_order_relaxed),
+	        .fault_reads   = g_walk_fault_reads.exchange(0, std::memory_order_relaxed)};
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

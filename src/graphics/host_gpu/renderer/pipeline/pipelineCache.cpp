@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -390,6 +391,7 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		PerfStats::ScopedTimer program_timer(PerfStats::Counter::ProgramNs, PerfStats::Counter::ProgramCount);
 		auto entry = programs.find(lookup_key);
 		const auto bind = [&](const Permutation& permutation) {
 			input_info.stage = {.program   = &permutation.program,
@@ -402,6 +404,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
+			PerfStats::ScopedTimer srt_timer(PerfStats::Counter::SrtNs);
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
@@ -413,6 +416,8 @@ struct PipelineCache::ProgramCache {
 			if (permutation != nullptr) return bind(*permutation);
 		}
 
+		PerfStats::ScopedTimer recompile_timer(PerfStats::Counter::RecompileNs,
+		                                       PerfStats::Counter::RecompileCount);
 		const char* label = nullptr;
 		const char* stage_name = nullptr;
 		switch (options.stage) {
@@ -1180,6 +1185,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::GfxPipelineNs,
+		                                  PerfStats::Counter::GfxPipelineCount);
 		CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, state,
 		                       static_params, m_driver_cache);
 	}
@@ -1212,6 +1219,8 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::CsPipelineNs,
+		                                  PerfStats::Counter::CsPipelineCount);
 		CreatePipelineInternal(m_graphics, pipeline, input_info, compute_program.module,
 		                       m_driver_cache);
 	}
