@@ -78,6 +78,7 @@ ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	layout.coord = cursor;
 	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
+	if (HasFlag(mem, Decoder::ImageSampleFlagLodClamp)) layout.clamp = cursor++;
 	return layout;
 }
 
@@ -1092,6 +1093,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				dref_value = AddressF32(ctx, mem, *address, layout.dref);
 			}
 		}
+		// _cl clamps the computed LOD from below. Without shaderResourceMinLod the clamp is dropped
+		// (the behaviour before it was decoded) rather than failing the sample.
+		uint32_t min_lod = 0;
+		if (layout.clamp != NoImageComponent) {
+			min_lod = AddressF32(ctx, mem, *address, layout.clamp);
+		}
 		std::array<uint32_t, 5> operands {};
 		size_t operand_count = 0;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
@@ -1103,6 +1110,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			auto lod = ZeroF32(state);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
 				lod = AddressF32(ctx, mem, *address, layout.lod);
+			}
+			// SPIR-V takes MinLod only with implicit LOD or Grad.
+			if (min_lod != 0) {
+				lod     = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, lod, min_lod);
+				min_lod = 0;
 			}
 			operands[0] = spv::ImageOperandsLodMask;
 			operands[1] = lod;
@@ -1127,6 +1139,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				sample_operands[sample_operand_count++] = PackedOffset(
 				    ctx, offset_value, candidate.dimension, sample_operands[0]);
 			}
+			uint32_t sample_min_lod = state.resource_min_lod ? min_lod : 0u;
 			if (candidate.sample_min_lod != 0u) {
 				const auto clamp = ConstantF32Value(state, static_cast<float>(candidate.sample_min_lod) / 256.0f);
 				if ((sample_operands[0] & spv::ImageOperandsLodMask) != 0u) {
@@ -1136,11 +1149,17 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 						ctx.Fail(inst, "image minimum LOD emulation requires shaderResourceMinLod");
 						return 0u;
 					}
-					state.builder.RequireCapability(spv::CapabilityMinLod);
-					sample_operands[0] |= spv::ImageOperandsMinLodMask;
-					sample_operand_count = std::max(size_t{1}, sample_operand_count);
-					sample_operands[sample_operand_count++] = clamp;
+					sample_min_lod = sample_min_lod != 0u
+					                     ? EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, sample_min_lod, clamp)
+					                     : clamp;
 				}
+			}
+			// MinLod follows the offset in operand order.
+			if (sample_min_lod != 0u) {
+				state.builder.RequireCapability(spv::CapabilityMinLod);
+				sample_operand_count = std::max(size_t{1}, sample_operand_count);
+				sample_operands[0] |= spv::ImageOperandsMinLodMask;
+				sample_operands[sample_operand_count++] = sample_min_lod;
 			}
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
