@@ -1067,6 +1067,9 @@ void* PthreadCreateMainGuestStack() {
 	                             g_pthread_self->attr->stack_size) &
 	                            ~static_cast<uintptr_t>(0x0f));
 
+	Memory::PrepareGuestStack(reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr),
+	                          g_pthread_self->attr->stack_size, "main", false);
+
 	LOGF("\tPthread main guest stack: stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64
 	     ", stack_top = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr),
@@ -3217,6 +3220,10 @@ int PthreadGetCurrentPriorityForKernel() {
 static void CleanupThread(void* arg) {
 	auto* thread = static_cast<Pthread>(arg);
 
+	if (thread->attr != nullptr) {
+		Memory::ReleaseGuestStack(reinterpret_cast<uint64_t>(thread->attr->stack_addr));
+	}
+
 	LibcInternalExt::RunThreadAtexitDestructors();
 
 	auto thread_dtors = g_pthread_context->GetThreadDtors();
@@ -3278,6 +3285,8 @@ static void* RunThread(void* arg) {
 	auto* stack_top = reinterpret_cast<void*>(
 	    (reinterpret_cast<uintptr_t>(thread->attr->stack_addr) + thread->attr->stack_size) &
 	    ~static_cast<uintptr_t>(0x0f));
+	Memory::PrepareGuestStack(reinterpret_cast<uint64_t>(thread->attr->stack_addr),
+	                          thread->attr->stack_size, thread->name.c_str(), thread->attr->stack_user);
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)

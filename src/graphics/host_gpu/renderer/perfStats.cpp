@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -146,6 +147,7 @@ void MaybeReport() noexcept {
 		            seconds, static_cast<double>(walk.ns) / 1e6, walk.walks, walk.backing_reads,
 		            walk.fault_reads);
 	}
+	GuestStacks::Report();
 	std::fflush(stdout);
 }
 

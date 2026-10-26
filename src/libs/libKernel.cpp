@@ -2577,6 +2577,10 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	fiber->magic_end = FIBER_MAGIC_END;
 
 	if (addr_context != nullptr) {
+		char owner[48];
+		std::snprintf(owner, sizeof(owner), "fiber %s", fiber->name);
+		LibKernel::Memory::PrepareGuestStack(reinterpret_cast<uint64_t>(addr_context), size_context,
+		                                     owner, true);
 		*static_cast<uint64_t*>(addr_context) = FIBER_STACK_MAGIC;
 	}
 
@@ -2629,6 +2633,7 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	LibKernel::Memory::ReleaseGuestStack(reinterpret_cast<uint64_t>(fiber->addr_context));
 
 	return OK;
 }

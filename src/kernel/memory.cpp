@@ -7,6 +7,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/guestStacks.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -968,6 +969,23 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
+}
+
+void PrepareGuestStack(uint64_t vaddr, uint64_t size, const char* owner, bool supplied) {
+	if (vaddr == 0 || size == 0) {
+		return;
+	}
+	Graphics::GuestStacks::Register(vaddr, size, owner);
+	if (supplied && Graphics::GuestStacks::InvalidateEnabled() && g_gpu_resources != nullptr &&
+	    g_gpu_resources->InvalidateMemory(vaddr, size)) {
+		Graphics::GuestStacks::NoteInvalidated();
+	}
+}
+
+void ReleaseGuestStack(uint64_t vaddr) {
+	if (vaddr != 0) {
+		Graphics::GuestStacks::Unregister(vaddr);
+	}
 }
 
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {

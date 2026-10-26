@@ -338,4 +338,53 @@ bool InstallHandler(Handler handler) {
 	return true;
 }
 
+bool WriteMinidump(const ExceptionInfo& info) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info.native_context == nullptr) {
+		return false;
+	}
+	using WriteDump = BOOL(WINAPI*)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+	auto* dbghelp   = LoadLibraryA("dbghelp.dll");
+	auto  write     = dbghelp != nullptr ? reinterpret_cast<WriteDump>(
+                                          reinterpret_cast<void*>(GetProcAddress(dbghelp, "MiniDumpWriteDump")))
+	                                     : nullptr;
+	if (write == nullptr) {
+		printf("minidump: dbghelp.dll unavailable\n");
+		return false;
+	}
+	char path[64];
+	snprintf(path, sizeof(path), "kyty-fault-%lu.dmp", GetCurrentProcessId());
+	HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		printf("minidump: cannot create %s\n", path);
+		return false;
+	}
+	EXCEPTION_RECORD record {};
+	record.ExceptionCode    = info.native_code;
+	record.ExceptionAddress = reinterpret_cast<void*>(info.exception_address);
+	if (info.type == ExceptionType::AccessViolation) {
+		record.NumberParameters        = 2;
+		record.ExceptionInformation[0] = info.access_violation_type == AccessViolationType::Write ? 1 : 0;
+		record.ExceptionInformation[1] = info.access_violation_vaddr;
+	}
+	EXCEPTION_POINTERS pointers {&record, static_cast<CONTEXT*>(info.native_context)};
+	struct {
+		DWORD               thread_id;
+		EXCEPTION_POINTERS* pointers;
+		BOOL                client_pointers;
+	} exception {GetCurrentThreadId(), &pointers, FALSE};
+	// MiniDumpWithDataSegs | MiniDumpWithUnloadedModules | MiniDumpWithIndirectlyReferencedMemory |
+	// MiniDumpWithThreadInfo
+	constexpr int type = 0x1 | 0x20 | 0x40 | 0x1000;
+	const BOOL    ok   = write(GetCurrentProcess(), GetCurrentProcessId(), file, type, &exception, nullptr, nullptr);
+	CloseHandle(file);
+	printf("minidump: %s %s\n", path, ok ? "written" : "failed");
+	fflush(stdout);
+	return ok != FALSE;
+#else
+	(void)info;
+	return false;
+#endif
+}
+
 } // namespace Common::HostException
