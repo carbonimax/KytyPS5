@@ -43317,6 +43317,108 @@ void CheckMixedDimensionImageTable(VulkanHarness &vulkan) {
   }
 }
 
+void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u, lanes = 64u;
+  TestCase test;
+  test.name = "ClampedSiblingImageTable";
+  test.bda_mappings = {{0u, 0u}};
+  test.initial.resize((base + table_offset + 8u * 32u) / 4u);
+  for (u32 lane = 0; lane < lanes; ++lane) test.initial[lane] = lane % 8u;
+  test.initial[lanes - 2u] = 9u;
+  test.initial[lanes - 1u] = UINT32_MAX;
+  for (u32 row = 0; row < 8u; ++row) {
+    auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    image[0] = row + 1u;
+    image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+  }
+  test.user_data[0] = base;
+  const auto output = MakeStructuredStorageBufferData(0u, lanes * 4u);
+  std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+  test.has_user_data = test.has_compute_info = true;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.thread_ids_num = 1u;
+  // Each lane loads its row from memory. A waterfall loop reads row min(row + 1, 7) of an
+  // eight-row table, then the unclamped row, which only that clamp bounds. The variants clamp
+  // another key or expression, or read the unclamped row from another table or row size.
+  struct Read {
+    const char *name;
+    u32 step = 0x02u, key = 5u, addend = InlineU32(1), offset = table_offset, sbase = 0u,
+        immediate = 0u;
+    bool r128 = false;
+  };
+  const auto build = [&](const Read &read) {
+    std::vector<u32> code;
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    code.insert(code.end(), {EncodeVop2(0x1a, 30, InlineU32(2), 0), EncodeMubuf0(0x0cu),
+        EncodeMubuf1(3, 12, 30), EncodeSop1(0x04, 34, 126)});
+    const auto loop = code.size();
+    code.push_back(EncodeSop1(0x14, 4, 34));
+    AppendVop3(&code, 0x360, 5, Vgpr(3), 4);
+    AppendVop3(&code, 0xc2, 36, 5, Vgpr(3));
+    code.insert(code.end(), {EncodeSop1(0x24, 30, 36),
+        EncodeSop2(read.step, 7, read.key, read.addend), EncodeSop2(0x06, 7, 7, InlineU32(7)),
+        EncodeSop2(0x1e, 7, 7, InlineU32(read.r128 ? 4 : 5)), EncodeSop2(0x02, 7, 7, 255),
+        table_offset, EncodeSmem0(read.r128 ? 0x02 : 0x03, 16), EncodeSmem1(0, 7),
+        EncodeMimg0(0x00, 1, 0, false, 1, read.r128), EncodeMimg1(5, 20, 4, 10),
+        EncodeSop2(0x1e, 6, 5, InlineU32(5)), EncodeSop2(0x02, 6, 6, 255), read.offset,
+        EncodeSmem0(0x03, 8, read.sbase), EncodeSmem1(read.immediate, 6),
+        EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 2, 10),
+        EncodeSop2(0x15, 34, 34, 36), EncodeSop1(0x04, 126, 30)});
+    code.push_back(EncodeSopp(0x05, loop - code.size() - 1u));
+    code.insert(code.end(), {EncodeVop2(0x20, 6, Vgpr(5), 4), std::bit_cast<u32>(16.0f)});
+    AppendBufferStoreDword(&code, 6, 30);
+    AppendEnd(&code);
+    return code;
+  };
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ShaderRecompiler::CompileOptions options;
+  options.user_data = test.user_data;
+  options.input_info.compute = &test.compute_info;
+  for (const auto &read : {Read{.name = "ClampedSiblingImageTableKey", .key = 4u},
+                           Read{.name = "ClampedSiblingImageTableScaled", .step = 0x1eu},
+                           Read{.name = "ClampedSiblingImageTableRegister", .addend = 4u},
+                           Read{.name = "ClampedSiblingImageTableStride", .r128 = true},
+                           Read{.name = "ClampedSiblingImageTableOffset", .offset = 0x200u},
+                           Read{.name = "ClampedSiblingImageTableBase", .sbase = 1u},
+                           Read{.name = "ClampedSiblingImageTableImmediate", .immediate = 0x20u}})
+    ExpectFatal(read.name, [&] { ShaderRecompiler::TranslateProgram(build(read), options); });
+#endif
+  test.code = build({.name = test.name});
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_MOV_B64,
+                  O::S_FF1_I32_B64, O::V_READLANE_B32, O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64,
+                  O::S_ADD_I32, O::S_MIN_I32, O::S_LSHL_B32, O::S_LOAD_DWORDX8, O::IMAGE_LOAD,
+                  O::S_ANDN2_B64, O::S_CBRANCH_SCC1, O::V_MADMK_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "table rows", compiled.resources.images.size() == 8u,
+          "descriptor planning did not bound the rows by the clamp");
+  std::vector<VulkanHarness::Image> images;
+  for (const auto &descriptor : compiled.resources.images)
+    images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled,
+        {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal));
+  auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+  vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+  // Rows past the clamp and negative rows read row 0; the clamp reads rows 7 and 0 for them.
+  std::vector<u32> expected;
+  for (u32 lane = 0; lane + 2u < lanes; ++lane) {
+    const auto row = lane % 8u, next = std::min(row + 1u, 7u);
+    expected.push_back(std::bit_cast<u32>(static_cast<float>(row + 1u + 16u * (next + 1u))));
+  }
+  expected.push_back(std::bit_cast<u32>(1.0f + 16.0f * 8.0f));
+  expected.push_back(std::bit_cast<u32>(1.0f + 16.0f));
+  CompareWords(test, "clamped sibling rows", expected,
+               vulkan.ReadBuffer(test.name, buffer, expected.size()));
+  vulkan.DestroyBuffer(&buffer);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %s ok\n", test.name);
+}
+
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -54400,6 +54502,7 @@ int main(int argc, char **argv) {
     CheckWorkgroupDividedImageTable(vulkan);
     CheckWaterfallFloorImageTable(vulkan);
     CheckMixedDimensionImageTable(vulkan);
+    CheckClampedSiblingImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54581,6 +54684,7 @@ int main(int argc, char **argv) {
   CheckWorkgroupDividedImageTable(vulkan);
   CheckWaterfallFloorImageTable(vulkan);
   CheckMixedDimensionImageTable(vulkan);
+  CheckClampedSiblingImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
