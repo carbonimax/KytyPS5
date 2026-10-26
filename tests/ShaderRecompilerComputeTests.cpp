@@ -43061,6 +43061,71 @@ void CheckPointerImageTable(VulkanHarness &vulkan) {
   }
 }
 
+void CheckWorkgroupDividedImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u, first = 3u;
+  TestCase test;
+  test.name = "WorkgroupDividedImageTable";
+  test.dispatch_z = 4u;
+  test.bda_mappings = {{0u, 0u}};
+  test.initial.resize((base + table_offset + 4u * 32u) / 4u);
+  test.initial[(base + 0x10u) / 4u] = first;
+  for (u32 row = 0; row < 4u; ++row) {
+    auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    image[0] = row + 1u;
+    image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+  }
+  test.user_data[0] = base;
+  const auto output = MakeStructuredStorageBufferData(0u, test.dispatch_z * 4u);
+  std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+  test.has_user_data = test.has_compute_info = true;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  test.compute_info.group_id[2] = true;
+  test.compute_info.workgroup_register = 44u;
+  // Row (first + workgroup ID z) / 3, divided by a multiply-high and shift.
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, 0u);
+  AppendVMovLiteral(&code, 21, 0u);
+  code.insert(code.end(), {EncodeSmem0(0x00, 21), EncodeSmem1(0x10, 125),
+      EncodeSop2(0x02, 23, 21, 44), EncodeSop2(0x35, 23, 23, 255), 0xaaaaaaabu,
+      EncodeSop2(0x20, 23, 23, InlineU32(1)), EncodeSop2(0x1e, 23, 23, InlineU32(5)),
+      EncodeSop2(0x02, 23, 23, 255), table_offset,
+      EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+      EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 2, 10),
+      EncodeSop2(0x1e, 25, 44, InlineU32(2)), EncodeVop1(0x01, 30, 25)});
+  AppendBufferStoreDword(&code, 4, 30);
+  AppendEnd(&code);
+  test.opcodes = {O::S_LOAD_DWORD, O::S_ADD_I32, O::S_MUL_HI_U32, O::S_LSHR_B32, O::S_LSHL_B32,
+                  O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "reachable rows", compiled.resources.images.size() == 2u,
+          "descriptor planning enumerated rows no workgroup reaches");
+  // The key mapping ends the flattened SRT: its count, then a (key, ordinal) pair per row.
+  const auto &flat = compiled.resources.flattened_srt;
+  CompareWords(test, "distinct row keys", {2u, 1u, 0u, 2u, 1u},
+               std::vector<u32>(flat.end() - std::min<size_t>(flat.size(), 5u), flat.end()));
+  std::vector<VulkanHarness::Image> images;
+  for (const auto &descriptor : compiled.resources.images)
+    images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled,
+        {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal));
+  auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+  vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+  std::vector<u32> expected;
+  for (u32 group = 0; group < test.dispatch_z; ++group)
+    expected.push_back(std::bit_cast<u32>(static_cast<float>((first + group) / 3u + 1u)));
+  CompareWords(test, "divided workgroup rows", expected,
+               vulkan.ReadBuffer(test.name, buffer, expected.size()));
+  vulkan.DestroyBuffer(&buffer);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %s ok\n", test.name);
+}
+
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -54141,6 +54206,7 @@ int main(int argc, char **argv) {
     vulkan.CheckNullTextureDescriptors();
     CheckCountedRowImageSelector(vulkan);
     CheckPointerImageTable(vulkan);
+    CheckWorkgroupDividedImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54319,6 +54385,7 @@ int main(int argc, char **argv) {
   CheckComputeThreadDimensions(vulkan);
   CheckCountedRowImageSelector(vulkan);
   CheckPointerImageTable(vulkan);
+  CheckWorkgroupDividedImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
