@@ -332,6 +332,16 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t, uint32_t);
 
+void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	if (signal) {
+		*counter = write ? 1u : *counter + 1u;
+	} else if (*counter == 0) {
+		SuspendPm4();
+	} else {
+		(*counter)--;
+	}
+}
+
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
