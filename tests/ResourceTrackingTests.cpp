@@ -1355,15 +1355,18 @@ void TestIndexedPointerImageTable() {
           {image, sampler, fixture->ImageAddress(), parent}, fixture->AddMemory(image_memory, 0x8bcu));
     return fixture;
   };
+  const auto nested_geometry = [](const auto& plan, uint32_t count) {
+    const auto& indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
+    return indirect.table_maximum == 1u && indirect.pointer_table &&
+           indirect.pointer_table->indexed && indirect.pointer_table->count == count &&
+           indirect.pointer_table->stride == 368u && indirect.pointer_table->offset == 64u;
+  };
   auto fixture = make();
   fixture->PlanAndTrack();
   const auto plan = ExtractResourcePlan(fixture->program);
   Check(plan.info.images.size() == 1u && plan.info.buffers.size() == 1u,
         "indexed nested table expanded IR candidates or discarded the GPU pointer load");
-  const auto& indirect = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
-  Check(indirect.table_maximum == 1u && indirect.pointer_table &&
-            indirect.pointer_table->indexed && indirect.pointer_table->count == 3u &&
-            indirect.pointer_table->stride == 368u && indirect.pointer_table->offset == 64u,
+  Check(nested_geometry(plan, 3u),
         "nested table did not preserve separate parent and child geometry");
   constexpr uint64_t high = uint64_t{1} << 32u;
   constexpr uint32_t table = 0x2000u, objects = 0x10000u, row_bytes = 1536u;
@@ -1462,8 +1465,13 @@ void TestIndexedPointerImageTable() {
         "explicit null pointer bypassed the specialization reader");
   auto reversed = make(Case::ReverseSigned);
   reversed->PlanAndTrack();
+  // An inclusive child limit bounds one more child record, never the exclusive count.
+  auto inclusive = make(Case::InclusiveChild);
+  inclusive->PlanAndTrack();
+  Check(nested_geometry(ExtractResourcePlan(inclusive->program), 4u),
+        "an inclusive child limit did not bound one more child record");
   for (const auto variant : {Case::MissingParent, Case::WrongParent, Case::MissingChild,
-          Case::InclusiveChild, Case::MismatchedPair, Case::DifferentLaneMask,
+          Case::MismatchedPair, Case::DifferentLaneMask,
           Case::ExtraUse, Case::UnboundedChoice, Case::MissingOuterWitness, Case::WrongOuterWitness,
           Case::CyclicChoice, Case::ExcessiveDomain}) {
     auto invalid = make(variant);
