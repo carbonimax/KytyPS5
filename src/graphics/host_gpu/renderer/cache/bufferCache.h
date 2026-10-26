@@ -186,6 +186,11 @@ private:
 	[[nodiscard]] uint64_t MainQueueBacklog();
 	// True when every such write to the range has completed on the GPU.
 	[[nodiscard]] bool WritesComplete(uint64_t vaddr, uint64_t size);
+	// Latest main-queue tick that wrote GPU data to the range (0: none known); UINT64_MAX when the
+	// range is not tracked or was written by the command buffer being recorded.
+	[[nodiscard]] uint64_t LatestWriteTick(uint64_t vaddr, uint64_t size);
+	// KYTY_SYNC_SIDE_READS: ReadMemoryWindow through the readback queue; false when not taken.
+	bool ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size);
 	void CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                     std::vector<vk::BufferCopy>& copies, uint64_t& total_size);
 	void RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies, uint64_t total_size,

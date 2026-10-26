@@ -153,7 +153,8 @@ void MaybeReport() noexcept {
 	std::printf("PERF stats%02d:%02d:%02d %.1fs: fps=%.2f gpu_busy=%.0f%% draw=%.0fms(%" PRIu64
 	            ") dispatch=%.0fms(%" PRIu64 ") programs=%.0fms(%" PRIu64 ") srt=%.0fms recompile=%.0fms(%" PRIu64
 	            ") gfx_pipe=%.0fms(%" PRIu64 ",hit=%" PRIu64 "/%.0fms,miss=%" PRIu64 "/%.0fms) cs_pipe=%.0fms(%" PRIu64
-	            ") wait_gpu_thread=%.0fms(%" PRIu64 ") wait_other=%.0fms(%" PRIu64 ") submits=%.0f/s idle_submits=%.0f/s\n",
+	            ") wait_gpu_thread=%.0fms(%" PRIu64 ") wait_other=%.0fms(%" PRIu64 ") side_reads=%.0fms(%" PRIu64
+	            ") submits=%.0f/s idle_submits=%.0f/s\n",
 	            local.tm_hour, local.tm_min, local.tm_sec, seconds,
 	            static_cast<double>(n(Counter::Frames)) / seconds, 100.0 * ms(Counter::GpuBusyNs) / wall_ms,
 	            ms(Counter::DrawNs), n(Counter::DrawCount), ms(Counter::DispatchNs), n(Counter::DispatchCount),
@@ -162,7 +163,8 @@ void MaybeReport() noexcept {
 	            n(Counter::GfxPipelineHits), ms(Counter::GfxPipelineHitNs), n(Counter::GfxPipelineMisses),
 	            ms(Counter::GfxPipelineMissNs), ms(Counter::CsPipelineNs), n(Counter::CsPipelineCount),
 	            ms(Counter::WaitGpuThreadNs), n(Counter::WaitGpuThreadCount), ms(Counter::WaitOtherNs),
-	            n(Counter::WaitOtherCount), static_cast<double>(n(Counter::Submits)) / seconds,
+	            n(Counter::WaitOtherCount), ms(Counter::SideReadNs), n(Counter::SideReadCount),
+	            static_cast<double>(n(Counter::Submits)) / seconds,
 	            static_cast<double>(n(Counter::IdleSubmits)) / seconds);
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64

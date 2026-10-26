@@ -39,6 +39,8 @@ enum class Counter : uint32_t {
 	WaitOtherCount,
 	Submits,           // vkQueueSubmit calls
 	IdleSubmits,       // of which KYTY_IDLE_SUBMIT submissions
+	SideReadNs,        // KYTY_SYNC_SIDE_READS: GPU thread waiting for readback-queue copies
+	SideReadCount,
 	Count
 };
 

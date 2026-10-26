@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -438,6 +439,72 @@ uint64_t BufferCache::MainQueueBacklog() {
 	const auto known   = master.KnownGpuTick();
 	const auto current = m_scheduler.CurrentTick();
 	return current - 1 > known ? current - 1 - known : 0;
+}
+
+uint64_t BufferCache::LatestWriteTick(uint64_t vaddr, uint64_t size) {
+	uint64_t latest = 0;
+	for (auto chunk = vaddr >> 16; chunk <= (vaddr + size - 1) >> 16; chunk++) {
+		if (!decltype(m_write_ticks)::IsValidPage(chunk)) {
+			return UINT64_MAX;
+		}
+		if (const auto* tick = m_write_ticks.Find(chunk); tick != nullptr) {
+			latest = std::max(latest, *tick);
+		}
+	}
+	return latest >= m_scheduler.CurrentTick() ? UINT64_MAX : latest;
+}
+
+// KYTY_SYNC_SIDE_READS=N (default 0): a synchronous read of GPU-written bytes by the GPU thread
+// (backing reads of the SRT walker, shader and vertex-table reads: ReadMemoryWindow; fault windows
+// published on the GPU thread, e.g. indirect arguments read by the command processor) whose writers
+// were all submitted copies them on the readback queue, as guest fault readbacks do, instead of
+// recording the copy in the command buffer being recorded, submitting it and waiting for the whole
+// main-queue backlog. 1: only when every write already completed; 2: also when the writers are
+// submitted but still running (waits for the latest writer's tick first). The copied bytes, their
+// publication and the memory-tracker state are the same; later main-queue writes to them wait for
+// the copy (NoteBufferWrite). Interrupts, labels and command order are untouched.
+static uint32_t SyncSideReads() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_SYNC_SIDE_READS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return mode;
+}
+
+bool BufferCache::ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size) {
+	const auto mode = SyncSideReads();
+	if (mode == 0 || m_readback_queue == nullptr) {
+		return false;
+	}
+	const auto latest = LatestWriteTick(begin, size);
+	if (latest == UINT64_MAX) {
+		return false;
+	}
+	if (latest != 0 && !m_scheduler.IsFree(latest)) {
+		if (mode < 2) {
+			return false;
+		}
+		m_scheduler.Wait(latest);
+	}
+	WaitPendingPublishes(begin, size);
+	auto done = DownloadForFault(buffer, begin, size, true);
+	if (done == nullptr) {
+		// No GPU-written byte left in the window: nothing to publish.
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, size);
+		return true;
+	}
+	if (done->side_tick != 0) {
+		PerfStats::ScopedTimer timer(PerfStats::Counter::SideReadNs, PerfStats::Counter::SideReadCount);
+		m_readback_queue->Wait(done->side_tick);
+		done->side_publish();
+		return true;
+	}
+	// No ring space: the main queue copies the window, published by a priority operation.
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	done->Wait();
+	return true;
 }
 
 bool BufferCache::WritesComplete(uint64_t vaddr, uint64_t size) {
@@ -911,7 +978,11 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		const auto window = ReadbackWindowBytes();
 		const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
 		const auto last   = std::min(base + buffer.Size(), Common::AlignDown(vaddr, window) + window);
-		if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
+		// A fault of the GPU thread itself (e.g. indirect arguments read by the command processor)
+		// can use the readback queue like ReadMemoryWindow (KYTY_SYNC_SIDE_READS).
+		if (begin < last && GuestGpu::IsGpuThread() && ReadWindowOnSideQueue(buffer, begin, last - begin)) {
+			// Published (or nothing GPU-written was left in the window).
+		} else if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 		}
 		if (is_write) {
@@ -966,6 +1037,9 @@ void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	const auto window = ReadbackWindowBytes();
 	const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
 	const auto last   = std::min(base + buffer.Size(), Common::AlignUp(vaddr + size, window));
+	if (begin < last && ReadWindowOnSideQueue(buffer, begin, last - begin)) {
+		return;
+	}
 	if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 	}
