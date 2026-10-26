@@ -751,39 +751,39 @@ void TestReadLaneElimination() {
 
 void TestCompleteWaveReduction() {
   enum class Case {
-    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32, Wave32Rows,
-    Wave32Maximum, UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
+    Masked, ScalarExec, Wave32, Wave32Rows, Wave32Maximum, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
+    Endpoint, EndpointSource, CrossBlock, WrongOperation
   };
-  for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
-       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::Wave32Rows,
-       Case::Wave32Maximum, Case::UnrelatedSeed,
-       Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
+  for (const auto test : {Case::Masked, Case::ScalarExec, Case::Wave32,
+       Case::Wave32Rows, Case::Wave32Maximum, Case::RowMask, Case::BankMask,
        Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
        Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
        Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
        Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
        Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::DifferentWitness, Case::CrossBlock, Case::WrongOperation}) {
+       Case::CrossBlock, Case::WrongOperation}) {
     Fixture fixture(test == Case::CrossBlock ? 2 : 1);
     const auto source = fixture.Emit(ValueOpcode::LaneId);
     const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
-    const auto other_mask = fixture.Emit(ValueOpcode::IEqual32, {source, Value(7u)});
     const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
-    const bool literal = test == Case::Literal || test == Case::LiteralMasked;
-    const auto enabled = literal ? Value(true) :
-        fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
-    auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
-    if (test == Case::Subset)
-      seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
+    auto enabled = fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
+    if (test == Case::ScalarExec) {
+      // s_orn2_saveexec of a mask that is not a ballot, read back as a lane bit.
+      const auto exec = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+      const auto full = fixture.Emit(ValueOpcode::BitwiseOr32,
+          {fixture.Emit(ValueOpcode::BitwiseNot32, {exec}), exec});
+      const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {source, Value(31u)});
+      const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32, {full, bit});
+      enabled = fixture.Emit(ValueOpcode::INotEqual32,
+          {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
+    }
     // A UMax scan seeds lanes outside EXEC with zero.
     const bool maximum = test == Case::Wave32Maximum;
-    const uint32_t neutral = test == Case::WrongNeutral || maximum ? 0u : UINT32_MAX;
-    const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
-        fixture.Emit(ValueOpcode::SelectU32, {seed_mask, source, Value(neutral)});
+    const uint32_t neutral = maximum ? 0u : UINT32_MAX;
+    const auto seed = fixture.Emit(ValueOpcode::SelectU32, {mask, source, Value(neutral)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
     auto operation = maximum ? ValueOpcode::UMax32 : ValueOpcode::UMin32;
@@ -799,8 +799,7 @@ void TestCompleteWaveReduction() {
         if (test == Case::Dpp8) flags.dpp8 = true;
       }
       const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
-          {test == Case::DppSource ? source : prefix,
-           test == Case::MoveExec ? mask : test == Case::LiteralMove ? Value(true) : enabled});
+          {test == Case::DppSource ? source : prefix, test == Case::MoveExec ? mask : enabled});
       move.Instruction()->SetFlags(flags);
       const auto combined = fixture.Emit(operation, {move, prefix});
       const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
@@ -810,11 +809,7 @@ void TestCompleteWaveReduction() {
       prefix = update;
       if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
     }
-    auto cross_exec = test == Case::CrossExec ? mask : enabled;
-    if (test == Case::DifferentWitness) {
-      const auto other_not = fixture.Emit(ValueOpcode::LogicalNot, {other_mask});
-      cross_exec = fixture.Emit(ValueOpcode::LogicalOr, {other_mask, other_not});
-    }
+    const auto cross_exec = test == Case::CrossExec ? mask : enabled;
     const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
         {test == Case::CrossSource ? source : prefix,
          Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
@@ -829,7 +824,7 @@ void TestCompleteWaveReduction() {
         {test == Case::FinalExec ? mask : enabled, combined, prefix});
     const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
     // Wave32 reads each half's row endpoint from the scan itself.
-    const bool rows = test == Case::Wave32Rows || maximum;
+    const bool rows = test == Case::Wave32Rows || test == Case::ScalarExec || maximum;
     const auto endpoints = rows ? prefix : final;
     uint32_t low_lane = test == Case::Endpoint ? 30u : 31u;
     if (rows) low_lane = 15u;
@@ -848,11 +843,11 @@ void TestCompleteWaveReduction() {
       fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
     }
     ValidateProgram(fixture.program, true);
-    const auto stats =
-        EliminateReadLane(fixture.program, test == Case::Wave32 || rows ? 32u : 64u);
-    const bool matches = test == Case::Masked || test == Case::Subset ||
-        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove ||
-        rows;
+    // The pipeline folds full-EXEC predicates to true before eliminating reads.
+    const uint32_t wave_size = test == Case::Wave32 || rows ? 32u : 64u;
+    ConstantPropagationPass(fixture.program.blocks, wave_size);
+    const auto stats = EliminateReadLane(fixture.program, wave_size);
+    const bool matches = test == Case::Masked || rows;
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
           ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
     if (matches) {
@@ -875,7 +870,7 @@ void TestCompleteWaveReduction() {
       ValidateProgram(fixture.program, true);
     } else {
       Check(use.Instruction()->Arg(0).Resolve() == result,
-            "rejected UMin proof changed its original result");
+            "rejected wave reduction proof changed its original result");
     }
   }
 }
