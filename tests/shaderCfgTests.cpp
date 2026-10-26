@@ -12088,7 +12088,7 @@ void TestMeshInputAssembly() {
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
+    const uint32_t draw[] = {test.count, test.base_vertex, test.width,
                              test.address_low, 0x12};
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
@@ -12133,7 +12133,7 @@ void TestMeshInputAssembly() {
     Check(sgprs[2] == test.group_info && sgprs[3] == test.wave_info &&
               vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 9u,
+              vgprs[test.fast_launch ? 6 : 8] == 2u,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }
