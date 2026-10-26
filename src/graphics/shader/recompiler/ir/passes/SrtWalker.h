@@ -90,7 +90,7 @@ struct WalkStats {
 	// guest load still read the same value (hits); validation time; verify-mode mismatches.
 	uint64_t reuse_checks = 0, reuse_hits = 0, reuse_ns = 0, reuse_diffs = 0;
 };
-// KYTY_SRT_WALK_REUSE (default 0; x86-64 walker): a walk whose user data and shader base equal the
+// KYTY_SRT_WALK_REUSE (default 1; x86-64 walker; 0 = off): a walk whose user data and shader base equal the
 // plan's last walk, and whose recorded guest loads all still read the recorded values (loaded the
 // way the walker loads them: protected-page list, backing reads, fault handling), is not run again:
 // the plan's scratch still holds that walk's results. 1 = reuse; 2 = verify (walk anyway and

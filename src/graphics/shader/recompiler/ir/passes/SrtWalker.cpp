@@ -1466,7 +1466,7 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 uint32_t WalkReuseMode() noexcept {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_SRT_WALK_REUSE");
-		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 0u;
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 1u;
 	}();
 	return mode;
 }
