@@ -553,7 +553,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_external_waited = m_external_wait_value;
 	}
-	m_command.End(); // vkEndCommandBuffer drains the recorder thread (KYTY_CP_RECORD_THREAD)
+	m_command.End();
 	if (m_record_main) {
 		CmdRecord::SetTarget(nullptr);
 	}
@@ -584,6 +584,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		CmdRecord::Call(&DeferredSubmit::Run, &deferred, sizeof(deferred));
 		result = vk::Result::eSuccess;
 	} else {
+		CmdRecord::Drain(); // End may be queued; wait before taking the queue lock.
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);

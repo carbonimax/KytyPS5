@@ -12,6 +12,8 @@
 
 #if defined(__linux__)
 #include <ucontext.h>
+#elif defined(__APPLE__) && defined(__x86_64__)
+#include <sys/ucontext.h>
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
@@ -23,18 +25,24 @@ public:
   explicit FakeGuestMemory(Libs::Graphics::ShaderRecompiler::IR::SrtMemoryReader reader = nullptr,
                            void *userdata = nullptr) {
     Current() = {reader, userdata};
-#if defined(__linux__)
+#if defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
     struct sigaction action {};
     action.sa_sigaction = Handle;
     action.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &action, &m_previous);
+#if defined(__APPLE__)
+    sigaction(SIGBUS, &action, &m_previous_bus);
+#endif
 #elif defined(_WIN32)
     m_handler = AddVectoredExceptionHandler(1, Handle);
 #endif
   }
   ~FakeGuestMemory() {
-#if defined(__linux__)
+#if defined(__linux__) || (defined(__APPLE__) && defined(__x86_64__))
     sigaction(SIGSEGV, &m_previous, nullptr);
+#if defined(__APPLE__)
+    sigaction(SIGBUS, &m_previous_bus, nullptr);
+#endif
 #elif defined(_WIN32)
     RemoveVectoredExceptionHandler(m_handler);
 #endif
@@ -64,6 +72,17 @@ private:
     registers[REG_RIP] += length;
   }
   struct sigaction m_previous {};
+#elif defined(__APPLE__) && defined(__x86_64__)
+  static void Handle(int, siginfo_t *, void *context) {
+    auto &registers = static_cast<ucontext_t *>(context)->uc_mcontext->__ss;
+    const auto length =
+        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(registers.__rip);
+    if (length == 0) std::abort();
+    registers.__rax = Read(registers.__r10);
+    registers.__rip += length;
+  }
+  struct sigaction m_previous {};
+  struct sigaction m_previous_bus {};
 #elif defined(_WIN32)
   static LONG CALLBACK Handle(EXCEPTION_POINTERS *info) {
     auto &context = *info->ContextRecord;
