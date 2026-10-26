@@ -585,6 +585,10 @@ struct RenderExecutorTestAccess {
     executor.ResetBindings();
   }
 
+  static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
+    return executor.ResolveColorTargets(buffer, 0);
+  }
+
   static bool BoundImagesInOrder(const RenderExecutor &executor, ImageId first,
                                  ImageId second) {
     return executor.m_bound_images.size() == 2 &&
@@ -11142,6 +11146,98 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "1D-array color direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckColorResolvePlacedTarget() {
+    constexpr const char *name = "ColorResolvePlacedTarget";
+    constexpr uintptr_t base = 0x0000000209000000ull;
+    constexpr uint64_t destination = base + 0x100000;
+    constexpr uint32_t extent = 256;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t allocation_size = 0x200000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "resolve direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "resolve fixed mapping failed");
+
+    for (const bool mip : {false, true}) {
+      std::memset(mapped, 0, allocation_size);
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      const auto set_target = [&](uint32_t slot, uint64_t address, uint32_t side,
+                                  uint32_t layers, uint32_t levels) {
+        registers.SetColorBase(slot, {.addr = address});
+        registers.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k8_8_8_8,
+                                      .channel_type = Prospero::ChannelType::kUNorm,
+                                      .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorView(slot, {.last_array_slice_index = layers - 1});
+        registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1,
+                                         .num_mip_levels = levels - 1});
+        registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                         .dimension = 1,
+                                         .metadata_pipe_aligned = true});
+      };
+      set_target(1, destination, extent, mip ? 1 : 2, mip ? 2 : 1);
+      registers.SetRenderTargetMask(0xff);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+
+      RenderColorInfo whole{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         whole, 1);
+      const auto &layout = whole.desc.info.mip_layout;
+      const auto side = mip ? extent / 2 : extent;
+      set_target(1, destination + (mip ? layout[1].offset : layout[0].size / 2), side, 1, 1);
+      set_target(0, base, side, 1, 1);
+      RenderColorInfo placed{};
+      RenderColorInfo source{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         placed, 1);
+      RenderExecutorTestAccess::ResolveRenderColorTarget(executor, scheduler.Current(),
+                                                         source, 0);
+      vk::ClearValue red{};
+      red.color.float32 = std::array{1.0f, 0.0f, 0.0f, 1.0f};
+      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
+                                         source.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, red);
+      registers.SetColorControl({.mode = 3});
+      Require(name, "resolve",
+              RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),
+              "the resolve draw was not consumed");
+      Require(name, "placed subresource",
+              ReadCachedTexel(name, context, whole.image_id, {}, {1, 1, 1}, mip ? 0 : 1,
+                              mip ? 1 : 0) == std::vector<u32>{0xff0000ffu} &&
+                  ReadCachedTexel(name, context, whole.image_id) == std::vector<u32>{0u},
+              "the resolve wrote the register level and layer, not the placed ones");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "resolve direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "resolve direct-memory allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -53968,6 +54064,7 @@ int main(int argc, char **argv) {
     vulkan.CheckGraphicsPushConstantBank();
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
+    vulkan.CheckColorResolvePlacedTarget();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
