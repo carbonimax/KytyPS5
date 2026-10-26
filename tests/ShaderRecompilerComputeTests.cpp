@@ -51834,6 +51834,13 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
       KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0), 0,
       auto_packet[2], auto_packet[3], Pm4::SH_NOP, 2, 0, 0, 16, 2};
   check_offsets(auto_multi_packet, hs, {53, 15}, "non-indexed multi-draw offsets");
+  // Word 4 bit 31 has the CP write each subdraw's index, even with no offsets to patch.
+  shaders.SetHsUserSgpr(11, 77);
+  auto_multi_packet[2] = auto_multi_packet[3] = Pm4::SH_NOP;
+  auto_multi_packet[4] = (1u << 31u) | (Pm4::SPI_SHADER_USER_DATA_HS_0 + 11);
+  Require("Pm4DrawIndirectMulti", "multi-draw index",
+          execute(auto_multi_packet.data(), auto_multi_packet.size()) && hs[11] == 1,
+          "multi-draw did not write the last subdraw index");
   arguments = {0, 1, 99, 101};
   auto_packet[2] = Pm4::SH_NOP;
   check_offsets(auto_packet, hs, {53, 101}, "independent destinations");
