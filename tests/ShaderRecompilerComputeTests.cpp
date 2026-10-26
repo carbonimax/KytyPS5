@@ -7761,6 +7761,40 @@ public:
         verify_array();
       }
 
+      // Image heaps keep a BC6H array and a raw block view of its first cube resident together.
+      // That raw read views the BC image and creates its view; a raw writer or a raw image of
+      // other levels, whose layers lie elsewhere, still replaces it.
+      for (uint32_t scenario = 0; scenario < 3; ++scenario) {
+        const uint64_t address = base + 0x1b00000 + scenario * 0x180000;
+        auto bc = MakeLinearDesc(address, 0, vk::Format::eBc6HUfloatBlock,
+            Prospero::BufferFormat::kBc6UFloat, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, 12, 16, 1);
+        auto raw = MakeLinearDesc(address, 0, vk::Format::eR32G32B32A32Uint,
+            Prospero::BufferFormat::k32_32_32_32UInt, Prospero::ImageType::kColor2D,
+            {64, 64, 1}, 6, 16, 1);
+        bc.info.resources.levels = 6;
+        raw.info.resources.levels = scenario == 2 ? 1 : 6;
+        for (auto *desc : {&bc, &raw}) {
+          desc->info.tile_mode = Prospero::TileMode::kStandard4KB;
+          desc->info.UpdateSize();
+          desc->view_info.level_count = desc->info.resources.levels;
+        }
+        if (scenario == 1) {
+          raw.type = BindingType::Storage;
+          raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        }
+        const auto bc_image = texture_cache.FindImage(bc);
+        (void)texture_cache.FindTexture(bc_image, bc);
+        const auto raw_image = texture_cache.FindImage(raw);
+        const bool viewed = scenario == 0;
+        Require(name, "raw block view of a BC image",
+                (raw_image == bc_image) == viewed &&
+                    texture_cache.GetImage(bc_image).registered == viewed,
+                "a raw block read did not view the clean BC image, or a raw writer or "
+                "raw image of other levels kept it");
+        if (viewed) (void)texture_cache.FindTexture(raw_image, raw);
+      }
+
       // A write through a separate buffer must not replace untouched image
       // texels with stale backing bytes. Exact-base writes still refresh it.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;
