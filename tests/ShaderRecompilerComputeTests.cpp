@@ -24193,6 +24193,23 @@ TestCase Rdna2ScalarOpcodes() {
            O::S_SLEEP, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarApertureLimits() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x04, 20, 236));
+  AppendStoreSgprPair(&code, 20, 0);
+  code.push_back(EncodeSop1(0x04, 20, 238));
+  AppendStoreSgprPair(&code, 20, 2);
+  AppendEnd(&code);
+
+  return {"ScalarApertureLimits",
+          code,
+          {},
+          {0xffffffffu, 0x80000000u, 0xffffffffu, 0x70000000u},
+          {O::S_MOV_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarTrapDisabledFallsThroughExactRaw() {
   using O = ShaderOpcode;
 
@@ -46431,6 +46448,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ExactPushConstantExtent);
   AddCase(ScalarShiftCountsMaskLowBits);
   AddCase(Rdna2ScalarOpcodes);
+  AddCase(ScalarApertureLimits);
   AddCase(ScalarTrapDisabledFallsThroughExactRaw);
   AddCase(ScalarWaitcntDepctrCapturedVmVsrc);
   AddCase(ScalarExtendedArithmetic);
