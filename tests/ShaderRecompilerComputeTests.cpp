@@ -1914,6 +1914,26 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           std::move(resources), std::move(packed_user_data)};
 }
 
+// Translates and materializes test without compiling it; returns whether materialization succeeded.
+bool MaterializeCase(const TestCase &test) {
+  ShaderRecompiler::CompileOptions options;
+  options.user_data = test.user_data;
+  options.input_info.compute = &test.compute_info;
+  auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  const auto plan = LoadedResourcePlan(test.name, translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = test.user_data,
+      .userdata = const_cast<std::vector<u32> *>(&test.initial),
+      .read_specialization_memory = ReadTestMemory,
+      .workgroup_counts = workgroup_counts,
+  };
+  FakeGuestMemory fake(ReadTestMemory, runtime.userdata);
+  return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+}
+
 std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
                                                     u32 num_records,
                                                     bool add_tid = false,
@@ -43269,23 +43289,7 @@ void CheckMixedDimensionImageTable(VulkanHarness &vulkan) {
     AppendBufferStoreDword(&code, 5, 30);
     AppendEnd(&code);
     if (variant != 0u) {
-      ShaderRecompiler::CompileOptions options;
-      options.user_data = test.user_data;
-      options.input_info.compute = &test.compute_info;
-      auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
-      const auto plan = LoadedResourcePlan(test.name, translated.program);
-      ShaderRecompiler::IR::ResourceSnapshot snapshot;
-      ShaderRecompiler::IR::ResourceSpecialization specialization;
-      const std::array workgroup_counts{rows, 1u, 1u};
-      const ShaderRecompiler::IR::SrtRuntime runtime{
-          .user_data = test.user_data,
-          .userdata = &test.initial,
-          .read_specialization_memory = ReadTestMemory,
-          .workgroup_counts = workgroup_counts,
-      };
-      FakeGuestMemory fake(ReadTestMemory, runtime.userdata);
-      Require(test.name, "coordinate layout",
-              !ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
+      Require(test.name, "coordinate layout", !MaterializeCase(test),
               "a candidate read a coordinate outside its layout");
       continue;
     }
@@ -43417,6 +43421,94 @@ void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
   vulkan.DestroyBuffer(&buffer);
   for (auto &image : images) vulkan.DestroyImage(&image);
   std::printf("[compute] %s ok\n", test.name);
+}
+
+void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u;
+  // A loop over the set bits of a mask reads each record's row from a four-record buffer. Rows
+  // past it read zero, and a guard keeps row -1, whose descriptor is a 3D image, from the table.
+  // A guard on another value keeps row -1, which a table behind a V# reads through the heap.
+  constexpr std::array names{"GuardedSelectorImageTable", "GuardedSelectorImageTableOther",
+                             "GuardedSelectorImageTableHeap"};
+  for (u32 variant = 0; variant < names.size(); ++variant) {
+    const bool guarded = variant == 0u, heap = variant == 2u;
+    TestCase test;
+    test.name = names[variant];
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + 8u * 32u) / 4u);
+    for (int row = -1; row < 8; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = static_cast<u32>(row + 2);
+      const auto type = row < 0 ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+      image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(type) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32) / 4u);
+    }
+    for (const auto [record, row] : {std::pair{0u, 2u}, {1u, 5u}, {2u, UINT32_MAX}, {3u, 1u}})
+      test.initial[(record * 16u + 8u) / 4u] = row;
+    auto table = MakeStructuredStorageBufferData(0u, table_offset + 8u * 32u);
+    table[0] = base;
+    std::copy_n(table.begin(), heap ? 4 : 1, test.user_data.begin());
+    test.user_data[8] = 0b1101u;
+    auto records = MakeStructuredStorageBufferData(0u, 64u);
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 12);
+    const auto output = MakeStructuredStorageBufferData(0u, 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = 64u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    AppendVMovLiteral(&code, 6, 0u);
+    AppendVMovLiteral(&code, 30, 0u);
+    code.push_back(EncodeSop1(0x03, 40, 8));
+    const auto header = code.size();
+    code.push_back(EncodeSopc(0x07, InlineU32(0), 40));
+    const auto exit_branch = code.size();
+    code.push_back(0u);
+    code.insert(code.end(), {EncodeSop1(0x13, 41, 40), EncodeSop2(0x1e, 5, 41, InlineU32(4)),
+        EncodeSmem0(0x08, 44, 6), EncodeSmem1(8, 5),
+        EncodeSopc(0x07, 193, guarded ? 44 : 41)});
+    const auto skip_branch = code.size();
+    code.push_back(0u);
+    code.insert(code.end(), {EncodeSop2(0x1e, 6, 44, InlineU32(5)),
+        EncodeSop2(0x02, 6, 6, 255), table_offset, EncodeSmem0(heap ? 0x0b : 0x03, 16),
+        EncodeSmem1(0, 6), EncodeMimg0(0x00, 1), EncodeMimg1(4, 20, 4, 10),
+        EncodeVop2(0x03, 6, Vgpr(4), 6)});
+    code[skip_branch] = EncodeSopp(0x04, code.size() - skip_branch - 1u);
+    code.push_back(EncodeSop1(0x1b, 40, 41));
+    code.push_back(EncodeSopp(0x02, header - code.size() - 1u));
+    code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+    AppendBufferStoreDword(&code, 6, 30);
+    AppendEnd(&code);
+    if (!guarded) {
+      Require(test.name, "excluded row", MaterializeCase(test) == heap,
+              "a guard on another value excluded row -1, or a V# table enumerated it");
+      continue;
+    }
+    test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_CMP_LG_U32, O::S_CBRANCH_SCC0,
+                    O::S_FF1_I32_B32, O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORD, O::S_ADD_I32,
+                    O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_ADD_F32, O::S_BITSET0_B32,
+                    O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "selected rows", compiled.resources.images.size() == 4u,
+            "record keys did not select rows 0, 1, 2 and 5");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+    CompareWords(test, "rows of records 0 and 3", {std::bit_cast<u32>(4.0f + 3.0f)},
+                 vulkan.ReadBuffer(test.name, buffer, 1u));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s ok\n", test.name);
+  }
 }
 
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
@@ -54503,6 +54595,7 @@ int main(int argc, char **argv) {
     CheckWaterfallFloorImageTable(vulkan);
     CheckMixedDimensionImageTable(vulkan);
     CheckClampedSiblingImageTable(vulkan);
+    CheckGuardedSelectorImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54685,6 +54778,7 @@ int main(int argc, char **argv) {
   CheckWaterfallFloorImageTable(vulkan);
   CheckMixedDimensionImageTable(vulkan);
   CheckClampedSiblingImageTable(vulkan);
+  CheckGuardedSelectorImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
