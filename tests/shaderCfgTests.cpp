@@ -14234,6 +14234,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint16_info;
   uint16_info.target_output_mode[0] = 7;
+  uint16_info.target_uint_mask = 1;
   options.input_info.pixel = &uint16_info;
   auto uint16_result = RecompileForTest(shader, options);
   const auto uint16_source = DisassembleSpirvBinary(uint16_result.spirv);
@@ -14247,6 +14248,18 @@ void TestNewShaderRecompilerExpPixelOutputs() {
   Check(!SpirvContainsExtInst(uint16_result.spirv, 62),
         "compressed UINT16 MRT export was incorrectly decoded as FP16");
   CheckSpirvBinaryValidates(uint16_result.spirv);
+
+  ShaderPixelInputInfo sint16_info;
+  sint16_info.target_output_mode[0] = 8;
+  sint16_info.target_sint_mask = 1;
+  options.input_info.pixel = &sint16_info;
+  auto sint16_result = RecompileForTest(shader, options);
+  const auto sint16_source = DisassembleSpirvBinary(sint16_result.spirv);
+  Check(sint16_source.find("OpVariable %_ptr_Output_v4int Output") != std::string::npos &&
+            CountSourceOccurrences(sint16_source, "OpBitFieldSExtract") == 4u &&
+            !SpirvContainsExtInst(sint16_result.spirv, 62),
+        "compressed SINT16 MRT export did not sign-extend into a signed output");
+  CheckSpirvBinaryValidates(sint16_result.spirv);
 
   ShaderPixelInputInfo unorm16_info;
   unorm16_info.target_output_mode[0] = 5;
@@ -14275,6 +14288,7 @@ void TestNewShaderRecompilerExpPixelOutputs() {
 
   ShaderPixelInputInfo uint_info;
   uint_info.target_output_mode[0] = 7;
+  uint_info.target_uint_mask = 1;
   options.input_info.pixel = &uint_info;
   auto partial_uint_result =
       RecompileForTest(partial_shader, options);
@@ -14300,6 +14314,15 @@ void TestNewShaderRecompilerExpPixelOutputs() {
                                    "OpBitFieldUExtract") == 2u,
         "compressed UINT16 BA-only export did not read and unpack VSRC1");
   CheckSpirvBinaryValidates(compressed_ba_result.spirv);
+
+  // 32-bit exports keep their raw bits in a UINT target's integer output.
+  uint_info.target_output_mode[0] = 9;
+  auto raw_uint_result = RecompileForTest(partial_shader, options);
+  const auto raw_uint_source = DisassembleSpirvBinary(raw_uint_result.spirv);
+  Check(raw_uint_source.find("OpVariable %_ptr_Output_v4uint Output") != std::string::npos &&
+            raw_uint_source.find("OpBitcast %v4float") == std::string::npos,
+        "32-bit MRT export to a UINT target did not use an unsigned integer output");
+  CheckSpirvBinaryValidates(raw_uint_result.spirv);
 
   unorm16_info.target_output_mode[0] = 5;
   options.input_info.pixel = &unorm16_info;

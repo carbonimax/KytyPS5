@@ -20406,6 +20406,40 @@ public:
       }
       Require(name, "packed rounding program distinction", half_up_program != truncate_program,
               "half-up and truncate exports shared one shader specialization");
+      // UINT and SINT targets give their exports integer outputs.
+      registers.Reset();
+      registers.SetViewportTransformControl(0x300);
+      registers.SetRenderTargetMask(0xffu);
+      registers.SetShaderMask(0xffu);
+      shaders.SetPsShaderBase(pixel_address);
+      for (const auto [slot, type] : {std::pair{0u, Prospero::ChannelType::kUInt},
+                                      std::pair{1u, Prospero::ChannelType::kSInt}}) {
+        registers.SetTargetOutputMode(slot, 9);
+        registers.SetColorBase(slot, {.addr = depth_address + 0x10000 * (slot + 1)});
+        registers.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k32, .channel_type = type,
+                                      .channel_order = Prospero::ChannelOrder::kStandard});
+        registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+        registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+      }
+      native_programs();
+      Require(name, "integer target outputs",
+              pixel.target_uint_mask == 1u && pixel.target_sint_mask == 2u,
+              "UINT and SINT targets did not select integer export outputs");
+      // MRT1 is the second blend source of a dual-source float target 0, not integer target 1.
+      HW::BlendControl dual_blend{};
+      dual_blend.enable = true;
+      dual_blend.color_srcblend = static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color);
+      registers.SetBlendControl(0, dual_blend);
+      for (const auto [slot, type] : {std::pair{0u, Prospero::ChannelType::kFloat},
+                                      std::pair{1u, Prospero::ChannelType::kUInt}}) {
+        registers.SetColorInfo(slot, {.format = Prospero::ChannelLayout::k32, .channel_type = type,
+                                      .channel_order = Prospero::ChannelOrder::kStandard});
+        native_programs();
+        Require(name, "dual-source float outputs",
+                pixel.dual_source_blending && pixel.target_uint_mask == 0u &&
+                    pixel.target_sint_mask == 0u,
+                "the second blend source kept the integer type of render target 1");
+      }
       DestroyBuffer(&packed_output);
       m_device.destroySampler(packed_sampler);
       DestroyBuffer(&stencil_readback);

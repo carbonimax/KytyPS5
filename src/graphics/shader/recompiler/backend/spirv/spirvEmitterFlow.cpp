@@ -292,9 +292,10 @@ uint32_t ExportRawComponent(ValueEmitContext& ctx, uint32_t vector, uint32_t com
 }
 
 uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo& exp,
-                      bool uint_output) {
-	auto& state = ctx.state;
-	if (exp.compr && !uint_output) {
+                      uint32_t vector_type) {
+	auto&      state          = ctx.state;
+	const bool integer_output = vector_type != TypeF32Vector(state, 4);
+	if (exp.compr && !integer_output) {
 		auto unpack = GLSLstd450UnpackHalf2x16;
 		switch (MrtOutputMode(state, exp)) {
 			case 5: unpack = GLSLstd450UnpackUnorm2x16; break;
@@ -331,9 +332,11 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
 		    ConstantU32(state, 0),
-		    ConstantU32(state, uint_output ? 1u : 0x3f800000u),
+		    ConstantU32(state, integer_output ? 1u : 0x3f800000u),
 		};
 		if (exp.compr) {
+			const auto extract = vector_type == TypeU32Vector(state, 4) ? spv::OpBitFieldUExtract
+			                                                            : spv::OpBitFieldSExtract;
 			for (uint32_t pair = 0; pair < 2u; pair++) {
 				if ((exp.en & (3u << (pair * 2u))) == 0u) {
 					continue;
@@ -345,8 +348,8 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 						continue;
 					}
 					raw[component] = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), raw[component],
-					                          packed, ConstantU32(state, lane * 16u),
+					state.builder.AddFunction(extract, TypeU32(state), raw[component], packed,
+					                          ConstantU32(state, lane * 16u),
 					                          ConstantU32(state, 16));
 				}
 			}
@@ -361,12 +364,10 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), data,
 		                          raw[0], raw[1], raw[2], raw[3]);
 	}
-	if (uint_output) {
+	if (vector_type == TypeU32Vector(state, 4)) {
 		return data;
 	}
-	const auto vector = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpBitcast, TypeF32Vector(state, 4), vector, data);
-	return vector;
+	return Unary(state, spv::OpBitcast, vector_type, data);
 }
 
 uint32_t DistancePointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -514,10 +515,15 @@ void EmitMergedMrtExport(ValueEmitContext& ctx, const IR::Inst& inst, const IR::
 	auto&       state       = ctx.state;
 	const auto& pixel       = *state.input_info.pixel;
 	const auto  slot        = pixel.target_merge_slot[exp.index];
-	const bool  uint_output = MrtOutputMode(state, exp) == 7u;
-	const auto  scalar      = uint_output ? TypeU32(state) : TypeF32(state);
-	const auto  vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-	auto        value       = ExportVector(ctx, ctx.Arg(inst, 0), exp, uint_output);
+	// The shared attachment's output variable is typed by its slot (integer for UINT/SINT).
+	const auto  vector_type = MrtOutputMode(state, exp) != 0u ? MrtOutputType(state, slot)
+	                                                          : TypeF32Vector(state, 4);
+	const bool  sint_output = vector_type == TypeI32Vector(state, 4);
+	const bool  uint_output = vector_type == TypeU32Vector(state, 4);
+	const auto  scalar      = sint_output   ? TypeI32(state)
+	                          : uint_output ? TypeU32(state)
+	                                        : TypeF32(state);
+	auto        value       = ExportVector(ctx, ctx.Arg(inst, 0), exp, vector_type);
 	const auto  mapping     = pixel.target_export_mapping[exp.index];
 	if (!mapping.IsIdentity()) {
 		const auto mapped = state.builder.AllocateId();
@@ -559,7 +565,9 @@ void EmitMergedMrtExport(ValueEmitContext& ctx, const IR::Inst& inst, const IR::
 		} else if (blend_source != 0 && exp.index == slot && (owned & (1u << component)) == 0) {
 			// Unowned components are outside the write mask; keep the second source defined.
 			store(blend_source, component,
-			      uint_output ? ConstantU32(state, 0) : ConstantF32(state, 0));
+			      sint_output   ? ConstantI32(state, 0)
+			      : uint_output ? ConstantU32(state, 0)
+			                    : ConstantF32(state, 0));
 		}
 	}
 }
@@ -626,11 +634,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		const auto vector_type = MrtOutputMode(state, exp) != 0u ? MrtOutputType(state, exp.index)
+		                                                         : TypeF32Vector(state, 4);
+		auto       value       = ExportVector(ctx, data, exp, vector_type);
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
-		    exp.index == 0 && !uint_output &&
+		    exp.index == 0 && vector_type == TypeF32Vector(state, 4) &&
 		    state.input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None) {
 			// Broadcast logical alpha before swizzling the primary output.
 			const auto blend_output =
