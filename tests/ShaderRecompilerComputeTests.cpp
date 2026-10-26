@@ -43511,6 +43511,84 @@ void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
   }
 }
 
+void CheckInclusiveGuardImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u;
+  // A key read from the record a loaded index selects reads its row only when it is at most 3,
+  // which bounds the table to four rows, as does a skip when it is above 3; row 4 is a 3D image.
+  // A limit of the U32 maximum bounds nothing.
+  constexpr std::array names{"InclusiveGuardImageTable", "InclusiveGuardImageTableSkip",
+                             "InclusiveGuardImageTableMaximum"};
+  for (u32 variant = 0; variant < names.size(); ++variant) {
+    const bool skip = variant == 1u, maximum = variant == 2u;
+    TestCase test;
+    test.name = names[variant];
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + 5u * 32u) / 4u);
+    test.initial[1] = 1u;
+    test.initial[(0x24u + 0x1cu) / 4u] = 2u;
+    for (u32 row = 0; row < 5u; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = row + 1u;
+      const auto type = row < 4u ? Prospero::ImageType::kColor2D : Prospero::ImageType::kColor3D;
+      image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(type) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    const auto records = MakeStructuredStorageBufferData(0u, 0x48u);
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 12);
+    const auto output = MakeStructuredStorageBufferData(0u, 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = 64u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 20, 0u);
+    AppendVMovLiteral(&code, 21, 0u);
+    AppendVMovLiteral(&code, 6, 0u);
+    AppendVMovLiteral(&code, 30, 0u);
+    code.insert(code.end(), {EncodeMubuf0(0x0cu, 4), EncodeMubuf1(1, 3, 30),
+        EncodeVop1(0x02, 38, Vgpr(1)), EncodeSop2(0x26, 5, 38, 255), 0x24u,
+        EncodeSmem0(0x08, 44, 6), EncodeSmem1(0x1c, 5),
+        EncodeSopc(skip ? 0x08 : 0x0b, 44, maximum ? 193 : InlineU32(3))});
+    const auto skip_branch = code.size();
+    code.push_back(0u);
+    code.insert(code.end(), {EncodeSop2(0x1e, 6, 44, InlineU32(5)),
+        EncodeSop2(0x02, 6, 6, 255), table_offset, EncodeSmem0(0x03, 16), EncodeSmem1(0, 6),
+        EncodeMimg0(0x00, 1), EncodeMimg1(6, 20, 4, 10)});
+    code[skip_branch] = EncodeSopp(skip ? 0x05 : 0x04, code.size() - skip_branch - 1u);
+    AppendBufferStoreDword(&code, 6, 30);
+    AppendEnd(&code);
+    if (maximum) {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal(test.name, [&] { MaterializeCase(test); });
+#endif
+      continue;
+    }
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MUL_I32,
+                    O::S_BUFFER_LOAD_DWORD, O::S_CMP_LE_U32, O::S_CMP_GT_U32,
+                    O::S_CBRANCH_SCC0, O::S_CBRANCH_SCC1, O::S_LSHL_B32, O::S_ADD_I32,
+                    O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "guarded rows", compiled.resources.images.size() == 4u,
+            "the inclusive guard did not bound the key to rows 0 to 3");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+    CompareWords(test, "row 2", {std::bit_cast<u32>(3.0f)},
+                 vulkan.ReadBuffer(test.name, buffer, 1u));
+    vulkan.DestroyBuffer(&buffer);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s ok\n", test.name);
+  }
+}
+
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -54596,6 +54674,7 @@ int main(int argc, char **argv) {
     CheckMixedDimensionImageTable(vulkan);
     CheckClampedSiblingImageTable(vulkan);
     CheckGuardedSelectorImageTable(vulkan);
+    CheckInclusiveGuardImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54779,6 +54858,7 @@ int main(int argc, char **argv) {
   CheckMixedDimensionImageTable(vulkan);
   CheckClampedSiblingImageTable(vulkan);
   CheckGuardedSelectorImageTable(vulkan);
+  CheckInclusiveGuardImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
