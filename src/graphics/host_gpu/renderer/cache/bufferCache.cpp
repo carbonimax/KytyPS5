@@ -781,7 +781,7 @@ uint64_t ReadbackWindowBytes() {
 		const char* value = std::getenv("KYTY_READBACK_WINDOW_KIB");
 		const auto  kib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 256ull;
 		const auto  size  = std::bit_floor(std::min<uint64_t>(kib, 64ull * 1024ull) * 1024ull);
-		return std::max(size, TRACKER_PAGE_SIZE);
+		return std::max<uint64_t>(size, TRACKER_PAGE_SIZE);
 	}();
 	return bytes;
 }
