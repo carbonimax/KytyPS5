@@ -4885,7 +4885,8 @@ void TestSharedAppendSelectorBounds() {
     Valid, PayloadOob, MissingInit, InactiveInit, UnknownInit, DuplicateAtomic,
     WrongAtomicGuard, UnguardedCandidate, WrongStep, WrongLocalIndex, Multiwave,
     OuterReentry, InnerAppendCycle, EarlyCounterRead, WrongConsumerBound, ExtraWriter, CounterAlias,
-    PayloadWrap, CounterOob
+    PayloadWrap, CounterOob, Lane, LaneUnimpliedRead, LaneUnimpliedCounter, LaneCounterMask,
+    LaneOtherBypass, LaneInactiveSelect
   };
   const auto make_plan = [](Variant variant, uint32_t first_base = 1032u, uint32_t consumed_base = 8u) {
     Fixture fixture;
@@ -4918,6 +4919,7 @@ void TestSharedAppendSelectorBounds() {
     auto *entry = fixture.block;
     auto *initialize = fixture.AddBlock();
     auto *initialized = fixture.AddBlock();
+    const bool lane = variant >= Variant::Lane;
     const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                           fixture.UserData(2), fixture.UserData(3)});
     const auto table = fixture.Address(fixture.UserData(4), fixture.UserData(5));
@@ -4936,12 +4938,18 @@ void TestSharedAppendSelectorBounds() {
         {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(1u)});
     const auto local = fixture.Emit(ValueOpcode::IAdd32,
         {x, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {y, Value(3u)})});
-    auto zero_lane = fixture.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
+    // The negated form skips the initializer only when every lane is nonzero.
+    const auto local_is = [&](uint32_t value) {
+      return fixture.Emit(ValueOpcode::LogicalNot,
+          {fixture.Emit(ValueOpcode::INotEqual32, {local, Value(value)})});
+    };
+    auto zero_lane = lane ? local_is(0u) : fixture.Emit(ValueOpcode::IEqual32, {local, Value(0u)});
     if (variant == Variant::InactiveInit) zero_lane = Value(false);
     if (variant == Variant::UnknownInit)
       zero_lane = fixture.Emit(ValueOpcode::LogicalAnd,
           {zero_lane, fixture.Emit(ValueOpcode::IEqual32, {fixture.UserData(8), Value(0u)})});
-    choose(entry, initialize, initialized, zero_lane, CFG::BranchCondition::ExecNonZero);
+    choose(entry, initialize, initialized, variant == Variant::LaneOtherBypass ? local_is(1u) : zero_lane,
+           CFG::BranchCondition::ExecNonZero);
     if (variant != Variant::MissingInit)
       fixture.Emit(ValueOpcode::WriteSharedU32x2,
           {Value(0u), Value(0u), Value(0u), zero_lane}, shared(0u), initialize);
@@ -5010,13 +5018,25 @@ void TestSharedAppendSelectorBounds() {
     if (variant == Variant::ExtraWriter)
       fixture.Emit(ValueOpcode::WriteSharedU32,
           {Value(0u), Value(UINT32_MAX), Value(true)}, shared(12u), previous);
-    if (final_counter.IsEmpty())
-      final_counter = fixture.Emit(ValueOpcode::LoadSharedU32,
-          {Value(0u), Value(true)}, shared(0u), previous);
+    // Lane variants consume under a lane mask, which their counter and record reads use.
+    Value lanes(true), other;
+    if (lane) {
+      lanes = fixture.Emit(ValueOpcode::ULessThan32, {y, fixture.UserData(8)}, 0, previous);
+      other = fixture.Emit(ValueOpcode::ULessThan32, {x, fixture.UserData(8)}, 0, previous);
+    }
+    auto *guarded = lane ? fixture.AddBlock() : previous;
     auto *header = fixture.AddBlock();
     auto *body = fixture.AddBlock();
     auto *latch = fixture.AddBlock();
     auto *exit = fixture.AddBlock();
+    if (lane) choose(previous, guarded, exit, lanes, CFG::BranchCondition::ExecNonZero);
+    previous = guarded;
+    if (final_counter.IsEmpty())
+      final_counter = fixture.Emit(ValueOpcode::LoadSharedU32,
+          {Value(0u), variant == Variant::LaneUnimpliedCounter ? other : lanes}, shared(0u), previous);
+    if (lane)
+      final_counter = fixture.Emit(ValueOpcode::ReadFirstLane,
+          {final_counter, variant == Variant::LaneCounterMask ? other : lanes}, 0, previous);
     branch(previous, header);
     auto &index = header->AppendNewInst(ValueOpcode::Phi);
     index.SetFlags(Type::U32);
@@ -5025,12 +5045,22 @@ void TestSharedAppendSelectorBounds() {
     choose(header, body, exit, in_list, CFG::BranchCondition::VccNonZero);
     fixture.block = body;
     const auto selected = fixture.Emit(ValueOpcode::LoadSharedU32,
-        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&index), Value(2u)}), Value(true)},
-        shared(consumed_base));
-    const auto offset32 = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(5u)});
-    const auto offset = fixture.Emit(ValueOpcode::ReadFirstLane,
-        {fixture.Emit(ValueOpcode::IAdd32,
-             {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {offset32, Value(2u)}), offset32}), Value(true)});
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&index), Value(2u)}),
+         variant == Variant::LaneUnimpliedRead ? other : lanes}, shared(consumed_base));
+    Value offset;
+    if (lane) {
+      // The record is selected from one lane and scaled on the scalar side.
+      const auto mask = variant == Variant::LaneInactiveSelect
+          ? fixture.Emit(ValueOpcode::LogicalAnd, {lanes, other}) : lanes;
+      offset = fixture.Emit(ValueOpcode::IMul32,
+          {fixture.Emit(ValueOpcode::ReadFirstLane, {selected, mask}), Value(160u)});
+    } else {
+      const auto offset32 = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {selected, Value(5u)});
+      offset = fixture.Emit(ValueOpcode::ReadFirstLane,
+          {fixture.Emit(ValueOpcode::IAdd32,
+               {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {offset32, Value(2u)}), offset32}),
+           Value(true)});
+    }
     MemoryInfo scalar;
     scalar.kind = ResourceKind::ScalarBuffer;
     scalar.offset = 144u;
@@ -5059,7 +5089,8 @@ void TestSharedAppendSelectorBounds() {
     fixture.PlanAndTrack({.compute = &compute});
     const auto &indirect = fixture.program.descriptor_sources[
         fixture.program.info.images[0].source].indirect_descriptor;
-    const bool proven = variant == Variant::Valid || variant == Variant::PayloadOob;
+    const bool proven = variant == Variant::Valid || variant == Variant::PayloadOob ||
+                        variant == Variant::Lane;
     Check(indirect && indirect->selector && indirect->selector->offset == 144u &&
               indirect->selector->stride == (proven ? 160u : 32u) &&
               indirect->key_count.IsEmpty() != proven &&
@@ -5076,6 +5107,11 @@ void TestSharedAppendSelectorBounds() {
       Variant::InnerAppendCycle, Variant::EarlyCounterRead, Variant::WrongConsumerBound, Variant::ExtraWriter,
       Variant::CounterAlias, Variant::PayloadWrap, Variant::CounterOob})
     make_plan(variant);
+  auto lane_plan = make_plan(Variant::Lane);
+  for (const auto variant : {Variant::LaneUnimpliedRead, Variant::LaneUnimpliedCounter,
+      Variant::LaneCounterMask, Variant::LaneOtherBypass, Variant::LaneInactiveSelect})
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "shared append provenance accepted an unimplied lane mask or initializer bypass");
 
   LinearTestMemory memory;
   for (uint32_t index = 0; index < 8u; ++index) memory.words[(144u + 160u * index) / 4u] = index + 1u;
@@ -5088,7 +5124,7 @@ void TestSharedAppendSelectorBounds() {
     memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
         (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
   }
-  std::array<uint32_t, 9> user_data {0x1000u, 160u << 16u, 8u, 0u, 0x2000u, 0u, 0x1800u, 0u, 0u};
+  std::array<uint32_t, 9> user_data {0x1000u, 160u << 16u, 8u, 0u, 0x2000u, 0u, 0x1800u, 0u, 8u};
   SrtRuntime runtime {.user_data = user_data, .userdata = &memory,
       .read_specialization_memory = ReadLinearTestMemory};
   FakeGuestMemory fake(ReadRuntimeMemory, &runtime);
@@ -5103,10 +5139,11 @@ void TestSharedAppendSelectorBounds() {
     memory.words[0x800u / 4u] = counts[0];
     memory.words[0x804u / 4u] = counts[1];
     const auto expected = counts[1];
-    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == std::max(expected, 1u) &&
-              (expected == 0u || snapshot.images.back().dwords[0] == 0x100u + expected),
-          "disjoint shared append lists or refreshed counts selected unrelated material keys");
+    for (const auto *tested : {&plan, &lane_plan})
+      Check(MaterializeResources(*tested, runtime, snapshot, specialization) &&
+                snapshot.images.size() == std::max(expected, 1u) &&
+                (expected == 0u || snapshot.images.back().dwords[0] == 0x100u + expected),
+            "disjoint shared append lists or refreshed counts selected unrelated material keys");
   }
   memory.words[0x800u / 4u] = 24u;
   memory.words[0x804u / 4u] = 2u;
