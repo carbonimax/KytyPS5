@@ -749,17 +749,18 @@ void TestReadLaneElimination() {
   ValidateProgram(refusal.program, false);
 }
 
-void TestCompleteUMinReduction() {
+void TestCompleteWaveReduction() {
   enum class Case {
-    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32,
-    UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
+    Masked, Subset, Literal, LiteralMasked, LiteralMove, Wave32, Wave32Rows,
+    Wave32Maximum, UnrelatedSeed, UnmaskedSymbolic, WrongNeutral, RowMask, BankMask,
     Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
     Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
     CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
     Endpoint, EndpointSource, DifferentWitness, CrossBlock, WrongOperation
   };
   for (const auto test : {Case::Masked, Case::Subset, Case::Literal,
-       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::UnrelatedSeed,
+       Case::LiteralMasked, Case::LiteralMove, Case::Wave32, Case::Wave32Rows,
+       Case::Wave32Maximum, Case::UnrelatedSeed,
        Case::UnmaskedSymbolic, Case::WrongNeutral, Case::RowMask, Case::BankMask,
        Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
        Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
@@ -778,13 +779,15 @@ void TestCompleteUMinReduction() {
     auto seed_mask = test == Case::UnrelatedSeed ? other_mask : mask;
     if (test == Case::Subset)
       seed_mask = fixture.Emit(ValueOpcode::LogicalAnd, {other_mask, mask});
+    // A UMax scan seeds lanes outside EXEC with zero.
+    const bool maximum = test == Case::Wave32Maximum;
+    const uint32_t neutral = test == Case::WrongNeutral || maximum ? 0u : UINT32_MAX;
     const auto seed = test == Case::Literal || test == Case::UnmaskedSymbolic ? source :
-        fixture.Emit(ValueOpcode::SelectU32,
-            {seed_mask, source, Value(test == Case::WrongNeutral ? 0u : UINT32_MAX)});
+        fixture.Emit(ValueOpcode::SelectU32, {seed_mask, source, Value(neutral)});
     auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
     Value preserved;
-    const auto operation = test == Case::WrongOperation ? ValueOpcode::BitwiseOr32 :
-                                                        ValueOpcode::UMin32;
+    auto operation = maximum ? ValueOpcode::UMax32 : ValueOpcode::UMin32;
+    if (test == Case::WrongOperation) operation = ValueOpcode::BitwiseOr32;
     for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
       DppMoveFlags flags{.control = 0x110u + shift};
       if (shift == 2) {
@@ -825,10 +828,16 @@ void TestCompleteUMinReduction() {
     const auto final = fixture.Emit(ValueOpcode::SelectU32,
         {test == Case::FinalExec ? mask : enabled, combined, prefix});
     const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
+    // Wave32 reads each half's row endpoint from the scan itself.
+    const bool rows = test == Case::Wave32Rows || maximum;
+    const auto endpoints = rows ? prefix : final;
+    uint32_t low_lane = test == Case::Endpoint ? 30u : 31u;
+    if (rows) low_lane = 15u;
     const auto low = fixture.Emit(ValueOpcode::ReadLane,
-        {final, Value(test == Case::Endpoint ? 30u : 31u)}, 0, result_block);
+        {endpoints, Value(low_lane)}, 0, result_block);
     const auto high = fixture.Emit(ValueOpcode::ReadLane,
-        {test == Case::EndpointSource ? prefix : final, Value(63u)}, 0, result_block);
+        {test == Case::EndpointSource ? prefix : endpoints, Value(rows ? 31u : 63u)}, 0,
+        result_block);
     const auto result = fixture.Emit(operation, {high, low}, 0, result_block);
     const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
     using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
@@ -839,16 +848,19 @@ void TestCompleteUMinReduction() {
       fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
     }
     ValidateProgram(fixture.program, true);
-    const auto stats = EliminateReadLane(fixture.program, test == Case::Wave32 ? 32u : 64u);
+    const auto stats =
+        EliminateReadLane(fixture.program, test == Case::Wave32 || rows ? 32u : 64u);
     const bool matches = test == Case::Masked || test == Case::Subset ||
-        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove;
+        test == Case::Literal || test == Case::LiteralMasked || test == Case::LiteralMove ||
+        rows;
     Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("UMin reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
+          ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
     if (matches) {
       const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
-      Check(reduction->GetOpcode() == ValueOpcode::SubgroupUMinU32 &&
+      Check(reduction->GetOpcode() ==
+                    (maximum ? ValueOpcode::SubgroupUMaxU32 : ValueOpcode::SubgroupUMinU32) &&
                 reduction->Arg(0).Resolve() == seed.Resolve(),
-            "UMin reduction changed the neutral-masked input");
+            "wave reduction changed the neutral-masked input");
       RemoveIdentities(fixture.program);
       EliminateDeadCode(fixture.program.blocks);
       uint32_t updates = 0;
@@ -856,10 +868,10 @@ void TestCompleteUMinReduction() {
         updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
         Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
                   inst.GetOpcode() != ValueOpcode::Permlane16U32,
-              "UMin reduction retained unused endpoint or cross-row operations");
+              "wave reduction retained unused endpoint or cross-row operations");
       }
       Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
-            "UMin reduction destroyed an independently consumed prefix or kept its dead suffix");
+            "wave reduction destroyed an independently consumed prefix or kept its dead suffix");
       ValidateProgram(fixture.program, true);
     } else {
       Check(use.Instruction()->Arg(0).Resolve() == result,
@@ -1005,7 +1017,7 @@ int main() {
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
-    TestCompleteUMinReduction();
+    TestCompleteWaveReduction();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
