@@ -454,19 +454,19 @@ uint64_t BufferCache::LatestWriteTick(uint64_t vaddr, uint64_t size) {
 	return latest >= m_scheduler.CurrentTick() ? UINT64_MAX : latest;
 }
 
-// KYTY_SYNC_SIDE_READS=N (default 0): a synchronous read of GPU-written bytes by the GPU thread
+// KYTY_SYNC_SIDE_READS=N (default 2): a synchronous read of GPU-written bytes by the GPU thread
 // (backing reads of the SRT walker, shader and vertex-table reads: ReadMemoryWindow; fault windows
 // published on the GPU thread, e.g. indirect arguments read by the command processor) whose writers
 // were all submitted copies them on the readback queue, as guest fault readbacks do, instead of
 // recording the copy in the command buffer being recorded, submitting it and waiting for the whole
-// main-queue backlog. 1: only when every write already completed; 2: also when the writers are
+// main-queue backlog. 0: off; 1: only when every write already completed; 2: also when the writers are
 // submitted but still running (waits for the latest writer's tick first). The copied bytes, their
 // publication and the memory-tracker state are the same; later main-queue writes to them wait for
 // the copy (NoteBufferWrite). Interrupts, labels and command order are untouched.
 static uint32_t SyncSideReads() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_SYNC_SIDE_READS");
-		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u;
 	}();
 	return mode;
 }
