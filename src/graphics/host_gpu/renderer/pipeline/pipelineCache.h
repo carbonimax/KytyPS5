@@ -197,6 +197,13 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// Driver pipeline-cache outcome of the latest CreatePipelineInternal call on this thread, from
+// pipeline creation feedback (core in Vulkan 1.3). `valid` is false when the driver did not report.
+struct PipelineCacheFeedback {
+	bool valid = false;
+	bool hit   = false;
+};
+[[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&   rendering,
                             const PipelineVertexInputState& vertex_input,
