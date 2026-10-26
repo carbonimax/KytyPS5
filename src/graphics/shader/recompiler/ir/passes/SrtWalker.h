@@ -86,7 +86,17 @@ bool WalkedActive(const ResourcePlan& plan, uint32_t source);
 struct WalkStats {
 	uint64_t walks = 0, ns = 0, backing_reads = 0, fault_reads = 0, protected_calls = 0,
 	         protected_evictions = 0, protected_ns = 0, protected_synced = 0;
+	// KYTY_SRT_WALK_REUSE: walks whose inputs matched the plan's last walk (checks), of which every
+	// guest load still read the same value (hits); validation time; verify-mode mismatches.
+	uint64_t reuse_checks = 0, reuse_hits = 0, reuse_ns = 0, reuse_diffs = 0;
 };
+// KYTY_SRT_WALK_REUSE (default 0; x86-64 walker): a walk whose user data and shader base equal the
+// plan's last walk, and whose recorded guest loads all still read the recorded values (loaded the
+// way the walker loads them: protected-page list, backing reads, fault handling), is not run again:
+// the plan's scratch still holds that walk's results. 1 = reuse; 2 = verify (walk anyway and
+// compare the flat buffer and the whole scratch; mismatches counted and logged). Walks that
+// restarted are never reused.
+[[nodiscard]] uint32_t WalkReuseMode() noexcept;
 // KYTY_SRT_PROTECTED_LOADS (default 1): the fault handler lists the page of a walker load it
 // completed from the backing (NoteProtectedLoad); later walker loads from a listed page call the
 // reader (GPU thread: the backing, synchronizing GPU-written bytes) instead of faulting. The reader
