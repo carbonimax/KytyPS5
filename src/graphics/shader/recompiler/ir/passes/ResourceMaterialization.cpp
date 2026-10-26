@@ -1047,6 +1047,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return dimension == Decoder::ImageDimension::Dim1D ||
 			       dimension == Decoder::ImageDimension::Dim2D;
 		};
+		// The descriptor's type selects the address layout. A 2D or 3D candidate reads the leading
+		// coordinates of an equal or larger dimension, but an array with more than one slice reads
+		// the next as its slice. Derivative, LOD, clamp and mip operands shift with the dimension.
+		const auto leading = [&](Decoder::ImageDimension dimension, const DescriptorValue& value) {
+			const bool sliced =
+			    static_cast<Prospero::ImageType>((value.dwords[3] >> 28u) & 0xfu) ==
+			        Prospero::ImageType::kColor2DArray &&
+			    (value.dwords[4] & 0x1fffu) != ((value.dwords[4] >> 16u) & 0x1fffu);
+			return !sliced &&
+			       (dimension == Decoder::ImageDimension::Dim2D || dimension == base.dimension);
+		};
+		const bool leading_coordinates = (base.dimension == Decoder::ImageDimension::Dim2D ||
+		                                  base.dimension == Decoder::ImageDimension::Dim3D) &&
+		    leading(image_class.dimension, snapshot.images[exemplar]) &&
+		    std::ranges::none_of(program.memory_info, [&](const MemoryInfo& memory) {
+			    return memory.kind == ResourceKind::Image && memory.resource == root_index &&
+			           (memory.image_has_mip || (memory.image_sample_flags &
+			               (Decoder::ImageSampleFlagLod | Decoder::ImageSampleFlagDerivative |
+			                Decoder::ImageSampleFlagLodClamp)) != 0u);
+		    });
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -1066,8 +1086,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    base.dimension == Decoder::ImageDimension::Dim2D &&
 			    !image.cube && !image_class.cube && is_1d_or_2d(image.dimension) &&
 			    is_1d_or_2d(image_class.dimension);
+			const bool prefix_coordinates =
+			    leading_coordinates && leading(image.dimension, snapshot.images[candidate]);
 			if ((!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
-			     !unfiltered_coordinates) ||
+			     !unfiltered_coordinates && !prefix_coordinates) ||
 			    image.conversion_format != image_class.conversion_format ||
 			    (!storage_swizzle && image.shader_swizzle != image_class.shader_swizzle)) {
 				return SpecializationFail(
@@ -1948,8 +1970,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
-	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, and
-	// entries that need shader-side conversion, read as null instead of failing the draw.
+	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, entries of
+	// another dimension and entries that need shader-side conversion read as null instead of
+	// failing the draw.
 	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
 	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
 	const auto numeric_class =

@@ -1762,6 +1762,13 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
+// Upstream round-trips the plan through its shader cache bytes here; the fork has no resource
+// plan serialization yet, so the extracted plan is used directly.
+ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char * /*name*/,
+                                                      const ShaderRecompiler::IR::Program &program) {
+  return ShaderRecompiler::IR::ExtractResourcePlan(program);
+}
+
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
@@ -18547,7 +18554,8 @@ public:
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
-                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
+                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -43209,6 +43217,106 @@ void CheckWaterfallFloorImageTable(VulkanHarness &vulkan) {
   std::printf("[compute] %s ok\n", test.name);
 }
 
+void CheckMixedDimensionImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u, rows = 4u;
+  // Row 0 is a one-slice 2D array under a 3D sample: it reads the leading two coordinates and
+  // clamps the third to its slice. A second slice or a LOD operand would read the third instead,
+  // and a 3D row 0 under a 2D sample, or 2D rows under a 1D sample, would read a coordinate the
+  // sample does not supply.
+  constexpr std::array names{"MixedDimensionImageTable", "MixedDimensionImageTableLod",
+                             "MixedDimensionImageTableSlices", "MixedDimensionImageTableFlat",
+                             "MixedDimensionImageTableLine"};
+  for (u32 variant = 0; variant < names.size(); ++variant) {
+    const bool lod = variant == 1u, slices = variant == 2u, flat = variant == 3u,
+               line = variant == 4u;
+    TestCase test;
+    test.name = names[variant];
+    test.dispatch_x = rows;
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + rows * 32u) / 4u);
+    for (u32 row = 0; row < rows; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = row + 1u;
+      auto type = row == 0u ? Prospero::ImageType::kColor2DArray : Prospero::ImageType::kColor3D;
+      if (flat) type = row == 0u ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+      if (line) type = row == 0u ? Prospero::ImageType::kColor1D : Prospero::ImageType::kColor2D;
+      image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(type) << 28u);
+      image[4] = row == 0u && slices ? 1u : 0u;
+      std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+    }
+    test.user_data[0] = base;
+    const auto output = MakeStructuredStorageBufferData(0u, rows * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = 64u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    u32 dim = 2u;
+    if (flat) dim = 1u;
+    if (line) dim = 0u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 10, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 11, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 12, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 13, 0u);
+    code.insert(code.end(), {EncodeSop2(0x1e, 23, 44, InlineU32(5)),
+        EncodeSop2(0x02, 23, 23, 255), table_offset, EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+        EncodeMimg0(lod ? 0x24 : 0x27, 1, 0, false, dim), EncodeMimg1(5, 10, 2, 13),
+        EncodeSop2(0x1e, 25, 44, InlineU32(2)), EncodeVop1(0x01, 30, 25)});
+    AppendBufferStoreDword(&code, 5, 30);
+    AppendEnd(&code);
+    if (variant != 0u) {
+      ShaderRecompiler::CompileOptions options;
+      options.user_data = test.user_data;
+      options.input_info.compute = &test.compute_info;
+      auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+      const auto plan = LoadedResourcePlan(test.name, translated.program);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      ShaderRecompiler::IR::ResourceSpecialization specialization;
+      const std::array workgroup_counts{rows, 1u, 1u};
+      const ShaderRecompiler::IR::SrtRuntime runtime{
+          .user_data = test.user_data,
+          .userdata = &test.initial,
+          .read_specialization_memory = ReadTestMemory,
+          .workgroup_counts = workgroup_counts,
+      };
+      FakeGuestMemory fake(ReadTestMemory, runtime.userdata);
+      Require(test.name, "coordinate layout",
+              !ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
+              "a candidate read a coordinate outside its layout");
+      continue;
+    }
+    test.opcodes = {O::V_MOV_B32, O::S_LSHL_B32, O::S_ADD_I32, O::S_LOAD_DWORDX8,
+                    O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images) {
+      const bool volume =
+          (descriptor.dwords[3] >> 28u) == static_cast<u32>(Prospero::ImageType::kColor3D);
+      images.push_back(vulkan.CreateImageMips(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {{std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal, volume ? vk::ImageType::e3D : vk::ImageType::e2D,
+          volume ? vk::ImageViewType::e3D : vk::ImageViewType::e2D, 1));
+    }
+    const auto sampler = vulkan.CreateSampler(test.name, 1);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    std::vector<u32> expected;
+    for (u32 row = 0; row < rows; ++row)
+      expected.push_back(std::bit_cast<u32>(static_cast<float>(row + 1u)));
+    CompareWords(test, "mixed dimension rows", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s ok\n", test.name);
+  }
+}
+
 void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 list_address = 160;
@@ -54291,6 +54399,7 @@ int main(int argc, char **argv) {
     CheckPointerImageTable(vulkan);
     CheckWorkgroupDividedImageTable(vulkan);
     CheckWaterfallFloorImageTable(vulkan);
+    CheckMixedDimensionImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
@@ -54471,6 +54580,7 @@ int main(int argc, char **argv) {
   CheckPointerImageTable(vulkan);
   CheckWorkgroupDividedImageTable(vulkan);
   CheckWaterfallFloorImageTable(vulkan);
+  CheckMixedDimensionImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
