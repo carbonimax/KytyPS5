@@ -6009,6 +6009,66 @@ void TestDynamicStorageMipTracking() {
         "an inverted mip range was not normalized consistently for plain and dynamic views");
 }
 
+// KYTY_SRT_WALK_REUSE=1 (ctest srt_walk_reuse): a walk with the inputs of the plan's last walk
+// reloads the recorded values (one read each) and is skipped while they hold; a changed value, a
+// failing read or other user data walk again.
+void TestSrtWalkReuse() {
+  Check(WalkReuseMode() == 1u, "srt_walk_reuse needs KYTY_SRT_WALK_REUSE=1");
+  Fixture fixture;
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  scalar.offset = 4;
+  const auto read0 = fixture.Emit(ValueOpcode::LoadAddressU32, {base, Value(0u), Value(0u), Value(true)},
+                                  fixture.AddMemory(scalar, 4));
+  const auto descriptor0 = fixture.Buffer({read0, Value(0u), Value(64u), Value(0u)}, 12);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32, {descriptor0, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 12));
+  fixture.PlanAndTrack();
+
+  std::array<uint32_t, 2> user_data{0x1000u, 0u};
+  TestMemory memory;
+  memory.words[1] = 0xdeadbeefu;
+  SrtRuntime runtime{.user_data = user_data};
+  FakeGuestMemory fake(ReadTestMemory, &memory);
+  auto plan = ExtractResourcePlan(fixture.program);
+  DescriptorValue descriptor;
+  std::vector<uint32_t> flat;
+  std::vector<std::pair<uint64_t, uint64_t>> reads;
+  const uint32_t request = fixture.program.info.buffers[0].source;
+  const auto refresh = [&] {
+    reads.clear();
+    return WalkSrt(plan, runtime, flat, &reads) && WalkedDescriptor(plan, request, descriptor);
+  };
+  const std::vector<std::pair<uint64_t, uint64_t>> expected_reads{{0x1004u, 4u}};
+  Check(refresh() && descriptor.dwords[0] == 0xdeadbeefu && memory.reads == 1 && reads == expected_reads,
+        "first walk");
+  memory.reads = 0;
+  Check(refresh() && descriptor.dwords[0] == 0xdeadbeefu && flat == std::vector<uint32_t>{0xdeadbeefu} &&
+            memory.reads == 1 && reads == expected_reads,
+        "an unchanged walk was not reused after one validating read");
+  memory.reads = 0;
+  memory.words[1] = 0x12345678u;
+  Check(refresh() && descriptor.dwords[0] == 0x12345678u && flat == std::vector<uint32_t>{0x12345678u} &&
+            memory.reads == 2,
+        "a changed value was reused");
+  memory.reads = 0;
+  memory.fail_after = 0;
+  Check(refresh() && descriptor.dwords[0] == 0u && flat == std::vector<uint32_t>{0u},
+        "a failing read was reused");
+  memory.fail_after = UINT32_MAX;
+  memory.reads = 0;
+  Check(refresh() && descriptor.dwords[0] == 0x12345678u && memory.reads == 2,
+        "a zero read was reused after the memory became readable");
+  memory.reads = 0;
+  user_data[0] = 0x1004u; // other user data: no validation, a full walk
+  memory.words[2] = 0x2468aceu;
+  Check(refresh() && descriptor.dwords[0] == 0x2468aceu && memory.reads == 1,
+        "other user data validated the last walk");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -9142,8 +9202,13 @@ void TestSharedSamplerLayout() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
+    if (argc > 1 && std::string_view(argv[1]) == "--walk-reuse-only") {
+      TestSrtWalkReuse();
+      std::printf("srt walk reuse tests passed\n");
+      return 0;
+    }
     const auto Run = [](const char *name, auto test) {
       try {
         test();
