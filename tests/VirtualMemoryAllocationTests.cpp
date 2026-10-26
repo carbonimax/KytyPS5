@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/runtimeLinker.h"
@@ -89,6 +90,7 @@ using Libs::LibKernel::Memory::VirtualQueryInfo;
 // Prospero ABI?
 constexpr uint64_t SceKernelPageSize             = 0x4000;
 constexpr uint64_t SceKernelTotalPhysicalSize    = 13824ull * 1024ull * 1024ull;
+constexpr uint64_t SceKernelFlexibleMemorySize   = 448ull * 1024ull * 1024ull;
 constexpr uint64_t TestFlexibleMemorySize        = 3072ull * 1024ull * 1024ull;
 constexpr int      SceKernelProtCpuRead          = 0x01;
 constexpr int      SceKernelProtCpuRw            = 0x02;
@@ -189,6 +191,10 @@ void InitSubsystems() {
 	      "failed to remove temporary param.json");
 	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
 	      "failed to read flexible memory size from param.json");
+	size_t default_flexible_memory_size = 0;
+	Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&default_flexible_memory_size);
+	Check("InitSubsystems", default_flexible_memory_size == SceKernelFlexibleMemorySize,
+	      "flexible memory does not default to 448 MiB without param.json");
 	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -3695,6 +3701,32 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestModuleSegmentsUseFlexibleMemory() {
+	const char* test = "ModuleSegmentsUseFlexibleMemory";
+	using namespace Loader;
+	// E, R and RW LOAD pages; GNU_RELRO over the RW page and the flagless LOAD add none.
+	const std::array<Elf64_Phdr, 6> phdrs {{
+	    {PT_LOAD, PF_X, 0x4000, 0x0000, 0x0000, 0x1ac, 0x1ac, 0x4000},
+	    {PT_LOAD, PF_R, 0x8000, 0x4000, 0x4000, 0x83, 0x83, 0x4000},
+	    {PT_LOAD, PF_R | PF_W, 0xc000, 0x8000, 0x8000, 0x338, 0x338, 0x4000},
+	    {0x6474e552, PF_R, 0xc000, 0x8000, 0x8000, 0x338, 0x4000, 0x1},
+	    {PT_LOAD, PF_R | PF_W, 0x10000, 0xc000, 0xc000, 0x21, 0x21, 0x4000},
+	    {PT_LOAD, 0, 0x10030, 0xc030, 0xc030, 0x550, 0x550, 0x4000},
+	}};
+	const auto size = CalcFlexibleMemorySize(phdrs.data(), phdrs.size());
+	Check(test, size == 4 * SceKernelPageSize, "module segments counted wrong");
+
+	const auto baseline = AvailableFlexibleMemory(test);
+	Libs::LibKernel::Memory::ChargeFlexibleMemory(size);
+	Check(test, AvailableFlexibleMemory(test) == baseline - size,
+	      "loaded module did not use flexible memory");
+	Libs::LibKernel::Memory::ReleaseFlexibleMemory(size);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "unloaded module did not return flexible memory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_instruction_traps = 0;
 
@@ -5099,6 +5131,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif

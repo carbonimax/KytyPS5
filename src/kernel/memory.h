@@ -229,6 +229,9 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
+// Loaded modules' segments use flexible memory without taking its backing.
+void ChargeFlexibleMemory(uint64_t size);
+void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,

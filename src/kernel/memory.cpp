@@ -69,7 +69,7 @@ constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
 constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
 constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
-constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
+constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 448ull * 1024ull * 1024ull;
 
 static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
 static bool                          g_flexible_memory_size_frozen = false;
@@ -777,6 +777,8 @@ public:
 
 	static uint64_t Size() { return g_flexible_memory_size; }
 	uint64_t        Available();
+	void            Charge(uint64_t size);
+	void            Release(uint64_t size);
 
 	bool Map(uint64_t vaddr, size_t len, int prot, VirtualMemory::Mode mode, GpuAccessMode gpu_mode,
 	         const char* name);
@@ -2057,6 +2059,19 @@ uint64_t FlexibleMemory::Available() {
 	Common::LockGuard lock(m_mutex);
 
 	return (Size() >= m_allocated_total ? Size() - m_allocated_total : 0);
+}
+
+void FlexibleMemory::Charge(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	m_allocated_total += size;
+}
+
+void FlexibleMemory::Release(uint64_t size) {
+	Common::LockGuard lock(m_mutex);
+
+	EXIT_IF(size > m_allocated_total);
+	m_allocated_total -= size;
 }
 
 void PooledMemory::AddFreeUnlocked(uint64_t start, uint64_t size) {
@@ -3860,6 +3875,14 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size, VirtualMemory::Mode mode,
                                const char* name) {
 	return AllocateGuestRuntimeMemory(search_addr, size, mode, name, VirtualRangeType::Code, false);
+}
+
+void ChargeFlexibleMemory(uint64_t size) {
+	g_flexible_memory->Charge(size);
+}
+
+void ReleaseFlexibleMemory(uint64_t size) {
+	g_flexible_memory->Release(size);
 }
 
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
