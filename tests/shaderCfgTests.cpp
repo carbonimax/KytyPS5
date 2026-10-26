@@ -15946,7 +15946,7 @@ void TestBoundedScalarMaterialImageKeys() {
       }
       return true;
     }
-    for (const uint32_t key : {5567u, 5582u, 5573u, 5588u}) {
+    for (const uint32_t key : {0u, 5567u, 5582u, 5573u, 5588u}) {
       if (address != 0x100000u + key * 32u || words.size() != 8) continue;
       ++m.images;
       std::ranges::fill(words, 0u);
@@ -16008,9 +16008,17 @@ void TestBoundedScalarMaterialImageKeys() {
     Check(!MaterializeResources(plan, runtime, snapshot, specialization),
           "unavailable selected material key was accepted");
   }
+  // Row 1's 0x94 key straddles a 311-byte V#, so it reads zero instead of 5573.
   memory = {.stride = 1, .records = 311};
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && memory.key_reads == 0,
-        "scalar material byte range escaped V# bounds");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "scalar material table past its V# was rejected");
+  for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
+    const auto &selector =
+        *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
+    const auto offset = specialization.images[root].indirect_mapping_offset;
+    Check(snapshot.flattened_srt[offset + 1u] == (selector.offset == 0x94u ? 0u : 5567u),
+          "scalar material key past its V# did not read as zero");
+  }
   memory = {.mixed = true};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 4 && specialization.images.size() == 4,

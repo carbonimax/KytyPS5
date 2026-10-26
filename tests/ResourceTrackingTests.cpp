@@ -5120,9 +5120,14 @@ void TestSharedAppendSelectorBounds() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 2u && snapshot.images.back().dwords[0] == 0x104u,
         "shared append materialization reused stale selector contents");
+  // Record 1 lies past a one-record V#, so its scalar key reads zero instead of key 4.
   user_data[2] = 1u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "shared append materialization accepted a range outside its V# bounds");
+  memory.fail_address = 0x1000u + 144u + 160u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords[0] == 0x100u &&
+            snapshot.images[1].dwords[0] == 0x101u,
+        "shared append materialization did not read records past its V# as zero");
+  memory.fail_address = UINT64_MAX;
   user_data[2] = 8u;
   for (const auto too_large : {65537u, UINT32_MAX}) {
     for (uint32_t list = 0; list < 2u; ++list) {
