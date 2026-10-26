@@ -22925,6 +22925,7 @@ private:
                                 available_features.drawIndirectFirstInstance &&
                                 available_features.multiDrawIndirect &&
                                 available_features.depthBounds &&
+                                available_features.fragmentStoresAndAtomics &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_color_write.colorWriteEnable &&
@@ -23041,6 +23042,7 @@ private:
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+    device_features.fragmentStoresAndAtomics = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -46183,6 +46185,92 @@ WaterfallHelper RunWqmWaterfallHelperCase(VulkanHarness *vulkan, bool shared_key
   return verdict;
 }
 
+// Covers only pixel 1 of a 2x1 target, so the rest of its quad runs as helper invocations, and
+// starts a GDS counter at 10 in dword 5.
+void CoverOnePixelOfQuad(GraphicsCase *test) {
+  test->width = 2;
+  test->vertices = {0x00000000u, 0xbf800000u, 0, 0, 0, 0,
+                    0x40400000u, 0xbf800000u, 0, 0, 0, 0,
+                    0x00000000u, 0x40400000u, 0, 0, 0, 0};
+  test->gds_initial = {0, 0, 0, 0, 0, 10};
+}
+
+GraphicsCase GraphicsDsAppendSkipsHelperLanes(bool consume) {
+  using O = ShaderOpcode;
+
+  // The EXEC and VCC words exclude the helper lanes. Exports the first counter value, the second
+  // minus the first minus s_bcnt1(exec) (reversed for consume), s_bcnt1(exec), and the EXEC plus
+  // VCC counts after an if/endif on a compare of the interpolant (zero in every lane).
+  const u32 op = consume ? 0x3d : 0x3e;
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0x00, 7, 0, 0, 0));
+  code.push_back(EncodeVintrp(0x01, 7, 0, 0, 1));
+  AppendSMovLiteral(&code, 124, 0x100);
+  code.push_back(EncodeDs0(op, 20, true));
+  code.push_back(EncodeDs1(1, 0, 0));
+  code.push_back(EncodeDs0(op, 20, true));
+  code.push_back(EncodeDs1(2, 0, 0));
+  code.push_back(EncodeSop1(0x10, 0, 126));
+  code.push_back(EncodeVop2(0x26, 3, Vgpr(consume ? 1 : 2), consume ? 2 : 1));
+  code.push_back(EncodeVop2(0x27, 3, 0, 3));
+  code.push_back(EncodeVop1(0x06, 4, Vgpr(1)));
+  code.push_back(EncodeVop1(0x05, 5, Vgpr(3)));
+  code.push_back(EncodeVop1(0x06, 6, 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 7));
+  code.push_back(EncodeSop1(0x24, 2, 106));
+  code.push_back(EncodeSop2(0x11, 126, 126, 2));
+  code.push_back(EncodeSop1(0x10, 1, 126));
+  code.push_back(EncodeSop1(0x10, 4, 106));
+  code.push_back(EncodeSop2(0x00, 1, 1, 4));
+  code.push_back(EncodeVop1(0x06, 7, 1));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(4, 5, 6, 7));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = consume ? "GraphicsDsConsumeSkipsHelperLanes" : "GraphicsDsAppendSkipsHelperLanes";
+  test.fragment_code = std::move(code);
+  CoverOnePixelOfQuad(&test);
+  test.expected_pixel = {0, 0, 0, 0, 0x41200000u, 0, 0x3f800000u, 0x40000000u};
+  test.opcodes = {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::S_MOV_B32,
+                  consume ? O::DS_CONSUME : O::DS_APPEND, O::S_BCNT1_I32_B64,
+                  O::V_SUB_NC_U32, O::V_SUBREV_NC_U32, O::V_CVT_F32_U32, O::V_CVT_F32_I32,
+                  O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64, O::S_OR_B64, O::S_ADD_U32, O::EXP,
+                  O::S_ENDPGM};
+  return test;
+}
+
+GraphicsCase GraphicsDsOrderedCountSkipsHelperLanes() {
+  using O = ShaderOpcode;
+
+  // A live lane adds the first lane's ADDR value (1) for the wave. Exports the first counter
+  // value and the difference to the second.
+  std::vector<u32> code;
+  code.push_back(EncodeVintrp(0x00, 7, 0, 0, 0));
+  code.push_back(EncodeVintrp(0x01, 7, 0, 0, 1));
+  code.push_back(EncodeVop1(0x01, 2, InlineU32(1)));
+  AppendSMovLiteral(&code, 124, 0x00100000u); // M0 base 0x10; offset0 adds 4: dword 5.
+  code.push_back(EncodeDs0(0x3f, 7, true));
+  code.push_back(EncodeDs1(1, 2, 2));
+  code.push_back(EncodeDs0(0x3f, 7, true));
+  code.push_back(EncodeDs1(3, 2, 2));
+  code.push_back(EncodeVop2(0x26, 4, Vgpr(3), 1));
+  code.push_back(EncodeVop1(0x06, 5, Vgpr(1)));
+  code.push_back(EncodeVop1(0x06, 6, Vgpr(4)));
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(5, 6, 6, 6));
+  AppendEnd(&code);
+
+  GraphicsCase test;
+  test.name = "GraphicsDsOrderedCountSkipsHelperLanes";
+  test.fragment_code = std::move(code);
+  CoverOnePixelOfQuad(&test);
+  test.expected_pixel = {0, 0, 0, 0, 0x41200000u, 0x3f800000u, 0x3f800000u, 0x3f800000u};
+  test.opcodes = {O::V_INTERP_P1_F32, O::V_INTERP_P2_F32, O::V_MOV_B32, O::S_MOV_B32,
+                  O::DS_ORDERED_COUNT, O::V_SUB_NC_U32, O::V_CVT_F32_U32, O::EXP, O::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
 
@@ -47056,6 +47144,9 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsFrontFaceBits(true, true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
+      GraphicsDsAppendSkipsHelperLanes(false),
+      GraphicsDsAppendSkipsHelperLanes(true),
+      GraphicsDsOrderedCountSkipsHelperLanes(),
       GraphicsDirectSgprPushConstantExport(),
       GraphicsInlineSrtScalarPromotionExport(),
       GraphicsNullVmExportDiscardsInactiveExec(),
@@ -52864,6 +52955,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--helper-lanes-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(false));
+    RunGraphicsCase(&vulkan, GraphicsDsAppendSkipsHelperLanes(true));
+    RunGraphicsCase(&vulkan, GraphicsDsOrderedCountSkipsHelperLanes());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {

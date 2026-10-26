@@ -863,9 +863,10 @@ void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
-	WriteOperand(inst.dst, ir.Emit(opcode,
-	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                               AddMemoryInfo(memory, inst.pc)));
+	const auto exec   = ExecMask();
+	WriteOperand(inst.dst,
+	             ir.Emit(opcode, {ReadU32(MemorySourceAt(inst, 0)), exec[0], exec[1], ir.GetExec()},
+	                     AddMemoryInfo(memory, inst.pc)));
 }
 
 void Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
@@ -901,10 +902,7 @@ void Translator::DS_ORDERED_COUNT(const Decoder::Instruction& inst) {
 		const auto packer = ir.BitwiseAnd(m0, IR::U32(IR::Value(0xfu)));
 		address = ir.IAdd(address, ir.ShiftLeftLogical(packer, IR::U32(IR::Value(2u))));
 	}
-	const auto exec   = ir.GetExec();
-	const auto ballot = ir.Emit(IR::ValueOpcode::Ballot, {exec});
-	const auto low = ir.CompositeExtract(ballot, 0u);
-	const auto high = ir.CompositeExtract(ballot, 1u);
+	const auto [low, high] = ExecMask();
 	const auto active = ir.INotEqual(ir.BitwiseOr(low, high), IR::U32(IR::Value(0u)));
 	const auto first = ir.Select(
 	    ir.INotEqual(low, IR::U32(IR::Value(0u))),

@@ -14145,6 +14145,34 @@ void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
     }
   }
 
+  // The wave32 live mask projects to the entry predicate, and VCC keeps its compare predicate
+  // after WQM.
+  const uint32_t live_mask_shader[] = {
+      EncodeSop1(0x03, 0, 126),      // s_mov_b32 s0, exec_lo
+      EncodeSop2(0x0e, 126, 126, 0), // s_and_b32 exec_lo, exec_lo, s0
+      EncodeVop1(0x01, 0, 242),      // v_mov_b32 v0, 1.0
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const uint32_t wqm_vcc_shader[] = {
+      EncodeSop1(0x09, 126, 126),  // s_wqm_b32 exec_lo, exec_lo
+      EncodeVop2(0x23, 0, 193, 1), // v_mbcnt_lo_u32_b32 v0, -1, v1
+      EncodeVopc(0xc1, 129, 0),    // v_cmp_lt_u32 vcc_lo, 1, v0
+      EncodeVop2(0x01, 2, 128, 0), // v_cndmask_b32 v2, 0, v0, vcc_lo
+      EncodeExp0(0x00, 0x1), EncodeExp1(2, 2, 2, 2),
+      EncodeSopp(0x01),
+  };
+  auto wave32_pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  wave32_pixel_options.wave_size = 32u;
+  for (const std::span<const uint32_t> shader : {std::span<const uint32_t>(live_mask_shader),
+                                                 std::span<const uint32_t>(wqm_vcc_shader)}) {
+    const auto pixel_result = RecompileForTest(shader, wave32_pixel_options);
+    CheckSpirvBinaryValidates(pixel_result.spirv);
+    Check(DisassembleSpirvBinary(pixel_result.spirv).find("OpGroupNonUniformBallot") ==
+              std::string::npos,
+          "wave32 pixel mask rebuilt a known predicate from a ballot");
+  }
+
   const uint32_t local_shader[] = {
       EncodeVopc(0xc1, 5 + 256, 8),    // v_cmp_lt_u32 vcc, v5, v8
       EncodeSop2(0x0f, 2, 126, 106),   // s_and_b64 s[2:3], exec, vcc
