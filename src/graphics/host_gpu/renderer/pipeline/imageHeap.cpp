@@ -101,10 +101,12 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	allocate.pSetLayouts        = &m_layout;
 	EXIT_IF(graphics.device.allocateDescriptorSets(&allocate, &m_set) != vk::Result::eSuccess);
 	graphics.image_heap_layout = m_layout;
-	// Slot word 0 selects element 0, which stays a null image.
+	// Without null descriptors Acquire uses ordinary materialization; no shader may read this set.
 	m_elements.push_back({.binding = {.layout = vk::ImageLayout::eShaderReadOnlyOptimal}});
-	m_writes.push_back(0u);
-	WriteDescriptors();
+	if (graphics.null_descriptor_enabled) {
+		m_writes.push_back(0u);
+		WriteDescriptors();
+	}
 }
 
 ImageHeap::~ImageHeap() {
@@ -117,6 +119,7 @@ ImageHeap::~ImageHeap() {
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
+	if (!m_context.GetGraphics().null_descriptor_enabled) return false;
 	const auto size = request.size & ~uint64_t {3};
 	if (size < MinTableBytes || request.count == 0u || request.step == 0u ||
 	    ((request.base | request.first | request.step) & 3u) != 0u) {
@@ -457,6 +460,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 
 void ImageHeap::WriteDescriptors() {
 	if (m_writes.empty()) return;
+	EXIT_IF(!m_context.GetGraphics().null_descriptor_enabled);
 	std::vector<vk::DescriptorImageInfo> infos;
 	std::vector<vk::WriteDescriptorSet>  writes(m_writes.size());
 	infos.reserve(m_writes.size());
@@ -477,6 +481,7 @@ void ImageHeap::WriteDescriptors() {
 void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
                        vk::PipelineLayout layout) {
 	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(!m_context.GetGraphics().null_descriptor_enabled);
 	const auto epoch = Image::heap_epoch.load(std::memory_order_relaxed);
 	for (auto* view: m_active) {
 		if (view->dirty_begin != view->dirty_end) {
