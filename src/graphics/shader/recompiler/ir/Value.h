@@ -16,6 +16,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Block;
 class Inst;
+class ProgramPacker;
 
 class Value {
 public:
@@ -56,6 +57,8 @@ public:
 	bool operator==(const Value& other) const;
 
 private:
+	friend class ProgramPacker;
+
 	Type type = Type::Void;
 	union {
 		Inst*     inst;
@@ -156,6 +159,7 @@ public:
 
 private:
 	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+	friend class ProgramPacker;
 
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
