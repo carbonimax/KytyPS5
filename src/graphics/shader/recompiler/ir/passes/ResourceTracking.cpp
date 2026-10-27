@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -1728,6 +1729,8 @@ private:
 		uint32_t initial_arm;
 	};
 
+	static bool ZeroBased(uint32_t initial, uint32_t step) { return initial == 0u && step == 1u; }
+
 	std::optional<Induction> MatchInduction(Value key, const auto& accepts_step) const {
 		key = key.Resolve();
 		const auto* phi = key.TryInstruction();
@@ -1789,8 +1792,7 @@ private:
 	}
 
 	uint32_t PostTestLoopMaximum(Value key) const {
-		const auto induction = MatchInduction(key,
-		    [](uint32_t initial, uint32_t step) { return initial == 0u && step == 1u; });
+		const auto induction = MatchInduction(key, ZeroBased);
 		if (!induction) return UINT32_MAX;
 		const auto [phi, step, initial_arm] = *induction;
 		const auto* incoming = phi->PhiBlock(initial_arm ^ 1u);
@@ -1823,8 +1825,7 @@ private:
 
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound,
 	                       LaneQuantifier lanes = LaneQuantifier::Any) const {
-		return BoundedInduction(key, use,
-		    [](uint32_t initial, uint32_t step) { return initial == 0u && step == 1u; },
+		return BoundedInduction(key, use, ZeroBased,
 		    [&](const Inst& compare, uint32_t initial) {
 			    return (compare.GetOpcode() == ValueOpcode::SLessThan32 ||
 			            compare.GetOpcode() == ValueOpcode::ULessThan32) &&
@@ -1847,6 +1848,29 @@ private:
 		return BoundedLoop(key, use, [&](const Inst& compare, uint32_t) {
 			return ValidateRuntimeValue(m_program, compare.Arg(1), RuntimeValueType::Integer);
 		});
+	}
+
+	// A zero-based key that only per-lane data bounds takes the count all uniform zero-based
+	// loops in the program share, assuming each lane's count stays within it.
+	bool ProgramLoopCount(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
+		if (!MatchInduction(key, ZeroBased) || BoundedLoop(key, nullptr) != nullptr) return false;
+		const Inst* count = nullptr;
+		for (auto* block: m_program.blocks) {
+			for (auto& phi: *block) {
+				if (phi.GetOpcode() != ValueOpcode::Phi) break;
+				const auto* compare = BoundedLoop(Value(&phi), nullptr);
+				if (compare == nullptr) continue;
+				if (count != nullptr && !EquivalentValue(m_program, compare->Arg(1), count->Arg(1)))
+					return false;
+				count = compare;
+			}
+		}
+		if (count == nullptr) return false;
+		std::printf("Warning: shader 0x%016llx bounds a per-lane table loop by its uniform loops' "
+		            "count\n", static_cast<unsigned long long>(m_program.shader_hash));
+		indirect.key_count    = count->Arg(1);
+		indirect.signed_count = count->GetOpcode() == ValueOpcode::SLessThan32;
+		return true;
 	}
 
 	Value ActiveValue(Value value, Value guard) const {
@@ -3276,8 +3300,10 @@ private:
 				}
 				if (maximum >= MaxIndirectDescriptorProbes)
 					maximum = ClampedTableMaximum(key, table_source, indirect);
-				if (maximum >= MaxIndirectDescriptorProbes) return false;
-				indirect.key_count = Value(maximum + 1u);
+				if (maximum < MaxIndirectDescriptorProbes)
+					indirect.key_count = Value(maximum + 1u);
+				else if (!ProgramLoopCount(key, indirect))
+					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;
 		} else {

@@ -43557,6 +43557,103 @@ void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
   std::printf("[compute] %s ok\n", test.name);
 }
 
+void CheckLaneCountedImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 0x100u, lanes = 64u, rows = 4u;
+  TestCase test;
+  test.name = "LaneCountedImageTable";
+  test.bda_mappings = {{0u, 0u}};
+  test.initial.resize((base + table_offset + rows * 32u) / 4u);
+  for (u32 lane = 0; lane < lanes; ++lane) test.initial[lane] = lane % (rows + 1u);
+  test.initial[(base + 0x10u) / 4u] = rows;
+  for (u32 row = 0; row < rows; ++row) {
+    auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    image[0] = row + 1u;
+    image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+  }
+  test.user_data[0] = base;
+  const auto output = MakeStructuredStorageBufferData(0u, lanes * 4u);
+  std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+  test.has_user_data = test.has_compute_info = true;
+  test.compute_info.wave_size = 64u;
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.thread_ids_num = 1u;
+  // Two scalar loops each count to [base + 0x10], loaded separately. A table loop sums rows until
+  // each lane reaches the count it loaded; only the scalar loops' count bounds those rows. The
+  // variants load the second count from [base + 0x14] or start the table loop at row 1.
+  struct Shape {
+    const char *name;
+    u32 second_offset = 0x10u, table_start = 0u;
+  };
+  const auto build = [&](const Shape &shape) {
+    std::vector<u32> code;
+    for (const u32 reg : {20u, 21u, 5u, 6u}) AppendVMovLiteral(&code, reg, 0u);
+    code.insert(code.end(), {EncodeVop2(0x1a, 30, InlineU32(2), 0), EncodeMubuf0(0x0cu),
+        EncodeMubuf1(3, 12, 30)});
+    const auto append_loop = [&](u32 key, u32 start, u32 compare, u32 exit_opcode,
+                                 std::initializer_list<u32> body) {
+      code.push_back(EncodeSMovB32(key, InlineU32(start)));
+      const auto loop = code.size(), exit = loop + 1u;
+      code.insert(code.end(), {compare, 0u});
+      code.insert(code.end(), body);
+      code.push_back(EncodeSop2(0x02, key, key, InlineU32(1)));
+      code.push_back(EncodeSopp(0x02, loop - code.size() - 1u));
+      code[exit] = EncodeSopp(exit_opcode, code.size() - exit - 1u);
+    };
+    for (const u32 offset : {0x10u, shape.second_offset}) {
+      code.insert(code.end(), {EncodeSmem0(0x00, 22), EncodeSmem1(offset, 125)});
+      append_loop(20, 0, EncodeSopc(0x0a, 20, 22), 0x04, {EncodeVop2(0x03, 5, 242u, 5)}); // += 1.0
+    }
+    code.push_back(EncodeSop1(0x04, 34, 126));
+    append_loop(21, shape.table_start, EncodeVopc(0xd1, 21, 3), 0x08,
+                {EncodeSop2(0x1e, 23, 21, InlineU32(5)), EncodeSop2(0x02, 23, 23, 255),
+                 table_offset, EncodeSmem0(0x03, 8), EncodeSmem1(0, 23), EncodeMimg0(0x00, 1),
+                 EncodeMimg1(4, 20, 2, 10), EncodeVop2(0x03, 6, Vgpr(4), 6)});
+    code.insert(code.end(), {EncodeSop1(0x04, 126, 34), EncodeVop2(0x20, 7, Vgpr(5), 6),
+        std::bit_cast<u32>(16.0f)});
+    AppendBufferStoreDword(&code, 7, 30);
+    AppendEnd(&code);
+    return code;
+  };
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ShaderRecompiler::CompileOptions options;
+  options.user_data = test.user_data;
+  options.input_info.compute = &test.compute_info;
+  for (const auto &shape : {Shape{.name = "LaneCountedImageTableCounts", .second_offset = 0x14u},
+                            Shape{.name = "LaneCountedImageTableStart", .table_start = 1u}})
+    ExpectFatal(shape.name, [&] { ShaderRecompiler::TranslateProgram(build(shape), options); });
+#endif
+  test.code = build({.name = test.name});
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_LOAD_DWORD,
+                  O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_LSHL_B32, O::S_ADD_I32,
+                  O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_ADD_F32, O::S_BRANCH, O::S_MOV_B64,
+                  O::V_CMPX_LT_U32, O::S_CBRANCH_EXECZ, O::V_MADMK_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  Require(test.name, "table rows", compiled.resources.images.size() == rows,
+          "the lane-counted loop did not take the scalar loops' rows");
+  std::vector<VulkanHarness::Image> images;
+  for (const auto &descriptor : compiled.resources.images)
+    images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+        vk::ImageUsageFlagBits::eSampled,
+        {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal));
+  auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+  vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, images);
+  std::vector<u32> expected;
+  for (u32 lane = 0; lane < lanes; ++lane) {
+    const auto count = lane % (rows + 1u);
+    expected.push_back(std::bit_cast<u32>(16.0f * 2.0f * rows +
+                                          static_cast<float>(count * (count + 1u) / 2u)));
+  }
+  CompareWords(test, "scalar counts and lane-counted rows", expected,
+               vulkan.ReadBuffer(test.name, buffer, expected.size()));
+  vulkan.DestroyBuffer(&buffer);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %s ok\n", test.name);
+}
+
 void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 base = 256u, table_offset = 0x100u;
@@ -54839,6 +54936,7 @@ int main(int argc, char **argv) {
     CheckWaterfallFloorImageTable(vulkan);
     CheckMixedDimensionImageTable(vulkan);
     CheckClampedSiblingImageTable(vulkan);
+    CheckLaneCountedImageTable(vulkan);
     CheckGuardedSelectorImageTable(vulkan);
     CheckInclusiveGuardImageTable(vulkan);
     CheckNestedPointerImageTable(vulkan);
@@ -55023,6 +55121,7 @@ int main(int argc, char **argv) {
   CheckWaterfallFloorImageTable(vulkan);
   CheckMixedDimensionImageTable(vulkan);
   CheckClampedSiblingImageTable(vulkan);
+  CheckLaneCountedImageTable(vulkan);
   CheckGuardedSelectorImageTable(vulkan);
   CheckInclusiveGuardImageTable(vulkan);
   CheckNestedPointerImageTable(vulkan);
