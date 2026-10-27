@@ -4,10 +4,12 @@
 
 #include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -75,6 +77,56 @@ bool IsGpuThread() noexcept {
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept {
 	Add(driver_cache_hit ? Counter::GfxPipelineHits : Counter::GfxPipelineMisses, 1);
 	Add(driver_cache_hit ? Counter::GfxPipelineHitNs : Counter::GfxPipelineMissNs, duration_ns);
+}
+
+uint64_t SteadyUs() noexcept {
+	return NowUs();
+}
+
+namespace {
+
+struct CompileLog {
+	std::mutex mutex;
+	std::FILE* file = nullptr;
+};
+
+CompileLog& GetCompileLog() noexcept {
+	static CompileLog* log = [] {
+		auto*       l    = new CompileLog;
+		const char* path = std::getenv("KYTY_COMPILE_LOG");
+		if (path != nullptr && path[0] != '\0') {
+			l->file = std::fopen(path, "w");
+		}
+		if (l->file != nullptr) {
+			const auto local = LocalNow();
+			std::fprintf(l->file, "# start %02d:%02d:%02d steady_us=%" PRIu64 "\n", local.tm_hour,
+			             local.tm_min, local.tm_sec, NowUs());
+			std::fflush(l->file);
+		}
+		return l;
+	}();
+	return *log;
+}
+
+} // namespace
+
+bool CompileLogEnabled() noexcept {
+	static const bool enabled = GetCompileLog().file != nullptr;
+	return enabled;
+}
+
+void CompileLogLine(const char* format, ...) noexcept {
+	auto& log = GetCompileLog();
+	if (log.file == nullptr) {
+		return;
+	}
+	std::va_list args;
+	va_start(args, format);
+	std::scoped_lock lock(log.mutex);
+	std::vfprintf(log.file, format, args);
+	std::fputc('\n', log.file);
+	std::fflush(log.file);
+	va_end(args);
 }
 
 void NoteFlipArg(int64_t arg) noexcept {

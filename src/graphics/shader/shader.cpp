@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
@@ -74,6 +75,10 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	if (PerfStats::CompileLogEnabled()) {
+		PerfStats::CompileLogLine("R %" PRIu64 " %016" PRIx64 " %u %u", PerfStats::SteadyUs(), hash,
+		                          static_cast<uint32_t>(data.type), data.code_size_bytes / 4u);
+	}
 	ShaderMapData mapped {data};
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
@@ -574,6 +579,67 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+}
+
+void BuildStageTranslationKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
+	// The static key without the fields only the SPIR-V emission reads: the pixel interpolation
+	// (pixel_input), PA_CL_VS_OUT_CNTL, user clip planes and the clip-space transform.
+	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
+	key.clear();
+	key.push_back(static_cast<uint32_t>(info.logical_stage));
+	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
+	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
+	key.push_back(info.resources_num);
+	key.push_back(info.wave_size);
+	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.lds_size_dwords);
+	key.push_back(info.mesh.threads_num[0]);
+	if (info.mesh.threads_num[0] != 0) {
+		const auto& mesh = info.mesh;
+		key.insert(key.end(), {mesh.threads_num[1], mesh.threads_num[2], mesh.wave_size,
+		                       mesh.host_subgroup_size, mesh.lds_size_dwords,
+		                       mesh.scratch_size_dwords, mesh.input_primitive,
+		                       mesh.primitives_per_group, mesh.vertices_per_group,
+		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
+		                       static_cast<uint32_t>(mesh.fast_launch)});
+	}
+	key.push_back(info.tess.input_control_points);
+	if (info.tess.input_control_points != 0) {
+		const auto& tess = info.tess;
+		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
+		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
+		                       tess.output_topology});
+	}
+	for (int i = 0; i < info.resources_num; i++) {
+		const auto& resource    = info.resources[i];
+		const auto& destination = info.resources_dst[i];
+		key.push_back(destination.registers_num);
+		key.push_back(static_cast<uint32_t>(destination.attr_id));
+		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+	}
+}
+
+void BuildStageTranslationKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
+	// Translation reads the pixel input VGPR layout; exports, interpolation and the render-target
+	// state are read by the SPIR-V emission only.
+	key.clear();
+	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.lds_size_dwords);
+	key.push_back(info.wave_size);
+	key.push_back(info.ps_system_input_base);
+	key.push_back(info.ps_perspective_center_vgpr);
+	key.push_back(info.ps_perspective_sample_vgpr);
+	key.push_back(info.ps_perspective_centroid_vgpr);
+	key.push_back(static_cast<uint32_t>(info.ps_pos_x) | (static_cast<uint32_t>(info.ps_pos_y) << 1u) |
+	              (static_cast<uint32_t>(info.ps_pos_z) << 2u) |
+	              (static_cast<uint32_t>(info.ps_pos_w) << 3u) |
+	              (static_cast<uint32_t>(info.ps_front_face) << 4u) |
+	              (static_cast<uint32_t>(info.ps_ancillary) << 5u));
+}
+
+void BuildStageTranslationKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
+	BuildStageStaticKey(info, key);
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

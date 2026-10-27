@@ -38,6 +38,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -321,8 +322,10 @@ struct PipelineCache::ProgramCache {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
+		const auto emit_begin = diag_log ? PerfStats::SteadyUs() : 0;
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (diag_log) diag_emit_us = PerfStats::SteadyUs() - emit_begin;
 		if (options.stage == ShaderType::Pixel) {
 			// Pixel waves run in 64-lane amdvlk subgroups with no required size: record the guest
 			// wave size and cross-lane use of every pixel shader.
@@ -340,8 +343,10 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		const auto module_begin = diag_log ? PerfStats::SteadyUs() : 0;
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		if (diag_log) diag_module_us = PerfStats::SteadyUs() - module_begin;
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -418,6 +423,28 @@ struct PipelineCache::ProgramCache {
 
 		PerfStats::ScopedTimer recompile_timer(PerfStats::Counter::RecompileNs,
 		                                       PerfStats::Counter::RecompileCount);
+		// KYTY_COMPILE_LOG: classify the miss (N new code, S new static state of known code, P new
+		// resource permutation, C changed callee) and time its phases.
+		const auto diag_begin = diag_log ? PerfStats::SteadyUs() : 0;
+		char       diag_class = 0;
+		bool       diag_translation_seen = false;
+		uint64_t   diag_translation_key  = 0;
+		if (diag_log) {
+			const auto code_key = params.hash ^ (static_cast<uint64_t>(options.stage) << 58u);
+			diag_class = entry != programs.end() ? (source_changed ? 'C' : 'P')
+			             : diag_codes.contains(code_key) ? 'S' : 'N';
+			diag_codes.insert(code_key);
+			BuildStageTranslationKey(input_info, diag_words);
+			diag_words.insert(diag_words.end(),
+			                  {static_cast<uint32_t>(options.stage), params.user_data_count,
+			                   static_cast<uint32_t>(params.code.size()),
+			                   static_cast<uint32_t>(params.back_code.size()), options.wave_size,
+			                   options.user_data_base});
+			diag_translation_key = XXH3_64bits_withSeed(
+			    diag_words.data(), diag_words.size() * sizeof(uint32_t), params.hash);
+			diag_translation_seen = !diag_translations.insert(diag_translation_key).second;
+			diag_emit_us = diag_module_us = 0;
+		}
 		const char* label = nullptr;
 		const char* stage_name = nullptr;
 		switch (options.stage) {
@@ -446,6 +473,7 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
 		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
+		const auto diag_prepared = diag_log ? PerfStats::SteadyUs() : 0;
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
@@ -467,6 +495,7 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		const auto diag_translated = diag_log ? PerfStats::SteadyUs() : 0;
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
@@ -483,6 +512,18 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
+		if (diag_log) {
+			const auto now = PerfStats::SteadyUs();
+			// S time stage hash class translation_seen translation_key prepare_us translate_us
+			//   emit_us module_us total_us program_id permutations
+			PerfStats::CompileLogLine(
+			    "S %" PRIu64 " %s %016" PRIx64 " %c %d %016" PRIx64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+			    " %" PRIu64 " %" PRIu64 " %" PRIu64 " %zu",
+			    diag_begin, stage_name, params.hash, diag_class, diag_translation_seen ? 1 : 0,
+			    diag_translation_key, diag_prepared - diag_begin, diag_translated - diag_prepared,
+			    diag_emit_us, diag_module_us, now - diag_begin,
+			    entry->second.permutations.back().handle.id, entry->second.permutations.size());
+		}
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
@@ -528,6 +569,13 @@ struct PipelineCache::ProgramCache {
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;
 	uint64_t                                                    next_shader_id = 0;
+	// KYTY_COMPILE_LOG diagnostics (GPU thread).
+	const bool                   diag_log = PerfStats::CompileLogEnabled();
+	std::unordered_set<uint64_t> diag_codes;
+	std::unordered_set<uint64_t> diag_translations;
+	std::vector<uint32_t>        diag_words;
+	uint64_t                     diag_emit_us   = 0;
+	uint64_t                     diag_module_us = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -1201,6 +1249,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto diag_begin = PerfStats::CompileLogEnabled() ? PerfStats::SteadyUs() : 0;
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -1211,6 +1260,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                       static_params, m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	if (PerfStats::CompileLogEnabled()) {
+		// P time driver_hit(1/0, -1 unknown) us vs_id ps_id
+		const auto feedback = LastPipelineCacheFeedback();
+		PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin,
+		                          feedback.valid ? (feedback.hit ? 1 : 0) : -1,
+		                          PerfStats::SteadyUs() - diag_begin, vs_id, ps_id);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
@@ -1235,6 +1291,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		ShaderDbgDumpInputInfo(input_info);
 	}
 
+	const auto diag_begin = PerfStats::CompileLogEnabled() ? PerfStats::SteadyUs() : 0;
 	{
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
@@ -1243,6 +1300,12 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                  PerfStats::Counter::CsPipelineCount);
 		CreatePipelineInternal(m_graphics, pipeline, input_info, compute_program.module,
 		                       m_driver_cache);
+	}
+	if (PerfStats::CompileLogEnabled()) {
+		const auto feedback = LastPipelineCacheFeedback();
+		PerfStats::CompileLogLine("C %" PRIu64 " %d %" PRIu64 " %" PRIu64, diag_begin,
+		                          feedback.valid ? (feedback.hit ? 1 : 0) : -1,
+		                          PerfStats::SteadyUs() - diag_begin, compute_program.id);
 	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

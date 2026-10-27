@@ -29,6 +29,11 @@ struct ShaderParams {
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
 void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
+// The part of the static key that ShaderRecompiler::TranslateProgram reads (the rest is read by
+// the SPIR-V emission only): programs with equal code and translation keys translate identically.
+void BuildStageTranslationKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
+void BuildStageTranslationKey(const ShaderPixelInputInfo& input_info, std::vector<uint32_t>& key);
+void BuildStageTranslationKey(const ShaderComputeInputInfo& input_info, std::vector<uint32_t>& key);
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
