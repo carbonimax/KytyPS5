@@ -368,6 +368,7 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	ResetOutputCalls();
 
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "first sync push failed");
+	SetPcm(port, pcm);
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK,
 	      "device-paced sync push was blocked by modelled queue");
 	const auto calls = OutputCalls();
@@ -447,6 +448,23 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestPushConsumesPcm() {
+	const auto context = CreateContext();
+	const auto port    = CreatePort(context, MakeParam());
+	uint32_t   pcm[512] {};
+	SetPcm(port, pcm);
+	ResetOutputCalls();
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push with PCM failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push without new PCM failed");
+	SetPcm(port, pcm);
+	SetPcm(port, nullptr);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push after clearing PCM failed");
+	Check(OutputCalls().size() == 1, "a push replayed PCM the game did not set again");
+
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestPcmCopiedBeforeScratchBufferReuse() {
 	const auto context = CreateContext();
 	const auto param   = MakeParam();
@@ -486,7 +504,6 @@ void TestPortGainAndValidation() {
 	const auto context = CreateContext();
 	const auto port = CreatePort(context, MakeParam());
 	std::vector<float> pcm(512 * 2, 0.25f);
-	SetPcm(port, pcm.data());
 	auto check_output = [&](const std::array<float, 2>& gain, float expected_pcm) {
 		CheckSamples(PushPcm(context, pcm.size() * sizeof(float)).at(0), {expected_pcm},
 		             "gain modified stored PCM");
@@ -494,10 +511,11 @@ void TestPortGainAndValidation() {
 		Check(g_output_gains.size() == 1 && g_output_gains[0] == gain,
 		      "incorrect per-channel gain forwarded to backend");
 	};
+	SetPcm(port, pcm.data());
 	check_output({1.0f, 1.0f}, 0.25f);
 	for (const std::array<float, 2> gain: {std::array {2.0f, 0.5f}, {0.0f, 0.0f}, {1.0f, 1.0f}}) {
 		SetAttribute(port, 1, gain);
-		check_output(gain, 0.25f);
+		SetPcm(port, pcm.data());
 		check_output(gain, 0.25f);
 	}
 
@@ -507,10 +525,11 @@ void TestPortGainAndValidation() {
 	SetPcm(port, pcm.data());
 	check_output(gain, 0.75f);
 
-	std::fill(pcm.begin(), pcm.end(), -0.25f);
-	const Pcm replacement {pcm.data()};
+	const std::vector<float> replacement_pcm(pcm.size(), -0.25f);
+	const Pcm                replacement {replacement_pcm.data()};
 	for (const float invalid: {-1.0f, std::numeric_limits<float>::infinity(),
 	                           std::numeric_limits<float>::quiet_NaN()}) {
+		SetPcm(port, pcm.data());
 		const std::array invalid_gain {1.0f, invalid};
 		const Attribute attributes[] {{0, 0, &replacement, sizeof(replacement)},
 		                              {1, 0, &invalid_gain, sizeof(invalid_gain)}};
@@ -523,6 +542,7 @@ void TestPortGainAndValidation() {
 		Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(&attribute), 1) ==
 		          static_cast<int32_t>(0x80268001u), "malformed gain was accepted");
 	}
+	SetPcm(port, pcm.data());
 	const Attribute duplicates[] {{0, 0, &replacement, sizeof(replacement)},
 	                              {1, 0, &gain, sizeof(gain)}, {1, 0, &gain, sizeof(gain)}};
 	Check(AudioOut2::AudioOut2PortSetAttributes(port, AsAttribute(duplicates), 3) ==
@@ -553,12 +573,10 @@ void TestObjectGainAndAmbisonics() {
 		std::fill(integer.begin(), integer.end(), 0);
 		SetAttribute(object, 1, 0.0f);
 		SetAttribute(object, 8, 65u);
-		for (int push = 0; push < 2; push++) {
-			const auto output = PushPcm(context, output_bytes);
-			Check(output.size() == 1, "object-only push did not output exactly once");
-			CheckSamples(output[0], {0.5f * half_power, 0.5f * half_power},
-			             "object PCM ownership, default gain, or attribute freeze failed");
-		}
+		const auto output = PushPcm(context, output_bytes);
+		Check(output.size() == 1, "object-only push did not output exactly once");
+		CheckSamples(output[0], {0.5f * half_power, 0.5f * half_power},
+		             "object PCM ownership, default gain, or attribute freeze failed");
 		std::fill(floating.begin(), floating.end(), 0.5f);
 		std::fill(integer.begin(), integer.end(), 16384);
 		for (const auto& test: cases) {
@@ -569,10 +587,8 @@ void TestObjectGainAndAmbisonics() {
 			                              {8, 0, &test.channel, sizeof(test.channel)}};
 			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
 			      "object attributes could not be set atomically with PCM first");
-			for (int push = 0; push < 2; push++) {
-				CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
-				             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
-			}
+			CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
+			             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
 		}
 		AudioOut2::AudioOut2ContextAdvance(context);
 		SetAttribute(object, 8, UINT32_MAX);
@@ -599,22 +615,21 @@ void TestObjectBusRouting() {
 	SetPcm(second, bed.data());
 	auto param = MakeParam(0x100);
 	param.port_type = 0x100;
-	std::vector<float> object_pcm(512, 0.25f);
-	SetPcm(CreatePort(context, param), object_pcm.data());
+	const auto object = CreatePort(context, param);
 	param.user_handle = other_user;
-	SetPcm(CreatePort(context, param), object_pcm.data());
-	std::fill(object_pcm.begin(), object_pcm.end(), 1.0f);
-	SetPcm(CreatePort(other_context, param), object_pcm.data());
+	const auto other_user_object = CreatePort(context, param);
+	std::vector<float> object_pcm(512, 0.25f);
+	SetPcm(object, object_pcm.data());
+	SetPcm(other_user_object, object_pcm.data());
+	SetPcm(CreatePort(other_context, param), std::vector<float>(512, 1.0f).data());
 	constexpr auto bytes = 512 * 2 * sizeof(float);
-	for (int push = 0; push < 2; push++) {
-		const auto output = PushPcm(context, bytes);
-		Check(output.size() == 3, "object bus was missing or queued more than once");
-		CheckSamples(output[0], {0.125f}, "objects modified first bed");
-		CheckSamples(output[1], {0.125f}, "objects modified second bed");
-		CheckSamples(output[2], {0.35355339f}, "MAIN objects failed to mix across users or leaked contexts");
-	}
-	SetPcm(first, nullptr);
-	SetPcm(second, nullptr);
+	const auto output = PushPcm(context, bytes);
+	Check(output.size() == 3, "object bus was missing or queued more than once");
+	CheckSamples(output[0], {0.125f}, "objects modified first bed");
+	CheckSamples(output[1], {0.125f}, "objects modified second bed");
+	CheckSamples(output[2], {0.35355339f}, "MAIN objects failed to mix across users or leaked contexts");
+	SetPcm(object, object_pcm.data());
+	SetPcm(other_user_object, object_pcm.data());
 	CheckSamples(PushPcm(context, bytes).at(0), {0.35355339f}, "object output depended on bed PCM");
 	AudioOut2::AudioOut2ContextDestroy(context);
 	Check(LiveDeviceCount() == 1, "context destroy closed another context's object device");
@@ -748,6 +763,7 @@ int main() {
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestPushConsumesPcm();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
