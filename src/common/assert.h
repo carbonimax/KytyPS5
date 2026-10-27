@@ -27,6 +27,14 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Speculative work on a host thread (its result may be dropped; no guest state, no lock held while
+// it works): instead of ending the process, a fatal check on that thread calls `on_retire` with the
+// fatal report, then blocks the thread forever. Nothing is unwound: the thread's objects stay alive
+// and untouched, so no state is left half torn down. The owner of the work replaces the retired
+// thread. nullptr clears it.
+using RetireHandler = void (*)(std::string_view report);
+void SetFatalRetiresThread(RetireHandler on_retire) noexcept;
+
 } // namespace Common
 
 #define EXIT_HALT() (Common::DbgExit(321), 1)
