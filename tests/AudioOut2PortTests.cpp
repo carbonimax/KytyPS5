@@ -111,8 +111,10 @@ PortParam MakeParam(uint32_t data_format = 0x200) {
 	return param;
 }
 
-AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4, uint32_t max_object_ports = 0) {
+AudioOut2::AudioOut2ContextHandle
+CreateContext(uint32_t queue_depth = 4, uint32_t max_object_ports = 0, uint32_t max_ports = 8) {
 	ContextParam param {};
+	param.max_ports                           = max_ports;
 	param.max_object_ports                    = max_object_ports;
 	param.queue_depth                         = queue_depth;
 	param.num_grains                          = 512;
@@ -281,13 +283,139 @@ void TestSlotReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestObjectPortCapacityPerContext() {
+	constexpr int port_full    = static_cast<int32_t>(0x80268012u);
+	constexpr int invalid_port = static_cast<int32_t>(0x80268009u);
+	std::array<AudioOut2::AudioOut2ContextHandle, 3> contexts {};
+	std::array<AudioOut2::AudioOut2PortHandle, 3>    last_ports {};
+	auto                                             object = MakeParam(0x100);
+	object.port_type                                        = 0x100;
+	for (size_t i = 0; i < contexts.size(); i++) {
+		contexts[i] = CreateContext(4, 512, 32);
+		CreatePort(contexts[i], MakeParam());
+		for (size_t j = 0; j < 512; j++) {
+			AudioOut2::AudioOut2PortHandle port = 0;
+			Check(AudioOut2::AudioOut2PortCreate(contexts[i], AsParam(&object), &port) == OK,
+			      "context could not create all 512 object ports");
+			last_ports[i] = port;
+		}
+		AudioOut2::AudioOut2PortHandle overflow = UINT64_MAX;
+		Check(AudioOut2::AudioOut2PortCreate(contexts[i], AsParam(&object), &overflow) ==
+		              port_full &&
+		          overflow == UINT64_MAX,
+		      "object capacity did not reject the 513th port without changing its output");
+		CreatePort(contexts[i], MakeParam());
+	}
+
+	for (size_t i = 0; i < contexts.size(); i++) {
+		const auto stale = last_ports[i];
+		AudioOut2::AudioOut2PortDestroy(stale);
+		last_ports[i] = CreatePort(contexts[i], object);
+		Check(last_ports[i] != stale &&
+		          AudioOut2::AudioOut2PortSetAttributes(stale, nullptr, 0) == invalid_port,
+		      "reused object slot accepted its old handle");
+		std::array<float, 512> pcm;
+		pcm.fill(0.25f * static_cast<float>(i + 1));
+		SetPcm(last_ports[i], pcm.data());
+		const auto  output   = PushPcm(contexts[i], 512 * 2 * sizeof(float));
+		const float expected = pcm[0] * 0.70710678f;
+		Check(output.size() == 1, "last object port did not reach its context's mixer");
+		CheckSamples(output[0], {expected, expected}, "object audio crossed context boundaries");
+	}
+
+	AudioOut2::AudioOut2ContextDestroy(contexts[0]);
+	Check(AudioOut2::AudioOut2PortSetAttributes(last_ports[0], nullptr, 0) == invalid_port,
+	      "destroyed context retained its object handles");
+	const auto replacement = CreateContext(4, 512);
+	for (size_t i = 0; i < 512; i++) {
+		CreatePort(replacement, object);
+	}
+	Check(AudioOut2::AudioOut2PortSetAttributes(last_ports[0], nullptr, 0) == invalid_port,
+	      "reused context accepted an old object handle");
+	for (size_t i = 1; i < contexts.size(); i++) {
+		Check(AudioOut2::AudioOut2PortSetAttributes(last_ports[i], nullptr, 0) == OK,
+		      "destroying another context invalidated a live object port");
+		AudioOut2::AudioOut2ContextDestroy(contexts[i]);
+	}
+	AudioOut2::AudioOut2ContextDestroy(replacement);
+	Check(LiveDeviceCount() == 0, "object capacity test leaked audio devices");
+}
+
+void TestContextPortLimits() {
+	constexpr int port_full = static_cast<int32_t>(0x80268012u);
+	ContextParam  param {};
+	param.max_ports                           = 1;
+	param.max_object_ports                    = 2;
+	param.num_grains                          = 512;
+	AudioOut2::AudioOut2ContextHandle context = 0;
+	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
+	      "small context create failed");
+	auto object             = MakeParam(0x100);
+	object.port_type        = 0x100;
+	const auto channel      = CreatePort(context, MakeParam());
+	const auto first_object = CreatePort(context, object);
+	CreatePort(context, object);
+	AudioOut2::AudioOut2PortHandle overflow      = 0;
+	const auto                     channel_param = MakeParam();
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&channel_param), &overflow) ==
+	              port_full &&
+	          AudioOut2::AudioOut2PortCreate(context, AsParam(&object), &overflow) == port_full,
+	      "declared channel/object capacities were ignored");
+	AudioOut2::AudioOut2PortDestroy(channel);
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&object), &overflow) == port_full,
+	      "object port borrowed a channel slot");
+	CreatePort(context, channel_param);
+	AudioOut2::AudioOut2PortDestroy(first_object);
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&channel_param), &overflow) == port_full,
+	      "channel port borrowed an object slot");
+	CreatePort(context, object);
+	AudioOut2::AudioOut2ContextDestroy(context);
+	param.max_ports = param.max_object_ports = 0;
+	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
+	      "empty context create failed");
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&channel_param), &overflow) ==
+	              port_full &&
+	          AudioOut2::AudioOut2PortCreate(context, AsParam(&object), &overflow) == port_full,
+	      "zero port capacity was ignored");
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestContextCapacityParameters() {
+	constexpr int invalid_param = static_cast<int32_t>(0x80268001u);
+	ContextParam  param;
+	std::memset(&param, 0xff, sizeof(param));
+	Check(AudioOut2::AudioOut2ContextResetParam(
+	          reinterpret_cast<AudioOut2::AudioOut2ContextParam*>(&param)) == OK &&
+	          param.max_ports == 8 && param.max_object_ports == 0 &&
+	          param.guarantee_object_ports == 0 && param.num_grains == 256 &&
+	          param.queue_depth == 1 && param.flags == 0 &&
+	          std::all_of(std::begin(param.reserved), std::end(param.reserved),
+	                      [](uint32_t word) { return word == 0; }),
+	      "context reset did not produce valid default parameters");
+	const auto defaults = param;
+	for (size_t i = 0; i < 3; i++) {
+		param = defaults;
+		if (i == 0) param.max_ports = 33;
+		if (i == 1) param.max_object_ports = 513;
+		if (i == 2) param.guarantee_object_ports = 1;
+		size_t                            memory  = SIZE_MAX;
+		AudioOut2::AudioOut2ContextHandle context = UINT64_MAX;
+		Check(AudioOut2::AudioOut2ContextQueryMemory(AsParam(&param), &memory) == invalid_param &&
+		          memory == SIZE_MAX &&
+		          AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) ==
+		              invalid_param &&
+		          context == UINT64_MAX && LiveDeviceCount() == 0,
+		      "invalid capacities allocated resources or modified outputs");
+	}
+}
+
 void TestFullTableRecovers() {
 	const auto                                  context = CreateContext();
 	const auto                                  param   = MakeParam();
 	std::vector<AudioOut2::AudioOut2PortHandle> ports;
-	ports.reserve(256);
+	ports.reserve(8);
 
-	for (int i = 0; i < 256; i++) {
+	for (int i = 0; i < 8; i++) {
 		AudioOut2::AudioOut2PortHandle port = 0;
 		Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
 		      "port table filled early");
@@ -324,6 +452,11 @@ void TestConcurrentCreates() {
 		});
 	}
 	WaitForDeviceOpens(thread_count);
+	AudioOut2::AudioOut2PortHandle overflow = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &overflow) ==
+	              static_cast<int32_t>(0x80268012u) &&
+	          overflow == 0,
+	      "pending creates did not reserve their channel capacity");
 	ReleaseDeviceOpens();
 	for (auto& thread: threads) {
 		thread.join();
@@ -351,17 +484,31 @@ void TestContextDestroyCancelsPendingCreate() {
 	    [&]() { result = AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port); });
 	WaitForDeviceOpens(1);
 	AudioOut2::AudioOut2ContextDestroy(context);
+	const auto                     replacement        = CreateContext();
+	AudioOut2::AudioOut2PortHandle replacement_port   = 0;
+	int                            replacement_result = OK;
+	std::thread                    replacement_creator([&]() {
+		replacement_result =
+		    AudioOut2::AudioOut2PortCreate(replacement, AsParam(&param), &replacement_port);
+	});
+	WaitForDeviceOpens(2);
 	ReleaseDeviceOpens();
 	creator.join();
+	replacement_creator.join();
 
 	Check(result != OK, "destroyed context retained a pending port create");
+	Check(replacement_result == OK &&
+	          AudioOut2::AudioOut2PortSetAttributes(replacement_port, nullptr, 0) == OK &&
+	          LiveDeviceCount() == 1,
+	      "cancelled create corrupted the replacement context or leaked a device");
+	AudioOut2::AudioOut2ContextDestroy(replacement);
 	Check(LiveDeviceCount() == 0, "cancelled port create leaked a device");
 }
 
 void TestSynchronousDevicePushBypassesModelledQueue() {
-	const auto context = CreateContext(1);
-	const auto param   = MakeParam();
-	AudioOut2::AudioOut2PortHandle port = 0;
+	const auto                     context = CreateContext(1);
+	const auto                     param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port    = 0;
 	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
 	      "device port create failed");
 
@@ -778,6 +925,9 @@ int main() {
 	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
 	TestUserSupportedAttributes();
 	TestSlotReuse();
+	TestObjectPortCapacityPerContext();
+	TestContextPortLimits();
+	TestContextCapacityParameters();
 	TestFullTableRecovers();
 	TestConcurrentCreates();
 	TestContextDestroyCancelsPendingCreate();
