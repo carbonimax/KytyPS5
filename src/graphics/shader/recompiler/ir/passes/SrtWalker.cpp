@@ -10,6 +10,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -185,6 +186,11 @@ std::atomic<uint64_t>                                  g_protected_calls {0};
 std::atomic<uint64_t>                                  g_protected_evictions {0};
 std::atomic<uint64_t>                                  g_protected_ns {0};
 std::atomic<uint64_t>                                  g_protected_synced {0};
+
+std::atomic<uint64_t> g_reuse_checks {0};
+std::atomic<uint64_t> g_reuse_hits {0};
+std::atomic<uint64_t> g_reuse_ns {0};
+std::atomic<uint64_t> g_reuse_diffs {0};
 
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
@@ -542,7 +548,7 @@ private:
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
-	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
+	uint32_t m_shader_base = 0, m_reach = 0, m_restart = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
 
@@ -793,6 +799,8 @@ void WalkerCompiler::Layout() {
 	}
 	m_reach = offset;
 	offset += static_cast<uint32_t>(m_plan.control_flow.size());
+	// Set when the walk restarts (zeroed with the reachability, kept by the restart).
+	m_restart = offset++;
 	m_states = offset;
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) m_nodes[index].state = offset++;
@@ -1067,7 +1075,13 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		c.add(c.r8, 8);
+		if (WalkReuseMode() != 0) {
+			// The loaded value too, for KYTY_SRT_WALK_REUSE (validation of a later walk).
+			c.mov(c.qword[c.r8 + 8], c.rax);
+			c.add(c.r8, 16);
+		} else {
+			c.add(c.r8, 8);
+		}
 		Store(node);
 	}
 	c.L(zero);
@@ -1426,6 +1440,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	c.ret();
 	if (resources && !blocks.empty()) {
 		c.L(reset);
+		c.mov(c.byte[c.rdx + m_restart], 1);
 		Zero(m_states, m_states_end - m_states);
 		c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
 		c.jmp(pass, Near);
@@ -1433,8 +1448,9 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
+	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures * (WalkReuseMode() != 0 ? 2u : 1u), 0u);
 	m_plan.srt_user_data = m_user_data;
+	m_plan.srt_restart   = m_restart;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
 }
@@ -1443,15 +1459,117 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	plan.srt_memo_loads = UINT32_MAX;
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
+
+uint32_t WalkReuseMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_SRT_WALK_REUSE");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 1u;
+	}();
+	return mode;
+}
+
+namespace {
+
+// KYTY_SRT_WALK_REUSE: compares the (address, value) pairs a walk recorded with what the walker
+// would load now, loading exactly as it does (LoadGuest), so the exception handler treats these
+// loads as walker loads while t_running_walker points here. Returns 1 when every value matches.
+using LoadValidator = uint32_t KYTY_SYSV_ABI (*)(const uint64_t* begin, const uint64_t* end);
+
+const Xbyak::CodeGenerator& LoadValidatorCode() {
+	static const auto* code = [] {
+		auto* c = new Xbyak::CodeGenerator(4096);
+		Xbyak::Label loop, same, differ;
+		c->L(loop);
+		c->cmp(c->rdi, c->rsi);
+		c->jae(same, Xbyak::CodeGenerator::T_NEAR);
+		c->mov(c->r10, c->qword[c->rdi]);
+		LoadGuest(*c, c->r10); // keeps rdi, rsi, rdx and r8
+		c->cmp(c->eax, c->dword[c->rdi + 8]);
+		c->jne(differ, Xbyak::CodeGenerator::T_NEAR);
+		c->add(c->rdi, 16);
+		c->jmp(loop, Xbyak::CodeGenerator::T_NEAR);
+		c->L(same);
+		c->mov(c->eax, 1);
+		c->ret();
+		c->L(differ);
+		c->xor_(c->eax, c->eax);
+		c->ret();
+		c->readyRE();
+		EXIT_IF(Xbyak::GetError() != 0);
+		return c;
+	}();
+	return *code;
+}
+
+uint64_t ElapsedNs(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+// The memo's recorded loads still read the same values (the plan's inputs already match).
+bool MemoLoadsHold(const ResourcePlan& plan) {
+	const auto* begin = plan.srt_scratch.data() + plan.srt_captures / 8u;
+	const auto& code  = LoadValidatorCode();
+	t_running_walker  = &code;
+	const auto same   = code.getCode<LoadValidator>()(begin, begin + 2u * plan.srt_memo_loads);
+	t_running_walker  = nullptr;
+	return same != 0u;
+}
+
+bool MemoInputsMatch(const ResourcePlan& plan, const SrtRuntime& runtime) {
+	return plan.srt_memo_loads != UINT32_MAX && plan.srt_memo_shader_base == runtime.shader_base &&
+	       std::equal(plan.srt_memo_user_data.begin(), plan.srt_memo_user_data.end(), runtime.user_data.begin());
+}
+
+void LogReuseMismatch(const ResourcePlan& plan, const char* what, size_t index, uint64_t memo, uint64_t walked) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		std::printf("SRT walk reuse mismatch: shader=%016llx stage=%u %s[%zu] memo=%016llx walk=%016llx\n",
+		            static_cast<unsigned long long>(plan.shader_hash), static_cast<unsigned>(plan.stage), what, index,
+		            static_cast<unsigned long long>(memo), static_cast<unsigned long long>(walked));
+	}
+}
+
+} // namespace
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
-	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	const bool timed = g_walk_stats.load(std::memory_order_relaxed);
+	const bool     timed  = g_walk_stats.load(std::memory_order_relaxed);
+	const uint32_t reuse  = WalkReuseMode();
+	const uint32_t stride = reuse != 0 ? 2u : 1u;
+	// Verify mode: the memo's scratch and flat result, compared with the walk below.
+	std::vector<uint64_t> memo_scratch;
+	bool                  verify = false;
+	if (reuse != 0 && MemoInputsMatch(plan, runtime)) {
+		const auto start = std::chrono::steady_clock::now();
+		const bool hold  = MemoLoadsHold(plan);
+		if (timed) {
+			g_reuse_checks.fetch_add(1, std::memory_order_relaxed);
+			g_reuse_hits.fetch_add(hold ? 1u : 0u, std::memory_order_relaxed);
+			g_reuse_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+		}
+		if (hold && reuse == 1u) {
+			flat = plan.srt_memo_flat;
+			if (reads != nullptr) {
+				const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
+				for (uint32_t load = 0; load < plan.srt_memo_loads; ++load)
+					reads->emplace_back(captures[load * 2u], sizeof(uint32_t));
+			}
+			return true;
+		}
+		if (hold) {
+			verify = true;
+			memo_scratch.assign(plan.srt_scratch.begin(),
+			                    plan.srt_scratch.begin() + plan.srt_captures / 8u + 2u * plan.srt_memo_loads);
+		}
+	}
+	plan.srt_memo_loads = UINT32_MAX;
+	flat.assign(plan.srt_reads.size(), 0u);
 	const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
@@ -1465,9 +1583,42 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		                    std::memory_order_relaxed);
 	}
 	if (end == nullptr) return false;
+	const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
+		for (const auto* read = captures; read != end; read += stride)
 			reads->emplace_back(*read, sizeof(uint32_t));
+	}
+	if (reuse != 0) {
+		const auto loads = static_cast<uint32_t>((end - captures) / 2);
+		if (verify) {
+			bool same = memo_scratch.size() == static_cast<size_t>(end - plan.srt_scratch.data());
+			for (size_t i = 0; same && i < memo_scratch.size(); ++i) {
+				if (memo_scratch[i] != plan.srt_scratch[i]) {
+					same = false;
+					LogReuseMismatch(plan, "scratch", i, memo_scratch[i], plan.srt_scratch[i]);
+				}
+			}
+			if (same && plan.srt_memo_flat != flat) {
+				same = false;
+				const auto at = static_cast<size_t>(
+				    std::mismatch(flat.begin(), flat.end(), plan.srt_memo_flat.begin(), plan.srt_memo_flat.end())
+				        .first -
+				    flat.begin());
+				LogReuseMismatch(plan, "flat", at, at < plan.srt_memo_flat.size() ? plan.srt_memo_flat[at] : 0u,
+				                 at < flat.size() ? flat[at] : 0u);
+			}
+			if (!same && memo_scratch.size() != static_cast<size_t>(end - plan.srt_scratch.data())) {
+				LogReuseMismatch(plan, "loads", 0, memo_scratch.size(), static_cast<uint64_t>(end - plan.srt_scratch.data()));
+			}
+			if (!same) g_reuse_diffs.fetch_add(1, std::memory_order_relaxed);
+		}
+		// A restarted walk may have reached blocks through loads its last pass no longer recorded.
+		if (Scratch(plan)[plan.srt_restart] == 0u) {
+			plan.srt_memo_user_data.assign(runtime.user_data.begin(), runtime.user_data.begin() + plan.srt_user_data);
+			plan.srt_memo_flat        = flat;
+			plan.srt_memo_shader_base = runtime.shader_base;
+			plan.srt_memo_loads       = loads;
+		}
 	}
 	return true;
 }
@@ -1542,7 +1693,11 @@ WalkStats TakeWalkStats() noexcept {
 	        .protected_calls = g_protected_calls.exchange(0, std::memory_order_relaxed),
 	        .protected_evictions = g_protected_evictions.exchange(0, std::memory_order_relaxed),
 	        .protected_ns = g_protected_ns.exchange(0, std::memory_order_relaxed),
-	        .protected_synced = g_protected_synced.exchange(0, std::memory_order_relaxed)};
+	        .protected_synced = g_protected_synced.exchange(0, std::memory_order_relaxed),
+	        .reuse_checks = g_reuse_checks.exchange(0, std::memory_order_relaxed),
+	        .reuse_hits   = g_reuse_hits.exchange(0, std::memory_order_relaxed),
+	        .reuse_ns     = g_reuse_ns.exchange(0, std::memory_order_relaxed),
+	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed)};
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

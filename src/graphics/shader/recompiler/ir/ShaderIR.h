@@ -699,8 +699,15 @@ struct ResourcePlan {
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.
+	uint32_t                              srt_restart   = 0; // Scratch byte set when a walk restarted.
 	// GPU-thread scratch for walker results and material keys.
 	mutable std::vector<uint64_t>           srt_scratch;
+	// KYTY_SRT_WALK_REUSE (SrtWalker.cpp): inputs and flat result of the last walk, whose results
+	// the scratch still holds; srt_memo_loads = UINT32_MAX when they cannot be reused.
+	mutable std::vector<uint32_t>           srt_memo_user_data;
+	mutable std::vector<uint32_t>           srt_memo_flat;
+	mutable uint64_t                        srt_memo_shader_base = 0;
+	mutable uint32_t                        srt_memo_loads       = UINT32_MAX;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
 };

@@ -712,6 +712,10 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	# These count the walker's guest reads: KYTY_SRT_WALK_REUSE validation would add reads.
+	set_tests_properties(shader_cfg resource_materialization resource_tracking PROPERTIES
+	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
+	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
