@@ -45427,6 +45427,123 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
 }
 
+void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
+  constexpr const char *name = "SamplerCandidateTables";
+  constexpr u32 wave_size = 32u, sampler_count = 4u;
+  using namespace ShaderRecompiler::IR;
+
+  CompiledShader compiled;
+  auto &program = compiled.program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = wave_size;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+
+  // Lane L selects ordinal L - 1, so lane 0 selects 0xffffffff.
+  auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &ordinal = block->AppendNewInst(ValueOpcode::ISub32, {Value(&lane), Value(1u)});
+  auto &image = block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &sampler = block->AppendNewInst(ValueOpcode::GetSamplerResource,
+                                       {Value(&ordinal), Value(0u), Value(0u), Value(0u)});
+  // LOD 16 clamps to each sampler's maxLod, so sampler N reads mip N.
+  auto &address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(std::bit_cast<u32>(16.0f)), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Image;
+  memory.dmask = 0xf;
+  memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
+  memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  memory.image_address_components = 3;
+  program.memory_info.push_back(memory);
+  auto &sample = block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw, {Value(&image), Value(&sampler), Value(&address), Value(true)});
+  sample.SetFlags(MemoryFlags{0u, 0x10f0u});
+  auto &sample_x =
+      block->AppendNewInst(ValueOpcode::CompositeExtractU32x4, {Value(&sample), Value(0u)});
+  auto &byte_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&lane), Value(4u)});
+  auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
+                                      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  auto &store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(&byte_offset), Value(0u), Value(&sample_x), Value(true)});
+  store.SetFlags(MemoryFlags{1u, 0u});
+
+  program.descriptor_sources.resize(2);
+  program.descriptor_sources[0].dword_count = 8;
+  program.descriptor_sources[1].dword_count = 4;
+  ImageResource texture{};
+  texture.first_use_pc = 0x10f0u;
+  texture.resource_class = ImageResourceClass::Sampled;
+  texture.numeric_class = Prospero::TextureNumericClass::Float;
+  texture.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  texture.read = true;
+  program.info.images = {texture};
+  program.info.samplers.assign(sampler_count,
+                               SamplerResource{.source = 1u, .first_use_pc = 0x10f0u});
+  program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+  program.info.buffers.push_back({.packed_stride = 1, .written = true});
+
+  std::vector<std::vector<u32>> mips;
+  std::vector<vk::Sampler> native_samplers;
+  for (u32 mip = 0; mip < sampler_count; ++mip) {
+    const auto size = 32u >> mip;
+    mips.emplace_back(size * size, std::bit_cast<u32>(float(10u + mip)));
+    native_samplers.push_back(vulkan.CreateSampler(name, mip + 1u));
+  }
+  std::array textures{vulkan.CreateImageMips(
+      name, 32, 32, vk::Format::eR32Sfloat, vk::ImageUsageFlagBits::eSampled, mips, 1,
+      vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1)};
+  ShaderComputeInputInfo compute{};
+  compute.wave_size = wave_size;
+  compute.host_subgroup_size = vulkan.SubgroupSize();
+  compute.threads_num[0] = wave_size;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  TestCase test;
+  test.name = name;
+  // A table consecutive from ordinal 1 selects without a switch; a single candidate and a table
+  // with a gap keep it.
+  const std::array<std::vector<u32>, 3> tables{{{3u, 0u, 1u}, {2u}, {0u, 2u, 1u}}};
+  for (const auto &table : tables) {
+    program.info.samplers[0].indirect_resources = table;
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
+    ValidateSpirv(name, compiled.spirv);
+    std::string text;
+    Require(name, "sampler table disassembly", tools.Disassemble(compiled.spirv, &text),
+            "failed to disassemble the sampler table shader");
+    Require(name, "sampler table selection",
+            CountText(text, "OpSwitch") == (&table == &tables.front() ? 0u : 1u),
+            "only a consecutive sampler table selects without a switch");
+    test.initial.assign(wave_size, 0xdeadbeefu);
+    test.expected.resize(wave_size);
+    for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {
+      const auto selected = lane_index - 1u;
+      test.expected[lane_index] =
+          std::bit_cast<u32>(float(10u + table[selected < table.size() ? selected : 0u]));
+    }
+    auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures,
+                    native_samplers);
+    CompareWords(test, "selected sampler per ordinal", test.expected,
+                 vulkan.ReadBuffer(name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", name);
+  for (const auto native_sampler : native_samplers) vulkan.Device().destroySampler(native_sampler);
+  vulkan.DestroyImage(&textures[0]);
+}
+
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
   using O = ShaderOpcode;
 
@@ -54983,6 +55100,7 @@ int main(int argc, char **argv) {
     vulkan.CheckResidentImageHeap();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
+    CheckSamplerCandidateTables(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -55170,6 +55288,7 @@ int main(int argc, char **argv) {
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);
   CheckFiniteInlineSamplerPhi(vulkan);
+  CheckSamplerCandidateTables(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
