@@ -35,6 +35,8 @@ int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
 bool                              g_block_outputs = false;
 std::vector<int>                  g_blocked_output;
+std::atomic_uint64_t              g_process_time {0};
+std::atomic_bool                  g_process_time_frozen {false};
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -465,6 +467,27 @@ void TestPushConsumesPcm() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestQueueDrainsAtExactGrainRate() {
+	// Three 512-sample grains play in exactly 32000 us.
+	const auto context = CreateContext();
+	g_process_time_frozen = true;
+	const auto start      = g_process_time.load();
+	for (int push = 0; push < 3; push++) {
+		Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "async push failed");
+	}
+	const auto queued_after = [&](uint64_t micros) {
+		g_process_time  = start + micros;
+		uint32_t queued = 0;
+		Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, nullptr) == OK,
+		      "queue-level query failed");
+		return queued;
+	};
+	Check(queued_after(31999) == 1, "the third grain drained before it finished playing");
+	Check(queued_after(32000) == 0, "three grains did not drain in their playing time");
+	g_process_time_frozen = false;
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestPcmCopiedBeforeScratchBufferReuse() {
 	const auto context = CreateContext();
 	const auto param   = MakeParam();
@@ -746,8 +769,7 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 namespace Libs::LibKernel {
 
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
-	static std::atomic_uint64_t now {0};
-	return now.fetch_add(1000);
+	return g_process_time_frozen ? g_process_time.load() : g_process_time.fetch_add(1000);
 }
 
 } // namespace Libs::LibKernel
@@ -764,6 +786,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPushConsumesPcm();
+	TestQueueDrainsAtExactGrainRate();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
