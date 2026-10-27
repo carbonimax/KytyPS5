@@ -407,6 +407,20 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 		dynamic_state.SetDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
+	// Rect lists are drawn without culling.
+	vk::CullModeFlags cull_mode {};
+	if (!Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
+		if (mode.cull_front) {
+			cull_mode |= vk::CullModeFlagBits::eFront;
+		}
+		if (mode.cull_back) {
+			cull_mode |= vk::CullModeFlagBits::eBack;
+		}
+	}
+	dynamic_state.SetCullMode(cull_mode);
+	dynamic_state.SetFrontFace(mode.face ? vk::FrontFace::eClockwise
+	                                     : vk::FrontFace::eCounterClockwise);
+
 	dynamic_state.SetStencilTestEnabled(depth.stencil_test_enable);
 	if (depth.stencil_test_enable) {
 		const auto& front = depth.stencil_front;

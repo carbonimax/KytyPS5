@@ -1255,12 +1255,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
-	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
