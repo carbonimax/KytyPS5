@@ -13154,6 +13154,71 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
 }
 #endif
 
+void TestSsaRewriteSealsFilledBlocks() {
+  using namespace ShaderRecompiler::IR;
+  constexpr ScalarReg s0{0};
+
+  const auto add_blocks = [](Program &program) {
+    std::array<Block *, 4> blocks{};
+    for (auto &block : blocks) {
+      block =
+          program.block_storage.emplace_back(std::make_unique<Block>()).get();
+      program.blocks.push_back(block);
+    }
+    return blocks;
+  };
+  const auto use = [&](Block *block) {
+    const auto value = IREmitter(block).GetScalarReg(s0);
+    return &block->AppendNewInst(ValueOpcode::ReferenceU32, {value});
+  };
+  const auto is_phi = [](Value value, const Block *first, Value first_value,
+                         const Block *second, Value second_value) {
+    const auto *phi = value.TryInstruction();
+    return phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
+           phi->NumArgs() == 2u && phi->PhiBlock(0) == first &&
+           phi->Arg(0) == first_value && phi->PhiBlock(1) == second &&
+           phi->Arg(1) == second_value;
+  };
+
+  {
+    // entry(s0 = 7) -> left(s0 = 9) | right -> join.
+    Program program;
+    const auto [entry, left, right, join] = add_blocks(program);
+    entry->AddBranch(left);
+    entry->AddBranch(right);
+    left->AddBranch(join);
+    right->AddBranch(join);
+    IREmitter(entry).SetScalarReg(s0, U32(Value(7u)));
+    IREmitter(left).SetScalarReg(s0, U32(Value(9u)));
+    const auto *right_use = use(right);
+    const auto *join_use = use(join);
+    RewriteToSsa(program.blocks);
+    Check(right_use->Arg(0) == Value(7u) && right->Instructions().size() == 2u,
+          "SSA read in a single-predecessor block went through a trivial Phi");
+    Check(is_phi(join_use->Arg(0), left, Value(9u), right, Value(7u)),
+          "SSA join Phi lost a predecessor value");
+  }
+
+  // entry(s0 = 1) -> header <-> latch(s0 += 1), header -> tail.
+  Program program;
+  const auto [entry, header, latch, tail] = add_blocks(program);
+  entry->AddBranch(header);
+  header->AddBranch(latch);
+  header->AddBranch(tail);
+  latch->AddBranch(header);
+  IREmitter(entry).SetScalarReg(s0, U32(Value(1u)));
+  const auto *header_use = use(header);
+  IREmitter latch_ir(latch);
+  const auto sum = latch_ir.IAdd(latch_ir.GetScalarReg(s0), U32(Value(1u)));
+  latch_ir.SetScalarReg(s0, sum);
+  RewriteToSsa(program.blocks);
+  const auto phi = header_use->Arg(0);
+  Check(is_phi(phi, entry, Value(1u), latch, sum),
+        "SSA loop header Phi lost its entry or back-edge value");
+  Check(sum.Instruction()->Arg(0) == phi && latch->Instructions().size() == 3u,
+        "SSA read after a loop header went through a trivial Phi");
+}
+
 void TestValuePhiValidation() {
   using namespace ShaderRecompiler::IR;
 
@@ -18026,6 +18091,7 @@ int main(int argc, char **argv) {
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();
 #endif
+  TestSsaRewriteSealsFilledBlocks();
   TestValuePhiValidation();
   TestLaneMaskProjection();
   TestLateConstantPropagation();
