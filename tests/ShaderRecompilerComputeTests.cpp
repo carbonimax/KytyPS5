@@ -43515,13 +43515,17 @@ void CheckClampedSiblingImageTable(VulkanHarness &vulkan) {
 void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
   using O = ShaderOpcode;
   constexpr u32 base = 256u, table_offset = 0x100u;
-  // A loop over the set bits of a mask reads each record's row from a four-record buffer. Rows
-  // past it read zero, and a guard keeps row -1, whose descriptor is a 3D image, from the table.
+  // A loop over the set bits of a mask word, which a lane selects from a mask buffer, reads each
+  // record's row from a four-record buffer. Only the words a lane can address select records, so
+  // record 1's float row, set in another word, is never read. Rank 5 is past the records and
+  // reads zero, and a guard keeps row -1, whose descriptor is a 3D image, from the table.
   // A guard on another value keeps row -1, which a table behind a V# reads through the heap.
+  // A loop guard on another value lets an empty mask's scan return -1, which reads key 0 past
+  // the records; the set ranks then miss a key, and no domain holds both, so tracking rejects it.
   constexpr std::array names{"GuardedSelectorImageTable", "GuardedSelectorImageTableOther",
-                             "GuardedSelectorImageTableHeap"};
+                             "GuardedSelectorImageTableHeap", "GuardedSelectorImageTableEmpty"};
   for (u32 variant = 0; variant < names.size(); ++variant) {
-    const bool guarded = variant == 0u, heap = variant == 2u;
+    const bool heap = variant == 2u, empty = variant == 3u, guarded = variant == 0u || empty;
     TestCase test;
     test.name = names[variant];
     test.bda_mappings = {{0u, 0u}};
@@ -43533,18 +43537,25 @@ void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
       image[3] = DstSel(4, 0, 0, 1) | (static_cast<u32>(type) << 28u);
       std::copy_n(image.begin(), 8, test.initial.begin() + (base + table_offset + row * 32) / 4u);
     }
-    for (const auto [record, row] : {std::pair{0u, 2u}, {1u, 5u}, {2u, UINT32_MAX}, {3u, 1u}})
+    for (const auto [record, row] :
+         {std::pair{0u, 2u}, {1u, 0x3f800000u}, {2u, UINT32_MAX}, {3u, 1u}})
       test.initial[(record * 16u + 8u) / 4u] = row;
+    // Lanes address the mask words at multiples of 16 bytes, between the record keys.
+    for (const auto [byte, ranks] : {std::pair{0u, 0b1001u}, {4u, 0b10u}, {16u, 0b100100u}})
+      test.initial[byte / 4u] = ranks;
     auto table = MakeStructuredStorageBufferData(0u, table_offset + 8u * 32u);
     table[0] = base;
     std::copy_n(table.begin(), heap ? 4 : 1, test.user_data.begin());
-    test.user_data[8] = 0b1101u;
     auto records = MakeStructuredStorageBufferData(0u, 64u);
     std::copy_n(records.begin(), 4, test.user_data.begin() + 12);
+    const auto masks = MakeStructuredStorageBufferData(0u, 32u);
+    std::copy_n(masks.begin(), 4, test.user_data.begin() + 24);
     const auto output = MakeStructuredStorageBufferData(0u, 4u);
     std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
     test.has_user_data = test.has_compute_info = true;
     test.compute_info.wave_size = 64u;
+    // The mask word's address sums two lane ids.
+    test.compute_info.thread_ids_num = 2u;
     test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
         test.compute_info.threads_num[2] = 1u;
     auto &code = test.code;
@@ -43552,9 +43563,12 @@ void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
     AppendVMovLiteral(&code, 21, 0u);
     AppendVMovLiteral(&code, 6, 0u);
     AppendVMovLiteral(&code, 30, 0u);
-    code.push_back(EncodeSop1(0x03, 40, 8));
+    const auto active_branch = code.size();
+    code.insert(code.end(), {0u, EncodeVop2(0x25, 7, Vgpr(0), 1),
+        EncodeVop2(0x1a, 7, InlineU32(4), 7), EncodeVop1(0x02, 42, Vgpr(7)),
+        EncodeSmem0(0x08, 40, 12), EncodeSmem1(0, 42)});
     const auto header = code.size();
-    code.push_back(EncodeSopc(0x07, InlineU32(0), 40));
+    code.push_back(EncodeSopc(0x07, InlineU32(0), empty ? 42 : 40));
     const auto exit_branch = code.size();
     code.push_back(0u);
     code.insert(code.end(), {EncodeSop1(0x13, 41, 40), EncodeSop2(0x1e, 5, 41, InlineU32(4)),
@@ -43570,20 +43584,28 @@ void CheckGuardedSelectorImageTable(VulkanHarness &vulkan) {
     code.push_back(EncodeSop1(0x1b, 40, 41));
     code.push_back(EncodeSopp(0x02, header - code.size() - 1u));
     code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+    code[active_branch] = EncodeSopp(0x08, code.size() - active_branch - 1u);
     AppendBufferStoreDword(&code, 6, 30);
     AppendEnd(&code);
+    if (empty) {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal(test.name, [&] { MaterializeCase(test); });
+#endif
+      continue;
+    }
     if (!guarded) {
       Require(test.name, "excluded row", MaterializeCase(test) == heap,
               "a guard on another value excluded row -1, or a V# table enumerated it");
       continue;
     }
-    test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_CMP_LG_U32, O::S_CBRANCH_SCC0,
+    test.opcodes = {O::V_MOV_B32, O::S_CBRANCH_EXECZ, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                    O::V_READFIRSTLANE_B32, O::S_CMP_LG_U32, O::S_CBRANCH_SCC0,
                     O::S_FF1_I32_B32, O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORD, O::S_ADD_I32,
                     O::S_LOAD_DWORDX8, O::IMAGE_LOAD, O::V_ADD_F32, O::S_BITSET0_B32,
                     O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
     const auto compiled = CompileCase(test, vulkan.SubgroupSize());
-    Require(test.name, "selected rows", compiled.resources.images.size() == 4u,
-            "record keys did not select rows 0, 1, 2 and 5");
+    Require(test.name, "selected rows", compiled.resources.images.size() == 3u,
+            "record keys did not select rows 0, 1 and 2");
     std::vector<VulkanHarness::Image> images;
     for (const auto &descriptor : compiled.resources.images)
       images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
