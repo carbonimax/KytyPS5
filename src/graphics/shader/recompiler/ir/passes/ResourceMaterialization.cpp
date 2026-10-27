@@ -1329,14 +1329,16 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 				block.sources.push_back(program.info.buffers.at(memory.resource).source);
 			} else {
 				block.sources.push_back(program.info.images.at(memory.resource).source);
+				block.images.push_back(memory.resource);
 				if (image.needs_sampler) {
 					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
 				}
 			}
 		}
-		std::ranges::sort(block.sources);
-		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
-		                    block.sources.end());
+		for (auto* list: {&block.sources, &block.images}) {
+			std::ranges::sort(*list);
+			list->erase(std::unique(list->begin(), list->end()), list->end());
+		}
 	}
 	for (auto& block: blocks) block.condition = predicate(block.condition);
 	if (std::ranges::none_of(
@@ -1932,7 +1934,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
-			if (!WalkedActive(program, image.source)) {
+			if (!WalkedActive(program, image.source) || !WalkedImageActive(program, i)) {
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
@@ -1952,7 +1954,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (!evaluate(image.source, snapshot.images[i])) {
 				return false;
 			}
-			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			// An image listed only by unreached blocks reads zero, not its source's descriptor.
+			if (!WalkedImageActive(program, i) ||
+			    !ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				snapshot.images[i].dwords.fill(0);
 			}
 		}
