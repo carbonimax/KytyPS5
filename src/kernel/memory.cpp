@@ -999,8 +999,10 @@ void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	g_gpu_resources = resources;
 }
 
-bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
+                    [[maybe_unused]] uint64_t guest_pc) noexcept {
+	// Execute and Unknown accesses are rejected by RenderContext::HandleFault.
+	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, guest_vaddr);
 }
 
 struct PrtAperture {

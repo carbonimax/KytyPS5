@@ -158,7 +158,20 @@ void                   InstallGpuResources(Graphics::RenderContext* renderer) no
 // True when `vaddr` lies in a mapping being split by a partial unmap: the caller waited for the
 // surviving part to be mapped again and can retry the faulting access.
 [[nodiscard]] bool WaitBackingRemap(uint64_t vaddr) noexcept;
-[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// Platform-neutral entry point for host access faults that may come from GPU memory tracking
+// (pages write- or read-protected by the buffer/texture caches). Shared by every host fault handler.
+// - guest_vaddr: the faulting byte, in guest address space (a handler with a biased host mapping
+//   un-biases the host address before calling).
+// - access: only Read and Write are resolved; Execute and Unknown return false.
+// - guest_pc: the faulting instruction's guest address when known, else 0 (informational; no host
+//   CPU context crosses this interface).
+// Returns true when the tracking fault is resolved and the faulting instruction can be retried;
+// false when the fault is not a GPU tracking fault and platform handling must continue.
+// Not async-signal-safe: the resolver takes locks (shared mutexes, mutexes, spinlocks) and a read may
+// wait for the GPU (readback of GPU-written bytes). Call it only from a handler context where
+// blocking on those is allowed (Windows vectored handler, or a signal handler that defers to such).
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t guest_vaddr,
+                                  uint64_t guest_pc = 0) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

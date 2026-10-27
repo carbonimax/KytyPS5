@@ -733,7 +733,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
+		                                            info->exception_address)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0) {
 				Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(false);
