@@ -5677,6 +5677,25 @@ public:
               ImageHeapTestAccess::MemoryCount(heap) == 0u &&
                   textures.GetImage(resident).heap_refs.load() == 0u,
               "unmapping the table kept its images pinned");
+      // A smaller table enters once a second draw acquires it and leaves at the suspend point
+      // after a frame that did not acquire it. Larger tables stay.
+      const IR::ImageHeapRequest small{table, table_size / 2u, 32u, 0u, table_size / 64u, &sampled};
+      Require(name, "first small draw",
+              acquire(sampled, idle_table) && !heap.Acquire(small, view) &&
+                  !heap.Acquire(small, view),
+              "a smaller table entered on its first draw");
+      draw();
+      Require(name, "second small draw", heap.Acquire(small, view),
+              "a smaller table was declined on its second draw");
+      context.RunGarbageCollector();
+      Require(name, "acquired frame", ImageHeapTestAccess::MemoryCount(heap) == 2u,
+              "a table left at the suspend point of a frame that acquired it");
+      draw();
+      context.RunGarbageCollector();
+      Require(name, "idle frame",
+              ImageHeapTestAccess::MemoryCount(heap) == 1u &&
+                  textures.GetImage(resident).heap_refs.load() == 0u,
+              "a suspend point kept an idle smaller table pinned or dropped a larger one");
       // The idle table stays watched; destroying the heap must unwatch it before the page
       // manager fails on live watches.
       Require(name, "idle table",
