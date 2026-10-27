@@ -654,6 +654,10 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	map.num_input_semantics = h->num_input_semantics;
 	map.code_size_bytes     = h->shader_size;
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
+	map.cx_registers        = h->cx_registers;
+	map.sh_registers        = h->sh_registers;
+	map.num_cx_registers    = h->cx_registers != nullptr ? h->num_cx_registers : 0u;
+	map.num_sh_registers    = h->sh_registers != nullptr ? h->num_sh_registers : 0u;
 
 	ShaderMapUserData(base, map);
 

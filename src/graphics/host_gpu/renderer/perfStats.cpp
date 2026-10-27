@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/shader/shaderPretranslate.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -229,6 +230,7 @@ void MaybeReport() noexcept {
 	}
 	CmdRecord::Report(seconds);
 	GuestStacks::Report();
+	ShaderPretranslate::Report();
 	std::fflush(stdout);
 }
 
