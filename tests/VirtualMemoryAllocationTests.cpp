@@ -89,9 +89,14 @@ using Libs::LibKernel::Memory::VirtualQueryInfo;
 
 // Prospero ABI?
 constexpr uint64_t SceKernelPageSize             = 0x4000;
-constexpr uint64_t SceKernelTotalPhysicalSize    = 13824ull * 1024ull * 1024ull;
 constexpr uint64_t SceKernelFlexibleMemorySize   = 448ull * 1024ull * 1024ull;
 constexpr uint64_t TestFlexibleMemorySize        = 3072ull * 1024ull * 1024ull;
+constexpr uint64_t GuestMemoryBudget             = 12800ull * 1024ull * 1024ull;
+constexpr uint64_t ReservedCacheSize             = 64ull * 1024ull * 1024ull;
+// The 128 MiB CPU and 96 MiB AMM mapping tables add 64 + 32 MiB; a zero GPU table size adds none.
+constexpr uint64_t TestCpuTableMemory            = 128ull * 1024ull * 1024ull;
+constexpr uint64_t TestAmmTableMemory            = 96ull * 1024ull * 1024ull;
+constexpr uint64_t TestTableOverhead             = 96ull * 1024ull * 1024ull;
 constexpr int      SceKernelProtCpuRead          = 0x01;
 constexpr int      SceKernelProtCpuRw            = 0x02;
 constexpr int      SceKernelProtCpuExec          = 0x04;
@@ -176,7 +181,9 @@ void InitSubsystems() {
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
 	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
-	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
+	constexpr char json[] =
+	    R"({"kernel":{"flexibleMemorySize":3221225472,"cpuPageTableSize":134217728,)"
+	    R"("gpuPageTableSize":0},"amm":{"pagetableMemorySizeInMib":96}})";
 	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
 	uint32_t bytes_written = 0;
@@ -186,16 +193,19 @@ void InitSubsystems() {
 	      "failed to write temporary param.json");
 
 	Loader::SystemContentLoadParamSfo(param_json);
-	const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+	const auto params = Loader::SystemContentGetMemoryParams();
 	Check("InitSubsystems", Common::File::DeleteFile(param_json),
 	      "failed to remove temporary param.json");
-	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
+	Check("InitSubsystems", params.flexible_size == TestFlexibleMemorySize,
 	      "failed to read flexible memory size from param.json");
+	Check("InitSubsystems",
+	      params.cpu_table_memory == TestCpuTableMemory && params.gpu_table_memory == 0 &&
+	          params.amm_table_memory == TestAmmTableMemory,
+	      "failed to read mapping table sizes from param.json");
 	size_t default_flexible_memory_size = 0;
 	Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&default_flexible_memory_size);
 	Check("InitSubsystems", default_flexible_memory_size == SceKernelFlexibleMemorySize,
 	      "flexible memory does not default to 448 MiB without param.json");
-	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
@@ -867,8 +877,8 @@ void TestFlexibleMemoryCapacityIsBootFixed() {
 	Check(test, configured == TestFlexibleMemorySize,
 	      "boot flexible pool did not use the param.json value");
 	Check(test, configured == baseline, "boot flexible pool did not start at configured capacity");
-	Check(test, backing == SceKernelTotalPhysicalSize,
-	      "boot backing is not the single 13.5 GiB physical file");
+	Check(test, backing == GuestMemoryBudget - ReservedCacheSize - TestTableOverhead,
+	      "boot backing is not the 12.5 GiB budget less the reserved cache and table overhead");
 	Check(test, backing == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
 	      "direct and flexible regions do not partition the boot backing");
 
@@ -1454,7 +1464,10 @@ void TestPageTableStatsTrackRangeEdits() {
 		        "KernelGetPageTableStats");
 		return stats;
 	};
-	const auto baseline    = read_stats();
+	// A 4 KiB table maps 2 MiB: 128 MiB of CPU tables gives 32768, the default 64 MiB GPU 16384.
+	const auto baseline = read_stats();
+	Check(test, baseline[0] == 32768 && baseline[2] == 16384,
+	      "page-table totals do not follow the configured table memory");
 	const auto expect_used = [&](int cpu, int gpu, const char* action) {
 		const auto stats = read_stats();
 		Check(test,

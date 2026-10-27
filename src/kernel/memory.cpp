@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/guestStacks.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
@@ -65,15 +66,21 @@ constexpr int PROT_GPU_WRITE = 0x20;
 
 enum class GpuAccessMode { NoAccess, Read, Write, ReadWrite };
 
-constexpr uint64_t PAGE_TABLE_POOL_SIZE   = 4ull * 1024ull * 1024ull * 1024ull;
-constexpr uint64_t PAGE_TABLE_GRANULARITY = 2ull * 1024ull * 1024ull;
-constexpr int      PAGE_TABLE_POOL_ENTRIES =
-    static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
+constexpr uint64_t PAGE_TABLE_GRANULARITY       = 2ull * 1024ull * 1024ull;
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 448ull * 1024ull * 1024ull;
+// A game gets 12.5 GiB. A fixed 64 MiB cache and mapping table memory past the 64 MiB included
+// for each of the CPU, GPU and AMM tables come off the top; flexible and direct memory share what
+// is left. One 4 KiB table maps 2 MiB.
+constexpr uint64_t GUEST_MEMORY_BUDGET   = 12800ull * 1024ull * 1024ull;
+constexpr uint64_t RESERVED_CACHE_SIZE   = 64ull * 1024ull * 1024ull;
+constexpr uint64_t INCLUDED_TABLE_MEMORY = 64ull * 1024ull * 1024ull;
+constexpr uint64_t MAPPING_TABLE_SIZE    = 4ull * 1024ull;
 
-static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static bool                          g_flexible_memory_size_frozen = false;
-static Graphics::RenderContext*       g_gpu_resources               = nullptr;
+static uint64_t                 g_guest_memory_size    = GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE;
+static uint64_t                 g_flexible_memory_size = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static uint64_t                 g_cpu_table_memory     = INCLUDED_TABLE_MEMORY;
+static uint64_t                 g_gpu_table_memory     = INCLUDED_TABLE_MEMORY;
+static Graphics::RenderContext* g_gpu_resources        = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
 #endif
@@ -703,11 +710,8 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
-	static uint64_t           Size() {
-		EXIT_IF(g_flexible_memory_size >= TotalSize());
-		return TotalSize() - g_flexible_memory_size;
-	}
+	static uint64_t TotalSize() { return g_guest_memory_size; }
+	static uint64_t Size() { return TotalSize() - g_flexible_memory_size; }
 
 	bool Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
 	           uint64_t* phys_addr_out, int memory_type,
@@ -1090,7 +1094,22 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
 void Initialize() {
-	g_flexible_memory_size_frozen = true;
+	const auto params = Loader::SystemContentGetMemoryParams();
+	if (params.flexible_size != 0) {
+		g_flexible_memory_size = params.flexible_size;
+	}
+	g_cpu_table_memory = std::max(params.cpu_table_memory, INCLUDED_TABLE_MEMORY);
+	g_gpu_table_memory = std::max(params.gpu_table_memory, INCLUDED_TABLE_MEMORY);
+
+	const auto table_overhead = g_cpu_table_memory + g_gpu_table_memory +
+	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
+	                            3 * INCLUDED_TABLE_MEMORY;
+	EXIT_IF(g_flexible_memory_size + table_overhead >= GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE);
+	g_guest_memory_size = GUEST_MEMORY_BUDGET - RESERVED_CACHE_SIZE - table_overhead;
+	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",
+	     g_flexible_memory_size / (1024ull * 1024ull),
+	     (g_guest_memory_size - g_flexible_memory_size) / (1024ull * 1024ull));
+
 	VirtualMemory::Init();
 	g_guest_address_space = std::make_unique<GuestAddressSpace>(PhysicalMemory::TotalSize());
 	g_physical_memory     = std::make_unique<PhysicalMemory>();
@@ -1156,15 +1175,6 @@ void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func) {
 	for (const auto& mapping: g_pooled_memory->GetMappings()) {
 		g_alloc_callback(mapping.vaddr, mapping.size);
 	}
-}
-
-void SetFlexibleMemorySize(uint64_t size) {
-	constexpr uint64_t GuestPageSize = 0x4000;
-	EXIT_IF(g_flexible_memory_size_frozen || g_guest_address_space != nullptr);
-	EXIT_IF(size == 0 || (size & (GuestPageSize - 1u)) != 0 || size >= PhysicalMemory::TotalSize());
-	g_flexible_memory_size = size;
-	LOGF("\t flexible memory size = 0x%016" PRIx64 " (%" PRIu64 " MiB)\n", size,
-	     size / (1024ull * 1024ull));
 }
 
 bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t len, size_t alignment,
@@ -2747,12 +2757,12 @@ int KYTY_SYSV_ABI KernelGetPageTableStats(int* cpu_total, int* cpu_available, in
 	const auto gpu_used =
 	    (g_virtual_ranges != nullptr ? g_virtual_ranges->CountPageTableEntries(true) : 0);
 
-	*cpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*gpu_total     = PAGE_TABLE_POOL_ENTRIES;
-	*cpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(cpu_used, PAGE_TABLE_POOL_ENTRIES));
-	*gpu_available = PAGE_TABLE_POOL_ENTRIES -
-	                 static_cast<int>(std::min<uint64_t>(gpu_used, PAGE_TABLE_POOL_ENTRIES));
+	const auto cpu_tables = g_cpu_table_memory / MAPPING_TABLE_SIZE;
+	const auto gpu_tables = g_gpu_table_memory / MAPPING_TABLE_SIZE;
+	*cpu_total            = static_cast<int>(cpu_tables);
+	*gpu_total            = static_cast<int>(gpu_tables);
+	*cpu_available        = static_cast<int>(cpu_tables - std::min(cpu_used, cpu_tables));
+	*gpu_available        = static_cast<int>(gpu_tables - std::min(gpu_used, gpu_tables));
 
 	LOGF_COLOR(Log::Color::Green,
 	           "\t cpu_total     = %d\n"
@@ -4473,7 +4483,8 @@ DebugStats GetDebugStats() {
 	stats.direct_total       = PhysicalMemory::Size();
 	stats.flexible_total     = FlexibleMemory::Size();
 	stats.pool_committed     = g_memory_pool_committed.load(std::memory_order_relaxed);
-	stats.page_entries_total = PAGE_TABLE_POOL_ENTRIES;
+	stats.cpu_page_entries_total = g_cpu_table_memory / MAPPING_TABLE_SIZE;
+	stats.gpu_page_entries_total = g_gpu_table_memory / MAPPING_TABLE_SIZE;
 	if (g_physical_memory != nullptr) {
 		Common::LockGuard lock(g_physical_memory->GetMutex());
 		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
