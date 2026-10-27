@@ -23853,6 +23853,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_ATOMIC_SUB:
   case Opcode::BUFFER_ATOMIC_SMIN:
   case Opcode::BUFFER_ATOMIC_UMIN:
+  case Opcode::BUFFER_ATOMIC_UMIN_X2:
   case Opcode::BUFFER_ATOMIC_SMAX:
   case Opcode::BUFFER_ATOMIC_UMAX:
   case Opcode::BUFFER_ATOMIC_AND:
@@ -39486,6 +39487,41 @@ TestCase BufferAtomicAddX2GlcAndExec() {
   return test;
 }
 
+TestCase BufferAtomicUMinX2GlcAndExec() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferAtomicUMinX2GlcAndExec";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  AppendVMovU32(&code, 20, 0);
+  const u32 values[][2] = {{0xffffffffu, 0x80000000u},
+                           {0xffffffffu, 0x7fffffffu},
+                           {0xfffffffeu, 0x7fffffffu},
+                           {0u, 0u}};
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendVMovLiteral(&code, 2, values[i][0]);
+    AppendVMovLiteral(&code, 3, values[i][1]);
+    if (i == 3) {
+      code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    }
+    AppendBufferStoreOpcode(&code, 0x56, 2, 20, i != 1);
+    code.push_back(EncodeSop1(0x04, 126, 12));
+    AppendStoreVgpr(&code, 2, 2 + i * 2);
+    AppendStoreVgpr(&code, 3, 3 + i * 2);
+  }
+  AppendEnd(&code);
+  test.initial = {0u, 0x80000001u, 0, 0, 0, 0, 0, 0, 1, 1};
+  // The high dwords decide the first two mins, the second only when compared
+  // unsigned, and the low dwords the third. GLC returns the old value, the
+  // second min keeps its operand, and EXEC = 0 suppresses the fourth min.
+  test.expected = {0xfffffffeu, 0x7fffffffu, 0u, 0x80000001u,
+                   0xffffffffu, 0x7fffffffu, 0xffffffffu, 0x7fffffffu, 0, 0};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_ATOMIC_UMIN_X2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicUMin %ulong", "Int64Atomics"};
+  return test;
+}
+
 TestCase BufferAtomicCmpSwapExactRaw() {
   using O = ShaderOpcode;
 
@@ -47956,6 +47992,7 @@ std::vector<TestCase> MakeCases() {
   }
   AddCase(BufferAtomicAndX2GlcAndExec);
   AddCase(BufferAtomicAddX2GlcAndExec);
+  AddCase(BufferAtomicUMinX2GlcAndExec);
   AddCase(ImageAtomicSignedMinMax<false>);
   AddCase(ImageAtomicSignedMinMax<true>);
   AddCase(ImageAtomicSignedMinMax<false, true>);
@@ -53909,6 +53946,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsAtomicReturn64());
     RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
     RunCase(&vulkan, BufferAtomicAddX2GlcAndExec());
+    RunCase(&vulkan, BufferAtomicUMinX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
     return 0;
