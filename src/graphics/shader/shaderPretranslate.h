@@ -9,7 +9,7 @@
 
 // Shader translation when the game registers a shader, instead of at its first draw.
 //
-// KYTY_SHADER_PRETRANSLATE=N (default 0 = off): N low-priority host workers translate each registered
+// KYTY_SHADER_PRETRANSLATE=N (default 4, 0 = off): N low-priority host workers translate each registered
 // pixel shader (GCN -> IR: decoding, CFG, SSA, simplification and resource tracking, the costly and
 // state-independent part of a shader miss) with the translation inputs predicted from the register
 // defaults of its binary (ShaderPredictPixelProgram). On a program-cache miss the GPU thread takes the

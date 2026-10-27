@@ -53,7 +53,7 @@ uint32_t EnvU32(const char* name, uint32_t fallback) {
 constexpr uint32_t MaxRetiredWorkers = 8;
 
 uint32_t WorkerCount() {
-	static const uint32_t count = std::min(EnvU32("KYTY_SHADER_PRETRANSLATE", 0), 16u);
+	static const uint32_t count = std::min(EnvU32("KYTY_SHADER_PRETRANSLATE", 4), 16u);
 	return count;
 }
 
