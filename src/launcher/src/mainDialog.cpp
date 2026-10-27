@@ -134,7 +134,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
 #endif
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	main_dialog->setWindowFlags(Qt::Dialog | Qt::WindowMinMaxButtonsHint |
+	                            Qt::WindowCloseButtonHint);
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
@@ -244,7 +245,7 @@ static void AddFlag(QStringList& args, bool enabled, const char* name) {
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
 	QStringList args;
-	auto        r = EnumToText(info.screen_resolution).split('x');
+	auto        r = Configuration::NormalizeResolution(info.screen_resolution).split('x');
 
 	if (r.size() != 2) {
 		return {};
@@ -270,6 +271,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
+	AddFlag(args, info.stretch_enabled, "--stretch");
 	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
 	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
 	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
