@@ -1,9 +1,11 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -51,42 +53,52 @@ using Variable =
 using ValueMap = std::unordered_map<Block*, Value>;
 
 struct DefTable {
+	// Per-block register definitions, only needed while the pass runs (not kept in IR::Block).
+	struct BlockDefs {
+		std::array<Value, NumScalarRegs> sreg {};
+		std::array<Value, NumScalarRegs> thread_bit_sreg {};
+		std::array<Value, NumScalarRegs> sreg_mask {};
+		std::array<Value, NumVectorRegs> vreg {};
+	};
+	std::vector<BlockDefs> block_defs;
+	BlockDefs&             Defs(Block* block) { return block_defs[block->ssa_index]; }
+
 	const Value& Get(Block* block, ScalarReg reg) {
 		if (RegIndex(reg) >= NumScalarRegs) {
 			EXIT("SSA scalar read index is out of range: %u", RegIndex(reg));
 		}
-		return block->ssa_sreg_values[RegIndex(reg)];
+		return Defs(block).sreg[RegIndex(reg)];
 	}
 	void Set(Block* block, ScalarReg reg, Value value) {
 		if (RegIndex(reg) >= NumScalarRegs) {
 			EXIT("SSA scalar write index is out of range: %u", RegIndex(reg));
 		}
-		block->ssa_sreg_values[RegIndex(reg)] = value;
+		Defs(block).sreg[RegIndex(reg)] = value;
 	}
 	const Value& Get(Block* block, ThreadBitScalarReg value) {
 		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
-		return block->ssa_thread_bit_sreg_values[RegIndex(value.reg)];
+		return Defs(block).thread_bit_sreg[RegIndex(value.reg)];
 	}
 	void Set(Block* block, ThreadBitScalarReg value, Value definition) {
 		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
-		block->ssa_thread_bit_sreg_values[RegIndex(value.reg)] = definition;
+		Defs(block).thread_bit_sreg[RegIndex(value.reg)] = definition;
 	}
 	const Value& Get(Block* block, ScalarMaskTag value) {
 		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
-		return block->ssa_sreg_mask_tags[RegIndex(value.reg)];
+		return Defs(block).sreg_mask[RegIndex(value.reg)];
 	}
 	void Set(Block* block, ScalarMaskTag value, Value definition) {
 		EXIT_IF(RegIndex(value.reg) >= NumScalarRegs);
-		block->ssa_sreg_mask_tags[RegIndex(value.reg)] = definition;
+		Defs(block).sreg_mask[RegIndex(value.reg)] = definition;
 	}
 
 	const Value& Get(Block* block, VectorReg reg) {
 		EXIT_IF(RegIndex(reg) >= NumVectorRegs);
-		return block->ssa_vreg_values[RegIndex(reg)];
+		return Defs(block).vreg[RegIndex(reg)];
 	}
 	void Set(Block* block, VectorReg reg, Value value) {
 		EXIT_IF(RegIndex(reg) >= NumVectorRegs);
-		block->ssa_vreg_values[RegIndex(reg)] = value;
+		Defs(block).vreg[RegIndex(reg)] = value;
 	}
 	const Value& Get(Block* block, GotoVariable value) {
 		return goto_variables[value.index][block];
@@ -175,6 +187,13 @@ struct ReadState {
 
 class Pass {
 public:
+	void PrepareBlocks(const BlockList& blocks) {
+		definitions.block_defs.resize(blocks.size());
+		for (uint32_t index = 0; index < blocks.size(); index++) {
+			blocks[index]->ssa_index = index;
+		}
+	}
+
 	template <typename T>
 	void Write(T variable, Block* block, Value value) {
 		definitions.Set(block, variable, value);
@@ -349,6 +368,7 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 
 void RewriteToSsa(const BlockList& blocks) {
 	Pass pass;
+	pass.PrepareBlocks(blocks);
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
 			VisitInstruction(pass, block, inst);
