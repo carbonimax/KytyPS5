@@ -941,6 +941,8 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		// Translated scalar loads have no cache of their own to invalidate.
+		case Decoder::Opcode::S_DCACHE_INV: return;
 		case Decoder::Opcode::BUFFER_GL0_INV:
 		case Decoder::Opcode::BUFFER_GL1_INV:
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);

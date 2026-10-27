@@ -2006,18 +2006,21 @@ void TestNggVertexEntryState() {
 
 void TestNativeDataCacheInvalidation() {
   using namespace ShaderRecompiler;
-  // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT.
+  // Captured f5edf70dbb1f6057:0x194 and 0x1a4, each followed by S_WAITCNT. The S_DCACHE_INV
+  // after them emits no fence.
   const std::array cache_ops = {0xe1c40000u, 0u, 0xbf8c0000u,
-                               0xe1c80000u, 0u, 0xbf8c0000u, EncodeSopp(0x01)};
+                               0xe1c80000u, 0u, 0xbf8c0000u,
+                               0xf4800000u, 0xfa000000u, EncodeSopp(0x01)};
   Decoder::Program decoded;
   Decoder::DecodeProgram(cache_ops, decoded);
-  for (const uint32_t index : {0u, 2u}) {
+  for (const auto [index, opcode] : {std::pair{0u, Decoder::Opcode::BUFFER_GL0_INV},
+                                     std::pair{2u, Decoder::Opcode::BUFFER_GL1_INV},
+                                     std::pair{4u, Decoder::Opcode::S_DCACHE_INV}}) {
     const auto &inst = decoded.instructions[index];
-    Check(inst.opcode == (index == 0 ? Decoder::Opcode::BUFFER_GL0_INV
-                                    : Decoder::Opcode::BUFFER_GL1_INV) &&
+    Check(inst.opcode == opcode &&
               inst.word_count == 2 && inst.src_count == 0 && inst.data_dwords == 0 &&
               inst.dst.kind == Decoder::OperandKind::Unknown,
-          "RDNA2 cache invalidation acquired a buffer operand or lost its encoding");
+          "RDNA2 cache invalidation acquired an operand or lost its encoding");
   }
 
   auto options = MakeCompileOptions(ShaderType::Compute);
