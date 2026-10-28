@@ -685,6 +685,7 @@ static bool IsYieldPoint(uint32_t opcode) {
 	switch (opcode) {
 		case Pm4::IT_WAIT_REG_MEM:
 		case Pm4::IT_WAIT_REG_MEM_64:
+		case Pm4::IT_MEM_SEMAPHORE:
 		case Pm4::IT_EVENT_WRITE:
 		case Pm4::IT_RELEASE_MEM:
 		case Pm4::IT_ACQUIRE_MEM: return true;
