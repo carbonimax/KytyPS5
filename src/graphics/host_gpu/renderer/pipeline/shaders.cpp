@@ -31,6 +31,7 @@ namespace Libs::Graphics {
 namespace {
 
 thread_local PipelineCacheFeedback t_last_feedback;
+thread_local bool                  t_quiet_creation = false;
 
 void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback& feedback,
                           bool graphics_pipeline) {
@@ -42,7 +43,7 @@ void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback&
 	t_last_feedback.valid = true;
 	t_last_feedback.hit   = static_cast<bool>(
 	    feedback.flags & vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit);
-	if (graphics_pipeline) {
+	if (graphics_pipeline && !t_quiet_creation) {
 		PerfStats::NoteGraphicsPipelineFeedback(t_last_feedback.hit, feedback.duration);
 	}
 }
@@ -51,6 +52,10 @@ void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback&
 
 PipelineCacheFeedback LastPipelineCacheFeedback() noexcept {
 	return t_last_feedback;
+}
+
+void SetPipelineCreationQuiet(bool quiet) noexcept {
+	t_quiet_creation = quiet;
 }
 
 // IDK: maybe we can remove it?

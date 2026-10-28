@@ -31,6 +31,8 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -77,6 +79,7 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -1707,6 +1710,174 @@ void CheckRectListShaders() {
   const auto position_only = BuildRectListShaders({}, param_export_mask);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
+}
+
+// Shader store records survive a reopen, a store cut short keeps its complete records, a damaged
+// record ends the store and another host key starts it over.
+void CheckShaderStore() {
+  constexpr const char *name = "ShaderStore";
+  EnsureConfigInitialized();
+  using ShaderRecompiler::IR::IoAll;
+  using ShaderRecompiler::IR::Writer;
+  std::error_code error;
+  const auto path = std::filesystem::temp_directory_path(error) /
+                    ("kyty_shader_store_test_" + std::to_string(std::rand()) + ".shaders");
+  std::filesystem::remove(path, error);
+  const std::vector<uint8_t> host_key{1, 2, 3, 4};
+  const std::vector<uint8_t> other_key{1, 2, 3, 5};
+
+  const auto make_module = [](uint64_t id, ShaderType stage, uint32_t words) {
+    ShaderStoreModule module;
+    module.stage = stage;
+    module.hash = 0x1234567800000000ull | id;
+    module.user_data_count = 16;
+    module.code_size = 40;
+    module.static_state = {7, 8, 9, static_cast<uint32_t>(id)};
+    module.plan = {1, 2, 3};
+    module.module.handle.id = id;
+    module.module.program.stage = stage;
+    module.module.program.wave_size = 32;
+    module.module.program.param_export_mask = 5;
+    module.module.program.bindings.push_data_start_dword = 4;
+    module.module.specialization.buffers.push_back({.packed_stride = 16});
+    module.module.vertex_formats = {vk::Format::eR32G32Sfloat};
+    module.module.rect_parameters = {{.input_location = 1, .output_location = 2, .flat = true}};
+    module.translation_id = id * 3;
+    module.spirv.assign(words, 0x07230203u + static_cast<uint32_t>(id));
+    return module;
+  };
+  const auto module_bytes = [](const ShaderStoreModule &module) {
+    Writer bytes;
+    IoAll(bytes, module.stage, module.hash, module.user_data_count, module.code_size,
+          module.static_state, module.plan, module.module.handle.id, module.module.program,
+          module.module.specialization, module.module.vertex_formats,
+          module.module.rect_parameters, module.translation_id, module.spirv);
+    return bytes.bytes;
+  };
+  const auto first = make_module(11, ShaderType::Vertex, 300);
+  const auto second = make_module(12, ShaderType::Pixel, 5000);
+  ShaderStorePipeline pipeline;
+  pipeline.rendering.color_count = 2;
+  pipeline.rendering.color_formats[1] = vk::Format::eR8G8B8A8Unorm;
+  pipeline.rendering.depth_feedback = true;
+  pipeline.vertex_ids = {11, 0, 0};
+  pipeline.ps_id = 12;
+  pipeline.vertex_input.binding_count = 1;
+  pipeline.vertex_input.bindings[0] = {.stride = 24, .instance = true};
+  pipeline.vertex_input.attribute_count = 1;
+  pipeline.vertex_input.attributes[0] = {.offset = 8, .binding = 0};
+  pipeline.static_params.samples = 4;
+  pipeline.static_params.patch_control_points = 3;
+  pipeline.static_params.color_mask[1] = 0xf;
+
+  const auto read_file = [&] {
+    std::error_code size_error;
+    const auto size = std::filesystem::file_size(path, size_error);
+    std::vector<uint8_t> bytes(size_error ? 0 : size);
+    std::FILE *file = std::fopen(path.string().c_str(), "rb");
+    Require(name, "read", file != nullptr &&
+                              std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size(),
+            "cannot read the store back");
+    std::fclose(file);
+    return bytes;
+  };
+  const auto write_file = [&](std::span<const uint8_t> bytes) {
+    std::FILE *file = std::fopen(path.string().c_str(), "wb");
+    Require(name, "write", file != nullptr &&
+                               std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size(),
+            "cannot rewrite the store");
+    std::fclose(file);
+  };
+  const auto check_contents = [&](const char *stage, const ShaderStoreContents &contents,
+                                  size_t modules, size_t pipelines) {
+    Require(name, stage,
+            contents.header_match && contents.modules.size() == modules &&
+                contents.pipelines.size() == pipelines,
+            "expected " + std::to_string(modules) + " modules and " +
+                std::to_string(pipelines) + " pipelines, got " +
+                std::to_string(contents.modules.size()) + " and " +
+                std::to_string(contents.pipelines.size()));
+    const std::array expected{&first, &second};
+    for (size_t i = 0; i < modules; i++) {
+      Require(name, stage, module_bytes(contents.modules[i]) == module_bytes(*expected[i]),
+              "a module record changed through the store");
+    }
+    for (const auto &loaded : contents.pipelines) {
+      Require(name, stage,
+              loaded.rendering == pipeline.rendering && loaded.vertex_ids == pipeline.vertex_ids &&
+                  loaded.ps_id == pipeline.ps_id && loaded.vertex_input == pipeline.vertex_input &&
+                  loaded.static_params == pipeline.static_params,
+              "a pipeline record changed through the store");
+    }
+  };
+
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "create", store.IsOpen() && !contents.header_match &&
+                                contents.modules.empty() && contents.kept_bytes == 0,
+            "a missing store did not start empty");
+    store.AppendModule(first);
+    store.AppendPipeline(pipeline);
+    store.AppendModule(second);
+  }
+  const auto complete = read_file();
+  check_contents("round trip", ShaderStore::Parse(complete, host_key), 2, 1);
+  {
+    // A sink takes the module records in file order instead of the contents.
+    std::vector<ShaderStoreModule> sunk;
+    auto contents = ShaderStore::Parse(complete, host_key, [&sunk](ShaderStoreModule &&module) {
+      sunk.push_back(std::move(module));
+    });
+    Require(name, "sink", contents.modules.empty() && sunk.size() == 2,
+            "the sink did not take every module record");
+    contents.modules = std::move(sunk);
+    check_contents("sink", contents, 2, 1);
+  }
+  {
+    ShaderStore store;
+    check_contents("reopen", store.Open(path, host_key), 2, 1);
+  }
+  Require(name, "reopen keeps the file", read_file() == complete,
+          "reopening an intact store changed it");
+
+  const auto other = ShaderStore::Parse(complete, other_key);
+  Require(name, "host key", !other.header_match && other.modules.empty() &&
+                                other.pipelines.empty() && other.kept_bytes == 0,
+          "a store written for another host key was loaded");
+
+  // A partial last record: the earlier records stay, and the reopened store appends after them.
+  const auto cut = std::span(complete).first(complete.size() - 7);
+  const auto truncated = ShaderStore::Parse(cut, host_key);
+  check_contents("truncated", truncated, 1, 1);
+  Require(name, "truncated tail", truncated.kept_bytes < cut.size(),
+          "the partial record was kept");
+  write_file(cut);
+  {
+    ShaderStore store;
+    check_contents("reopen truncated", store.Open(path, host_key), 1, 1);
+    store.AppendModule(second);
+  }
+  check_contents("append after truncation", ShaderStore::Parse(read_file(), host_key), 2, 1);
+
+  // A damaged byte in the second record ends the store there.
+  auto damaged = complete;
+  damaged[truncated.kept_bytes - 3] ^= 0x40u;
+  const auto parsed = ShaderStore::Parse(damaged, host_key);
+  check_contents("damaged", parsed, 1, 0);
+
+  // Another host key starts the store over.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, other_key);
+    Require(name, "start over", !contents.header_match && contents.modules.empty(),
+            "a store of another host key was kept");
+  }
+  Require(name, "start over file", ShaderStore::Parse(read_file(), host_key).modules.empty() &&
+                                       ShaderStore::Parse(read_file(), other_key).header_match,
+          "the store was not rewritten for the new host key");
+  std::filesystem::remove(path, error);
+  std::printf("[host]    ShaderStore                       ok\n");
 }
 
 // Words without OpName/OpString/OpLine, which only graphics debug dumps emit.
@@ -53522,6 +53693,10 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-store-only") == 0) {
+    CheckShaderStore();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
@@ -53805,6 +53980,7 @@ int main(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
+  CheckShaderStore();
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);

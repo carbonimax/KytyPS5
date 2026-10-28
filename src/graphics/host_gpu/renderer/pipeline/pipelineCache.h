@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -27,6 +28,7 @@ namespace Libs::Graphics {
 struct AliasedColorTargets;
 struct GraphicContext;
 class CommandBuffer;
+class ShaderStore;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -116,6 +118,9 @@ struct ShaderModule {
 	std::vector<vk::Format>                      vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
+	// Loaded from the shader store with KYTY_SHADER_STORE=2: the hash of its SPIR-V until its
+	// first use retranslates it to check the store.
+	uint64_t                                     stored_spirv_hash = 0;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -201,6 +206,10 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// The shader store (KYTY_SHADER_STORE, --shader-cache), loaded by m_warm_up. Every other member
+	// function waits for the warm-up first.
+	std::unique_ptr<ShaderStore>  m_store;
+	std::thread                   m_warm_up;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -211,6 +220,14 @@ private:
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	// Loads the shader store: its modules, then its pipelines, created on several threads.
+	void WarmUp(const std::filesystem::path& path);
+	void WaitWarmUp() {
+		if (m_warm_up.joinable()) [[unlikely]] {
+			JoinWarmUp();
+		}
+	}
+	void JoinWarmUp();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -221,6 +238,8 @@ struct PipelineCacheFeedback {
 	bool hit   = false;
 };
 [[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
+// Pipelines created by this thread are left out of the performance counters (shader store warm-up).
+void SetPipelineCreationQuiet(bool quiet) noexcept;
 // `vertex_stages`: VS, mesh or LS/HS/TES; `pixel` is null without a pixel stage.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&        rendering,
