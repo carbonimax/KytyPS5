@@ -65,11 +65,6 @@ uint16_t Value::U16() const {
 	return imm_u16;
 }
 
-uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
 uint64_t Value::U64() const {
 	EXIT_IF(type != Type::U64);
 	return imm_u64;
@@ -132,14 +127,6 @@ size_t Inst::NumPhiBlocks() const {
 Block* Inst::PhiBlock(size_t index) const {
 	EXIT_IF(opcode != ValueOpcode::Phi || index >= phi_args.size());
 	return phi_args[index].first;
-}
-
-Block* Inst::Parent() const {
-	return parent;
-}
-
-const std::vector<Use>& Inst::Uses() const {
-	return uses;
 }
 
 void Inst::SetParent(Block* block) {

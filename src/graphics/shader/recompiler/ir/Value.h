@@ -198,6 +198,19 @@ inline ValueOpcode Inst::GetOpcode() const {
 	return opcode;
 }
 
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline Block* Inst::Parent() const {
+	return parent;
+}
+
+inline const std::vector<Use>& Inst::Uses() const {
+	return uses;
+}
+
 inline size_t Inst::NumArgs() const {
 	return num_args == PhiArity ? phi_args.size() : num_args;
 }
