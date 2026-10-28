@@ -49766,7 +49766,7 @@ bool HasPatchInterface(const std::string &assembly, const std::string &storage, 
 }
 
 void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u32 domain = 1,
-                              u32 output_topology = 2) {
+                              u32 output_topology = 2, u32 partitioning = 2) {
   using namespace ShaderRecompiler;
   const bool quad = domain == 2;
   const u32 control_points = quad ? 4 : 3;
@@ -49869,7 +49869,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
   ShaderTessellationInputInfo tess{.input_control_points = control_points,
                                   .output_control_points = control_points,
                                   .domain = domain,
-                                  .partitioning = 2,
+                                  .partitioning = partitioning,
                                   .output_topology = output_topology};
   AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
@@ -49924,7 +49924,10 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
   Require(name, "native domain and winding",
           ds.assembly.find("TessCoord") != std::string::npos &&
               ds.assembly.find(quad ? "Quads" : "Triangles") != std::string::npos &&
-              ds.assembly.find("SpacingFractionalOdd") != std::string::npos &&
+              ds.assembly.find(partitioning == 2 ? "SpacingFractionalOdd" : "SpacingFractionalEven") !=
+                  std::string::npos &&
+              ds.assembly.find(partitioning == 2 ? "SpacingFractionalEven" : "SpacingFractionalOdd") ==
+                  std::string::npos &&
               ds.assembly.find(output_topology == 2 ? "VertexOrderCw" : "VertexOrderCcw") !=
                   std::string::npos &&
               ds.assembly.find(output_topology == 2 ? "VertexOrderCcw" : "VertexOrderCw") ==
@@ -50106,6 +50109,7 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
   CheckTessellationProgram("TessellationQuadFactors", 36, 128, 2);
   CheckTessellationProgram("TessellationCounterclockwiseQuads", 36, 128, 2, 3);
+  CheckTessellationProgram("TessellationFractionalEvenQuads", 36, 128, 2, 2, 3);
   CheckTessellationProgram("TessellationMaskedControlPoint", 32, 256, 2);
   CheckTessellationPatchConstants();
 }
