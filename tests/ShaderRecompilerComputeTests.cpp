@@ -14870,133 +14870,166 @@ public:
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }
-    for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
-      constexpr std::array<u32, 4> words{0x883005e1u, 0x7c0e81c0u,
-                                         0x800f0000u, 0x98120280u};
-      constexpr std::array<std::array<float, 4>, 4> channels{{
-          {1.03125f, 2.03125f, 4.0625f, 1.f}, {0.5f, 0.75f, 1.5f, 1.f},
-          {0.f, 1.f, 2.f, 1.f}, {32.f, 8.f, 16.f, 1.f}}};
-      const auto target = TextureGetRenderTargetFormat(
-          Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
-          Prospero::ChannelOrder::kReversed);
-      Require(name, "10_11_11 reversed render target",
-              target.format == vk::Format::eB10G11R11UfloatPack32 &&
-                  target.guest_format == Prospero::BufferFormat::k10_11_11Float &&
-                  target.export_mapping == Prospero::ColorMappingRgba,
-              "PPSA24156 reversed packed-float target lost its physical encoding");
-      std::memset(mapped, 0, allocation_size);
-      std::array<u32, 4> offsets{0, 4, 8, 12};
-      if (tile == Prospero::TileMode::kRenderTarget) {
-        TileBlockLayout block{};
-        u32 block_xor = 0;
-        Require(name, "10_11_11 tile layout",
-                TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, 4, block) &&
-                    TileGetBlockXor(block, 0, 0, 0, block_xor),
-                "packed-float render-target layout is unavailable");
-        for (u32 pixel = 0; pixel < words.size(); ++pixel) {
-          Require(name, "10_11_11 tile offset",
-                  TileGetBlockOffset(block, pixel, 0, 0, offsets[pixel]),
-                  "packed-float texel offset is unavailable");
-          offsets[pixel] ^= block_xor;
+    struct TransferCase {
+      Prospero::ChannelLayout layout;
+      Prospero::ChannelType type;
+      Prospero::BufferFormat format;
+      Prospero::BufferFormat alias_format;
+      vk::Format native_format;
+      u32 swizzle;
+      std::array<u32, 4> words;
+      std::array<std::array<float, 4>, 4> channels;
+      std::array<float, 4> clear;
+      u32 clear_word;
+      std::array<float, 4> alias_clear;
+      u32 alias_word;
+    };
+    constexpr std::array transfers{
+        TransferCase{Prospero::ChannelLayout::k10_11_11, Prospero::ChannelType::kFloat,
+            Prospero::BufferFormat::k10_11_11Float, Prospero::BufferFormat::k11_11_10Float,
+            vk::Format::eB10G11R11UfloatPack32, DstSel(4, 5, 6, 1),
+            {0x883005e1u, 0x7c0e81c0u, 0x800f0000u, 0x98120280u},
+            {{{1.03125f, 2.03125f, 4.0625f, 1.f}, {0.5f, 0.75f, 1.5f, 1.f},
+              {0.f, 1.f, 2.f, 1.f}, {32.f, 8.f, 16.f, 1.f}}},
+            {8.f, 4.f, 2.f, 1.f}, 0x90110200u,
+            {16.f, 8.f, 4.f, 1.f}, 0x98120220u},
+        TransferCase{Prospero::ChannelLayout::k2_10_10_10, Prospero::ChannelType::kUNorm,
+            Prospero::BufferFormat::k2_10_10_10UNorm, Prospero::BufferFormat::k10_10_10_2UNorm,
+            vk::Format::eA2R10G10B10UnormPack32, DstSel(4, 5, 6, 7),
+            {0x0540d015u, 0x00000fffu, 0x003ff000u, 0xffe01406u},
+            {{{1.f / 3, 5.f / 1023, 13.f / 1023, 21.f / 1023}, {1.f, 1.f, 0.f, 0.f},
+              {0.f, 0.f, 1.f, 0.f}, {2.f / 3, 257.f / 1023, 513.f / 1023, 1.f}}},
+            {21.f / 1023, 13.f / 1023, 5.f / 1023, 1.f / 3}, 0x0540d015u,
+            {33.f / 1023, 65.f / 1023, 129.f / 1023, 2.f / 3}, 0x08441206u},
+    };
+    for (const auto &format : transfers) {
+      for (const auto tile : {Prospero::TileMode::kLinear, Prospero::TileMode::kRenderTarget}) {
+        const auto target = TextureGetRenderTargetFormat(
+            format.layout, format.type, Prospero::ChannelOrder::kReversed);
+        Require(name, "reversed packed render target",
+                target.format == format.native_format && target.guest_format == format.format &&
+                    target.export_mapping == Prospero::ColorMappingRgba,
+                "PPSA24156 reversed packed target lost its physical encoding");
+        std::memset(mapped, 0, allocation_size);
+        std::array<u32, 4> offsets{0, 4, 8, 12};
+        if (tile == Prospero::TileMode::kRenderTarget) {
+          TileBlockLayout block{};
+          u32 block_xor = 0;
+          Require(name, "packed tile layout",
+                  TileGetBlockLayout(TileBlockFamily::RenderTarget64KB, 4, block) &&
+                      TileGetBlockXor(block, 0, 0, 0, block_xor),
+                  "packed render-target layout is unavailable");
+          for (u32 pixel = 0; pixel < format.words.size(); ++pixel) {
+            Require(name, "packed tile offset",
+                    TileGetBlockOffset(block, pixel, 0, 0, offsets[pixel]),
+                    "packed texel offset is unavailable");
+            offsets[pixel] ^= block_xor;
+          }
         }
-      }
-      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
-        std::memcpy(static_cast<uint8_t *>(mapped) + offsets[pixel], &words[pixel], sizeof(u32));
-      }
-      RenderContext context(m_runtime_context);
-      auto &scheduler = context.GetCommandScheduler();
-      HW::Context registers{};
-      HW::UserConfig user_config{};
-      HW::Shader shaders{};
-      scheduler.Begin(registers, user_config, shaders);
-      context.MapMemory(base, allocation_size);
-      auto &cache = context.GetTextureCache();
-      auto &executor = context.GetRenderExecutor();
-      constexpr u32 swizzle = DstSel(4, 5, 6, 1);
-      ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
-          (static_cast<u32>(Prospero::BufferFormat::k10_11_11Float) << 20u) |
-              (3u << 30u), 0,
-          swizzle | (static_cast<u32>(tile) << 20u) |
-              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
-          0, 0x00700000u, 0, 0}};
-      TestCase test;
-      test.name = name;
-      test.has_user_data = true;
-      test.image_descriptor_swizzle = swizzle;
-      std::copy_n(descriptor.fields, 8, test.user_data.begin());
-      test.user_data[50] = 16 * sizeof(u32);
-      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
-        AppendVMovU32(&test.code, 20, pixel);
-        AppendVMovU32(&test.code, 21, 0);
-        test.code.push_back(EncodeMimg0(0x00, 0xf));
-        test.code.push_back(EncodeMimg1(0, 20));
-        for (u32 channel = 0; channel < 4; ++channel) {
-          AppendStoreVgpr(&test.code, channel, pixel * 4 + channel);
-          test.expected.push_back(std::bit_cast<u32>(channels[pixel][channel]));
+        for (u32 pixel = 0; pixel < format.words.size(); ++pixel) {
+          std::memcpy(static_cast<uint8_t *>(mapped) + offsets[pixel], &format.words[pixel], sizeof(u32));
         }
-      }
-      AppendEnd(&test.code);
-      const auto compiled = CompileCase(test, SubgroupSize());
-      ShaderRecompiler::IR::DescriptorValue value{};
-      value.dword_count = 8;
-      std::copy_n(descriptor.fields, 8, value.dwords.begin());
-      const auto binding = RenderExecutorTestAccess::ResolveTexture(
-          executor, compiled.program.info.images.at(0), value);
-      Image sampled;
-      sampled.view = cache.FindTexture(binding.image_id, binding.desc);
-      sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
-      scheduler.Finish();
-      auto output = CreateStorageBuffer(name, {}, 16);
-      Dispatch(test, compiled, output, nullptr, &sampled);
-      Require(name, "10_11_11 uploaded components",
-              ReadBuffer(name, output, 16) == test.expected,
-              "packed-float upload or sample changed a component's width or order");
-      DestroyBuffer(&output);
+        RenderContext context(m_runtime_context);
+        auto &scheduler = context.GetCommandScheduler();
+        HW::Context registers{};
+        HW::UserConfig user_config{};
+        HW::Shader shaders{};
+        scheduler.Begin(registers, user_config, shaders);
+        context.MapMemory(base, allocation_size);
+        auto &cache = context.GetTextureCache();
+        auto &executor = context.GetRenderExecutor();
+        ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+            (static_cast<u32>(format.format) << 20u) | (3u << 30u), 0,
+            format.swizzle | (static_cast<u32>(tile) << 20u) |
+                (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        TestCase test;
+        test.name = name;
+        test.has_user_data = true;
+        test.image_descriptor_swizzle = format.swizzle;
+        std::copy_n(descriptor.fields, 8, test.user_data.begin());
+        test.user_data[50] = 16 * sizeof(u32);
+        for (u32 pixel = 0; pixel < format.words.size(); ++pixel) {
+          AppendVMovU32(&test.code, 20, pixel);
+          AppendVMovU32(&test.code, 21, 0);
+          test.code.push_back(EncodeMimg0(0x00, 0xf));
+          test.code.push_back(EncodeMimg1(0, 20));
+          for (u32 channel = 0; channel < 4; ++channel) {
+            AppendStoreVgpr(&test.code, channel, pixel * 4 + channel);
+            test.expected.push_back(std::bit_cast<u32>(format.channels[pixel][channel]));
+          }
+        }
+        AppendEnd(&test.code);
+        const auto compiled = CompileCase(test, SubgroupSize());
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, compiled.program.info.images.at(0), value);
+        Image sampled;
+        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
+        scheduler.Finish();
+        auto output = CreateStorageBuffer(name, {}, 16);
+        Dispatch(test, compiled, output, nullptr, &sampled);
+        const auto actual = ReadBuffer(name, output, 16);
+        for (u32 component = 0; component < actual.size(); ++component) {
+          bool matches = actual[component] == test.expected[component];
+          if (format.type == Prospero::ChannelType::kUNorm) {
+            const float observed = std::bit_cast<float>(actual[component]);
+            const float expected = std::bit_cast<float>(test.expected[component]);
+            matches = std::abs(observed - expected) < 0.000001f;
+          }
+          Require(name, "packed uploaded components", matches,
+                  "packed upload or sample changed a component's width or order");
+        }
+        DestroyBuffer(&output);
 
-      const auto clear = [&](std::array<float, 4> channels) {
-        auto &native = cache.GetImage(binding.image_id);
-        native.Transit(vk::ImageLayout::eTransferDstOptimal,
-                       vk::AccessFlagBits2::eTransferWrite, {},
-                       scheduler.Current().Handle());
-        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-        scheduler.Current().Handle().clearColorImage(native.backing.image,
-            vk::ImageLayout::eTransferDstOptimal, vk::ClearColorValue{channels}, range);
-        cache.MarkGpuWritten(binding.image_id);
-      };
-      clear({8.f, 4.f, 2.f, 1.f});
-      Require(name, "10_11_11 guest download",
-              TextureCacheTestAccess::TryDownload(cache, binding.image_id),
-              "packed-float native contents could not be downloaded");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
-      std::array<u32, 4> guest{};
-      for (u32 pixel = 0; pixel < words.size(); ++pixel) {
-        Require(name, "10_11_11 guest texel",
-                Libs::LibKernel::Memory::TryReadBacking(base + offsets[pixel],
-                                                        &guest[pixel], sizeof(u32)),
-                "packed-float guest texel is inaccessible");
-      }
-      Require(name, "10_11_11 exact guest words",
-              guest == std::array<u32, 4>{0x90110200u, 0x90110200u, 0x90110200u, 0x90110200u},
-              "native packed-float write lost the guest 10/11/11 bit layout");
+        const auto clear = [&](std::array<float, 4> channels) {
+          auto &native = cache.GetImage(binding.image_id);
+          native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                         vk::AccessFlagBits2::eTransferWrite, {},
+                         scheduler.Current().Handle());
+          const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+          scheduler.Current().Handle().clearColorImage(native.backing.image,
+              vk::ImageLayout::eTransferDstOptimal, vk::ClearColorValue{channels}, range);
+          cache.MarkGpuWritten(binding.image_id);
+        };
+        clear(format.clear);
+        Require(name, "packed guest download",
+                TextureCacheTestAccess::TryDownload(cache, binding.image_id),
+                "packed native contents could not be downloaded");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        std::array<u32, 4> guest{};
+        for (u32 pixel = 0; pixel < format.words.size(); ++pixel) {
+          Require(name, "packed guest texel",
+                  Libs::LibKernel::Memory::TryReadBacking(base + offsets[pixel],
+                                                          &guest[pixel], sizeof(u32)),
+                  "packed guest texel is inaccessible");
+        }
+        Require(name, "exact packed guest words",
+                std::all_of(guest.begin(), guest.end(), [&](u32 word) { return word == format.clear_word; }),
+                "native packed write lost the guest bit layout");
 
-      clear({16.f, 8.f, 4.f, 1.f});
-      auto alias_desc = binding.desc;
-      alias_desc.info.guest_format = Prospero::BufferFormat::k11_11_10Float;
-      alias_desc.view_info.mapping = {};
-      Require(name, "same-format transform compatibility",
-              !alias_desc.info.IsCompatible(binding.desc.info),
-              "equal Vulkan formats hid incompatible guest color transforms");
-      const auto alias = cache.FindImage(alias_desc);
-      (void)cache.FindTexture(alias, alias_desc);
-      Require(name, "same-format transformed alias",
-              alias != binding.image_id &&
-                  ReadCachedTexel(name, context, alias, {}, {4, 1, 1}) ==
-                      std::vector<u32>(4, 0x98120220u),
-              "packed-float alias reused a transformed image or bypassed guest bytes");
-      RenderExecutorTestAccess::ResetBindings(executor);
-      context.UnmapMemory(base, allocation_size);
-      scheduler.Finish();
+        clear(format.alias_clear);
+        auto alias_desc = binding.desc;
+        alias_desc.info.guest_format = format.alias_format;
+        alias_desc.view_info.mapping = {};
+        Require(name, "same-format transform compatibility",
+                !alias_desc.info.IsCompatible(binding.desc.info),
+                "equal Vulkan formats hid incompatible guest color transforms");
+        const auto alias = cache.FindImage(alias_desc);
+        (void)cache.FindTexture(alias, alias_desc);
+        Require(name, "same-format transformed alias",
+                alias != binding.image_id &&
+                    ReadCachedTexel(name, context, alias, {}, {4, 1, 1}) ==
+                        std::vector<u32>(4, format.alias_word),
+                "packed alias reused a transformed image or bypassed guest bytes");
+        RenderExecutorTestAccess::ResetBindings(executor);
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+      }
     }
     Require(name, "release",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
