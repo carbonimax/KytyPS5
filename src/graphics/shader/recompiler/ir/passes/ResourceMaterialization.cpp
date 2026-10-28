@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
@@ -1748,7 +1749,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
-	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+	auto&      times      = t_materialize_times;
+	const auto now        = [] { return std::chrono::steady_clock::now(); };
+	const auto elapsed_ns = [](std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+	};
+	auto mark = times.enabled ? now() : std::chrono::steady_clock::time_point {};
+	const bool walked_srt = WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr);
+	if (times.enabled) {
+		const auto walked = now();
+		times.walk_ns += elapsed_ns(mark, walked);
+		mark = walked;
+	}
+	if (!walked_srt) {
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}
@@ -1938,7 +1951,14 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported, emulate_image_min_lod);
+	if (!times.enabled) {
+		return BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported, emulate_image_min_lod);
+	}
+	const auto evaluated = now();
+	times.eval_ns += elapsed_ns(mark, evaluated);
+	const bool built = BuildResourceSpecialization(program, snapshot, specialization, runtime.null_descriptor_supported, emulate_image_min_lod);
+	times.spec_ns += elapsed_ns(evaluated, now());
+	return built;
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {

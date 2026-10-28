@@ -63,6 +63,14 @@ bool BindProfEnabled() noexcept {
 	return enabled;
 }
 
+bool SrtProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_PROF");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -182,6 +190,24 @@ void MaybeReport() noexcept {
 		            ms(Counter::BindImagesNs), ms(Counter::BindBuffersNs), ms(Counter::BindCommitNs),
 		            n(Counter::BindCommitCount), ms(Counter::BindCheckNs), ms(Counter::BindTransitNs),
 		            ms(Counter::BindPushNs), n(Counter::BindWriteCount), n(Counter::BindDescriptorCount));
+	}
+	if (SrtProfEnabled()) {
+		std::printf("PERF srtsplit %.1fs: lookups=%" PRIu64 " refresh=%.0fms walk=%.0fms eval=%.0fms spec=%.0fms match=%.0fms"
+		            " same_perm=%" PRIu64 " multi_perm=%" PRIu64 " miss=%" PRIu64 " user_same=%" PRIu64
+		            " desc_same=%" PRIu64 " flat_same=%" PRIu64 " no_load=%" PRIu64 " loads=%" PRIu64
+		            " flat_words=%" PRIu64 " buffers=%" PRIu64 " images=%" PRIu64 " heap_images=%" PRIu64
+		            " conv_images=%" PRIu64 " samplers=%" PRIu64 " no_res=%" PRIu64 " heap_only=%" PRIu64
+		            " with_buf=%" PRIu64 " with_img=%" PRIu64 " with_samp=%" PRIu64 " format_spec=%" PRIu64
+		            " find_image=%.0fms sampler=%.0fms obtain=%.0fms upload=%.0fms view=%.0fms\n",
+		            seconds, n(Counter::SrtLookups), ms(Counter::SrtRefreshNs), ms(Counter::SrtWalkNs),
+		            ms(Counter::SrtEvalNs), ms(Counter::SrtSpecNs), ms(Counter::SrtMatchNs), n(Counter::SrtSamePerm),
+		            n(Counter::SrtMultiPerm), n(Counter::SrtMiss), n(Counter::SrtUserSame), n(Counter::SrtDescSame),
+		            n(Counter::SrtFlatSame), n(Counter::SrtNoLoad), n(Counter::SrtLoads), n(Counter::SrtFlatWords),
+		            n(Counter::SrtBuffers), n(Counter::SrtImages), n(Counter::SrtHeapImages), n(Counter::SrtConvImages),
+		            n(Counter::SrtSamplers), n(Counter::SrtNoResources), n(Counter::SrtHeapOnly),
+		            n(Counter::SrtWithBuffers), n(Counter::SrtWithImages), n(Counter::SrtWithSamplers),
+		            n(Counter::SrtFormatSpec), ms(Counter::BindFindImageNs), ms(Counter::BindSamplerNs),
+		            ms(Counter::BindObtainNs), ms(Counter::BindUploadNs), ms(Counter::BindViewNs));
 	}
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64

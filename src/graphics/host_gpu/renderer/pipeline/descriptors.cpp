@@ -622,7 +622,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base + resource.view_min_level;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto id = [&] {
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
+		return texture_cache.FindImage(desc, shader_conversion);
+	}();
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -728,6 +731,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
+	PerfStats::ScopedTimer sampler_timer(PerfStats::Counter::BindSamplerNs,
+	                                     PerfStats::SrtProfEnabled() && !program.info.samplers.empty());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
@@ -843,10 +848,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
+		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 	}
+	PerfStats::ScopedTimer upload_timer(PerfStats::Counter::BindUploadNs, PerfStats::SrtProfEnabled());
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
@@ -891,6 +898,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
+			PerfStats::ScopedTimer view_timer(PerfStats::Counter::BindViewNs, PerfStats::SrtProfEnabled());
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);

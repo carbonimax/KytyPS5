@@ -54,12 +54,48 @@ enum class Counter : uint32_t {
 	BindCommitCount,   // CommitBindings calls
 	BindWriteCount,    // vk::WriteDescriptorSet entries
 	BindDescriptorCount, // descriptors in those writes
+	// KYTY_SRT_PROF=1 (with KYTY_PERF_STATS=1): program lookups that found a cached source (GPU thread).
+	SrtLookups,        // lookups timed
+	SrtRefreshNs,      // call-source refresh (GPU-selected call targets)
+	SrtWalkNs,         // WalkSrt: x86 walker or walk reuse
+	SrtEvalNs,         // descriptor evaluation, indirect tables, sampler checks
+	SrtSpecNs,         // BuildResourceSpecialization
+	SrtMatchNs,        // permutation search and the rest of the lookup
+	SrtSamePerm,       // chose the entry's previous permutation
+	SrtMultiPerm,      // entry has more than one permutation
+	SrtMiss,           // no permutation matched (translation follows)
+	SrtUserSame,       // user data equal to the entry's previous lookup
+	SrtDescSame,       // buffer/image/sampler descriptors equal to the previous lookup
+	SrtFlatSame,       // flattened SRT equal to the previous lookup
+	SrtNoLoad,         // walk loaded no guest memory (descriptors from user data only)
+	SrtLoads,          // guest loads of the walks (memo count)
+	SrtFlatWords,      // flattened SRT dwords (scalar values the shader reads)
+	SrtBuffers,        // buffer resources
+	SrtImages,         // image resources, of which
+	SrtHeapImages,     //   resident image heap roots/kinds
+	SrtConvImages,     //   images needing a format conversion in the shader
+	SrtSamplers,       // sampler resources
+	SrtNoResources,    // lookups without buffers, images or samplers
+	SrtHeapOnly,       // lookups whose resources are all heap images
+	SrtWithBuffers,    // lookups with at least one buffer
+	SrtWithImages,     // lookups with at least one non-heap image
+	SrtWithSamplers,   // lookups with at least one sampler
+	SrtFormatSpec,     // lookups whose specialization depends on a descriptor format/stride/type field
+	BindFindImageNs,   // of prepare/images: TextureCache::FindImage (resolution + tracking)
+	BindSamplerNs,     // of prepare: sampler cache
+	BindObtainNs,      // of buffers: NativeStorageBuffer (buffer cache, uploads)
+	BindUploadNs,      // of buffers: flattened SRT + shader data stream uploads
+	BindViewNs,        // of images: TextureCache::FindTexture (views)
 	Count
 };
 
 [[nodiscard]] bool Enabled() noexcept;
 // KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases.
 [[nodiscard]] bool BindProfEnabled() noexcept;
+// KYTY_SRT_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): splits program lookups (walk,
+// descriptor evaluation, specialization, permutation search), counts what changes between lookups and
+// which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
+[[nodiscard]] bool SrtProfEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
