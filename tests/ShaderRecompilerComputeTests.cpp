@@ -1613,18 +1613,12 @@ void CheckRectListShaders() {
   program.info.inputs.push_back(
       {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
 
-  ShaderVertexInputInfo vertex{};
-  ShaderRecompiler::IR::CompiledShaderInfo vertex_program{.param_export_mask = 1u};
-  ShaderRecompiler::IR::ResourceSnapshot empty_snapshot;
-  vertex.stage.program = &vertex_program;
-  vertex.stage.resources = &empty_snapshot;
+  constexpr uint32_t param_export_mask = 1u;
   ShaderPixelInputInfo pixel{};
   pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
-  pixel.stage.program = &program;
-  pixel.stage.resources = &empty_snapshot;
   std::vector<uint32_t> perspective_specialization;
   BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
@@ -1643,7 +1637,8 @@ void CheckRectListShaders() {
           "duplicate pixel mappings must receive distinct effective output "
           "locations");
 
-  const auto shaders = BuildRectListShaders(vertex, &pixel);
+  const auto shaders =
+      BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
   Require(name, "SPIR-V version",
           shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
               shaders.evaluation.size() > 1 &&
@@ -1692,7 +1687,8 @@ void CheckRectListShaders() {
   for (const auto flat : {0u, 0x400u}) {
     pixel.interpolator_settings[0] = flat;
     pixel.interpolator_settings[1] = flat;
-    const auto shared = BuildRectListShaders(vertex, &pixel);
+    const auto shared =
+        BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
     ValidateSpirv(name, shared.control);
     ValidateSpirv(name, shared.evaluation);
     Require(name, "same-mode alias disassembly",
@@ -1708,7 +1704,7 @@ void CheckRectListShaders() {
             "the shared location in each rectangle-list stage");
   }
 
-  const auto position_only = BuildRectListShaders(vertex, nullptr);
+  const auto position_only = BuildRectListShaders({}, param_export_mask);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
 }
@@ -19144,8 +19140,8 @@ public:
     AppendEnd(&test.fragment_code);
     auto fragment = CompileFragmentCase(test);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
-    ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
-    ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
+    ShaderModule vertex_shader{.handle = {1, CreateShaderModule(name, vertex_spirv)}};
+    ShaderModule pixel_shader{.handle = {2, CreateShaderModule(name, fragment.spirv)}};
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.info.vertex_fetch_components[0] = 2;
@@ -19172,6 +19168,9 @@ public:
     ShaderPixelInputInfo pixel{};
     pixel.stage.program = &pixel_program;
     pixel.stage.resources = &fragment.resources;
+    vertex_shader.program = vertex_program;
+    vertex_shader.vertex_formats = VertexInputFormats(vertex, vertex_program);
+    pixel_shader.program = pixel_program;
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -19218,8 +19217,10 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      state.vertex_info[0].stage.handle = &vertex_shader;
-      state.ps_input_info.stage.handle = &pixel_shader;
+      state.vertex_info[0].stage.handle = &vertex_shader.handle;
+      state.vertex_info[0].stage.module = &vertex_shader;
+      state.ps_input_info.stage.handle = &pixel_shader.handle;
+      state.ps_input_info.stage.module = &pixel_shader;
       return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
@@ -19595,8 +19596,8 @@ public:
         const auto native = refresh();
         vertex = native.vertex_info[0];
         pixel = native.ps_input_info;
-        vertex_shader = *vertex.stage.handle;
-        pixel_shader = *pixel.stage.handle;
+        vertex_shader = *vertex.stage.module;
+        pixel_shader = *pixel.stage.module;
       };
       const auto silent = refresh();
       registers.SetDepthShaderControl({.shader_kill_enable = true});
@@ -19638,10 +19639,10 @@ public:
         BuildStageStaticKey(pixel, key);
         if (wave_ids[index] != 0) {
           Require(name, "pixel wave cache reuse",
-                  pixel_shader.id == wave_ids[index] && key == wave_keys[index],
+                  pixel_shader.handle.id == wave_ids[index] && key == wave_keys[index],
                   "restoring wave64 did not reuse its original program");
         }
-        wave_ids[index] = pixel_shader.id;
+        wave_ids[index] = pixel_shader.handle.id;
         wave_keys[index] = std::move(key);
         draw(pipeline(true, 2, 2));
         const auto wave_pixels = read_color();
@@ -19764,10 +19765,10 @@ public:
         auto &selected = pipeline(true, 2, 2);
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
-                  broadcast_program == 0 || (pixel_shader.id == broadcast_program &&
+                  broadcast_program == 0 || (pixel_shader.handle.id == broadcast_program &&
                                               selected.pipeline == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
-          broadcast_program = pixel_shader.id;
+          broadcast_program = pixel_shader.handle.id;
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
@@ -20390,9 +20391,9 @@ public:
                 "packed conversion or rounding contaminated another MRT or followed a physical slot");
         if (test.slot == 2) {
           auto &id = test.truncate ? truncate_program : half_up_program;
-          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.id,
+          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.handle.id,
                   "restoring half-up rounding failed to reuse its program");
-          id = pixel_shader.id;
+          id = pixel_shader.handle.id;
         }
         RenderColorInfo packed_target{}, float_target{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -20457,8 +20458,8 @@ public:
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
     DestroyBuffer(&buffer);
-    m_device.destroyShaderModule(pixel_shader.module);
-    m_device.destroyShaderModule(vertex_shader.module);
+    m_device.destroyShaderModule(pixel_shader.handle.module);
+    m_device.destroyShaderModule(vertex_shader.handle.module);
     Require(name, "release depth memory",
               Libs::LibKernel::Memory::KernelMunmap(depth_address, allocation_size) == 0 &&
                   Libs::LibKernel::Memory::KernelReleaseDirectMemory(

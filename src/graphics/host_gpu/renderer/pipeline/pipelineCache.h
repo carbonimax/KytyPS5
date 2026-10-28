@@ -8,6 +8,9 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
 #include <chrono>
@@ -17,6 +20,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -34,6 +38,8 @@ struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	// 0 without tessellation, 3 for a rectangle list, else the input control points.
+	uint8_t                    patch_control_points     = 0;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
@@ -58,7 +64,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 114);
+static_assert(sizeof(PipelineStaticParameters) == 115);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -96,6 +102,20 @@ struct ShaderProgram {
 	vk::ShaderModule module = nullptr;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
+};
+
+// A compiled program variant. The handle id is stable across runs: it hashes the program key,
+// push data start, specialization and function code, which with the host and the build decide
+// the SPIR-V. A pipeline is built from its key and its stages' modules alone.
+struct ShaderModule {
+	ShaderProgram                                handle;
+	ShaderRecompiler::IR::CompiledShaderInfo     program;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	std::vector<uint32_t>                        function_code;
+	// VS or LS: the host format of each vertex input attribute.
+	std::vector<vk::Format>                      vertex_formats;
+	// Rectangle-list PS: the parameters it reads.
+	std::vector<RectListParameter>               rect_parameters;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -201,15 +221,18 @@ struct PipelineCacheFeedback {
 	bool hit   = false;
 };
 [[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
+// `vertex_stages`: VS, mesh or LS/HS/TES; `pixel` is null without a pixel stage.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&   rendering,
-                            const PipelineVertexInputState& vertex_input,
-                            const DrawRenderState&          state,
-                            const PipelineStaticParameters& static_params,
-                            vk::PipelineCache               driver_cache);
+                            const PipelineRenderingState&        rendering,
+                            const PipelineVertexInputState&      vertex_input,
+                            const PipelineStaticParameters&      static_params,
+                            std::span<const ShaderModule* const> vertex_stages,
+                            const ShaderModule* pixel, vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            const ShaderModule& compute, vk::PipelineCache driver_cache);
+// The host format of each vertex input attribute of a VS or LS program.
+std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
+                                           const ShaderRecompiler::IR::CompiledShaderInfo& program);
 
 } // namespace Libs::Graphics
 

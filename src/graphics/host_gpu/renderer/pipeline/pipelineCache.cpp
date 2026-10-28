@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderPretranslate.h"
 #include "kernel/memory.h"
@@ -242,12 +243,7 @@ struct PipelineCache::ProgramCache {
 		bool operator==(const ProgramKey&) const = default;
 	};
 
-	struct Permutation {
-		std::vector<uint32_t>                       function_code;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		ShaderRecompiler::IR::CompiledShaderInfo     program;
-		ShaderProgram                                handle;
-	};
+	using Permutation = ShaderModule;
 
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
@@ -315,7 +311,20 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
+	// The stable id of a module: everything its SPIR-V depends on besides the host and the build.
+	static uint64_t ModuleId(const ProgramKey& key, uint32_t push_data_start_dword,
+	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                         std::span<const uint32_t>                          function_code) {
+		ShaderRecompiler::IR::Writer bytes;
+		ShaderRecompiler::IR::IoAll(bytes, key.stage, key.hash, key.user_data_count, key.code_size,
+		                            key.static_state, push_data_start_dword, specialization);
+		bytes.Raw(function_code.data(), function_code.size_bytes());
+		const auto id = XXH3_64bits(bytes.bytes.data(), bytes.bytes.size());
+		return id != 0 ? id : 1; // 0 names an absent stage.
+	}
+
 	Permutation CompilePermutation(const char*                                  stage_name,
+	                               const ProgramKey&                            key,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
@@ -356,12 +365,25 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		return {
-		    .function_code  = {function_code.begin(), function_code.end()},
-		    .specialization = std::move(specialization),
+		Permutation permutation {
+		    .handle         = {.module = module},
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .specialization = std::move(specialization),
+		    .function_code  = {function_code.begin(), function_code.end()},
 		};
+		permutation.handle.id = ModuleId(key, permutation.program.bindings.push_data_start_dword,
+		                                 permutation.specialization, function_code);
+		// The inputs of these come from the stage's static key.
+		if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
+		    options.input_info.vertex != nullptr) {
+			permutation.vertex_formats = VertexInputFormats(*options.input_info.vertex,
+			                                                permutation.program);
+		} else if (options.stage == ShaderType::Pixel &&
+		           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
+			permutation.rect_parameters = RectListParameters(*options.input_info.pixel,
+			                                                 permutation.program);
+		}
+		return permutation;
 	}
 
 	template <typename InputInfo>
@@ -406,7 +428,8 @@ struct PipelineCache::ProgramCache {
 		const auto bind = [&](const Permutation& permutation) {
 			input_info.stage = {.program   = &permutation.program,
 			                    .resources = &entry->second.resources,
-			                    .handle    = &permutation.handle};
+			                    .handle    = &permutation.handle,
+			                    .module    = &permutation};
 			permutation.program.bindings.AdvancePushData(push_data_cursor);
 			return permutation.handle;
 		};
@@ -551,7 +574,7 @@ struct PipelineCache::ProgramCache {
 			verify_spirv_hash = XXH3_64bits(check.spirv.data(), check.spirv.size() * sizeof(uint32_t));
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    stage_name, lookup_key, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		if (verify_local) {
 			const bool equal = verify_spirv_hash == last_spirv_hash;
@@ -617,7 +640,6 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;
-	uint64_t                                                    next_shader_id = 0;
 	// KYTY_COMPILE_LOG diagnostics (GPU thread).
 	const bool                   diag_log = PerfStats::CompileLogEnabled();
 	std::unordered_set<uint64_t> diag_codes;
@@ -1258,8 +1280,18 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
+	if (vertex_info.size() == 3) {
+		EXIT_IF(vs_input_info.tess.input_control_points == 0 ||
+		        vs_input_info.tess.input_control_points > 32);
+		static_params.patch_control_points =
+		    static_cast<uint8_t>(vs_input_info.tess.input_control_points);
+	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
+		// Rectangle lists expand through generated tessellation stages.
+		static_params.patch_control_points = 3;
+	}
 
-	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
+	if (!mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
 		        vs_input_info.resources_num < 0 ||
@@ -1306,8 +1338,13 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::GfxPipelineNs,
 		                                  PerfStats::Counter::GfxPipelineCount);
-		CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, state,
-		                       static_params, m_driver_cache);
+		std::array<const ShaderModule*, 3> vertex_stages {};
+		for (uint32_t i = 0; i < vertex_info.size(); i++) {
+			vertex_stages[i] = vertex_info[i].stage.module;
+		}
+		CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, static_params,
+		                       std::span(vertex_stages).first(vertex_info.size()),
+		                       ps_active ? ps_input_info.stage.module : nullptr, m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 	if (PerfStats::CompileLogEnabled()) {
@@ -1328,8 +1365,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(input_info.stage.handle == nullptr);
-	const auto& compute_program = *input_info.stage.handle;
+	EXIT_IF(input_info.stage.module == nullptr);
+	const auto& compute_program = input_info.stage.module->handle;
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(compute_program.id);
 	auto& pipeline        = iter->second;
@@ -1348,8 +1385,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::CsPipelineNs,
 		                                  PerfStats::Counter::CsPipelineCount);
-		CreatePipelineInternal(m_graphics, pipeline, input_info, compute_program.module,
-		                       m_driver_cache);
+		CreatePipelineInternal(m_graphics, pipeline, *input_info.stage.module, m_driver_cache);
 	}
 	if (PerfStats::CompileLogEnabled()) {
 		const auto feedback = LastPipelineCacheFeedback();
