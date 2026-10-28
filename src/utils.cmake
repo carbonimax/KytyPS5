@@ -65,10 +65,10 @@ else()
 	SET(CMAKE_NINJA_FORCE_RESPONSE_FILE 1 CACHE INTERNAL "")
 endif()
 
-# Host instruction set. Guest code runs natively on x86-64 hosts, so every such host has x86-64-v3
-# (AVX2, BMI1, BMI2, FMA, F16C, LZCNT, MOVBE) and the emulator is built for it. Never on other hosts
-# (the ARM64 port). KYTY_X86_64_V3=OFF keeps the baseline x86-64 target, e.g. for a binary translator
-# that lacks one of these extensions.
+# Host instruction set. Windows and Linux x86-64 hosts are built for x86-64-v3 (AVX2, BMI1, BMI2,
+# FMA, F16C, LZCNT, MOVBE) by default. macOS x86-64 builds are not: Rosetta executes these
+# instructions but does not report them in CPUID, and older Intel Macs lack them. Never on other
+# hosts (the ARM64 port). KYTY_X86_64_V3 overrides the default.
 set(KYTY_HOST_X86_64 FALSE)
 if(APPLE)
 	if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
@@ -82,7 +82,11 @@ elseif(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
 	set(KYTY_HOST_X86_64 TRUE)
 endif()
-option(KYTY_X86_64_V3 "Build x86-64 hosts for x86-64-v3 (AVX2, BMI2, FMA)" ${KYTY_HOST_X86_64})
+set(KYTY_X86_64_V3_DEFAULT ${KYTY_HOST_X86_64})
+if(APPLE)
+	set(KYTY_X86_64_V3_DEFAULT FALSE)
+endif()
+option(KYTY_X86_64_V3 "Build x86-64 hosts for x86-64-v3 (AVX2, BMI2, FMA)" ${KYTY_X86_64_V3_DEFAULT})
 set(KYTY_TARGET_X86_64_V3 FALSE)
 if(KYTY_X86_64_V3 AND KYTY_HOST_X86_64)
 	set(KYTY_TARGET_X86_64_V3 TRUE)
