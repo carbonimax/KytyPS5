@@ -20,12 +20,12 @@ void Translator::Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpco
 	Write16Bits(DestinationOperand(inst), result);
 }
 
-void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
-	const auto lhs    = ReadU16AsU32(inst.src0, true);
-	const auto rhs    = ReadU16AsU32(inst.src1, true);
-	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, true));
+void Translator::Integer16Mad(const Decoder::Instruction& inst, bool sign) {
+	const auto lhs    = ReadU16AsU32(inst.src0, sign);
+	const auto rhs    = ReadU16AsU32(inst.src1, sign);
+	auto       result = ir.IAdd(ir.IMul(lhs, rhs), ReadU16AsU32(inst.src2, sign));
 	if (inst.dst.clamp) {
-		result = Saturate16(result, true);
+		result = Saturate16(result, sign);
 	}
 	Write16Bits(DestinationOperand(inst), result);
 }
