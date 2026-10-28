@@ -20380,6 +20380,78 @@ public:
       registers.SetShaderStages(saved_stages);
       shaders.SetEsShaderBase(vertex_address);
 
+      // Local shaders rebuild EXEC from the low-byte vertex count in s3.
+      // Bound the waterfall and collapse incomplete geometry without hanging the GPU.
+      const auto local_waterfall = [&] {
+        std::vector<u32> code{
+            EncodeSop2(0x1e, 106, 3, InlineU32(16)),
+            EncodeSop2(0x29, 126, 193, 106),
+            EncodeSop1(0x04, 10, 126), EncodeSop1(0x04, 12, 126),
+            EncodeSop1(0x03, 20, InlineU32(0)),
+            EncodeVop2(0x1b, 8, InlineU32(3), 2)};
+        const auto loop = code.size();
+        code.insert(code.end(), {
+            EncodeVop1(0x02, 16, Vgpr(8)), EncodeVopc(0xd2, 16, 8),
+            EncodeSop2(0x15, 12, 12, 126), EncodeSop1(0x04, 126, 12)});
+        const auto complete = code.size();
+        code.push_back(0);
+        code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+        code.push_back(EncodeSopc(0x0a, 20, InlineU32(4)));
+        code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+        code[complete] = EncodeSopp(0x04, static_cast<int16_t>(code.size() - complete - 1u));
+        AppendSMovLiteral(&code, 21, 0x3f800000u);
+        code.insert(code.end(), {
+            EncodeSop2(0x10, 16, 12, 13),
+            EncodeSop2(0x0a, 20, InlineU32(0), 21),
+            EncodeSop1(0x04, 126, 10), EncodeVop1(0x01, 9, 20),
+            EncodeVop1(0x01, 5, Vgpr(2))});
+        const auto base = code.size();
+        code.insert(code.end(), native_vertex.begin(), native_vertex.end());
+        const auto position = std::find(code.begin() + base, code.end(), EncodeExp0(0x0c, 0xf));
+        code.insert(position, {EncodeVop2(0x08, 3, Vgpr(9), 3),
+                               EncodeVop2(0x08, 4, Vgpr(9), 4)});
+        code.back() = EncodeSop1(0x20, 0, 6);
+        return code;
+      }();
+      const auto saved_vertex = vertex;
+      for (const u32 wave : {32u, 64u}) {
+        ShaderVertexInputInfo local_info{};
+        local_info.logical_stage = ShaderType::Local;
+        local_info.wave_size = wave;
+        ShaderRecompiler::CompileOptions options;
+        options.stage = ShaderType::Local;
+        options.wave_size = wave;
+        options.input_info.vertex = &local_info;
+        auto translated = ShaderRecompiler::TranslateProgram(local_waterfall, options);
+        auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, {});
+        ValidateSpirv(name, compiled.spirv);
+        ShaderModule local_module{
+            .handle = {0x4c53000000000000ull | wave, CreateShaderModule(name, compiled.spirv)},
+            .program = std::move(compiled.program).TakeCompiledInfo()};
+        ShaderRecompiler::IR::ResourceSnapshot local_resources;
+        // pipeline() binds the vertex stage to vertex_shader.
+        const auto saved_vertex_shader = vertex_shader;
+        vertex_shader = local_module;
+        local_info.stage = {&vertex_shader.program, &local_resources, &vertex_shader.handle,
+                            &vertex_shader};
+        vertex = local_info;
+        Require(name, "native local waterfall stage",
+                local_module.program.stage == ShaderType::Local &&
+                    local_module.program.wave_size == wave,
+                "local waterfall lost its native stage or guest wave width");
+        for (const u32 count : {3u, 6u, 33u, 96u}) {
+          draw(pipeline(true, 2, 2), count);
+          const auto pixels = read_color();
+          for (size_t component = 0; component < pixels.size(); ++component)
+            Require(name, "local partial-wave waterfall completion",
+                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "local waterfall retained unprocessed lanes after its iteration bound");
+        }
+        vertex_shader = saved_vertex_shader;
+        m_device.destroyShaderModule(local_module.handle.module);
+      }
+      vertex = saved_vertex;
+
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
       static const auto blend_pixel = [] {
