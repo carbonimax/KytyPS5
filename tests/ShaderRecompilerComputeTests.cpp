@@ -49476,8 +49476,15 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
     control.push_back(EncodeSopk(0x00, 106, control_points * hs_stride));
     control.push_back(EncodeVop2(0x0b, 2, 249u, 1));
     control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
-    AppendVop3(&control, 0x346, output_address, Vgpr(control_point), InlineU32(7),
-               Vgpr(2));
+    if (hs_stride == 256) {
+      // Keep the packed control-point field in place: bits 12:8 give a 256-byte stride.
+      control.push_back(EncodeVop2(0x1b, output_address, 255u, 1));
+      control.push_back(0x1f00u);
+      control.push_back(EncodeVop2(0x25, output_address, Vgpr(output_address), 2));
+    } else {
+      AppendVop3(&control, 0x346, output_address, Vgpr(control_point), InlineU32(7),
+                 Vgpr(2));
+    }
     control.push_back(EncodeVop2(0x0b, input_address, 255u, control_point));
     control.push_back(ls_stride);
   }
@@ -49759,6 +49766,7 @@ void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
   CheckTessellationProgram("TessellationQuadFactors", 36, 128, 2);
+  CheckTessellationProgram("TessellationMaskedControlPoint", 32, 256, 2);
   CheckTessellationPatchConstants();
 }
 
