@@ -70,6 +70,8 @@ enum class Counter : uint32_t {
 	SrtNoLoad,         // walk loaded no guest memory (descriptors from user data only)
 	SrtLoads,          // guest loads of the walks (memo count)
 	SrtFlatWords,      // flattened SRT dwords (scalar values the shader reads)
+	SrtFlatNeeded,     // of the plan's flattened SRT reads, those descriptors/selectors/conditions depend on
+	SrtFlatPlan,       // the plan's flattened SRT reads
 	SrtBuffers,        // buffer resources
 	SrtImages,         // image resources, of which
 	SrtHeapImages,     //   resident image heap roots/kinds
