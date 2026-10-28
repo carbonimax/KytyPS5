@@ -187,7 +187,7 @@ private:
 	void V_XOR3_B32(const Decoder::Instruction& inst);
 	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb, bool sign);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
+	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
 	void V_ADD3_U32(const Decoder::Instruction& inst);
