@@ -364,6 +364,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.PrepareBda();
 	}
 	if (program.info.uses_image_heap) {
+		PerfStats::ScopedTimer heap_timer(PerfStats::Counter::BindHeapNs, PerfStats::BindProfEnabled());
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);
@@ -516,6 +517,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	if (program.info.uses_image_heap) {
+		PerfStats::ScopedTimer heap_timer(PerfStats::Counter::BindHeapNs, PerfStats::BindProfEnabled());
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	RebindImages(bindings);

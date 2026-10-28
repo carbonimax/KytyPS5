@@ -41,10 +41,25 @@ enum class Counter : uint32_t {
 	IdleSubmits,       // of which KYTY_IDLE_SUBMIT submissions
 	SideReadNs,        // KYTY_SYNC_SIDE_READS: GPU thread waiting for readback-queue copies
 	SideReadCount,
+	// KYTY_BIND_PROF=1 (with KYTY_PERF_STATS=1): resource binding of draws and dispatches.
+	BindPrepareNs,     // PrepareBindings: texture resolution, samplers, shader data
+	BindFindBuffersNs, // FindBuffers: buffer cache lookups
+	BindHeapNs,        // ImageHeap::Rebind
+	BindImagesNs,      // RebindImages: image views
+	BindBuffersNs,     // RebindBuffers: storage buffer views, uploads
+	BindCommitNs,      // CommitBindings, whole
+	BindCheckNs,       // of which scalar-read overlap checks + image heap commit
+	BindTransitNs,     // of which image layout transitions
+	BindPushNs,        // of which push descriptors / set update + bind (record hook or driver)
+	BindCommitCount,   // CommitBindings calls
+	BindWriteCount,    // vk::WriteDescriptorSet entries
+	BindDescriptorCount, // descriptors in those writes
 	Count
 };
 
 [[nodiscard]] bool Enabled() noexcept;
+// KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases.
+[[nodiscard]] bool BindProfEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
@@ -93,6 +108,14 @@ public:
 	}
 	ScopedTimer(const ScopedTimer&)            = delete;
 	ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+	// Timer that only runs when `on` (e.g. BindProfEnabled()).
+	ScopedTimer(Counter time, bool on) noexcept: m_time(time), m_count(Counter::Count) {
+		if (on) {
+			m_start = std::chrono::steady_clock::now();
+			m_on    = true;
+		}
+	}
 
 private:
 	Counter                               m_time;

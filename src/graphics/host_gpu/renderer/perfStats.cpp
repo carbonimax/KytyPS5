@@ -55,6 +55,14 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
+bool BindProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BIND_PROF");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -166,6 +174,15 @@ void MaybeReport() noexcept {
 	            n(Counter::WaitOtherCount), ms(Counter::SideReadNs), n(Counter::SideReadCount),
 	            static_cast<double>(n(Counter::Submits)) / seconds,
 	            static_cast<double>(n(Counter::IdleSubmits)) / seconds);
+	if (BindProfEnabled()) {
+		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
+		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
+		            " descriptors=%" PRIu64 "\n",
+		            seconds, ms(Counter::BindPrepareNs), ms(Counter::BindFindBuffersNs), ms(Counter::BindHeapNs),
+		            ms(Counter::BindImagesNs), ms(Counter::BindBuffersNs), ms(Counter::BindCommitNs),
+		            n(Counter::BindCommitCount), ms(Counter::BindCheckNs), ms(Counter::BindTransitNs),
+		            ms(Counter::BindPushNs), n(Counter::BindWriteCount), n(Counter::BindDescriptorCount));
+	}
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64
