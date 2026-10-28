@@ -49355,8 +49355,10 @@ bool HasPatchInterface(const std::string &assembly, const std::string &storage, 
              std::string::npos;
 }
 
-void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
+void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u32 domain = 1) {
   using namespace ShaderRecompiler;
+  const bool quad = domain == 2;
+  const u32 control_points = quad ? 4 : 3;
   const bool multiplied_stride = hs_stride == 112;
   const u32 local_address = multiplied_stride ? 18 : 21;
   const u32 control_point = multiplied_stride ? 30 : 34;
@@ -49391,12 +49393,12 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
     control.push_back(ls_stride);
     AppendVop3(&control, 0x143, output_address, 255u, Vgpr(relative_patch),
                Vgpr(0));
-    control.push_back(3 * hs_stride);
+    control.push_back(control_points * hs_stride);
     AppendVop3(&control, 0x143, input_address, 255u, Vgpr(relative_patch),
                Vgpr(1));
-    control.push_back(3 * ls_stride);
+    control.push_back(control_points * ls_stride);
   } else {
-    control.push_back(EncodeSopk(0x00, 106, 3 * hs_stride));
+    control.push_back(EncodeSopk(0x00, 106, control_points * hs_stride));
     control.push_back(EncodeVop2(0x0b, 2, 249u, 1));
     control.push_back(EncodeVop2Sdwa(106, 6, 0, 6, 0, 0, 0, 0, 0, 0, 0, 1));
     AppendVop3(&control, 0x346, output_address, Vgpr(control_point), InlineU32(7),
@@ -49415,7 +49417,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   AppendVMovLiteral(&control, 4, 0x42280000u);
   AppendVMovLiteral(&control, 5, 0x422c0000u);
   control.push_back(EncodeVopc(0xd4, InlineU32(1), control_point));
-  control.push_back(EncodeVop2(0x1a, 4, InlineU32(4), relative_patch));
+  control.push_back(EncodeVop2(0x0b, 4, InlineU32(quad ? 24 : 16), relative_patch));
   control.push_back(EncodeVop2(0x1a, 6, InlineU32(6), relative_patch));
   control.push_back(EncodeVop2(0x26, 5, 255u, 6));
   control.push_back(0x7fc0);
@@ -49424,6 +49426,12 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   }
   control.push_back(EncodeMubuf0(0x1e));
   control.push_back(EncodeMubuf1(0, 2, 4, 4));
+  if (quad) {
+    AppendVMovLiteral(&control, 6, std::bit_cast<u32>(5.0f));
+    AppendVMovLiteral(&control, 7, std::bit_cast<u32>(6.0f));
+    control.push_back(EncodeMubuf0(0x1d, 16));
+    control.push_back(EncodeMubuf1(6, 2, 4, 4));
+  }
   for (u32 i = 0; i < 4; i++) {
     control.push_back(EncodeMubuf0(0x1c, i * 16));
     control.push_back(EncodeMubuf1(i, 2, 5, 2));
@@ -49431,7 +49439,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   AppendEnd(&control);
 
   AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
-  evaluation.push_back(3 * hs_stride);
+  evaluation.push_back(control_points * hs_stride);
   evaluation.push_back(EncodeMubuf0(0x0d, 28));
   evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
   evaluation.push_back(EncodeMubuf0(0x0d, 2 * hs_stride + 28));
@@ -49440,9 +49448,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   evaluation.push_back(EncodeExp1(5, 6, 10, 12));
   AppendEnd(&evaluation);
 
-  ShaderTessellationInputInfo tess{.input_control_points = 3,
-                                  .output_control_points = 3,
-                                  .domain = 1,
+  ShaderTessellationInputInfo tess{.input_control_points = control_points,
+                                  .output_control_points = control_points,
+                                  .domain = domain,
                                   .partitioning = 2,
                                   .output_topology = 2};
   AnalyzeTessellationPrograms(local, control, tess);
@@ -49462,9 +49470,24 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   Require(name, "offchip component addressing",
           ds.addresses[Attribute::EvaluationInput] == std::set<u32>{28, 2 * hs_stride + 28},
           "TES control point and component offsets must survive lowering");
-  Require(name, "triangle factor layout",
-          hs.addresses[Attribute::Factor] == std::set<u32>{0, 4, 8, 12},
-          "the four packed guest factors must retain their order");
+  Require(name, "factor layout",
+          hs.addresses[Attribute::Factor] ==
+              (quad ? std::set<u32>{0, 4, 8, 12, 16, 20} : std::set<u32>{0, 4, 8, 12}),
+          "packed guest factors must retain their order");
+  const auto factor_access = [&](const char *builtin, u32 index) {
+    const auto end = hs.assembly.find(std::string(" BuiltIn ") + builtin);
+    Require(name, "factor builtin", end != std::string::npos, "missing tessellation factor");
+    const auto begin = hs.assembly.rfind('%', end);
+    const auto variable = hs.assembly.substr(begin, end - begin);
+    return hs.assembly.find(" " + variable + " %uint_" + std::to_string(index) + "\n") !=
+           std::string::npos;
+  };
+  Require(name, "outer and inner factor routing",
+          factor_access("TessLevelOuter", 2) &&
+              factor_access("TessLevelOuter", 3) == quad &&
+              factor_access("TessLevelInner", 0) &&
+              factor_access("TessLevelInner", 1) == quad,
+          "edge factors must precede the domain's interior factors");
   Require(name, "predicated patch addresses",
           hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
           "CP0 patch stores must use the address assigned on their active predicate");
@@ -49480,16 +49503,12 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
           hs.assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
               hs.assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos,
           "HS barriers must match GLSL450 control point synchronization semantics");
-  Require(name, "factor builtins",
-          hs.assembly.find("TessLevelOuter") != std::string::npos &&
-              hs.assembly.find("TessLevelInner") != std::string::npos,
-          "triangle factors require outer[4] and inner[2] Vulkan builtins");
   Require(name, "native domain and winding",
           ds.assembly.find("TessCoord") != std::string::npos &&
-              ds.assembly.find("Triangles") != std::string::npos &&
+              ds.assembly.find(quad ? "Quads" : "Triangles") != std::string::npos &&
               ds.assembly.find("SpacingFractionalOdd") != std::string::npos &&
               ds.assembly.find("VertexOrderCw") != std::string::npos,
-          "TES must preserve guest triangle domain, partitioning, and winding");
+          "TES must preserve guest domain, partitioning, and winding");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -49664,6 +49683,7 @@ void CheckTessellationPatchConstants() {
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationProgram("TessellationQuadFactors", 36, 128, 2);
   CheckTessellationPatchConstants();
 }
 
