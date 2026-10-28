@@ -597,12 +597,10 @@ struct PipelineCache::ProgramCache {
 			    pretranslated ? 1 : 0);
 		}
 
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
-		}
+		auto& counts = compiled;
+		counts[static_cast<size_t>(options.stage)]++;
 		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+		std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 		            counts[static_cast<size_t>(ShaderType::Vertex)],
 		            counts[static_cast<size_t>(ShaderType::Pixel)],
 		            counts[static_cast<size_t>(ShaderType::Compute)],
@@ -640,6 +638,8 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;
+	// Modules compiled per stage, without those loaded from the shader store.
+	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> compiled {};
 	// KYTY_COMPILE_LOG diagnostics (GPU thread).
 	const bool                   diag_log = PerfStats::CompileLogEnabled();
 	std::unordered_set<uint64_t> diag_codes;
