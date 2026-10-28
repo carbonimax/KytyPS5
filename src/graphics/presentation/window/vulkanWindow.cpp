@@ -30,9 +30,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#if defined(__APPLE__)
-#include <dlfcn.h>
-#endif
 #include <fmt/format.h>
 #include <memory>
 #include <string>
@@ -58,27 +55,6 @@ struct VulkanExtensions {
 static bool PerVertexExperimentalEnabled() {
 	const auto* value = std::getenv("KYTY_PERVERTEX_EXPERIMENTAL");
 	return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-static void EnableExperimentalMesh(vk::PhysicalDevice device) {
-	Dl_info provider {};
-	if (dladdr(reinterpret_cast<void*>(SDL_Vulkan_GetVkGetInstanceProcAddr()), &provider) == 0 || provider.dli_fname == nullptr || provider.dli_fbase == nullptr) {
-		EXIT("Experimental mesh cannot identify the loaded Vulkan provider\n");
-	}
-	void* image = dlopen(provider.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
-	if (image == nullptr) {
-		EXIT("Experimental mesh cannot open the loaded Vulkan provider\n");
-	}
-	auto enable = reinterpret_cast<void (*)(VkPhysicalDevice)>(dlsym(image, "mvkEnableMeshTestDevice"));
-	Dl_info adapter {};
-	if (enable == nullptr || dladdr(reinterpret_cast<void*>(enable), &adapter) == 0 || adapter.dli_fbase != provider.dli_fbase) {
-		dlclose(image);
-		EXIT("Experimental mesh requires mvkEnableMeshTestDevice from the loaded Vulkan provider\n");
-	}
-	LOGF("Experimental mesh Vulkan provider: %s\n", provider.dli_fname);
-	enable(static_cast<VkPhysicalDevice>(device));
-	dlclose(image);
-	LOGF("Experimental mesh adapter called; opt-in enabled\n");
 }
 #endif
 
@@ -220,12 +196,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
-#if defined(__APPLE__)
-		if (PerVertexExperimentalEnabled()) {
-			EnableExperimentalMesh(device);
-		}
-#endif
-
 		vk::PhysicalDeviceProperties device_properties {};
 		device.getProperties(&device_properties);
 
@@ -804,9 +774,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// }
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
-	robustness2.pNext = &features12;
-#else
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 	if (barycentric_supported) {
 		fragment_barycentric.pNext                     = &features12;
@@ -815,7 +782,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	} else {
 		robustness2.pNext = &features12;
 	}
-#endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	graphics.null_descriptor_enabled = robustness2_extension && supported_robustness2.nullDescriptor == VK_TRUE;
@@ -1139,6 +1105,13 @@ void WindowContext::CreateVulkan() {
 		}
 		inst_info.flags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
 		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+	}
+	// MoltenVK reads this when the instance enumerates its devices: it then exposes
+	// VK_KHR_fragment_shader_barycentric and VK_EXT_mesh_shader where Metal supports them.
+	if (PerVertexExperimentalEnabled()) {
+		setenv("MVK_CONFIG_PERVERTEX_EXPERIMENTAL", "1", 0);
+		LOGF("Experimental PerVertex and mesh: MVK_CONFIG_PERVERTEX_EXPERIMENTAL=%s\n",
+		     std::getenv("MVK_CONFIG_PERVERTEX_EXPERIMENTAL"));
 	}
 #endif
 	inst_info.pApplicationInfo        = &app_info;
