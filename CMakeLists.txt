@@ -760,6 +760,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
 	add_test(NAME shader_recompiler_quadmask
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
