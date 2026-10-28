@@ -123,6 +123,8 @@ uint32_t EmitSourceLaneActive(ValueEmitContext& ctx, uint32_t exec, uint32_t lan
 	if (ctx.half != 0) {
 		lane = EmitAndConstant(state, lane, 31);
 	}
+	// Packed wave32: the guest lane lives in this invocation's 32-lane half of the host ballot.
+	lane = EmitPhysicalSubgroupLane(state, lane);
 	return EmitNative<spv::OpGroupNonUniformBallotBitExtract, IR::Type::U1>(state, scope, ballot,
 	                                                                        lane);
 }
@@ -906,8 +908,10 @@ uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {
 uint32_t EmitLiveMask(EmitterState& state) {
 	const auto helper =
 	    EmitNative<spv::OpLoad, IR::Type::U1>(state, state.helper_invocation_variable);
-	return EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(
-	    state, ConstantU32(state, spv::ScopeSubgroup), EmitLogicalNotBool(state, helper));
+	// Packed wave32: word 0 is this invocation's guest wave, as for every other ballot.
+	return EmitGuestBallot(state, EmitNative<spv::OpGroupNonUniformBallot, IR::Type::U32x4>(
+	                                  state, ConstantU32(state, spv::ScopeSubgroup),
+	                                  EmitLogicalNotBool(state, helper)));
 }
 
 uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -941,25 +945,40 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 template <spv::Op Reduce, auto Combine>
-static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+static uint32_t EmitSubgroupReduceU32(ValueEmitContext& ctx, const IR::Inst& inst,
+                                      uint32_t identity) {
 	auto& state = ctx.state;
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		value = Combine(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
 	}
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(Reduce, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
-	                          value);
-	return result;
+	const auto reduce = [&](uint32_t input) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(Reduce, TypeU32(state), result,
+		                          ConstantU32(state, spv::ScopeSubgroup),
+		                          spv::GroupOperationReduce, input);
+		return result;
+	};
+	if (!state.packed_wave32) {
+		return reduce(value);
+	}
+	// A 64-lane host subgroup holds two guest waves: reduce each half with the other half's
+	// lanes contributing the identity, and keep this invocation's half.
+	const auto upper = Binary(state, spv::OpINotEqual, TypeBool(state),
+	                          EmitPhysicalSubgroupLane(state, ConstantU32(state, 0)),
+	                          ConstantU32(state, 0));
+	const auto none  = ConstantU32(state, identity);
+	const auto low   = reduce(Select(state, TypeU32(state), upper, none, value));
+	const auto high  = reduce(Select(state, TypeU32(state), upper, value, none));
+	return Select(state, TypeU32(state), upper, high, low);
 }
 
 uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst);
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMin, EmitUMin32>(ctx, inst, UINT32_MAX);
 }
 
 uint32_t EmitSubgroupUMaxU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst);
+	return EmitSubgroupReduceU32<spv::OpGroupNonUniformUMax, EmitUMax32>(ctx, inst, 0u);
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {
