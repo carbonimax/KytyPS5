@@ -1852,6 +1852,10 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 		CpPipeline::Note(CpPipeline::Stat::FallbackTargets);
 		return false;
 	}
+	if (!CpPipeline::Engaged()) {
+		CpPipeline::Note(CpPipeline::Stat::FallbackFast);
+		return false;
+	}
 	vk::PrimitiveTopology topology {};
 	if (!DrawHasValidVertexShader(buffer.GetShaders()) ||
 	    !GetDrawTopology(buffer.GetUserConfig(), topology)) {

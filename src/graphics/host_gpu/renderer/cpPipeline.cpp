@@ -162,6 +162,14 @@ int Mode() noexcept {
 	return mode;
 }
 
+bool Engaged() noexcept {
+	static const uint64_t min_frame_us = [] {
+		const char* value = std::getenv("KYTY_CP_PIPELINE_MIN_FRAME_MS");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000ull : 25000ull;
+	}();
+	return Mode() == 2 || PerfStats::RecentFrameUs() >= min_frame_us;
+}
+
 void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feedback) {
 	auto& s = S();
 	if (s.slots != nullptr || Mode() == 0) return;
@@ -302,10 +310,10 @@ void Report(double seconds) noexcept {
 	const auto fulls  = take(s.full_waits);
 	const auto full   = take(s.full_wait_ns);
 	std::printf("PERF cppipe %.1fs: queued=%" PRIu64 " inline_heap=%" PRIu64 " inline_writes=%" PRIu64
-	            " fallback_args=%" PRIu64 " fallback_targets=%" PRIu64 " fallback_shaders=%" PRIu64
+	            " fallback_args=%" PRIu64 " fallback_targets=%" PRIu64 " fallback_shaders=%" PRIu64 " fallback_fast=%" PRIu64
 	            " drain_waits=%" PRIu64 "(%.0fms) full_waits=%" PRIu64 "(%.0fms) relookups=%" PRIu64
 	            " back_busy=%.0fms\n",
-	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], drains, ms(drain), fulls, ms(full),
+	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], drains, ms(drain), fulls, ms(full),
 	            take(s.relookups), ms(take(s.back_busy_ns)));
 }
 

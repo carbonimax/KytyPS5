@@ -57,6 +57,10 @@ using RelookupFn = void (*)(void* context, DrawRecord& record);
 using FeedbackFn = void (*)(void* context, const DrawRecord& record);
 
 [[nodiscard]] int Mode() noexcept;
+// KYTY_CP_PIPELINE_MIN_FRAME_MS=M (default 25, 0 = always): mode 1 queues draws only while presented
+// frames are at least M ms apart on average (PerfStats::RecentFrameUs), as the record thread does. At
+// the display rate the GPU thread has time to spare and each hand-off only delays the submission.
+[[nodiscard]] bool Engaged() noexcept;
 // Registered once by the renderer before the first record.
 void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feedback);
 
@@ -97,6 +101,7 @@ enum class Stat : uint32_t {
 	FallbackArgs,     // offset source, indirect, empty or debug dump
 	FallbackTargets,  // metadata color operation, resolve or depth copy
 	FallbackShaders,  // no valid vertex shader or topology
+	FallbackFast,     // frames faster than KYTY_CP_PIPELINE_MIN_FRAME_MS
 	Count
 };
 void Note(Stat stat) noexcept;
