@@ -53831,7 +53831,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-wait-only") == 0) {
-    VulkanHarness vulkan;
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
     CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
