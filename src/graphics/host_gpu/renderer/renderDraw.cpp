@@ -15,6 +15,8 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1011,22 +1013,28 @@ static SingleSampleGuess& GetSingleSampleGuess() {
 	return guess;
 }
 
+static bool GuessSingleSample(uint64_t ps_address) {
+	const auto& guess = GetSingleSampleGuess();
+	if (const auto it = guess.by_shader.find(ps_address); it != guess.by_shader.end()) {
+		return it->second;
+	}
+	return guess.last;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
-	                                        DrawRenderState& state) {
-	m_context.GetImageHeap().BeginDraw();
-	if (draw.IsIndexed()) {
-		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
+	                                        DrawRenderState& state, CpPipeline::DrawRecord* record,
+                                            DrawPrepared prepared) {
+	if (prepared != DrawPrepared::LookedUpHeapBegun) {
+		m_context.GetImageHeap().BeginDraw();
 	}
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
-	auto&      guess      = GetSingleSampleGuess();
-	bool       guessed    = guess.last;
-	if (const auto it = guess.by_shader.find(ps_address); it != guess.by_shader.end()) {
-		guessed = it->second;
-	}
-	{
+	if (prepared == DrawPrepared::No) {
+		if (draw.IsIndexed()) {
+			LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
+		}
 		CpSplitProf::LookupScope lookup;
-		RefreshShaders(buffer, state, guessed);
+		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
@@ -1091,11 +1099,28 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                                state.depth_info,
 	                                                buffer.GetRegisters().GetAaConfig());
 	if (state.ps_active) {
-		guess.last                  = single_sample;
-		guess.by_shader[ps_address] = single_sample;
+		if (record != nullptr) {
+			// The GPU thread owns the guess; it applies this once the record is done.
+			record->feedback_valid         = true;
+			record->feedback_ps_address    = ps_address;
+			record->feedback_single_sample = single_sample;
+		} else {
+			auto& guess                 = GetSingleSampleGuess();
+			guess.last                  = single_sample;
+			guess.by_shader[ps_address] = single_sample;
+		}
 		if (state.ps_input_info.ps_single_sample != single_sample) {
-			CpSplitProf::LookupScope lookup;
-			RefreshShaders(buffer, state, single_sample);
+			if (record != nullptr) {
+				// Program lookups stay on the GPU thread, which may need this mutex meanwhile.
+				record->relookup_single_sample = single_sample;
+				const bool back                = CpPipeline::IsBackThread();
+				if (back) m_context.GetMutex().Unlock();
+				CpPipeline::RequestRelookup(*record);
+				if (back) m_context.GetMutex().Lock();
+			} else {
+				CpSplitProf::LookupScope lookup;
+				RefreshShaders(buffer, state, single_sample);
+			}
 		}
 	}
 
@@ -1543,10 +1568,22 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 
 bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
+	if (CpPipeline::FrontActive() && PipelineDraw(submit_id, buffer, &args, nullptr)) {
+		return true;
+	}
+	CpPipeline::Drain();
+	return DrawIndexBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
+}
+
+// `prepared`: the draw's programs were already looked up into it (KYTY_CP_PIPELINE); `record`: run
+// from a pipeline record.
+bool RenderExecutor::DrawIndexBody(uint64_t submit_id, CommandBuffer& buffer,
+                                   const DrawIndexArgs& args, DrawRenderState* prepared,
+                                   CpPipeline::DrawRecord* record, DrawPrepared stage) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
-	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1563,15 +1600,17 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return true;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
-		ResetBindings();
-		return true;
-	}
+	if (prepared == nullptr) {
+		if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+		    DepthStencilCopy(buffer) ||
+		    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+			ResetBindings();
+			return true;
+		}
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return true;
+		if (!DrawHasValidVertexShader(sh_ctx)) {
+			return true;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1595,8 +1634,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	hw_check(buffer);
 
-	DrawRenderState state {};
-	if (!GetDrawTopology(ucfg, state.topology)) {
+	DrawRenderState  local_state {};
+	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
 
@@ -1634,7 +1674,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state, record,
+	                            stage)) {
 		ResetBindings();
 		return true;
 	}
@@ -1652,10 +1693,21 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
+	if (CpPipeline::FrontActive() && PipelineDraw(submit_id, buffer, nullptr, &args)) {
+		return true;
+	}
+	CpPipeline::Drain();
+	return DrawAutoBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
+}
+
+// NOLINTNEXTLINE(readability-function-cognitive-complexity)
+bool RenderExecutor::DrawAutoBody(uint64_t submit_id, CommandBuffer& buffer,
+                                  const DrawAutoArgs& args, DrawRenderState* prepared,
+                                  CpPipeline::DrawRecord* record, DrawPrepared stage) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
-	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1672,15 +1724,17 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return true;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
-	    DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
-		ResetBindings();
-		return true;
-	}
+	if (prepared == nullptr) {
+		if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
+		    DepthStencilCopy(buffer) ||
+		    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+			ResetBindings();
+			return true;
+		}
 
-	if (!DrawHasValidVertexShader(sh_ctx)) {
-		return true;
+		if (!DrawHasValidVertexShader(sh_ctx)) {
+			return true;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1703,12 +1757,14 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
-	DrawRenderState state {};
-	if (!GetDrawTopology(ucfg, state.topology)) {
+	DrawRenderState  local_state {};
+	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state, record,
+	                            stage)) {
 		ResetBindings();
 		return true;
 	}
@@ -1736,6 +1792,171 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	ResetBindings();
 	return emit.has_value();
+}
+
+// The register predicate of DepthStencilCopy (a copy draw runs on the GPU thread).
+static bool DepthStencilCopyRequested(const HW::Context& hw) {
+	const auto& z        = hw.GetDepthRenderTarget();
+	const auto& override = hw.GetDepthRenderOverride();
+	return (override.force_z_dirty && override.force_z_valid &&
+	        z.z_info.format != Prospero::DepthFormat::kInvalid && z.z_read_base_addr != 0 &&
+	        z.z_write_base_addr != 0 && z.z_read_base_addr != z.z_write_base_addr) ||
+	       (override.force_stencil_dirty && override.force_stencil_valid &&
+	        z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	        z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	        z.stencil_read_base_addr != z.stencil_write_base_addr);
+}
+
+// The program cache rewrites a stage's resource snapshot at its next lookup: the record keeps its own.
+static void CopySnapshots(CpPipeline::DrawRecord& record) {
+	for (size_t i = 0; i < record.state.vertex_info.size(); i++) {
+		auto& stage = record.state.vertex_info[i].stage;
+		if (stage.resources != nullptr) {
+			record.snapshots[i] = *stage.resources;
+			stage.resources     = &record.snapshots[i];
+		}
+	}
+	auto& ps = record.state.ps_input_info.stage;
+	if (ps.resources != nullptr) {
+		record.snapshots[3] = *ps.resources;
+		ps.resources        = &record.snapshots[3];
+	}
+}
+
+static bool DrawWritesMemory(const DrawRenderState& state) {
+	return std::ranges::any_of(state.VertexStages(),
+	                           [](const auto& vs) { return HasShaderBufferWrites(vs.stage); }) ||
+	       (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage));
+}
+
+// GPU thread: a re-lookup serves a draw that already began its image heap draw.
+static bool g_pipeline_relookup = false;
+
+bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
+                                  const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args) {
+	const bool indexed  = index_args != nullptr;
+	const auto source   = indexed ? index_args->offset_source : auto_args->offset_source;
+	const auto indirect = indexed ? index_args->indirect.address : auto_args->indirect.address;
+	const bool empty    = indexed ? index_args->index_count == 0 || index_args->instance_count == 0
+	                              : auto_args->vertex_count == 0 || auto_args->instance_count == 0;
+	if (source != DrawOffsetSource::DrawState || indirect != 0 || empty ||
+	    graphics_debug_dump_enabled()) {
+		CpPipeline::Note(CpPipeline::Stat::FallbackArgs);
+		return false;
+	}
+	// Metadata operations, resolves and depth copies bind and copy targets themselves.
+	const auto& hw = buffer.GetRegisters();
+	const auto mode = static_cast<CbColorMode>(hw.GetColorControl().mode);
+	if ((mode != CbColorMode::Normal && mode != CbColorMode::Disable) ||
+	    (mode == CbColorMode::Disable && DepthStencilCopyRequested(hw))) {
+		CpPipeline::Note(CpPipeline::Stat::FallbackTargets);
+		return false;
+	}
+	vk::PrimitiveTopology topology {};
+	if (!DrawHasValidVertexShader(buffer.GetShaders()) ||
+	    !GetDrawTopology(buffer.GetUserConfig(), topology)) {
+		CpPipeline::Note(CpPipeline::Stat::FallbackShaders);
+		return false;
+	}
+	static const bool initialized = [this] {
+		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
+		CpPipeline::SetHeapHook(PipelineHeap);
+		return true;
+	}();
+	(void)initialized;
+
+	auto& record          = CpPipeline::Acquire();
+	record.state          = {};
+	record.state.topology = topology;
+	const bool guessed    = GuessSingleSample(buffer.GetShaders().GetPs().ps_regs.data_addr);
+	CpPipeline::SetInLookup(true);
+	{
+		CpSplitProf::LookupScope lookup;
+		RefreshShaders(buffer, record.state, guessed);
+	}
+	CpPipeline::SetInLookup(false);
+	const bool heap = CpPipeline::TakeHeapInline();
+	if (heap || DrawWritesMemory(record.state)) {
+		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.
+		CpPipeline::Note(heap ? CpPipeline::Stat::InlineHeap : CpPipeline::Stat::InlineWrites);
+		CpPipeline::Drain();
+		const auto stage = heap ? DrawPrepared::LookedUpHeapBegun : DrawPrepared::LookedUp;
+		if (indexed) {
+			DrawIndexBody(submit_id, buffer, *index_args, &record.state, nullptr, stage);
+		} else {
+			DrawAutoBody(submit_id, buffer, *auto_args, &record.state, nullptr, stage);
+		}
+		return true;
+	}
+	record.indexed   = indexed;
+	record.submit_id = submit_id;
+	if (indexed) {
+		record.index_args = *index_args;
+	} else {
+		record.auto_args = *auto_args;
+	}
+	record.registers             = buffer.GetRegisters();
+	record.user_config           = buffer.GetUserConfig();
+	record.shaders               = buffer.GetShaders();
+	record.guessed_single_sample = guessed;
+	CopySnapshots(record);
+	CpPipeline::Note(CpPipeline::Stat::Queued);
+	CpPipeline::Publish();
+	return true;
+}
+
+void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& record) {
+	auto*                  self      = static_cast<RenderExecutor*>(context);
+	auto&                  scheduler = self->m_context.GetCommandScheduler();
+	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
+	auto&                  buffer = scheduler.Current();
+	if (record.indexed) {
+		self->DrawIndexBody(record.submit_id, buffer, record.index_args, &record.state, &record,
+		                    DrawPrepared::LookedUp);
+	} else {
+		self->DrawAutoBody(record.submit_id, buffer, record.auto_args, &record.state, &record,
+		                   DrawPrepared::LookedUp);
+	}
+	// KYTY_IDLE_SUBMIT: the GPU thread only checks it between packets with an idle back thread.
+	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
+	if (idle_submit && CpPipeline::IsBackThread() && scheduler.Active() &&
+	    scheduler.IdleSubmitDue()) {
+		PerfStats::Add(PerfStats::Counter::IdleSubmits, 1);
+		scheduler.Flush();
+		self->m_context.GetOcclusionQueries().Publish();
+	}
+}
+
+void RenderExecutor::PipelineRelookup(void* context, CpPipeline::DrawRecord& record) {
+	auto*                  self = static_cast<RenderExecutor*>(context);
+	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
+	auto&                  buffer = self->m_context.GetCommandScheduler().CurrentUnchecked();
+	g_pipeline_relookup         = true;
+	CpPipeline::SetInLookup(true);
+	{
+		CpSplitProf::LookupScope lookup;
+		RefreshShaders(buffer, record.state, record.relookup_single_sample);
+	}
+	CpPipeline::SetInLookup(false);
+	(void)CpPipeline::TakeHeapInline();
+	g_pipeline_relookup = false;
+	CopySnapshots(record);
+}
+
+void RenderExecutor::PipelineFeedback(void* /*context*/, const CpPipeline::DrawRecord& record) {
+	if (!record.feedback_valid) {
+		return;
+	}
+	auto& guess                                 = GetSingleSampleGuess();
+	guess.last                                  = record.feedback_single_sample;
+	guess.by_shader[record.feedback_ps_address] = record.feedback_single_sample;
+}
+
+void RenderExecutor::PipelineHeap(void* context) {
+	if (g_pipeline_relookup) {
+		return;
+	}
+	static_cast<RenderExecutor*>(context)->m_context.GetImageHeap().BeginDraw();
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

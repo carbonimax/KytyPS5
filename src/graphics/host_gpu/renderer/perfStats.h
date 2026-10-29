@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PERFSTATS_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PERFSTATS_H_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -116,11 +117,11 @@ void NoteFlipArg(int64_t arg) noexcept;
 // Smoothed interval between presented frames in microseconds (0 before the second frame).
 [[nodiscard]] uint64_t RecentFrameUs() noexcept;
 
-// Draws and dispatches recorded by the calling thread (GPU thread), always counted: KYTY_IDLE_SUBMIT
-// reads it (CommandScheduler::IdleSubmitDue).
-inline thread_local uint64_t t_work_recorded = 0;
+// Draws and dispatches recorded (GPU thread, and the KYTY_CP_PIPELINE back thread), always counted:
+// KYTY_IDLE_SUBMIT reads it (CommandScheduler::IdleSubmitDue).
+inline std::atomic<uint64_t> t_work_recorded {0};
 inline void                  NoteWork() noexcept {
-    ++t_work_recorded;
+    t_work_recorded.fetch_add(1, std::memory_order_relaxed);
 }
 
 class ScopedTimer {

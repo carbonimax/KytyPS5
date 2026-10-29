@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -119,6 +120,8 @@ ImageHeap::~ImageHeap() {
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
+	// KYTY_CP_PIPELINE: a pipelined lookup that needs the heap runs its draw on the GPU thread.
+	CpPipeline::NoteHeapAcquire();
 	if (!m_context.GetGraphics().null_descriptor_enabled) return false;
 	const auto size = request.size & ~uint64_t {3};
 	if (size < MinTableBytes || request.count == 0u || request.step == 0u ||

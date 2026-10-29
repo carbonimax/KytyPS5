@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
@@ -206,6 +207,8 @@ void CommandScheduler::Shutdown() {
 
 void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
                              HW::Shader& shaders) {
+	// KYTY_CP_PIPELINE: the GPU thread reads the command buffer state only once the back is idle.
+	CpPipeline::Drain();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
@@ -222,6 +225,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 }
 
 void CommandScheduler::EndRendering() {
+	CpPipeline::Drain();
 	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
@@ -233,17 +237,20 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	CpPipeline::Drain();
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	CpPipeline::Drain();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	CpPipeline::Drain();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -254,6 +261,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	CpPipeline::Drain();
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -471,7 +479,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	}
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
-	m_work_at_begin = PerfStats::t_work_recorded;
+	m_work_at_begin = PerfStats::t_work_recorded.load(std::memory_order_relaxed);
 	return m_command;
 }
 
@@ -509,7 +517,7 @@ static uint64_t IdleSubmitMinFrameUs() {
 }
 
 bool CommandScheduler::IdleSubmitDue() {
-	if (m_command.IsInvalid() || PerfStats::t_work_recorded - m_work_at_begin < IdleSubmitMinWork()) {
+	if (m_command.IsInvalid() || PerfStats::t_work_recorded.load(std::memory_order_relaxed) - m_work_at_begin < IdleSubmitMinWork()) {
 		return false;
 	}
 	if (!IdleSubmitSplitsPasses() && m_command.Rendering()) {
@@ -535,8 +543,10 @@ bool CommandScheduler::IdleSubmitDue() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
-	EXIT_IF(m_command.IsInvalid());
 	CpSplitProf::NoteSubmitOrWait();
+	// KYTY_CP_PIPELINE: the GPU thread reads the command buffer state only once the back is idle.
+	CpPipeline::Drain();
+	EXIT_IF(m_command.IsInvalid());
 	if (m_pre_submit != nullptr) [[unlikely]] {
 		m_pre_submit(m_pre_submit_context);
 	}

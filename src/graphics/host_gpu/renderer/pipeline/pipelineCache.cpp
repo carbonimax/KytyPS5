@@ -23,6 +23,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -250,9 +251,7 @@ struct PipelineCache::ProgramCache {
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
-		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {}
 
 		std::span<const uint32_t> FunctionCode() const {
 			return call_source
@@ -291,7 +290,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: KYTY_CP_PIPELINE records keep pointers to permutations while later lookups add some.
+		std::deque<Permutation>                     permutations;
 		bool                                       skip_dispatch = false;
 		// KYTY_SRT_PROF: the previous lookup's permutation and input/output hashes.
 		size_t   prof_permutation = SIZE_MAX;
@@ -351,8 +351,10 @@ struct PipelineCache::ProgramCache {
 		const auto split = refresh_ns + times.walk_ns + times.eval_ns + times.spec_ns;
 		Add(Counter::SrtMatchNs, total_ns > split ? total_ns - split : 0);
 		times = {};
-		const size_t index = permutation != nullptr
-		                         ? static_cast<size_t>(permutation - entry.permutations.data()) : SIZE_MAX;
+		size_t index = SIZE_MAX;
+		for (size_t i = 0; permutation != nullptr && i < entry.permutations.size(); i++) {
+			if (&entry.permutations[i] == permutation) index = i;
+		}
 		Add(Counter::SrtMiss, permutation == nullptr ? 1 : 0);
 		Add(Counter::SrtSamePerm, index != SIZE_MAX && index == entry.prof_permutation ? 1 : 0);
 		Add(Counter::SrtMultiPerm, entry.permutations.size() > 1 ? 1 : 0);

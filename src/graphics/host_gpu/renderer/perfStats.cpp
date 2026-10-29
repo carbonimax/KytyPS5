@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -221,6 +222,7 @@ void MaybeReport() noexcept {
 	}
 	CmdRecord::Report(seconds);
 	CpSplitProf::Report(seconds);
+	CpPipeline::Report(seconds);
 	GuestStacks::Report();
 	std::fflush(stdout);
 }

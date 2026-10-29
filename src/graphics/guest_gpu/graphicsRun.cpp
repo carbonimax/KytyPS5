@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -108,6 +109,8 @@ void GuestGpu::ProcessCommands() {
 		CpSplitProf::Drain(CpSplitProf::Cause::Command);
 	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		// Per command: one may arrive after the check above (it records and submits like the back).
+		CpPipeline::Drain();
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
@@ -537,6 +540,7 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
 				CpSplitProf::BusyBegin();
+				CpPipeline::Drain();
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -590,6 +594,8 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 	}
 
+	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
+	CpPipeline::Drain();
 	cp.BufferInit();
 	bool complete = true;
 
@@ -690,6 +696,33 @@ static bool IsYieldPoint(uint32_t opcode) {
 	}
 }
 
+// KYTY_CP_PIPELINE: packets the front runs while draws are queued (register writes, fetcher,
+// direct draws). Every other packet drains the queue first.
+static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
+	switch (opcode) {
+		case Pm4::IT_NOP: return custom == Pm4::R_ZERO || custom == Pm4::R_CONTEXT_STATE;
+		case Pm4::IT_SET_BASE:
+		case Pm4::IT_CLEAR_STATE:
+		case Pm4::IT_INDEX_BASE:
+		case Pm4::IT_INDEX_BUFFER_SIZE:
+		case Pm4::IT_INDEX_TYPE:
+		case Pm4::IT_NUM_INSTANCES:
+		case Pm4::IT_DRAW_INDEX_2:
+		case Pm4::IT_DRAW_INDEX_OFFSET_2:
+		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_DRAW_INDEX_AUTO:
+		case Pm4::IT_INDIRECT_BUFFER:
+		case Pm4::IT_SET_CONTEXT_REG:
+		case Pm4::IT_SET_SH_REG:
+		case Pm4::IT_SET_UCONFIG_REG:
+		case Pm4::IT_SET_UCONFIG_REG_INDEX:
+		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+		case Pm4::IT_SET_SH_REG_INDIRECT:
+		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return true;
+		default: return false;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
 	while (!execution.m_buffer_stack.empty()) {
@@ -697,7 +730,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			g_gpu_state->ProcessCommands();
 		}
 		// KYTY_IDLE_SUBMIT: an idle host GPU gets the work recorded so far (earlier submission only).
-		if (idle_submit && GetScheduler().Active() && GetScheduler().IdleSubmitDue()) {
+		CpPipeline::Poll();
+		if (idle_submit && CpPipeline::BackIdle() && GetScheduler().Active() &&
+		    GetScheduler().IdleSubmitDue()) {
 			PerfStats::Add(PerfStats::Counter::IdleSubmits, 1);
 			BufferFlush();
 		}
@@ -755,6 +790,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
+		if (!IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
+			CpPipeline::Drain();
+		}
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -887,7 +925,11 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, DrawBuffer(), args);
+}
+
+CommandBuffer& CommandProcessor::DrawBuffer() {
+	return CpPipeline::Mode() != 0 ? GetScheduler().CurrentUnchecked() : CurrentBuffer();
 }
 
 const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
@@ -1047,7 +1089,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
 	}
-	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, DrawBuffer(), args);
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
@@ -1249,6 +1291,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+void GuestGpu::MarkHostGpuThread() noexcept {
+	g_gpu_thread = true;
 }
 
 } // namespace Libs::Graphics
