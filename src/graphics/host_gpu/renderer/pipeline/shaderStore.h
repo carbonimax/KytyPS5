@@ -21,9 +21,9 @@ namespace Libs::Graphics {
 // The per-title shader store, _PipelineCache/<title>.shaders: a header naming everything the
 // records depend on besides their own fields (the build, the host and the switches that change
 // the SPIR-V), then checksummed zstd frames, one per record. Each frame names its record's kind,
-// id and the last launch that used it. A store cut short keeps every complete record; the first
-// damaged one ends it. Any header difference starts the store over, so SPIR-V from another build
-// or host is never loaded.
+// id, the last launch that wrote or used it and how many launches did. A store cut short keeps
+// every complete record; the first damaged one ends it. Any header difference starts the store
+// over, so SPIR-V from another build or host is never loaded.
 //
 // Records are appended while the title runs: programs (key and resource plan), modules (their
 // compiled info), the SPIR-V of each module in a frame of its own, graphics pipelines, and lists
@@ -65,6 +65,8 @@ struct ShaderStoreModule {
 	// AppendModule: the SPIR-V. Loaded modules leave it empty; ReadSpirv(spirv_index) reads it.
 	std::vector<uint32_t> spirv;
 	uint32_t              spirv_index = 0;
+	// Loaded modules: how many launches wrote or used it (at most 255).
+	uint32_t              uses = 0;
 };
 
 struct ShaderStorePipeline {
@@ -73,8 +75,10 @@ struct ShaderStorePipeline {
 	uint64_t                 ps_id = 0;
 	PipelineVertexInputState vertex_input;
 	PipelineStaticParameters static_params;
-	// Loaded pipelines: the record id, for NoteUsedPipeline.
-	uint64_t                 id = 0;
+	// Loaded pipelines: the record id, for NoteUsedPipeline, and how many launches wrote or used
+	// it (at most 255).
+	uint64_t                 id   = 0;
+	uint32_t                 uses = 0;
 };
 
 struct ShaderStoreContents {
@@ -102,6 +106,9 @@ class ShaderStore {
 public:
 	// A record unused for this many launches is dead.
 	static constexpr uint32_t RetainedLaunches = 2;
+	// The prewarm creates the pipelines of records that this many launches wrote or used; the
+	// others, often variants of one launch only, are created when a draw needs them.
+	static constexpr uint32_t PrewarmUses = 2;
 
 	ShaderStore();
 	~ShaderStore();

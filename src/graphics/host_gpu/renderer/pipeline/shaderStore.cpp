@@ -60,7 +60,9 @@ struct Frame {
 	// The last launch that wrote or used the record.
 	uint32_t               launch          = 0;
 	Record                 type            = Record::Launch;
-	std::array<uint8_t, 3> reserved {};
+	// How many launches wrote or used it as of `launch` (at most 255).
+	uint8_t                uses            = 1;
+	std::array<uint8_t, 2> reserved {};
 };
 static_assert(sizeof(Frame) == 32);
 
@@ -259,6 +261,7 @@ struct ShaderStore::Layout {
 		uint64_t offset = 0;
 		uint32_t size   = 0;
 		uint32_t launch = 0;
+		uint8_t  uses   = 1;
 	};
 	std::vector<uint8_t>  header;
 	// In file order.
@@ -284,6 +287,9 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 	std::vector<FrameView>                 frames;
 	std::unordered_map<uint64_t, uint32_t> module_use;
 	std::unordered_map<uint64_t, uint32_t> pipeline_use;
+	// The launches whose use lists name each module and pipeline.
+	std::unordered_map<uint64_t, std::vector<uint32_t>> module_launches;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> pipeline_launches;
 	std::unordered_map<uint64_t, size_t>   program_frames;
 	std::unordered_map<uint64_t, size_t>   spirv_frames;
 	const auto use = [](std::unordered_map<uint64_t, uint32_t>& uses, uint64_t id, uint32_t launch) {
@@ -306,9 +312,11 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 				if (DecodeFrame(view, used, DecodeUsed)) {
 					for (const auto id: used.first) {
 						use(module_use, id, frame.launch);
+						module_launches[id].push_back(frame.launch);
 					}
 					for (const auto id: used.second) {
 						use(pipeline_use, id, frame.launch);
+						pipeline_launches[id].push_back(frame.launch);
 					}
 				}
 				break;
@@ -322,6 +330,21 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 	const auto live     = [&contents](uint32_t used) {
 		return used + ShaderStore::RetainedLaunches >= contents.launch;
 	};
+	// The record's own count, plus the later launches whose use lists name it.
+	const auto count_uses = [](std::unordered_map<uint64_t, std::vector<uint32_t>>& launches,
+	                           const Frame& frame) {
+		uint32_t uses = frame.uses;
+		if (const auto found = launches.find(frame.id); found != launches.end()) {
+			auto& list = found->second;
+			std::ranges::sort(list);
+			const auto [first, last] = std::ranges::unique(list);
+			list.erase(first, last);
+			uses += static_cast<uint32_t>(std::ranges::count_if(
+			    list, [&frame](uint32_t launch) { return launch > frame.launch; }));
+		}
+		return static_cast<uint8_t>(std::min(uses, 255u));
+	};
+	std::vector<uint8_t> counts(frames.size(), 1);
 
 	// Live modules: the first record of each id, used recently, with its SPIR-V and its program.
 	std::vector<uint32_t>                  tags(frames.size(), 0);
@@ -350,6 +373,8 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 		const auto last = module_use[frame.id];
 		keep[i] = keep[spirv->second] = true;
 		tags[i] = tags[spirv->second] = last;
+		counts[i] = counts[spirv->second] = count_uses(module_launches, frame);
+		record.uses = counts[i];
 		use(program_use, program, last);
 		module_frames.push_back(i);
 		module_spirv.push_back(spirv->second);
@@ -406,8 +431,10 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 			continue;
 		}
 		keep[i]   = true;
-		tags[i]   = pipeline_use[frame.id];
-		record.id = frame.id;
+		tags[i]     = pipeline_use[frame.id];
+		counts[i]   = count_uses(pipeline_launches, frame);
+		record.id   = frame.id;
+		record.uses = counts[i];
 		contents.pipelines.push_back(record);
 	}
 
@@ -424,7 +451,8 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 			kept_index[i] = static_cast<uint32_t>(layout->frames.size());
 			layout->frames.push_back({.offset = frames[i].offset,
 			                          .size   = static_cast<uint32_t>(frames[i].Size()),
-			                          .launch = tags[i]});
+			                          .launch = tags[i],
+			                          .uses   = counts[i]});
 		}
 	}
 	for (size_t i = 0; i < contents.modules.size(); i++) {
@@ -742,6 +770,7 @@ bool ShaderStore::Compact() {
 			break;
 		}
 		frame.launch   = kept.launch;
+		frame.uses     = kept.uses;
 		frame.checksum = FrameChecksum(frame, compressed);
 		std::memcpy(bytes.data(), &frame, sizeof(frame));
 		target.Write(bytes.data(), kept.size, &written);

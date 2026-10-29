@@ -1894,6 +1894,7 @@ void CheckShaderStore() {
     // Only the launch record is dead: nothing was written twice.
     Require(name, "written once",
             contents.launch == 2 && contents.dead_records == 1 &&
+                contents.modules[0].uses == 1 && contents.pipelines[0].uses == 1 &&
                 contents.kept_bytes == complete.size() && contents.live_bytes < complete.size(),
             "duplicates or records that cannot load reached the store (" +
                 std::to_string(contents.dead_records) + " dead records)");
@@ -1907,6 +1908,7 @@ void CheckShaderStore() {
     Require(name, "reopen launch", contents.launch == 2 && !contents.compacting,
             "the second launch is not launch 2 or compacts a live store");
     check_spirv("reopen", store, contents);
+    store.NoteUsedModule(first.module.handle.id);
     store.NoteUsedModule(first.module.handle.id);
     // Known already: not written again.
     store.AppendModule(second);
@@ -1950,6 +1952,10 @@ void CheckShaderStore() {
     Require(name, "launch 3", contents.launch == 3 && !contents.compacting &&
                                   contents.modules.size() == 2 && contents.pipelines.size() == 1,
             "launch 3 did not keep the records of launch 1");
+    // Launch 2 used the vertex module and the pipeline, once each however often it noted them.
+    Require(name, "uses", contents.modules[0].uses == 2 && contents.modules[1].uses == 1 &&
+                              contents.pipelines[0].uses == 2,
+            "the launches that used each record were not counted");
     store.NoteUsedModule(first.module.handle.id);
   }
   const auto before_compaction = read_file(path);
@@ -1973,8 +1979,9 @@ void CheckShaderStore() {
     const auto contents = ShaderStore::Parse(read_file(path), host_key);
     check_contents("after compaction", contents, {&first}, 0);
     Require(name, "after compaction",
-            contents.launch == 5 && contents.dead_records == 1,
-            "the compacted store lost its launch count or kept dead records");
+            contents.launch == 5 && contents.dead_records == 1 &&
+                contents.modules[0].uses == 3,
+            "the compacted store lost its launch count, its use counts or kept dead records");
   }
   {
     ShaderStore store;

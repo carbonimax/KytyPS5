@@ -861,7 +861,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		entry.plan_stored     = true;
 		entry.plan_unverified = verify;
 	}
-	ProgramCache::ProgramKey key;
+	// Compute pipelines depend only on their module: prewarmed when it was used in enough launches.
+	std::unordered_set<uint64_t> prewarm_compute;
+	ProgramCache::ProgramKey     key;
 	for (auto& record: contents.modules) {
 		key.stage           = record.stage;
 		key.hash            = record.hash;
@@ -873,7 +875,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			dropped_modules++;
 			continue;
 		}
-		auto& module                = record.module;
+		auto& module = record.module;
+		if (record.uses >= ShaderStore::PrewarmUses) {
+			prewarm_compute.insert(module.handle.id);
+		}
 		module.store_spirv          = record.spirv_index + 1;
 		module.store_use_pending    = true;
 		module.store_verify_pending = verify;
@@ -907,8 +912,8 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		return found != slot_by_id.end() ? found->second : nullptr;
 	};
 
-	// Pipelines, created on several threads. Graphics pipelines whose state does not fit their
-	// modules are left out.
+	// Pipelines used in enough launches, created on several threads. Graphics pipelines whose
+	// state does not fit their modules are left out.
 	struct Job {
 		const ShaderStorePipeline* record = nullptr;
 		std::array<Slot*, 3>       stages {};
@@ -921,7 +926,12 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	std::vector<Job> jobs;
 	jobs.reserve(contents.pipelines.size() + slots.size());
 	size_t dropped_pipelines = 0;
+	size_t later_pipelines   = 0;
 	for (const auto& record: contents.pipelines) {
+		if (record.uses < ShaderStore::PrewarmUses) {
+			later_pipelines++;
+			continue;
+		}
 		Job job {.record = &record};
 		job.stage_count = record.vertex_ids[1] != 0 ? 3u : 1u;
 		bool valid      = record.vertex_ids[0] != 0 && (record.vertex_ids[1] != 0) ==
@@ -954,7 +964,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	// A compute pipeline depends only on its module.
 	for (auto& slot: slots) {
 		if (slot.module->program.stage == ShaderType::Compute) {
-			jobs.push_back({.compute = &slot});
+			if (prewarm_compute.contains(slot.module->handle.id)) {
+				jobs.push_back({.compute = &slot});
+			} else {
+				later_pipelines++;
+			}
 		}
 	}
 	const auto job_slots = [](Job& job, auto&& visit) {
@@ -1075,11 +1089,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	PipelineCacheLog(
 	    "Shader store: {} {:.1f} MB for launch {} ({:.1f} MB live, {} dead records{}): {} programs, "
 	    "{} modules, {} graphics and {} compute pipelines in {} ms (read {} ms, {} modules created "
-	    "for them, {} workers){}{}{}",
+	    "for them, {} workers, {} pipelines used in fewer launches left for later){}{}{}",
 	    contents.header_match ? "loaded" : "started over", mb(contents.file_bytes), contents.launch,
 	    mb(contents.live_bytes), contents.dead_records, contents.compacting ? ", compacting" : "",
 	    cache.programs.size(), module_count, created_graphics, created_compute, elapsed(), read_ms,
-	    created_modules.load(), workers,
+	    created_modules.load(), workers, later_pipelines,
 	    contents.kept_bytes != 0 && contents.kept_bytes != contents.file_bytes
 	        ? fmt::format(", dropped a damaged tail of {} bytes",
 	                      contents.file_bytes - contents.kept_bytes)
