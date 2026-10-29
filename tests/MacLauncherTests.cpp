@@ -88,7 +88,7 @@ int main(int argc, char* argv[]) {
 	changed.mac_moltenvk_path = library.fileName();
 	Check(changed.MacEnvironment(environment, error) && environment.value("SDL_VULKAN_LIBRARY") == library.fileName(), "custom dylib with spaces");
 	ConfigurationEditDialog dialog(changed);
-	dialog.SetGlobalSettings({temporary.path()});
+	dialog.SetGlobalSettings({temporary.path()}, {});
 	auto* tabs = dialog.findChild<QTabWidget*>("settings_tabs");
 	const int mac_tab = tabs != nullptr ? tabs->count() - 1 : -1;
 	Check(tabs != nullptr && dialog.findChildren<QTabWidget*>().size() == 1 && tabs->tabText(mac_tab) == "macOS / performance", "Mac tab visible");
@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
 	changed.mac_extra_environment += "\nLAUNCHER_TEST_LITERAL=$(echo nope)";
 	changed.basedir = temporary.filePath("fake game directory");
 	QProcess process;
-	launcher.RunInterpreter(&process, changed);
+	launcher.RunInterpreter(&process, changed, false);
 	if (process.state() != QProcess::NotRunning) {
 		Check(process.waitForFinished(5000), "fake launch terminates");
 	}

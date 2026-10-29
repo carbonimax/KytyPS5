@@ -105,16 +105,17 @@ public:
 
 	Configuration() = default;
 
-	QString    name;
-	QString    title_id;    /* Serial / title id from sce_sys/param.json */
-	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
-	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
-	QString    basedir;     /* Game base directory */
-	QString    game_path;   /* Launcher-unique game path */
-	QString    addons_dir;  /* Global setting; not saved per game. */
-	bool       custom_settings = false;
-	GameStatus game_status     = GameStatus::Unknown;
-	QString    game_comment;
+	QString     name;
+	QString     title_id;    /* Serial / title id from sce_sys/param.json */
+	QString     gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
+	QString     firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
+	QString     basedir;     /* Game base directory */
+	QString     game_path;   /* Launcher-unique game path */
+	QString     addons_dir;  /* Global setting; not saved per game. */
+	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
+	bool        custom_settings = false;
+	GameStatus  game_status     = GameStatus::Unknown;
+	QString     game_comment;
 
 	// Controller preferences always come from the global configuration.
 	ControllerSettings controller;
