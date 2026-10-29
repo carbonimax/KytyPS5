@@ -38,7 +38,48 @@ void TestTrinityStackInstruction() {
   }
 }
 
+void TestTrinityBvhInstruction() {
+  namespace D = ShaderRecompiler::Decoder;
+  const std::array code{0xf1949f05u, 0x00010000u, 0x0a030201u, 0x0000040du,
+      EncodeMubuf0(0x1e, 0, false), EncodeMubuf1(0, 0, 0),
+      EncodeMubuf0(0x1e, 16, false), EncodeMubuf1(4, 0, 0),
+      EncodeMubuf0(0x1d, 32, false), EncodeMubuf1(8, 0, 0),
+      EncodeMubuf0(0x1e, 40, false), EncodeMubuf1(10, 0, 0),
+      EncodeMubuf0(0x1d, 56, false), EncodeMubuf1(14, 0, 0), EncodeSopp(0x01)};
+  D::Program decoded;
+  D::DecodeProgram(code, decoded);
+  const auto& inst = decoded.instructions.front();
+  Check(inst.opcode == D::Opcode::IMAGE_BVH8_INTERSECT_RAY && inst.word_count == 4 &&
+            inst.data_dwords == 10 && inst.image_address_components == 11 &&
+            inst.image_nsa_addr[3] == 10 && inst.image_nsa_addr[5] == 12 &&
+            inst.image_nsa_addr[6] == 13 && inst.image_nsa_addr[8] == 15 &&
+            inst.image_nsa_addr[9] == 4 && inst.src1.reg == 4,
+        "Trinity BVH8 grouped ray registers were not decoded");
+  const auto result = RecompileForTest(code, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.info.bvh8 && !result.program.info.bvh &&
+            result.program.info.uses_dma && result.program.info.images.empty(),
+        "Trinity BVH8 did not use its separate raw-memory helper");
+  Check(CountSourceOccurrences(result.ir_dump, " = Bvh8Intersect ") == 1,
+        "Trinity BVH8 result and ray writes duplicated the intersection");
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, 54u) == 6 &&
+            SpirvInstructionOpcodeCount(result.spirv, 246u) == 1,
+        "Trinity BVH8 duplicated helpers or unrolled its four-child loop");
+  CheckSpirvBinaryValidates(RecompileForTest(code, MakeCompileOptions(ShaderType::Pixel)).spirv);
+  for (const auto words : {std::array{0xf1949f05u, 0x40010000u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x0001f700u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010000u, 0xfe030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010700u, 0x0a030201u, 0x0000040du},
+                           std::array{0xf1949f05u, 0x00010000u, 0x0a030201u, 0x0000040bu}}) {
+    const std::array invalid{words[0], words[1], words[2], words[3], EncodeSopp(0x01)};
+    D::DecodeProgram(invalid, decoded);
+    Check(decoded.instructions[0].opcode == D::Opcode::UNSUPPORTED,
+          "Trinity BVH8 accepted truncated ray or destination registers");
+  }
+}
+
 void TestRayTracingInstructions() {
+  TestTrinityBvhInstruction();
   TestTrinityStackInstruction();
   namespace D = ShaderRecompiler::Decoder;
   const std::array code{

@@ -414,6 +414,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U32:
 		case IR::Type::F16: return TypeU32(state);
 		case IR::Type::U64: return TypeU64(state);
+		case IR::Type::Bvh8Result: return TypeBvh8Result(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
 		case IR::Type::F64: return TypeF64(state);

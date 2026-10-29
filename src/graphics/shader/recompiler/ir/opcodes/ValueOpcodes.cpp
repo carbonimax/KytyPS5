@@ -44,6 +44,7 @@ constexpr Type AddressResource = Type::AddressResource;
 constexpr Type ImageResource   = Type::ImageResource;
 constexpr Type SamplerResource = Type::SamplerResource;
 constexpr Type ImageAddress    = Type::ImageAddress;
+constexpr Type Bvh8Result      = Type::Bvh8Result;
 
 constexpr std::array<OpcodeMeta, static_cast<size_t>(ValueOpcode::Count)> MetaTable = {{
 #define VALUE_OPCODE(name, ...) MakeMeta(#name __VA_OPT__(, ) __VA_ARGS__),

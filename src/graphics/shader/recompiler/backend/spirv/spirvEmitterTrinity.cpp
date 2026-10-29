@@ -184,6 +184,7 @@ void DefineBvhStack(EmitterState& s) {
 
 void DefineTrinityFunctions(EmitterState& s) {
 	DefineBvhStack(s);
+	DefineTrinityBvhIntersect(s);
 }
 
 uint32_t EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst) {

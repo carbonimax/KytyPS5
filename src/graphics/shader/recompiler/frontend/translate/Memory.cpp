@@ -326,7 +326,8 @@ IR::Value Translator::MakeImageAddress(const Decoder::Instruction& inst,
 	    inst.image_sample_flags, inst.image_dimension, inst.image_address_components);
 	EXIT_IF(count > components.size());
 	const auto nsa_components =
-	    std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
+	    inst.opcode == Decoder::Opcode::IMAGE_BVH8_INTERSECT_RAY && inst.image_nsa_dwords != 0u
+	        ? 10u : std::min(inst.image_nsa_dwords * 4u, Decoder::MaxImageNsaAddressComponents);
 	for (uint32_t index = 0; index < count; index++) {
 		if (index != 0u && index - 1u < nsa_components) {
 			components[index] =
@@ -948,6 +949,31 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 	                               {ReadU32(inst.src1), address, ir.GetExec()}));
 }
 
+void Translator::IMAGE_BVH8(const Decoder::Instruction& inst) {
+	std::array<IR::U32, 10> previous;
+	for (uint32_t i = 0; i < previous.size(); ++i)
+		previous[i] = ReadU32(OffsetOperand(inst.dst, i));
+	const auto result = ir.Emit(IR::ValueOpcode::Bvh8Intersect,
+	    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()});
+	const auto get = [&](uint32_t i) {
+		return IR::U32(ir.Emit(IR::ValueOpcode::Bvh8Extract, {result, IR::Value(i)}));
+	};
+	const auto instance = ir.INotEqual(get(16), IR::U32(IR::Value(0u)));
+	for (uint32_t i = 0; i < 10; ++i) {
+		auto value = get(i);
+		if (i == 0 || i == 1 || i == 4 || i == 5 || i == 8 || i == 9)
+			value = ir.Select(instance, previous[i], value);
+		WriteOperand(OffsetOperand(inst.dst, i), value);
+	}
+	for (uint32_t i = 0; i < 6; ++i) {
+		auto reg = inst.image_nsa_dwords != 0 ? inst.image_nsa_addr[3 + i] : inst.src0.reg + 4 + i;
+		auto target = inst.src0;
+		target.reg = reg;
+		// Non-instance results may alias the ray inputs.
+		WriteOperand(target, ir.Select(instance, get(10 + i), ReadU32(target)));
+	}
+}
+
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		// Translated scalar loads have no cache of their own to invalidate.
@@ -956,6 +982,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_GL1_INV:
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
 			return;
+		case Decoder::Opcode::IMAGE_BVH8_INTERSECT_RAY: return IMAGE_BVH8(inst);
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
 			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
