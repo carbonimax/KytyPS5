@@ -105,6 +105,7 @@ private:
 	void WriteSharedU32(uint32_t width, IR::U32 address, const std::array<IR::Value, 4>& values,
 	                    const IR::MemoryInfo& memory, uint32_t pc);
 	void DS_READ(const Decoder::Instruction& inst);
+	void DS_BVH_STACK(const Decoder::Instruction& inst);
 	void DS_READ2(const Decoder::Instruction& inst);
 	void DS_WRITE(const Decoder::Instruction& inst);
 	void DS_WRITE2(const Decoder::Instruction& inst);

@@ -318,6 +318,7 @@ VALUE_OPCODE(SwizzleU32, U32, U32, U32, U1)
 
 VALUE_OPCODE(ImageQueryDimensions, U32x4, ImageResource, ImageAddress)
 VALUE_OPCODE(BvhIntersect, U32x4, U32x4, ImageAddress, U1)
+VALUE_OPCODE(BvhStack, U32x2, U32, U32, U32x4, U32x4, U1)
 VALUE_OPCODE(ImageQueryLod, U32x4, ImageResource, SamplerResource, ImageAddress)
 VALUE_OPCODE(ImageRead, U32x4, ImageResource, ImageAddress, U1)
 VALUE_OPCODE(ImageWrite, Void, ImageResource, ImageAddress, U32x4, U1)

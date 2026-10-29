@@ -49233,6 +49233,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 capacity : {8u, 16u, 31u}) cases.push_back(TrinityStack(wave, capacity));
+    cases.push_back(TrinityStack(wave, 8, true));
+  }
   cases.push_back(BvhIntersections(true, true, 1));
   cases.push_back(BvhIntersections(true, true, 0, true));
   for (bool barycentrics : {false, true}) {
@@ -55668,6 +55672,10 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--ray-tracing-only") == 0) {
     VulkanHarness vulkan;
+    for (const u32 wave : {32u, 64u}) {
+      for (const u32 capacity : {8u, 16u, 31u}) RunCase(&vulkan, TrinityStack(wave, capacity));
+      RunCase(&vulkan, TrinityStack(wave, 8, true));
+    }
     RunCase(&vulkan, FlatStackApertures(32));
     RunCase(&vulkan, FlatStackApertures(64));
     RunCase(&vulkan, BvhIntersections(true, true, 1));

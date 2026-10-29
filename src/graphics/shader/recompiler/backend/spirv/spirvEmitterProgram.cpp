@@ -689,6 +689,7 @@ void EmitProgram(EmitterState& state) {
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineBvhIntersect(state);
+	DefineTrinityFunctions(state);
 	if (program.info.uses_swizzle) {
 		ctx.scratch_u32_variable = state.builder.AllocateId();
 		if (state.lane_count == 2) {

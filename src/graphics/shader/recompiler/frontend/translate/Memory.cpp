@@ -781,6 +781,15 @@ void Translator::WriteSharedU32(uint32_t width, IR::U32 address,
 	}
 }
 
+void Translator::DS_BVH_STACK(const Decoder::Instruction& inst) {
+	const auto result = ir.Emit(IR::ValueOpcode::BvhStack,
+	    {ReadU32(inst.src0), ReadU32(inst.src1), ConstructU32x4(inst.src2, 4),
+	     ConstructU32x4(OffsetOperand(inst.src2, 4), 4), ir.GetExec()},
+	    AddMemoryInfo(MemoryInfoFromDecoded(inst), inst.pc));
+	WriteOperand(inst.src0, ir.Emit(IR::ValueOpcode::CompositeExtractU32x2, {result, IR::Value(0u)}));
+	WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::CompositeExtractU32x2, {result, IR::Value(1u)}));
+}
+
 void Translator::DS_READ(const Decoder::Instruction& inst) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
 	const auto address = ReadU32(MemorySourceAt(inst, 0));
@@ -1186,6 +1195,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_APPEND_CONSUME(inst, IR::ValueOpcode::DataAppend);
 		case Decoder::Opcode::DS_WRITE_ADDTID_B32: return DS_ADDTID(inst, true);
 		case Decoder::Opcode::DS_READ_ADDTID_B32: return DS_ADDTID(inst, false);
+		case Decoder::Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32: return DS_BVH_STACK(inst);
 		case Decoder::Opcode::DS_READ2_B32:
 		case Decoder::Opcode::DS_READ2ST64_B32:
 		case Decoder::Opcode::DS_READ2_B64:

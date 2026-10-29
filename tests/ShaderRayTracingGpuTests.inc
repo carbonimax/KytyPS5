@@ -1,3 +1,132 @@
+TestCase TrinityStack(u32 wave_size, u32 capacity, bool storage = false) {
+  TestCase test;
+  static constexpr const char* names[2][3] = {
+      {"TrinityStack32Capacity8", "TrinityStack32Capacity16", "TrinityStack32Capacity31"},
+      {"TrinityStack64Capacity8", "TrinityStack64Capacity16", "TrinityStack64Capacity31"}};
+  test.name = storage ? (wave_size == 32 ? "TrinityStackStorage32" : "TrinityStackStorage64")
+                      : names[wave_size == 64][capacity == 8 ? 0 : capacity == 16 ? 1 : 2];
+  constexpr u32 Invalid = 0xffffffffu, Terminal = 0xfffffffeu;
+  constexpr u32 Parent = 1u << 29, Overflow = 1u << 30, Return = 1u << 31;
+  const auto state = [](u32 count, u32 parent, u32 ring, u32 flags = 0) {
+    return count | (parent << 5) | (ring << 10) | flags;
+  };
+  test.initial.resize(wave_size * 32);
+  struct Output { u32 control, node; std::array<u32, 8> lds; };
+  std::vector<Output> outputs(wave_size);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    const u32 which = lane % 16;
+    const u32 base = which == 15 ? 0x3fff : (lane / 32) * capacity * 32 + lane % 32;
+    auto* input = test.initial.data() + lane * 32;
+    auto& out = outputs[lane];
+    input[0] = base << 15;
+    input[1] = Invalid;
+    std::fill(input + 2, input + 10, Invalid);
+    input[10] = base * 4;
+    for (u32 i = 0; i < 8; ++i) out.lds[i] = 100 + i * 8;
+    if (capacity == 8) out.lds[7] = 88;
+    out.node = Terminal;
+    out.control = 0;
+    const auto children = [&] {
+      for (u32 i = 0; i < 8; ++i) input[2 + i] = (i + 1) * 8;
+    };
+    switch (which) {
+      case 0: break;
+      case 1: input[0] |= Overflow; out.control = Overflow; out.node = Invalid; break;
+      case 2:
+        children(); out.control = state(7, 7, 7); out.node = 8;
+        out.lds = {64, 56, 48, 40, 32, 24, 16, 8}; break;
+      case 3:
+        input[2] = 8; input[4] = 24; input[7] = 48; input[9] = 64;
+        out.control = state(3, 3, 3); out.node = 8;
+        out.lds[0] = 64; out.lds[1] = 48; out.lds[2] = 24; out.lds[3] = 8; break;
+      case 4:
+      case 14:
+        input[0] |= state(capacity, capacity, 0, which == 14 ? Parent : 0);
+        input[2] = 8; out.control = state(capacity - 1, capacity - 1, 0, Overflow);
+        out.node = out.lds[0] = 8; break;
+      case 5:
+        input[0] |= state(1, 1, 0); out.control = state(0, 0, capacity - 1); out.node = 88; break;
+      case 6:
+        input[0] |= state(1, 0, 1, Parent);
+        out.control = state(0, 31, 0, Return); out.node = 100; break;
+      case 7:
+        input[2] = 14; out.control = Parent; out.node = out.lds[0] = 14; break;
+      case 8:
+        input[0] |= state(3, 1, 3, Parent);
+        out.lds[2] = 14;
+        out.control = state(0, 0, 2, Parent | Overflow); out.node = 14; break;
+      case 9:
+        children(); input[1] = 24; out.control = state(4, 4, 4); out.node = 32;
+        out.lds[0] = 64; out.lds[1] = 56; out.lds[2] = 48; out.lds[3] = 40; out.lds[4] = 32; break;
+      case 10:
+        children(); input[1] = 96; input[0] |= state(1, 1, 1);
+        out.node = 100; break;
+      case 11:
+        children(); input[9] = 0xfffffffbu; out.control = state(3, 3, 3); out.node = 8;
+        out.lds[0] = 32; out.lds[1] = 24; out.lds[2] = 16; out.lds[3] = 8; break;
+      case 12: children(); input[9] = 0xfffffff9u; break;
+      case 13:
+        children(); input[5] = 0xfffffffdu; out.control = state(3, 3, 3); out.node = 40;
+        out.lds[0] = 64; out.lds[1] = 56; out.lds[2] = 48; out.lds[3] = 40; break;
+      case 15:
+        input[0] |= state(1, 1, 1); out.node = 0; out.lds.fill(0); break;
+    }
+    out.control |= base << 15;
+    if ((lane % 32) >= 16) {
+      out.control = input[0]; out.node = input[2];
+      for (u32 i = 0; i < 8; ++i) out.lds[i] = 100 + i * 8;
+      if (capacity == 8) out.lds[7] = 88;
+      if (which == 8) out.lds[2] = 14;
+      if (which == 15) out.lds.fill(0);
+    }
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[lane * 32 + 20] = outputs[lane].control;
+    test.expected[lane * 32 + 21] = outputs[lane].node;
+    std::copy(outputs[lane].lds.begin(), outputs[lane].lds.end(), test.expected.begin() + lane * 32 + 24);
+  }
+  auto& code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(7), 0));
+  code.insert(code.end(), {EncodeMubuf0(0x0d), EncodeMubuf1(8, 0, 1),
+                           EncodeMubuf0(0x0e, 8), EncodeMubuf1(16, 0, 1),
+                           EncodeMubuf0(0x0e, 24), EncodeMubuf1(20, 0, 1),
+                           EncodeMubuf0(0x0c, 40), EncodeMubuf1(2, 0, 1)});
+  for (u32 i = 0; i < 8; ++i) {
+    AppendVMovU32(&code, 3, 100 + i * 8);
+    code.insert(code.end(), {EncodeDs0(0x0d, i * 128), EncodeDs1(0, 3, 2)});
+  }
+  AppendVMovU32(&code, 3, 88);
+  code.insert(code.end(), {EncodeDs0(0x0d, (capacity - 1) * 128), EncodeDs1(0, 3, 2)});
+  // Lane eight starts with a nested instance on top of its stack.
+  AppendSMovLiteral(&code, 126, 0x01000100u);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0x01000100u);
+  AppendVMovU32(&code, 3, 14);
+  code.insert(code.end(), {EncodeDs0(0x0d, 256), EncodeDs1(0, 3, 2)});
+  AppendSMovLiteral(&code, 126, 0x0000ffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0x0000ffffu);
+  code.insert(code.end(), {EncodeDs0(0xe1, capacity), EncodeDs1Ex(16, 16, 9, 8)});
+  code.push_back(EncodeSop1(0x04, 126, 193));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(5), 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 3, 20);
+  AppendStoreVgprAtLaneDwordOffset(&code, 16, 3, 21);
+  for (u32 i = 0; i < 8; ++i) {
+    code.insert(code.end(), {EncodeDs0(0x36, i * 128), EncodeDs1(24, 0, 2)});
+    AppendStoreVgprAtLaneDwordOffset(&code, 24, 3, 24 + i);
+  }
+  AppendEnd(&code);
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.lds_size_dwords = wave_size * capacity;
+  test.compute_info.lds_storage = storage;
+  test.has_compute_info = true;
+  test.decoded_counts = {{"DS_BVH_STACK_PUSH8_POP1_RTN_B32", 1}};
+  test.forbidden_spirv = {"OpControlBarrier", "OpMemoryBarrier", "get_bda_pointer"};
+  return test;
+}
+
 TestCase FlatStackApertures(u32 wave_size) {
   TestCase test;
   test.name = wave_size == 32 ? "FlatStackApertures32" : "FlatStackApertures64";

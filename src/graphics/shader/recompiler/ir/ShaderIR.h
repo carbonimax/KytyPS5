@@ -547,6 +547,7 @@ struct ShaderInfo {
 	bool                            uses_image_heap               = false;
 	bool                            uses_dispatch_threads         = false;
 	bool                            bvh                           = false;
+	bool                            bvh_stack                     = false;
 	bool                            subgroup_ballot               = false;
 	bool                            subgroup_vote                 = false;
 	bool                            subgroup_barrier              = false;

@@ -76,7 +76,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		return true;
 	}
 	const auto shared_access = SharedAccessOf(opcode);
-	if (shared_access == SharedAccess::Write || shared_access == SharedAccess::Atomic ||
+	if (shared_access == SharedAccess::Write || shared_access == SharedAccess::ReadWrite ||
+	    shared_access == SharedAccess::Atomic ||
 	    shared_access == SharedAccess::Append || shared_access == SharedAccess::Consume) {
 		return true;
 	}
@@ -156,6 +157,7 @@ uint32_t BufferComponentCount(ValueOpcode opcode) {
 
 SharedAccess SharedAccessOf(ValueOpcode opcode) {
 	switch (opcode) {
+		case ValueOpcode::BvhStack: return SharedAccess::ReadWrite;
 		case ValueOpcode::LoadSharedU8:
 		case ValueOpcode::LoadSharedU16:
 		case ValueOpcode::LoadSharedU32:
