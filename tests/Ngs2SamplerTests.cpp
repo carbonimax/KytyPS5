@@ -822,6 +822,38 @@ void TestPatchToRackHandle() {
 	      "patch to a rack handle did not connect to its voice #0");
 }
 
+void TestMasteringGain() {
+	Ngs2Internal system;
+	system.option                   = Ngs2DefaultSystemOption();
+	system.option.num_grain_samples = 1;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source = sampler.Voice();
+	auto& mastering = master.Voice();
+	mastering.channels = 8;
+	mastering.state = Ngs2VoicePlayState::Playing;
+	const int16_t frame[8] = {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192};
+	source.SetupSampler({0x12, 8, 48000});
+	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
+	source.ports[0].dest = &mastering;
+	source.SetEvent(1);
+	struct {
+		Ngs2VoiceParamHeader header {16, 0, 0x30000004};
+		float fbw = 5.0f, lfe = 0.5f;
+	} gain;
+	float pcm[8] = {};
+	Ngs2RenderBufferInfo output {pcm, sizeof(pcm), 0x18, 8};
+	const float expected[8] = {1.0f, 1.0f, 1.0f, 0.125f, 1.0f, 1.0f, 1.0f, 1.0f};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &gain.header) == OK &&
+	          Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
+	          std::ranges::equal(pcm, expected),
+	      "mastering gain was not clamped or applied per full band and LFE channel");
+}
+
 void TestCustomMasteringChannelMixer() {
 	Ngs2Internal system;
 	system.option = Ngs2DefaultSystemOption();
@@ -1819,6 +1851,7 @@ int main() {
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();
+	TestMasteringGain();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();

@@ -568,6 +568,8 @@ struct Ngs2VoiceInternal {
 	std::vector<float>              output_matrix;
 	uint32_t                        channels        = 0;
 	uint32_t                        output_id       = 0;
+	float                           fbw_level       = 1.0f;
+	float                           lfe_level       = 1.0f;
 	bool                            rendering       = false;
 	bool                            rendered        = false;
 	bool                            has_samples     = false;
@@ -1978,10 +1980,13 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 			pcm = static_cast<float*>(output.buffer);
 		}
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
+			// Output channel 3 is LFE; every other channel is full band.
+			const float gain = dst == 3 ? voice->lfe_level : voice->fbw_level;
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level = voice->output_matrix.empty()
-				                        ? (src == dst ? 1.0f : 0.0f)
-				                        : voice->output_matrix.at(src * output.num_channels + dst);
+				const float level =
+				    gain * (voice->output_matrix.empty()
+				                ? static_cast<float>(src == dst)
+				                : voice->output_matrix.at(src * output.num_channels + dst));
 				if (level == 0.0f) {
 					continue;
 				}
@@ -2479,6 +2484,12 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						EXIT_NOT_IMPLEMENTED(matrix->matrix_id != 5);
 						voice->output_matrix.assign(matrix->levels,
 						                            matrix->levels + matrix->num_levels);
+						break;
+					}
+					case 4: {
+						const auto* levels = reinterpret_cast<const float*>(values);
+						voice->fbw_level   = std::clamp(levels[0], 0.0f, 4.0f);
+						voice->lfe_level   = std::clamp(levels[1], 0.0f, 4.0f);
 						break;
 					}
 					case 5: voice->output_id = values[0]; break;
