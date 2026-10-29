@@ -2584,9 +2584,9 @@ public:
       VkMemoryPropertyFlags properties{};
       vmaGetAllocationMemoryProperties(graphics.allocator, image.allocation,
                                        &properties);
-      Require(name, "allocation policy",
+      Require(name, "small allocation preference",
               (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0,
-              "native image lost its device-local memory requirement");
+              "native image did not prefer available device-local memory");
 
       // A reused presentation image may still describe its previous recording.
       // No commands use this fixture; seed that bookkeeping before retirement.
