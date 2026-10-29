@@ -620,8 +620,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base + resource.view_min_level;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	desc.heap = resource.heap;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto id = texture_cache.FindImage(desc, shader_conversion);
+	if (!id) {
+		// Another extent at the address holds it; the heap retries once an image is created.
+		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
