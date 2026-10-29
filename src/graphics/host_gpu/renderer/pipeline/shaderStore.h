@@ -48,7 +48,9 @@ struct ShaderStoreProgram {
 	uint32_t              user_data_count = 0;
 	uint32_t              code_size       = 0;
 	std::vector<uint32_t> static_state;
+	// AppendProgram: the plan. Loaded programs leave it empty; ReadPlan(plan_index) reads it.
 	std::vector<uint8_t>  plan;
+	uint32_t              plan_index = 0;
 };
 
 struct ShaderStoreModule {
@@ -129,9 +131,11 @@ public:
 	void NoteUsedModule(uint64_t id);
 	void NoteUsedPipeline(uint64_t id);
 
-	// The SPIR-V of a loaded module (ShaderStoreModule::spirv_index, handle id); empty when the
-	// store cannot read it back. Any thread.
+	// The SPIR-V of a loaded module (ShaderStoreModule::spirv_index, handle id) and the plan of a
+	// loaded program (ShaderStoreProgram::plan_index); empty when the store cannot read them back.
+	// Any thread.
 	[[nodiscard]] std::vector<uint32_t> ReadSpirv(uint32_t index, uint64_t module_id);
+	[[nodiscard]] std::vector<uint8_t>  ReadPlan(uint32_t index);
 
 	// Waits until the store thread wrote everything posted and noted so far, and the compaction
 	// (tests).
@@ -155,16 +159,21 @@ private:
 	void WriteFrame(uint8_t type, uint64_t id, std::span<const uint8_t> raw,
 	                std::vector<uint8_t>& frame_bytes);
 	bool Compact();
+	// Reads and checks the frame at offsets[index]; `frame` is a Frame.
+	bool ReadFrame(const std::vector<uint64_t>& offsets, uint32_t index, void* frame,
+	               std::vector<uint8_t>& compressed);
 
 	std::filesystem::path m_path;
 	uint32_t              m_launch = 0;
 	// The append handle, store thread only once it runs.
 	Common::File          m_file;
 
-	// The read handle and where each loaded module's SPIR-V frame is in the file.
+	// The read handle and where each loaded module's SPIR-V and each loaded program are in the
+	// file.
 	std::mutex            m_read_mutex;
 	Common::File          m_read;
 	std::vector<uint64_t> m_spirv_offsets;
+	std::vector<uint64_t> m_program_offsets;
 
 	// What the file holds, and the loaded modules and pipelines not used yet (Append and Note
 	// callers).

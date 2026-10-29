@@ -297,6 +297,8 @@ struct PipelineCache::ProgramCache {
 		bool                                       plan_stored   = false;
 		// KYTY_SHADER_STORE=2: the plan was loaded and is not checked yet.
 		bool                                       plan_unverified = false;
+		// Loaded programs: ShaderStoreProgram::plan_index + 1 until the first lookup reads the plan.
+		uint32_t                                   store_plan      = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -473,6 +475,9 @@ struct PipelineCache::ProgramCache {
 		bool source_changed = false;
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
+			if (cached.store_plan != 0) [[unlikely]] {
+				LoadStoredPlan(cached, params, options, finish_options);
+			}
 			if (cached.skip_dispatch) return {};
 			PerfStats::ScopedTimer srt_timer(PerfStats::Counter::SrtNs);
 			Permutation* permutation = nullptr;
@@ -639,6 +644,24 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return bind(entry->second.permutations.back());
+	}
+
+	// Reads the plan of a loaded program at its first lookup. Should the store fail to read it
+	// back, the program is translated again for it: plans depend on the code and options only.
+	template <typename FinishOptions>
+	void LoadStoredPlan(SourceEntry& entry, const ShaderParams& params,
+	                    ShaderRecompiler::CompileOptions& options, FinishOptions& finish_options) {
+		const auto index = std::exchange(entry.store_plan, 0) - 1;
+		if (store != nullptr &&
+		    ShaderRecompiler::IR::LoadResourcePlan(store->ReadPlan(index), entry.resource_plan)) {
+			return;
+		}
+		PipelineCacheLog("Shader store: cannot read back the plan of program 0x{:016x}, "
+		                 "translating it", params.hash);
+		finish_options();
+		entry.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(
+		    ShaderRecompiler::TranslateProgram(params.code, options).program);
+		entry.plan_unverified = false;
 	}
 
 	// The pretranslation id of a pixel program without a back stage (ShaderPretranslate).
@@ -844,22 +867,21 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 
 	// Programs, then their modules. Loaded modules have no handle module: one is created for the
 	// pipelines below and destroyed after them, and again when a new pipeline needs it, so that
-	// modules this launch never builds a pipeline from hold no SPIR-V.
+	// modules this launch never builds a pipeline from hold no SPIR-V. Likewise a program's plan
+	// is read at its first lookup.
 	size_t dropped_modules = 0;
 	for (auto& record: contents.programs) {
-		ShaderRecompiler::IR::ResourcePlan plan;
-		if (!ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan)) {
-			continue;
-		}
 		ProgramCache::ProgramKey key {.stage           = record.stage,
 		                              .hash            = record.hash,
 		                              .user_data_count = record.user_data_count,
 		                              .code_size       = record.code_size,
 		                              .static_state    = std::move(record.static_state)};
-		auto& entry           = cache.programs.try_emplace(std::move(key), std::move(plan), nullptr)
+		auto& entry = cache.programs
+		                  .try_emplace(std::move(key), ShaderRecompiler::IR::ResourcePlan {}, nullptr)
 		                  .first->second;
 		entry.plan_stored     = true;
 		entry.plan_unverified = verify;
+		entry.store_plan      = record.plan_index + 1;
 	}
 	// Compute pipelines depend only on their module: prewarmed when it was used in enough launches.
 	std::unordered_set<uint64_t> prewarm_compute;

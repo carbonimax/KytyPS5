@@ -266,15 +266,19 @@ struct ShaderStore::Layout {
 	std::vector<uint8_t>  header;
 	// In file order.
 	std::vector<Kept>     frames;
-	// The index in `frames` of each loaded module's SPIR-V (ShaderStoreModule::spirv_index).
+	// The index in `frames` of each loaded module's SPIR-V (ShaderStoreModule::spirv_index) and
+	// of each loaded program (ShaderStoreProgram::plan_index).
 	std::vector<uint32_t> spirv_frames;
+	std::vector<uint32_t> program_frames;
 };
 
 namespace {
 
-// `layout`: what compaction keeps; `spirv_offsets`: where each loaded module's SPIR-V is.
+// `layout`: what compaction keeps; `spirv_offsets` and `program_offsets`: where each loaded
+// module's SPIR-V and each loaded program are.
 ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const uint8_t> host_key,
-                               ShaderStore::Layout* layout, std::vector<uint64_t>* spirv_offsets) {
+                               ShaderStore::Layout* layout, std::vector<uint64_t>* spirv_offsets,
+                               std::vector<uint64_t>* program_offsets) {
 	ShaderStoreContents contents;
 	contents.file_bytes = bytes.size();
 	const auto header   = FileHeader(host_key);
@@ -389,6 +393,7 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 	}
 	std::ranges::sort(program_order);
 	std::unordered_set<uint64_t> failed_programs;
+	std::vector<size_t>          program_indices;
 	for (const auto index: program_order) {
 		const auto&        frame = frames[index].frame;
 		ShaderStoreProgram record;
@@ -398,6 +403,10 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 		}
 		keep[index] = true;
 		tags[index] = program_use.at(frame.id);
+		// Read back by ReadPlan when the program is first looked up.
+		record.plan       = {};
+		record.plan_index = static_cast<uint32_t>(contents.programs.size());
+		program_indices.push_back(index);
 		contents.programs.push_back(std::move(record));
 	}
 	std::unordered_set<uint64_t> live_modules;
@@ -464,6 +473,14 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 			spirv_offsets->push_back(frames[module_spirv[i]].offset);
 		}
 	}
+	for (const auto index: program_indices) {
+		if (layout != nullptr) {
+			layout->program_frames.push_back(kept_index[index]);
+		}
+		if (program_offsets != nullptr) {
+			program_offsets->push_back(frames[index].offset);
+		}
+	}
 	return contents;
 }
 
@@ -514,7 +531,7 @@ std::vector<uint8_t> ShaderStoreHostKey(const GraphicContext& graphics) {
 
 ShaderStoreContents ShaderStore::Parse(std::span<const uint8_t> bytes,
                                        std::span<const uint8_t> host_key) {
-	return ParseStore(bytes, host_key, nullptr, nullptr);
+	return ParseStore(bytes, host_key, nullptr, nullptr, nullptr);
 }
 
 ShaderStoreContents ShaderStore::Open(const std::filesystem::path& path,
@@ -536,7 +553,7 @@ ShaderStoreContents ShaderStore::Open(const std::filesystem::path& path,
 		}
 	}
 	auto layout   = std::make_unique<Layout>();
-	auto contents = ParseStore(bytes, host_key, layout.get(), &m_spirv_offsets);
+	auto contents = ParseStore(bytes, host_key, layout.get(), &m_spirv_offsets, &m_program_offsets);
 	bytes         = {};
 	m_launch      = contents.launch;
 	Common::File::CreateDirectories(path.parent_path());
@@ -661,29 +678,34 @@ void ShaderStore::NoteUsedPipeline(uint64_t id) {
 	m_used_pipelines.push_back(id);
 }
 
-std::vector<uint32_t> ShaderStore::ReadSpirv(uint32_t index, uint64_t module_id) {
-	Frame                frame;
-	std::vector<uint8_t> compressed;
+bool ShaderStore::ReadFrame(const std::vector<uint64_t>& offsets, uint32_t index, void* frame_out,
+                            std::vector<uint8_t>& compressed) {
+	Frame frame;
 	{
 		std::scoped_lock lock(m_read_mutex);
-		if (index >= m_spirv_offsets.size() || m_read.IsInvalid() ||
-		    !m_read.Seek(m_spirv_offsets[index])) {
-			return {};
+		if (index >= offsets.size() || m_read.IsInvalid() || !m_read.Seek(offsets[index])) {
+			return false;
 		}
 		uint32_t read = 0;
 		m_read.Read(&frame, sizeof(frame), &read);
 		if (read != sizeof(frame) || frame.compressed_size > MaxFrameBytes) {
-			return {};
+			return false;
 		}
 		compressed.resize(frame.compressed_size);
 		m_read.Read(compressed.data(), frame.compressed_size, &read);
 		if (read != frame.compressed_size) {
-			return {};
+			return false;
 		}
 	}
-	if (frame.type != Record::Spirv || frame.id != module_id || frame.raw_size == 0 ||
-	    frame.raw_size % sizeof(uint32_t) != 0 ||
-	    FrameChecksum(frame, compressed) != frame.checksum) {
+	std::memcpy(frame_out, &frame, sizeof(frame));
+	return FrameChecksum(frame, compressed) == frame.checksum;
+}
+
+std::vector<uint32_t> ShaderStore::ReadSpirv(uint32_t index, uint64_t module_id) {
+	Frame                frame;
+	std::vector<uint8_t> compressed;
+	if (!ReadFrame(m_spirv_offsets, index, &frame, compressed) || frame.type != Record::Spirv ||
+	    frame.id != module_id || frame.raw_size == 0 || frame.raw_size % sizeof(uint32_t) != 0) {
 		return {};
 	}
 	std::vector<uint32_t> spirv(frame.raw_size / sizeof(uint32_t));
@@ -691,6 +713,19 @@ std::vector<uint32_t> ShaderStore::ReadSpirv(uint32_t index, uint64_t module_id)
 		return {};
 	}
 	return spirv;
+}
+
+std::vector<uint8_t> ShaderStore::ReadPlan(uint32_t index) {
+	Frame                frame;
+	std::vector<uint8_t> compressed;
+	ShaderStoreProgram   program;
+	if (!ReadFrame(m_program_offsets, index, &frame, compressed) ||
+	    frame.type != Record::Program ||
+	    !DecodeFrame({.frame = frame, .compressed = compressed}, program, DecodeProgram) ||
+	    ProgramId(program) != frame.id || program.plan.empty()) {
+		return {};
+	}
+	return std::move(program.plan);
 }
 
 void ShaderStore::WaitForWrites() {
@@ -801,6 +836,9 @@ bool ShaderStore::Compact() {
 		if (renamed) {
 			for (size_t i = 0; i < m_spirv_offsets.size(); i++) {
 				m_spirv_offsets[i] = offsets[layout.spirv_frames[i]];
+			}
+			for (size_t i = 0; i < m_program_offsets.size(); i++) {
+				m_program_offsets[i] = offsets[layout.program_frames[i]];
 			}
 		}
 		if (!m_read.Open(m_path, Common::File::Mode::Read)) {

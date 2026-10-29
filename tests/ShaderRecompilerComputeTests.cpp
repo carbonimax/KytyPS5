@@ -1843,7 +1843,8 @@ void CheckShaderStore() {
       const auto &program = modules[i] == &first ? vertex_program : pixel_program;
       Require(name, stage,
               module_bytes(loaded) == module_bytes(*modules[i]) && loaded.spirv.empty() &&
-                  contents.programs[i].plan == program.plan &&
+                  contents.programs[i].hash == program.hash &&
+                  contents.programs[i].plan.empty() && contents.programs[i].plan_index == i &&
                   contents.programs[i].static_state == program.static_state,
               "a program or module record changed through the store");
     }
@@ -1864,6 +1865,14 @@ void CheckShaderStore() {
               store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id) == expected.spirv &&
                   store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id + 1).empty(),
               "a module's SPIR-V did not read back");
+    }
+    // Plans are read back on demand too.
+    for (const auto &loaded : contents.programs) {
+      const auto &expected = loaded.hash == vertex_program.hash ? vertex_program : pixel_program;
+      Require(name, stage,
+              store.ReadPlan(loaded.plan_index) == expected.plan &&
+                  store.ReadPlan(static_cast<uint32_t>(contents.programs.size())).empty(),
+              "a program's plan did not read back");
     }
   };
 
