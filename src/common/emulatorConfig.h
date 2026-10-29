@@ -66,6 +66,7 @@ struct ConfigOptions {
 	bool                   hide_cursor_enabled         = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
+	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
 	bool                   network_connected           = false;
 	uint32_t               vblank_frequency            = 60;
@@ -126,6 +127,7 @@ bool     FullscreenEnabled();
 bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();
+bool     Ps5ProEnabled();
 bool     AmdCpuEnabled();
 bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
