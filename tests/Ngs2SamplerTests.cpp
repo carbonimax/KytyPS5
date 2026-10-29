@@ -807,6 +807,21 @@ void TestPcm16RenderOutput() {
 	      "PCM16 output retained samples from the previous render");
 }
 
+void TestPatchToRackHandle() {
+	Ngs2Internal system;
+	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
+	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
+	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
+	sampler_option.common.max_voices = 1;
+	RenderRack sampler(system, 0x1000, sampler_option.common);
+	RenderRack master(system, 0x3000, mastering_option.common);
+	auto& source = sampler.Voice();
+	Ngs2VoicePatchParam patch {{24, 0, 5}, 0, 0, master.handle};
+	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&source), &patch.header) == OK &&
+	          source.ports[0].dest == &master.Voice(),
+	      "patch to a rack handle did not connect to its voice #0");
+}
+
 void TestCustomMasteringChannelMixer() {
 	Ngs2Internal system;
 	system.option = Ngs2DefaultSystemOption();
@@ -1803,6 +1818,7 @@ int main() {
 	TestAtrac9Vibration();
 	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
+	TestPatchToRackHandle();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();

@@ -2339,6 +2339,17 @@ int KYTY_SYSV_ABI Ngs2RackGetVoiceHandle(uintptr_t rack_handle, uint32_t voice_i
 	return OK;
 }
 
+// A patch to a rack handle connects to voice #0 of that rack.
+static Ngs2VoiceInternal* Ngs2FindPatchDestination(uintptr_t handle) {
+	Common::LockGuard racks_lock(g_racks_mutex);
+	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+		if (reinterpret_cast<uintptr_t>(rack) == handle) {
+			return reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+		}
+	}
+	return reinterpret_cast<Ngs2VoiceInternal*>(handle);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamHeader* param_list) {
 	PRINT_NAME();
@@ -2408,7 +2419,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						const auto* patch = reinterpret_cast<const Ngs2VoicePatchParam*>(param);
 						EXIT_NOT_IMPLEMENTED(patch->port >= voice->ports.size());
 						voice->ports[patch->port].dest =
-						    reinterpret_cast<Ngs2VoiceInternal*>(patch->dest_handle);
+						    Ngs2FindPatchDestination(patch->dest_handle);
 						voice->ports[patch->port].input = patch->dest_input_id;
 						LOGF("\t connect->port          = %u\n"
 						     "\t connect->dest_input_id = %u\n"
