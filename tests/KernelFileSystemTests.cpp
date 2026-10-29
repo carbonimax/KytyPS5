@@ -577,17 +577,16 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, &info[3].label, &point) == OK &&
             !std::string_view(point.data).ends_with('/'),
         "mount owned add-on without trailing slash");
+  MountPoint repeated {};
+  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
+        "duplicate mount reports BUSY");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
   const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
   std::array<char, 11> payload {};
   Check(fd >= 3 && FileSystem::KernelRead(fd, payload.data(), payload.size()) == payload.size() &&
             std::string_view(payload.data(), payload.size()) == "DLC payload" &&
             FileSystem::KernelClose(fd) == OK,
-        "guest reads files from the selected title's add-on");
-  MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == OK &&
-            std::strcmp(repeated.data, point.data) == 0,
-        "duplicate mount returns the same mount point");
+        "guest reads the original mount after a rejected duplicate mount");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
