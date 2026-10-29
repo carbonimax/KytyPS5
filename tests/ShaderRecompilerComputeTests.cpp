@@ -1712,30 +1712,60 @@ void CheckRectListShaders() {
   ValidateSpirv(name, position_only.evaluation);
 }
 
-// Shader store records survive a reopen, a store cut short keeps its complete records, a damaged
-// record ends the store and another host key starts it over.
+// Shader store: records survive a reopen and their SPIR-V reads back; records are written once;
+// a store cut short keeps its complete records, a damaged record ends it and another host key
+// starts it over; records unused for ShaderStore::RetainedLaunches launches are dropped by a
+// compaction, which a temporary file left by an earlier one cut short does not disturb.
 void CheckShaderStore() {
   constexpr const char *name = "ShaderStore";
   EnsureConfigInitialized();
   using ShaderRecompiler::IR::IoAll;
   using ShaderRecompiler::IR::Writer;
   std::error_code error;
-  const auto path = std::filesystem::temp_directory_path(error) /
-                    ("kyty_shader_store_test_" + std::to_string(std::rand()) + ".shaders");
-  std::filesystem::remove(path, error);
+  const auto directory = std::filesystem::temp_directory_path(error);
+  const auto stem = "kyty_shader_store_test_" + std::to_string(std::rand());
+  const auto path = directory / (stem + ".shaders");
+  const auto other_path = directory / (stem + "_cut.shaders");
+  auto temp = path;
+  temp += ".tmp";
+  for (const auto &file : {path, other_path, temp}) {
+    std::filesystem::remove(file, error);
+  }
   const std::vector<uint8_t> host_key{1, 2, 3, 4};
   const std::vector<uint8_t> other_key{1, 2, 3, 5};
 
-  const auto make_module = [](uint64_t id, ShaderType stage, uint32_t words) {
+  // Words that do not compress, so that a module's SPIR-V is most of its bytes.
+  const auto make_spirv = [](uint64_t seed, uint32_t words) {
+    std::vector<uint32_t> spirv(words);
+    uint64_t state = seed * 0x9e3779b97f4a7c15ull + 1;
+    for (auto &word : spirv) {
+      state ^= state << 13u;
+      state ^= state >> 7u;
+      state ^= state << 17u;
+      word = static_cast<uint32_t>(state);
+    }
+    spirv[0] = 0x07230203u;
+    return spirv;
+  };
+  const auto make_program = [](uint64_t id, ShaderType stage) {
+    ShaderStoreProgram program;
+    program.stage = stage;
+    program.hash = 0x1234567800000000ull | id;
+    program.user_data_count = 16;
+    program.code_size = 40;
+    program.static_state = {7, 8, 9, static_cast<uint32_t>(id)};
+    program.plan = {1, 2, 3, static_cast<uint8_t>(id)};
+    return program;
+  };
+  const auto make_module = [&](uint64_t id, const ShaderStoreProgram &program, uint32_t words) {
     ShaderStoreModule module;
-    module.stage = stage;
-    module.hash = 0x1234567800000000ull | id;
-    module.user_data_count = 16;
-    module.code_size = 40;
-    module.static_state = {7, 8, 9, static_cast<uint32_t>(id)};
-    module.plan = {1, 2, 3};
+    module.stage = program.stage;
+    module.hash = program.hash;
+    module.user_data_count = program.user_data_count;
+    module.code_size = program.code_size;
+    module.static_state = program.static_state;
     module.module.handle.id = id;
-    module.module.program.stage = stage;
+    module.module.program.stage = program.stage;
     module.module.program.wave_size = 32;
     module.module.program.param_export_mask = 5;
     module.module.program.bindings.push_data_start_dword = 4;
@@ -1743,19 +1773,24 @@ void CheckShaderStore() {
     module.module.vertex_formats = {vk::Format::eR32G32Sfloat};
     module.module.rect_parameters = {{.input_location = 1, .output_location = 2, .flat = true}};
     module.translation_id = id * 3;
-    module.spirv.assign(words, 0x07230203u + static_cast<uint32_t>(id));
+    module.spirv = make_spirv(id, words);
     return module;
   };
+  // A module record without its SPIR-V.
   const auto module_bytes = [](const ShaderStoreModule &module) {
     Writer bytes;
     IoAll(bytes, module.stage, module.hash, module.user_data_count, module.code_size,
-          module.static_state, module.plan, module.module.handle.id, module.module.program,
+          module.static_state, module.module.handle.id, module.module.program,
           module.module.specialization, module.module.vertex_formats,
-          module.module.rect_parameters, module.translation_id, module.spirv);
+          module.module.rect_parameters, module.translation_id);
     return bytes.bytes;
   };
-  const auto first = make_module(11, ShaderType::Vertex, 300);
-  const auto second = make_module(12, ShaderType::Pixel, 5000);
+  const auto vertex_program = make_program(1, ShaderType::Vertex);
+  const auto pixel_program = make_program(2, ShaderType::Pixel);
+  const auto first = make_module(11, vertex_program, 300);
+  const auto second = make_module(12, pixel_program, 5000);
+  // Its program is never stored.
+  const auto orphan = make_module(13, make_program(3, ShaderType::Pixel), 100);
   ShaderStorePipeline pipeline;
   pipeline.rendering.color_count = 2;
   pipeline.rendering.color_formats[1] = vk::Format::eR8G8B8A8Unorm;
@@ -1769,102 +1804,192 @@ void CheckShaderStore() {
   pipeline.static_params.samples = 4;
   pipeline.static_params.patch_control_points = 3;
   pipeline.static_params.color_mask[1] = 0xf;
+  auto orphan_pipeline = pipeline;
+  orphan_pipeline.ps_id = 13;
 
-  const auto read_file = [&] {
+  const auto read_file = [&](const std::filesystem::path &file_path) {
     std::error_code size_error;
-    const auto size = std::filesystem::file_size(path, size_error);
+    const auto size = std::filesystem::file_size(file_path, size_error);
     std::vector<uint8_t> bytes(size_error ? 0 : size);
-    std::FILE *file = std::fopen(path.string().c_str(), "rb");
+    std::FILE *file = std::fopen(file_path.string().c_str(), "rb");
     Require(name, "read", file != nullptr &&
                               std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size(),
             "cannot read the store back");
     std::fclose(file);
     return bytes;
   };
-  const auto write_file = [&](std::span<const uint8_t> bytes) {
-    std::FILE *file = std::fopen(path.string().c_str(), "wb");
+  const auto write_file = [&](const std::filesystem::path &file_path,
+                              std::span<const uint8_t> bytes) {
+    std::FILE *file = std::fopen(file_path.string().c_str(), "wb");
     Require(name, "write", file != nullptr &&
                                std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size(),
             "cannot rewrite the store");
     std::fclose(file);
   };
   const auto check_contents = [&](const char *stage, const ShaderStoreContents &contents,
-                                  size_t modules, size_t pipelines) {
+                                  std::vector<const ShaderStoreModule *> modules,
+                                  size_t pipelines) {
     Require(name, stage,
-            contents.header_match && contents.modules.size() == modules &&
+            contents.header_match && contents.modules.size() == modules.size() &&
+                contents.programs.size() == modules.size() &&
                 contents.pipelines.size() == pipelines,
-            "expected " + std::to_string(modules) + " modules and " +
+            "expected " + std::to_string(modules.size()) + " programs and modules and " +
                 std::to_string(pipelines) + " pipelines, got " +
+                std::to_string(contents.programs.size()) + ", " +
                 std::to_string(contents.modules.size()) + " and " +
                 std::to_string(contents.pipelines.size()));
-    const std::array expected{&first, &second};
-    for (size_t i = 0; i < modules; i++) {
-      Require(name, stage, module_bytes(contents.modules[i]) == module_bytes(*expected[i]),
-              "a module record changed through the store");
+    for (size_t i = 0; i < modules.size(); i++) {
+      const auto &loaded = contents.modules[i];
+      const auto &program = modules[i] == &first ? vertex_program : pixel_program;
+      Require(name, stage,
+              module_bytes(loaded) == module_bytes(*modules[i]) && loaded.spirv.empty() &&
+                  contents.programs[i].plan == program.plan &&
+                  contents.programs[i].static_state == program.static_state,
+              "a program or module record changed through the store");
     }
     for (const auto &loaded : contents.pipelines) {
       Require(name, stage,
-              loaded.rendering == pipeline.rendering && loaded.vertex_ids == pipeline.vertex_ids &&
-                  loaded.ps_id == pipeline.ps_id && loaded.vertex_input == pipeline.vertex_input &&
+              loaded.id != 0 && loaded.rendering == pipeline.rendering &&
+                  loaded.vertex_ids == pipeline.vertex_ids && loaded.ps_id == pipeline.ps_id &&
+                  loaded.vertex_input == pipeline.vertex_input &&
                   loaded.static_params == pipeline.static_params,
               "a pipeline record changed through the store");
     }
   };
+  const auto check_spirv = [&](const char *stage, ShaderStore &store,
+                               const ShaderStoreContents &contents) {
+    for (const auto &loaded : contents.modules) {
+      const auto &expected = loaded.module.handle.id == first.module.handle.id ? first : second;
+      Require(name, stage,
+              store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id) == expected.spirv &&
+                  store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id + 1).empty(),
+              "a module's SPIR-V did not read back");
+    }
+  };
 
+  // Launch 1. Records the store holds are not written again, nor what could never load.
   {
     ShaderStore store;
     const auto contents = store.Open(path, host_key);
     Require(name, "create", store.IsOpen() && !contents.header_match &&
-                                contents.modules.empty() && contents.kept_bytes == 0,
-            "a missing store did not start empty");
+                                contents.modules.empty() && contents.kept_bytes == 0 &&
+                                contents.launch == 1,
+            "a missing store did not start empty at launch 1");
+    store.AppendProgram(vertex_program);
     store.AppendModule(first);
-    store.AppendPipeline(pipeline);
+    store.AppendModule(first);
+    store.AppendPipeline(pipeline); // Its pixel module is not stored yet.
+    store.AppendModule(orphan);
+    store.AppendPipeline(orphan_pipeline);
+    store.AppendProgram(pixel_program);
+    store.AppendProgram(pixel_program);
     store.AppendModule(second);
+    store.AppendPipeline(pipeline);
+    store.AppendPipeline(pipeline);
   }
-  const auto complete = read_file();
-  check_contents("round trip", ShaderStore::Parse(complete, host_key), 2, 1);
+  const auto complete = read_file(path);
   {
-    // A sink takes the module records in file order instead of the contents.
-    std::vector<ShaderStoreModule> sunk;
-    auto contents = ShaderStore::Parse(complete, host_key, [&sunk](ShaderStoreModule &&module) {
-      sunk.push_back(std::move(module));
-    });
-    Require(name, "sink", contents.modules.empty() && sunk.size() == 2,
-            "the sink did not take every module record");
-    contents.modules = std::move(sunk);
-    check_contents("sink", contents, 2, 1);
+    const auto contents = ShaderStore::Parse(complete, host_key);
+    check_contents("round trip", contents, {&first, &second}, 1);
+    // Only the launch record is dead: nothing was written twice.
+    Require(name, "written once",
+            contents.launch == 2 && contents.dead_records == 1 &&
+                contents.kept_bytes == complete.size() && contents.live_bytes < complete.size(),
+            "duplicates or records that cannot load reached the store (" +
+                std::to_string(contents.dead_records) + " dead records)");
   }
+
+  // Launch 2 reads everything back and uses the vertex module only.
   {
     ShaderStore store;
-    check_contents("reopen", store.Open(path, host_key), 2, 1);
+    const auto contents = store.Open(path, host_key);
+    check_contents("reopen", contents, {&first, &second}, 1);
+    Require(name, "reopen launch", contents.launch == 2 && !contents.compacting,
+            "the second launch is not launch 2 or compacts a live store");
+    check_spirv("reopen", store, contents);
+    store.NoteUsedModule(first.module.handle.id);
+    // Known already: not written again.
+    store.AppendModule(second);
+    store.AppendPipeline(pipeline);
   }
-  Require(name, "reopen keeps the file", read_file() == complete,
-          "reopening an intact store changed it");
 
   const auto other = ShaderStore::Parse(complete, other_key);
   Require(name, "host key", !other.header_match && other.modules.empty() &&
                                 other.pipelines.empty() && other.kept_bytes == 0,
           "a store written for another host key was loaded");
 
-  // A partial last record: the earlier records stay, and the reopened store appends after them.
+  // A partial last record (the pipeline): the earlier records stay, and the reopened store
+  // appends after them.
   const auto cut = std::span(complete).first(complete.size() - 7);
   const auto truncated = ShaderStore::Parse(cut, host_key);
-  check_contents("truncated", truncated, 1, 1);
+  check_contents("truncated", truncated, {&first, &second}, 0);
   Require(name, "truncated tail", truncated.kept_bytes < cut.size(),
           "the partial record was kept");
-  write_file(cut);
+  write_file(other_path, cut);
   {
     ShaderStore store;
-    check_contents("reopen truncated", store.Open(path, host_key), 1, 1);
-    store.AppendModule(second);
+    const auto contents = store.Open(other_path, host_key);
+    check_contents("reopen truncated", contents, {&first, &second}, 0);
+    check_spirv("reopen truncated", store, contents);
+    store.AppendPipeline(pipeline);
   }
-  check_contents("append after truncation", ShaderStore::Parse(read_file(), host_key), 2, 1);
+  check_contents("append after truncation", ShaderStore::Parse(read_file(other_path), host_key),
+                 {&first, &second}, 1);
 
-  // A damaged byte in the second record ends the store there.
+  // A damaged byte in the pixel module's SPIR-V ends the store there: that module, its program
+  // and the pipeline go.
   auto damaged = complete;
-  damaged[truncated.kept_bytes - 3] ^= 0x40u;
-  const auto parsed = ShaderStore::Parse(damaged, host_key);
-  check_contents("damaged", parsed, 1, 0);
+  damaged[complete.size() - 2000] ^= 0x40u;
+  check_contents("damaged", ShaderStore::Parse(damaged, host_key), {&first}, 0);
+
+  // Launch 3 uses the vertex module again. Then at launch 4 the pixel module, its program and
+  // the pipeline were last used at launch 1: dead, and most of the file, so the store compacts.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "launch 3", contents.launch == 3 && !contents.compacting &&
+                                  contents.modules.size() == 2 && contents.pipelines.size() == 1,
+            "launch 3 did not keep the records of launch 1");
+    store.NoteUsedModule(first.module.handle.id);
+  }
+  const auto before_compaction = read_file(path);
+  // A compaction cut short leaves its temporary file next to the whole store.
+  write_file(temp, std::span(before_compaction).first(before_compaction.size() / 3));
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    check_contents("expired", contents, {&first}, 0);
+    Require(name, "compacting", contents.launch == 4 && contents.compacting,
+            "dead records did not start a compaction");
+    store.WaitForWrites();
+    Require(name, "compacted", !std::filesystem::exists(temp, error),
+            "the compaction left its temporary file");
+    check_spirv("compacted", store, contents);
+  }
+  Require(name, "compacted size", read_file(path).size() < before_compaction.size() / 2,
+          "the compaction did not replace the store with a smaller file");
+  {
+    // The compacted file keeps the last use of each record (launch 3) and counts launch 4.
+    const auto contents = ShaderStore::Parse(read_file(path), host_key);
+    check_contents("after compaction", contents, {&first}, 0);
+    Require(name, "after compaction",
+            contents.launch == 5 && contents.dead_records == 1,
+            "the compacted store lost its launch count or kept dead records");
+  }
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    check_contents("launch 5", contents, {&first}, 0);
+    check_spirv("launch 5", store, contents);
+  }
+  {
+    // Unused at launches 4 and 5.
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "launch 6", contents.launch == 6 && contents.modules.empty() &&
+                                  contents.programs.empty() && contents.compacting,
+            "a module unused for two launches was kept");
+  }
 
   // Another host key starts the store over.
   {
@@ -1873,10 +1998,13 @@ void CheckShaderStore() {
     Require(name, "start over", !contents.header_match && contents.modules.empty(),
             "a store of another host key was kept");
   }
-  Require(name, "start over file", ShaderStore::Parse(read_file(), host_key).modules.empty() &&
-                                       ShaderStore::Parse(read_file(), other_key).header_match,
+  Require(name, "start over file",
+          ShaderStore::Parse(read_file(path), host_key).modules.empty() &&
+              ShaderStore::Parse(read_file(path), other_key).header_match,
           "the store was not rewritten for the new host key");
-  std::filesystem::remove(path, error);
+  for (const auto &file : {path, other_path, temp}) {
+    std::filesystem::remove(file, error);
+  }
   std::printf("[host]    ShaderStore                       ok\n");
 }
 

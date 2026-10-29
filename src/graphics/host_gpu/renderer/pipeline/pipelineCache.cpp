@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
@@ -483,9 +484,13 @@ struct PipelineCache::ProgramCache {
 				                                            !graphics.image_view_min_lod_enabled);
 			}
 			if (permutation != nullptr) {
-				if (permutation->stored_spirv_hash != 0) [[unlikely]] {
-					finish_options();
-					VerifyStored(*permutation, cached, params, options, push_data_cursor);
+				if (permutation->store_use_pending && store != nullptr) [[unlikely]] {
+					permutation->store_use_pending = false;
+					store->NoteUsedModule(permutation->handle.id);
+					if (permutation->store_verify_pending) {
+						finish_options();
+						VerifyStored(*permutation, cached, params, options, push_data_cursor);
+					}
 				}
 				return bind(*permutation);
 			}
@@ -636,12 +641,6 @@ struct PipelineCache::ProgramCache {
 		return bind(entry->second.permutations.back());
 	}
 
-	// Never 0, which marks a checked module.
-	static uint64_t StoredSpirvHash(std::span<const uint32_t> spirv) {
-		const auto hash = XXH3_64bits(spirv.data(), spirv.size_bytes());
-		return hash != 0 ? hash : 1;
-	}
-
 	// The pretranslation id of a pixel program without a back stage (ShaderPretranslate).
 	uint64_t PixelTranslationId(const ShaderPixelInputInfo& input_info, const ShaderParams& params,
 	                            const ShaderRecompiler::CompileOptions& options) {
@@ -652,7 +651,7 @@ struct PipelineCache::ProgramCache {
 		                            params.hash);
 	}
 
-	// Appends the module just compiled for `entry` to the shader store, with the program's plan if
+	// Appends the module just compiled for `entry` to the shader store, after the program's plan if
 	// the store does not hold it yet. Records are encoded here since modules and plans change later.
 	template <typename InputInfo>
 	void StoreModule(SourceEntry& entry, const InputInfo& input_info, const ShaderParams& params,
@@ -663,9 +662,13 @@ struct PipelineCache::ProgramCache {
 		store_record.user_data_count = lookup_key.user_data_count;
 		store_record.code_size       = lookup_key.code_size;
 		store_record.static_state    = lookup_key.static_state;
-		store_record.plan.clear();
 		if (!entry.plan_stored) {
-			store_record.plan = ShaderRecompiler::IR::SaveResourcePlan(entry.resource_plan);
+			store->AppendProgram({.stage           = lookup_key.stage,
+			                      .hash            = lookup_key.hash,
+			                      .user_data_count = lookup_key.user_data_count,
+			                      .code_size       = lookup_key.code_size,
+			                      .static_state    = lookup_key.static_state,
+			                      .plan = ShaderRecompiler::IR::SaveResourcePlan(entry.resource_plan)});
 			entry.plan_stored = true;
 		}
 		store_record.module.handle          = module.handle;
@@ -688,7 +691,8 @@ struct PipelineCache::ProgramCache {
 	// the store.
 	void VerifyStored(Permutation& permutation, SourceEntry& entry, const ShaderParams& params,
 	                  const ShaderRecompiler::CompileOptions& options, uint32_t push_data_cursor) {
-		const auto stored_hash = std::exchange(permutation.stored_spirv_hash, 0);
+		permutation.store_verify_pending = false;
+		const auto stored = store->ReadSpirv(permutation.store_spirv - 1, permutation.handle.id);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		bool plan_equal = true;
 		if (std::exchange(entry.plan_unverified, false)) {
@@ -698,13 +702,13 @@ struct PipelineCache::ProgramCache {
 		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               permutation.specialization, push_data_cursor);
-		const auto spirv_hash = StoredSpirvHash(result.spirv);
+		const bool spirv_equal = !stored.empty() && result.spirv == stored;
 		const auto info       = std::move(result.program).TakeCompiledInfo();
 		ShaderRecompiler::IR::Writer fresh;
 		ShaderRecompiler::IR::Writer loaded;
 		ShaderRecompiler::IR::IoAll(fresh, info);
 		ShaderRecompiler::IR::IoAll(loaded, permutation.program);
-		const bool equal = plan_equal && spirv_hash == stored_hash && fresh.bytes == loaded.bytes;
+		const bool equal = plan_equal && spirv_equal && fresh.bytes == loaded.bytes;
 		verify_checked++;
 		if (!equal) {
 			verify_failed++;
@@ -712,7 +716,7 @@ struct PipelineCache::ProgramCache {
 			                 "SPIR-V {}, info {})",
 			                 permutation.handle.id, options.dump_label, params.hash,
 			                 plan_equal ? "same" : "differs",
-			                 spirv_hash == stored_hash ? "same" : "differs",
+			                 spirv_equal ? "same" : "differs",
 			                 fresh.bytes == loaded.bytes ? "same" : "differs");
 		}
 		if (!equal || (verify_checked & 255u) == 0) {
@@ -830,70 +834,92 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	const bool verify = GetShaderStoreMode() == ShaderStoreMode::Verify;
 	auto&      cache  = *m_program_cache;
 
-	// Modules as the store decodes them (one decoded record at a time), then every module by id
-	// once no permutation vector grows any more.
-	size_t                   dropped_modules = 0;
-	std::chrono::nanoseconds module_time {};
-	const auto               add_module = [&](ShaderStoreModule&& record) {
-		const auto module_start = std::chrono::steady_clock::now();
-		ProgramCache::ProgramKey key {.stage           = record.stage,
-		                              .hash            = record.hash,
-		                              .user_data_count = record.user_data_count,
-		                              .code_size       = record.code_size,
-		                              .static_state    = std::move(record.static_state)};
-		auto entry = cache.programs.find(key);
-		if (entry == cache.programs.end()) {
-			ShaderRecompiler::IR::ResourcePlan plan;
-			if (record.plan.empty() || !ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan)) {
-				dropped_modules++;
-				return;
-			}
-			entry = cache.programs.try_emplace(std::move(key), std::move(plan), nullptr).first;
-			entry->second.plan_stored     = true;
-			entry->second.plan_unverified = verify;
-		}
-		auto& module         = record.module;
-		module.handle.module = CompileSPV(record.spirv, m_graphics.device);
-		if (verify) {
-			module.stored_spirv_hash = ProgramCache::StoredSpirvHash(record.spirv);
-		}
-		entry->second.permutations.push_back(std::move(module));
-		module_time += std::chrono::steady_clock::now() - module_start;
-	};
-	auto contents = m_store->Open(path, host_key, add_module);
+	auto contents = m_store->Open(path, host_key);
 	if (!m_store->IsOpen()) {
 		PipelineCacheLog("Shader store: disabled (cannot write {})", Common::PathToString(path));
 		m_store.reset();
 		return;
 	}
-	const auto modules_ms = elapsed();
-	const auto read_ms =
-	    modules_ms - std::chrono::duration_cast<std::chrono::milliseconds>(module_time).count();
-	std::unordered_map<uint64_t, const ShaderModule*> modules;
-	size_t                                            module_count = 0;
-	for (const auto& [key, entry]: cache.programs) {
-		for (const auto& module: entry.permutations) {
-			modules.emplace(module.handle.id, &module);
-			module_count++;
+	const auto read_ms = elapsed();
+
+	// Programs, then their modules. Loaded modules have no handle module: one is created for the
+	// pipelines below and destroyed after them, and again when a new pipeline needs it, so that
+	// modules this launch never builds a pipeline from hold no SPIR-V.
+	size_t dropped_modules = 0;
+	for (auto& record: contents.programs) {
+		ShaderRecompiler::IR::ResourcePlan plan;
+		if (!ShaderRecompiler::IR::LoadResourcePlan(record.plan, plan)) {
+			continue;
+		}
+		ProgramCache::ProgramKey key {.stage           = record.stage,
+		                              .hash            = record.hash,
+		                              .user_data_count = record.user_data_count,
+		                              .code_size       = record.code_size,
+		                              .static_state    = std::move(record.static_state)};
+		auto& entry           = cache.programs.try_emplace(std::move(key), std::move(plan), nullptr)
+		                  .first->second;
+		entry.plan_stored     = true;
+		entry.plan_unverified = verify;
+	}
+	ProgramCache::ProgramKey key;
+	for (auto& record: contents.modules) {
+		key.stage           = record.stage;
+		key.hash            = record.hash;
+		key.user_data_count = record.user_data_count;
+		key.code_size       = record.code_size;
+		key.static_state    = std::move(record.static_state);
+		const auto entry    = cache.programs.find(key);
+		if (entry == cache.programs.end()) {
+			dropped_modules++;
+			continue;
+		}
+		auto& module                = record.module;
+		module.store_spirv          = record.spirv_index + 1;
+		module.store_use_pending    = true;
+		module.store_verify_pending = verify;
+		entry->second.permutations.push_back(std::move(module));
+	}
+	contents.programs = {};
+	contents.modules  = {};
+
+	// Every module by id once no permutation vector grows any more; a slot creates the handle
+	// module for the first pipeline that needs it and destroys it after the last.
+	struct Slot {
+		ShaderModule*         module = nullptr;
+		std::once_flag        created;
+		std::atomic<uint32_t> users {0};
+	};
+	std::deque<Slot>                   slots;
+	std::unordered_map<uint64_t, Slot*> slot_by_id;
+	size_t                             module_count = 0;
+	for (auto& [program_key, entry]: cache.programs) {
+		for (auto& module: entry.permutations) {
+			if (module.store_spirv != 0) {
+				auto& slot  = slots.emplace_back();
+				slot.module = &module;
+				slot_by_id.emplace(module.handle.id, &slot);
+				module_count++;
+			}
 		}
 	}
-	const auto find = [&modules](uint64_t id) {
-		const auto found = modules.find(id);
-		return found != modules.end() ? found->second : nullptr;
+	const auto find = [&slot_by_id](uint64_t id) {
+		const auto found = slot_by_id.find(id);
+		return found != slot_by_id.end() ? found->second : nullptr;
 	};
 
-	// Pipelines, created on several threads. Graphics pipelines whose modules are not all in the
-	// store (their programs have calls) or whose state does not fit them are left out.
+	// Pipelines, created on several threads. Graphics pipelines whose state does not fit their
+	// modules are left out.
 	struct Job {
-		const ShaderStorePipeline*         record = nullptr;
-		std::array<const ShaderModule*, 3> stages {};
-		uint32_t                           stage_count = 0;
-		const ShaderModule*                pixel       = nullptr;
-		const ShaderModule*                compute     = nullptr;
-		Pipeline                           pipeline;
+		const ShaderStorePipeline* record = nullptr;
+		std::array<Slot*, 3>       stages {};
+		uint32_t                   stage_count = 0;
+		Slot*                      pixel       = nullptr;
+		Slot*                      compute     = nullptr;
+		Pipeline                   pipeline;
+		bool                       created = false;
 	};
 	std::vector<Job> jobs;
-	jobs.reserve(contents.pipelines.size() + modules.size());
+	jobs.reserve(contents.pipelines.size() + slots.size());
 	size_t dropped_pipelines = 0;
 	for (const auto& record: contents.pipelines) {
 		Job job {.record = &record};
@@ -909,7 +935,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			valid     = job.pixel != nullptr;
 		}
 		if (valid) {
-			const auto& vertex   = *job.stages[0];
+			const auto& vertex   = *job.stages[0]->module;
 			const bool  mesh     = vertex.program.stage == ShaderType::Mesh;
 			const bool  tess     = job.stage_count == 3;
 			const bool  rect     = !mesh && !tess &&
@@ -925,31 +951,79 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		}
 		jobs.push_back(job);
 	}
-	const auto graphics_jobs = jobs.size();
 	// A compute pipeline depends only on its module.
-	for (const auto& [id, module]: modules) {
-		if (module->program.stage == ShaderType::Compute) {
-			jobs.push_back({.compute = module});
+	for (auto& slot: slots) {
+		if (slot.module->program.stage == ShaderType::Compute) {
+			jobs.push_back({.compute = &slot});
 		}
 	}
+	const auto job_slots = [](Job& job, auto&& visit) {
+		for (uint32_t i = 0; i < job.stage_count; i++) {
+			visit(*job.stages[i]);
+		}
+		if (job.pixel != nullptr) {
+			visit(*job.pixel);
+		}
+		if (job.compute != nullptr) {
+			visit(*job.compute);
+		}
+	};
+	for (auto& job: jobs) {
+		job_slots(job, [](Slot& slot) { slot.users++; });
+	}
+	std::atomic<size_t> created_modules {0};
+	std::atomic<size_t> unreadable {0};
+	const auto          acquire = [&](Slot& slot) {
+        std::call_once(slot.created, [&] {
+            auto&      module = *slot.module;
+            const auto spirv  = m_store->ReadSpirv(module.store_spirv - 1, module.handle.id);
+            if (!spirv.empty()) {
+                module.handle.module = CompileSPV(spirv, m_graphics.device);
+                created_modules++;
+            }
+        });
+        return slot.module->handle.module != nullptr;
+	};
+	const auto release = [this](Slot& slot) {
+		if (slot.users-- == 1) {
+			m_graphics.device.destroyShaderModule(slot.module->handle.module, nullptr);
+			slot.module->handle.module = nullptr;
+		}
+	};
 	std::atomic<size_t> next_job {0};
 	std::atomic<bool>   missed {false};
 	const auto          work = [&] {
         SetPipelineCreationQuiet(true);
         for (size_t index = next_job++; index < jobs.size(); index = next_job++) {
-            auto& job = jobs[index];
-            if (job.compute != nullptr) {
-                CreatePipelineInternal(m_graphics, job.pipeline, *job.compute, m_driver_cache);
+            auto& job   = jobs[index];
+            bool  ready = true;
+            job_slots(job, [&](Slot& slot) { ready = acquire(slot) && ready; });
+            if (!ready) {
+                unreadable++;
+            } else if (job.compute != nullptr) {
+                CreatePipelineInternal(m_graphics, job.pipeline, *job.compute->module,
+                                       m_driver_cache);
+                job.created = true;
             } else {
-                const auto& record = *job.record;
+                const auto&                        record = *job.record;
+                std::array<const ShaderModule*, 3> stages {};
+                for (uint32_t i = 0; i < job.stage_count; i++) {
+                    stages[i] = job.stages[i]->module;
+                }
                 CreatePipelineInternal(m_graphics, job.pipeline, record.rendering,
                                        record.vertex_input, record.static_params,
-                                       std::span(job.stages).first(job.stage_count), job.pixel,
+                                       std::span(stages).first(job.stage_count),
+                                       job.pixel != nullptr ? job.pixel->module : nullptr,
                                        m_driver_cache);
+                job.pipeline.store_id = record.id;
+                job.created           = true;
             }
-            if (const auto feedback = LastPipelineCacheFeedback(); !feedback.valid || !feedback.hit) {
-                missed = true;
+            if (job.created) {
+                if (const auto feedback = LastPipelineCacheFeedback(); !feedback.valid || !feedback.hit) {
+                    missed = true;
+                }
             }
+            job_slots(job, release);
         }
         SetPipelineCreationQuiet(false);
 	};
@@ -967,10 +1041,17 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 		m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
 	};
+	size_t created_graphics = 0;
+	size_t created_compute  = 0;
 	for (auto& job: jobs) {
+		if (!job.created) {
+			continue;
+		}
 		bool inserted = false;
 		if (job.compute != nullptr) {
-			inserted = m_compute_pipelines.try_emplace(job.compute->handle.id, job.pipeline).second;
+			inserted =
+			    m_compute_pipelines.try_emplace(job.compute->module->handle.id, job.pipeline).second;
+			created_compute += inserted ? 1 : 0;
 		} else {
 			const auto&         record = *job.record;
 			GraphicsPipelineKey key {.rendering     = record.rendering,
@@ -981,6 +1062,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				key.vertex_shader_ids[i] = record.vertex_ids[i];
 			}
 			inserted = m_graphics_pipelines.try_emplace(key, job.pipeline).second;
+			created_graphics += inserted ? 1 : 0;
 		}
 		if (!inserted) {
 			destroy(job.pipeline);
@@ -989,13 +1071,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	// Saved by the GPU thread, like the pipelines it creates.
 	m_driver_cache_dirty = m_driver_cache_dirty || missed;
 	cache.store          = m_store.get();
+	const auto mb        = [](uint64_t bytes) { return static_cast<double>(bytes) / 1'000'000.0; };
 	PipelineCacheLog(
-	    "Shader store: {} {:.1f} MB: {} programs, {} modules, {} graphics and {} compute pipelines "
-	    "in {} ms (read {} ms, modules {} ms, {} workers){}{}",
-	    contents.header_match ? "loaded" : "started over",
-	    static_cast<double>(contents.file_bytes) / 1'000'000.0, cache.programs.size(), module_count,
-	    graphics_jobs, jobs.size() - graphics_jobs, elapsed(), read_ms, modules_ms - read_ms,
-	    workers,
+	    "Shader store: {} {:.1f} MB for launch {} ({:.1f} MB live, {} dead records{}): {} programs, "
+	    "{} modules, {} graphics and {} compute pipelines in {} ms (read {} ms, {} modules created "
+	    "for them, {} workers){}{}{}",
+	    contents.header_match ? "loaded" : "started over", mb(contents.file_bytes), contents.launch,
+	    mb(contents.live_bytes), contents.dead_records, contents.compacting ? ", compacting" : "",
+	    cache.programs.size(), module_count, created_graphics, created_compute, elapsed(), read_ms,
+	    created_modules.load(), workers,
 	    contents.kept_bytes != 0 && contents.kept_bytes != contents.file_bytes
 	        ? fmt::format(", dropped a damaged tail of {} bytes",
 	                      contents.file_bytes - contents.kept_bytes)
@@ -1003,7 +1087,30 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    dropped_modules + dropped_pipelines != 0
 	        ? fmt::format(", left out {} modules and {} pipelines", dropped_modules,
 	                      dropped_pipelines)
-	        : std::string());
+	        : std::string(),
+	    unreadable != 0 ? fmt::format(", {} pipelines with unreadable modules", unreadable.load())
+	                    : std::string());
+}
+
+void PipelineCache::LoadStoredModule(const ShaderModule* stage) {
+	if (stage == nullptr || stage->handle.module != nullptr || stage->store_spirv == 0) {
+		return;
+	}
+	const auto& module = *stage;
+	EXIT_IF(m_store == nullptr);
+	const auto spirv = m_store->ReadSpirv(module.store_spirv - 1, module.handle.id);
+	if (spirv.empty()) {
+		EXIT("Shader store: cannot read module %016" PRIx64 " back; delete the title's .shaders "
+		     "file in _PipelineCache\n",
+		     module.handle.id);
+	}
+	// Program cache modules are not const; only their handle changes.
+	const_cast<ShaderModule&>(module).handle.module = CompileSPV(spirv, m_graphics.device);
+	EXIT_IF(module.handle.module == nullptr);
+	if ((++m_stored_modules_created & 255u) == 1) {
+		PipelineCacheLog("Shader store: {} loaded modules created for new pipelines",
+		                 m_stored_modules_created);
+	}
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -1649,7 +1756,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
 	if (!inserted) {
+		if (pipeline.store_id != 0 && m_store != nullptr) [[unlikely]] {
+			m_store->NoteUsedPipeline(std::exchange(pipeline.store_id, 0));
+		}
 		return pipeline;
+	}
+	for (const auto& stage: vertex_info) {
+		LoadStoredModule(stage.stage.module);
+	}
+	if (ps_active) {
+		LoadStoredModule(ps_input_info.stage.module);
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1713,6 +1829,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	if (!inserted) {
 		return pipeline;
 	}
+	LoadStoredModule(input_info.stage.module);
 
 	if (graphics_debug_dump_enabled()) {
 		ShaderDbgDumpInputInfo(input_info);

@@ -103,7 +103,8 @@ struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 
-	explicit operator bool() const { return id != 0 && module != nullptr; }
+	// A module loaded from the shader store has no handle module until a pipeline needs it.
+	explicit operator bool() const { return id != 0; }
 };
 
 // A compiled program variant. The handle id is stable across runs: it hashes the program key,
@@ -118,9 +119,13 @@ struct ShaderModule {
 	std::vector<vk::Format>                      vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
-	// Loaded from the shader store with KYTY_SHADER_STORE=2: the hash of its SPIR-V until its
-	// first use retranslates it to check the store.
-	uint64_t                                     stored_spirv_hash = 0;
+	// Loaded from the shader store: 1 + the index of its SPIR-V there (ShaderStore::ReadSpirv),
+	// from which the handle module is created when a pipeline needs it; 0 otherwise.
+	uint32_t                                     store_spirv = 0;
+	// Loaded from the shader store and not used yet in this launch.
+	bool                                         store_use_pending = false;
+	// Loaded with KYTY_SHADER_STORE=2: its first use retranslates it to check the store.
+	bool                                         store_verify_pending = false;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -157,6 +162,8 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Prewarmed from the shader store and not used yet in this launch: its record id.
+		uint64_t                store_id              = 0;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -210,6 +217,8 @@ private:
 	// function waits for the warm-up first.
 	std::unique_ptr<ShaderStore>  m_store;
 	std::thread                   m_warm_up;
+	// Loaded modules whose handle module a new pipeline needed (GPU thread).
+	uint64_t                      m_stored_modules_created = 0;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -228,6 +237,8 @@ private:
 		}
 	}
 	void JoinWarmUp();
+	// Creates the handle module of a module loaded from the shader store, if it has none.
+	void LoadStoredModule(const ShaderModule* module);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
