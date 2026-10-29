@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
@@ -535,6 +536,7 @@ bool CommandScheduler::IdleSubmitDue() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	CpSplitProf::NoteSubmitOrWait();
 	if (m_pre_submit != nullptr) [[unlikely]] {
 		m_pre_submit(m_pre_submit_context);
 	}

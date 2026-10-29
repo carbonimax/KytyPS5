@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "libs/errno.h"
@@ -933,6 +934,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
 			buffers.ReadMemoryWindow(vaddr, size);
 		}
 	}

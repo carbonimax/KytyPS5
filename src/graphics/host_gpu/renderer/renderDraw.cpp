@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -1023,7 +1024,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (const auto it = guess.by_shader.find(ps_address); it != guess.by_shader.end()) {
 		guessed = it->second;
 	}
-	RefreshShaders(buffer, state, guessed);
+	{
+		CpSplitProf::LookupScope lookup;
+		RefreshShaders(buffer, state, guessed);
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -1090,6 +1094,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		guess.last                  = single_sample;
 		guess.by_shader[ps_address] = single_sample;
 		if (state.ps_input_info.ps_single_sample != single_sample) {
+			CpSplitProf::LookupScope lookup;
 			RefreshShaders(buffer, state, single_sample);
 		}
 	}
@@ -1413,6 +1418,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	if (shader_write_stages) {
+		CpSplitProf::NoteItemWrites();
+	}
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto& pipeline = *pipelines[pass];
 		SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
@@ -1538,6 +1546,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1646,6 +1655,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);

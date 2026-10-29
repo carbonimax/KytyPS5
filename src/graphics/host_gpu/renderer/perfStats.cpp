@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -219,6 +220,7 @@ void MaybeReport() noexcept {
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
 	}
 	CmdRecord::Report(seconds);
+	CpSplitProf::Report(seconds);
 	GuestStacks::Report();
 	std::fflush(stdout);
 }

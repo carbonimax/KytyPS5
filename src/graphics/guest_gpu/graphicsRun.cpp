@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -103,6 +104,9 @@ void GuestGpu::Wake() {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		CpSplitProf::Drain(CpSplitProf::Cause::Command);
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -532,7 +536,9 @@ void GuestGpu::ThreadRun(void* data) {
 			EXIT_IF(g_current_processor != nullptr);
 			{
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+				CpSplitProf::BusyBegin();
 				command();
+				CpSplitProf::BusyEnd();
 			}
 			PerfStats::MaybeReport();
 
@@ -548,7 +554,9 @@ void GuestGpu::ThreadRun(void* data) {
 		bool complete = false;
 		{
 			PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+			CpSplitProf::BusyBegin();
 			complete = gpu->Process(submission);
+			CpSplitProf::BusyEnd();
 		}
 		PerfStats::MaybeReport();
 
@@ -746,6 +754,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
 
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
@@ -940,6 +949,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	struct IndirectScope {
+		IndirectScope() { CpSplitProf::SetIndirect(true); }
+		~IndirectScope() { CpSplitProf::SetIndirect(false); }
+	} indirect_scope;
 	// NUM_INSTANCES keeps the last draw's instance count.
 	m_num_instances_addr = args_addr + static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                       offsetof(vk::DrawIndirectCommand, instanceCount);
