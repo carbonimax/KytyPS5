@@ -1158,6 +1158,13 @@ void TestDeferredSamplerSetup() {
 	      "sampler did not play after deferred stream setup");
 }
 
+void TestSetupQuery() {
+	Fixture  f(48000, 2);
+	uint32_t info[2] = {99, 99};
+	Ngs2VoiceQueryInfo(reinterpret_cast<uintptr_t>(&f.voice), 0x4001, info, sizeof(info));
+	Check(info[0] == 2 && info[1] == 0, "setup query did not report the voice channels");
+}
+
 void TestPlayStateBeforeRender() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {8192, -16384};
@@ -1888,6 +1895,7 @@ int main() {
 	TestMonoRateAndRouting();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
+	TestSetupQuery();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
