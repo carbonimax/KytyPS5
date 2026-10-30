@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/agc.h"
 #include "libs/errno.h"
+#include "loader/elf.h"
 #include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
 #include "loader/runtimeLinker.h"
@@ -88,8 +89,14 @@ using Libs::LibKernel::Memory::VirtualQueryInfo;
 
 // Prospero ABI?
 constexpr uint64_t SceKernelPageSize             = 0x4000;
-constexpr uint64_t SceKernelTotalPhysicalSize    = 13824ull * 1024ull * 1024ull;
+constexpr uint64_t SceKernelFlexibleMemorySize   = 448ull * 1024ull * 1024ull;
 constexpr uint64_t TestFlexibleMemorySize        = 3072ull * 1024ull * 1024ull;
+constexpr uint64_t GuestMemoryBudget             = 12800ull * 1024ull * 1024ull;
+constexpr uint64_t ReservedCacheSize             = 64ull * 1024ull * 1024ull;
+// The 128 MiB CPU and 96 MiB AMM mapping tables add 64 + 32 MiB; a zero GPU table size adds none.
+constexpr uint64_t TestCpuTableMemory            = 128ull * 1024ull * 1024ull;
+constexpr uint64_t TestAmmTableMemory            = 96ull * 1024ull * 1024ull;
+constexpr uint64_t TestTableOverhead             = 96ull * 1024ull * 1024ull;
 constexpr int      SceKernelProtCpuRead          = 0x01;
 constexpr int      SceKernelProtCpuRw            = 0x02;
 constexpr int      SceKernelProtCpuExec          = 0x04;
@@ -174,7 +181,9 @@ void InitSubsystems() {
 	const auto param_json = std::filesystem::temp_directory_path() /
 	                        ("kyty_virtual_memory_" +
 	                         std::to_string(reinterpret_cast<uintptr_t>(&initialized)) + ".json");
-	constexpr char json[] = R"({"kernel":{"flexibleMemorySize":3221225472}})";
+	constexpr char json[] =
+	    R"({"kernel":{"flexibleMemorySize":3221225472,"cpuPageTableSize":134217728,)"
+	    R"("gpuPageTableSize":0},"amm":{"pagetableMemorySizeInMib":96}})";
 	Common::File   param_file;
 	Check("InitSubsystems", param_file.Create(param_json), "failed to create temporary param.json");
 	uint32_t bytes_written = 0;
@@ -184,12 +193,19 @@ void InitSubsystems() {
 	      "failed to write temporary param.json");
 
 	Loader::SystemContentLoadParamSfo(param_json);
-	const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+	const auto params = Loader::SystemContentGetMemoryParams();
 	Check("InitSubsystems", Common::File::DeleteFile(param_json),
 	      "failed to remove temporary param.json");
-	Check("InitSubsystems", flexible_memory_size == TestFlexibleMemorySize,
+	Check("InitSubsystems", params.flexible_size == TestFlexibleMemorySize,
 	      "failed to read flexible memory size from param.json");
-	Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
+	Check("InitSubsystems",
+	      params.cpu_table_memory == TestCpuTableMemory && params.gpu_table_memory == 0 &&
+	          params.amm_table_memory == TestAmmTableMemory,
+	      "failed to read mapping table sizes from param.json");
+	size_t default_flexible_memory_size = 0;
+	Libs::LibKernel::Memory::KernelConfiguredFlexibleMemorySize(&default_flexible_memory_size);
+	Check("InitSubsystems", default_flexible_memory_size == SceKernelFlexibleMemorySize,
+	      "flexible memory does not default to 448 MiB without param.json");
 
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 
@@ -861,8 +877,8 @@ void TestFlexibleMemoryCapacityIsBootFixed() {
 	Check(test, configured == TestFlexibleMemorySize,
 	      "boot flexible pool did not use the param.json value");
 	Check(test, configured == baseline, "boot flexible pool did not start at configured capacity");
-	Check(test, backing == SceKernelTotalPhysicalSize,
-	      "boot backing is not the single 13.5 GiB physical file");
+	Check(test, backing == GuestMemoryBudget - ReservedCacheSize - TestTableOverhead,
+	      "boot backing is not the 12.5 GiB budget less the reserved cache and table overhead");
 	Check(test, backing == Libs::LibKernel::Memory::KernelGetDirectMemorySize() + configured,
 	      "direct and flexible regions do not partition the boot backing");
 
@@ -1448,7 +1464,10 @@ void TestPageTableStatsTrackRangeEdits() {
 		        "KernelGetPageTableStats");
 		return stats;
 	};
-	const auto baseline    = read_stats();
+	// A 4 KiB table maps 2 MiB: 128 MiB of CPU tables gives 32768, the default 64 MiB GPU 16384.
+	const auto baseline = read_stats();
+	Check(test, baseline[0] == 32768 && baseline[2] == 16384,
+	      "page-table totals do not follow the configured table memory");
 	const auto expect_used = [&](int cpu, int gpu, const char* action) {
 		const auto stats = read_stats();
 		Check(test,
@@ -3695,6 +3714,32 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestModuleSegmentsUseFlexibleMemory() {
+	const char* test = "ModuleSegmentsUseFlexibleMemory";
+	using namespace Loader;
+	// E, R and RW LOAD pages; GNU_RELRO over the RW page and the flagless LOAD add none.
+	const std::array<Elf64_Phdr, 6> phdrs {{
+	    {PT_LOAD, PF_X, 0x4000, 0x0000, 0x0000, 0x1ac, 0x1ac, 0x4000},
+	    {PT_LOAD, PF_R, 0x8000, 0x4000, 0x4000, 0x83, 0x83, 0x4000},
+	    {PT_LOAD, PF_R | PF_W, 0xc000, 0x8000, 0x8000, 0x338, 0x338, 0x4000},
+	    {0x6474e552, PF_R, 0xc000, 0x8000, 0x8000, 0x338, 0x4000, 0x1},
+	    {PT_LOAD, PF_R | PF_W, 0x10000, 0xc000, 0xc000, 0x21, 0x21, 0x4000},
+	    {PT_LOAD, 0, 0x10030, 0xc030, 0xc030, 0x550, 0x550, 0x4000},
+	}};
+	const auto size = CalcFlexibleMemorySize(phdrs.data(), phdrs.size());
+	Check(test, size == 4 * SceKernelPageSize, "module segments counted wrong");
+
+	const auto baseline = AvailableFlexibleMemory(test);
+	Libs::LibKernel::Memory::ChargeFlexibleMemory(size);
+	Check(test, AvailableFlexibleMemory(test) == baseline - size,
+	      "loaded module did not use flexible memory");
+	Libs::LibKernel::Memory::ReleaseFlexibleMemory(size);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "unloaded module did not return flexible memory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_instruction_traps = 0;
 
@@ -5099,6 +5144,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestModuleSegmentsUseFlexibleMemory);
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestTlsStubsPreserveFlags);
 #endif

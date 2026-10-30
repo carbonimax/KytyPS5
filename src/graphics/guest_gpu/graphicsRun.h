@@ -45,6 +45,8 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// KYTY_CP_PIPELINE back thread: runs GPU-thread code paths (never guest code).
+	static void MarkHostGpuThread() noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

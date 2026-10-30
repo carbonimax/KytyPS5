@@ -29,6 +29,9 @@ struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+namespace CpPipeline {
+struct DrawRecord;
+} // namespace CpPipeline
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
@@ -99,6 +102,29 @@ struct SubmitInfo {
 	}
 };
 
+// KYTY_CP_PIPELINE: the back thread reads a draw record's copy of the registers through the same
+// CommandBuffer the GPU thread keeps binding to the live ones.
+struct RegisterOverride {
+	HW::Context*    registers   = nullptr;
+	HW::UserConfig* user_config = nullptr;
+	HW::Shader*     shaders     = nullptr;
+};
+inline thread_local RegisterOverride t_register_override;
+
+class ScopedRegisterOverride {
+public:
+	ScopedRegisterOverride(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept
+	    : m_previous(t_register_override) {
+		t_register_override = {&registers, &user_config, &shaders};
+	}
+	~ScopedRegisterOverride() { t_register_override = m_previous; }
+	ScopedRegisterOverride(const ScopedRegisterOverride&)            = delete;
+	ScopedRegisterOverride& operator=(const ScopedRegisterOverride&) = delete;
+
+private:
+	RegisterOverride m_previous;
+};
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -123,9 +149,15 @@ public:
 	void               FlushUploadPost() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] HW::Context& GetRegisters() const noexcept {
+		return t_register_override.registers != nullptr ? *t_register_override.registers : *m_registers;
+	}
+	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept {
+		return t_register_override.user_config != nullptr ? *t_register_override.user_config : *m_user_config;
+	}
+	[[nodiscard]] HW::Shader& GetShaders() const noexcept {
+		return t_register_override.shaders != nullptr ? *t_register_override.shaders : *m_shaders;
+	}
 
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
@@ -183,6 +215,21 @@ private:
 	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
+	// KYTY_CP_PIPELINE (cpPipeline.h). How much of PrepareDrawRenderState already ran: nothing, the
+	// program lookup, or the lookup after the image heap's BeginDraw.
+	enum class DrawPrepared { No, LookedUp, LookedUpHeapBegun };
+	bool DrawIndexBody(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	                   DrawRenderState* prepared, CpPipeline::DrawRecord* record, DrawPrepared stage);
+	bool DrawAutoBody(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	                  DrawRenderState* prepared, CpPipeline::DrawRecord* record, DrawPrepared stage);
+	// GPU thread: looks the draw's programs up and queues it; false when it must run here.
+	bool PipelineDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs* index_args,
+	                  const DrawAutoArgs* auto_args);
+	static void PipelineExecute(void* context, CpPipeline::DrawRecord& record);
+	static void PipelineRelookup(void* context, CpPipeline::DrawRecord& record);
+	static void PipelineFeedback(void* context, const CpPipeline::DrawRecord& record);
+	static void PipelineHeap(void* context);
+
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
 		std::optional<PreparedBindings> pixel;
@@ -200,7 +247,9 @@ private:
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
-	                                          DrawRenderState& state);
+	                                          DrawRenderState& state,
+	                                          CpPipeline::DrawRecord* record = nullptr,
+	                                          DrawPrepared prepared = DrawPrepared::No);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, const DrawEmitInfo& emit,
 	                         const DrawIndexBufferSource& index_source);
