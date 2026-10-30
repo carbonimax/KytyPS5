@@ -61,7 +61,8 @@ static bool GraphicsRunDebugDumpEnabled() {
 // and buffer-cache uploads of guest memory overlay the pending bytes, so the front never waits for
 // its own end of pipe and later recorded work still sees the label. Labels on GPU-modified pages
 // keep the immediate GPU-owned path (a guest sees them only through a readback, which waits for
-// this point of the command stream).
+// this point of the command stream). Timestamp labels (data_sel 3) keep the reference clock read
+// with the packet, as with 0: only their delivery waits for completion.
 // =2 (verify): labels are written immediately as with 0; the pending table and the completion
 // operations run as with 1 and check the delivery order, that the label bytes reached memory, and
 // that overlays agree with memory. Counters: "PERF eop" lines (KYTY_PERF_STATS=1).
@@ -1524,12 +1525,14 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 	const auto released_ns = EopNowNs();
 	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, event_id = m_interrupt_event_id,
 	                                       interrupt_context_id, interrupt, deferred, address_value,
-	                                       label_size, value, ref_clock, seq, order, released_ns] {
+	                                       label_size, value, seq, order, released_ns] {
 		auto& st = g_eop_stats;
 		CheckOrder(order);
 		if (deferred) {
-			// End-of-pipe timestamps are taken now, at completion.
-			const uint64_t label  = ref_clock ? Sync::ReadReferenceClock() : value;
+			// End-of-pipe timestamps keep the clock read with the packet (as with 0). Read now,
+			// every packet of a command buffer would get the buffer's end time and the guest's
+			// pass timings would collapse; games that size their work from them then add work.
+			const uint64_t label  = value;
 			const auto     result = renderer.WriteCompletedLabel(address_value, &label, label_size);
 			if (result == RenderContext::CompletedWrite::NotBacking &&
 			    !renderer.IsMapped(address_value, label_size)) {
