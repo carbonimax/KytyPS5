@@ -240,6 +240,45 @@ public:
 		return true;
 	}
 
+	// KYTY_MEM_IMPORT: backing offset of [vaddr, vaddr + size) when the whole range is mapped from one
+	// contiguous run of the backing (one view, or adjacent views of adjacent backing ranges).
+	bool ContiguousOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (!IsAvailable() || offset == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		auto it = m_maps.upper_bound(vaddr);
+		if (it == m_maps.begin()) {
+			return false;
+		}
+		--it;
+		if (vaddr >= it->second.vaddr + it->second.size) {
+			return false;
+		}
+		const auto base    = it->second.backing_offset + (vaddr - it->second.vaddr);
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
+		for (;;) {
+			const auto& entry = it->second;
+			if (current < entry.vaddr || current >= entry.vaddr + entry.size ||
+			    entry.backing_offset + (current - entry.vaddr) != base + (current - vaddr)) {
+				return false;
+			}
+			current = std::min(end, entry.vaddr + entry.size);
+			if (current >= end) {
+				break;
+			}
+			if (++it == m_maps.end()) {
+				return false;
+			}
+		}
+		if (!RangeOk(base, size)) {
+			return false;
+		}
+		*offset = base;
+		return true;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) {
 		std::shared_lock lock(m_mutex);
@@ -673,6 +712,15 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	// KYTY_MEM_IMPORT: see GuestBackingStore::ContiguousOffset; never for ranges with private mappings.
+	bool BackingOffsetOf(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+		if (!Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock lock(m_mutex);
+		return !OverlapsPrivateUnlocked(vaddr, size) && m_backing->ContiguousOffset(vaddr, size, offset);
 	}
 
 	// KYTY_MEMTRACK_PROF: 0 = view of the backing, 1 = private mapping, 2 = unknown (or the

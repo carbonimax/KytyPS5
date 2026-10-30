@@ -65,6 +65,10 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	bool                                      device_address_destruction_waits_for_queue = false;
 	bool                                      release_waits_for_submission_fence = false;
+	// KYTY_MEM_IMPORT=1 with KYTY_EOP_AT_GPU=1 and VK_EXT_external_memory_host: buffer-cache buffers
+	// over contiguous direct memory are bound to the imported backing alias (BufferCache).
+	bool                                      host_memory_import_enabled = false;
+	uint64_t                                  host_import_alignment      = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	// KYTY_BOUNDS_MODE: storage buffer bounds (Spirv::StorageBounds: 0 shader, 1 select, 2 device),
 	// robustStorageBufferAccessSizeAlignment, and with mode 2 the verify counters (host-mapped).

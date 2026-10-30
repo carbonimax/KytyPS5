@@ -147,9 +147,80 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+namespace {
+
+// One create info for imported buffers and their requirement queries.
+struct ImportedBufferInfo {
+	vk::ExternalMemoryBufferCreateInfo external {};
+	std::array<uint32_t, 2>            families {};
+	vk::BufferCreateInfo               info {};
+
+	ImportedBufferInfo(const GraphicContext& graphics, vk::BufferUsageFlags flags, uint64_t size) {
+		external.handleTypes = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		info.pNext           = &external;
+		info.size            = size;
+		info.usage           = flags;
+		families             = {graphics.queue_family, graphics.readback_family};
+		if (graphics.readback_queue != nullptr && graphics.readback_family != graphics.queue_family) {
+			info.sharingMode           = vk::SharingMode::eConcurrent;
+			info.queueFamilyIndexCount = 2;
+			info.pQueueFamilyIndices   = families.data();
+		}
+	}
+	ImportedBufferInfo(const ImportedBufferInfo&)            = delete;
+	ImportedBufferInfo& operator=(const ImportedBufferInfo&) = delete;
+};
+
+} // namespace
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               vk::BufferUsageFlags flags, uint64_t size, const ImportedMemory& imported)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size) {
+	EXIT_IF(size == 0 || imported.memory == nullptr);
+	const ImportedBufferInfo create(graphics, flags, size);
+	EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&create.info, nullptr, &m_buffer) !=
+	                     vk::Result::eSuccess);
+	const auto bound = graphics.device.bindBufferMemory(m_buffer, imported.memory, imported.offset);
+	if (bound != vk::Result::eSuccess) {
+		EXIT("Buffer: binding imported host memory failed (%d)\n", static_cast<int>(bound));
+	}
+	m_import_memory = imported.memory;
+	m_owns_import   = imported.owned;
+	m_coherent      = true;
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = graphics.device.getBufferAddress(address_info);
+		EXIT_IF(m_device_address == 0);
+		if (graphics.device_fault_enabled) {
+			DeviceFault::Registry().Add({m_device_address, size, cpu_address, "imported guest buffer"});
+		}
+	}
+}
+
+vk::MemoryRequirements Buffer::ImportedRequirements(GraphicContext& graphics,
+                                                    vk::BufferUsageFlags flags, uint64_t size) {
+	const ImportedBufferInfo        create(graphics, flags, size);
+	vk::DeviceBufferMemoryRequirements query {};
+	query.pCreateInfo = &create.info;
+	vk::MemoryRequirements2 requirements {};
+	graphics.device.getBufferMemoryRequirements(&query, &requirements);
+	return requirements.memoryRequirements;
+}
+
 Buffer::~Buffer() {
 	if (m_device_address != 0 && m_graphics->device_fault_enabled) {
 		DeviceFault::Registry().Remove(m_device_address);
+	}
+	if (m_import_memory != nullptr) {
+		if (m_buffer != nullptr) {
+			m_graphics->device.destroyBuffer(m_buffer);
+		}
+		if (m_owns_import) {
+			m_graphics->device.freeMemory(m_import_memory);
+		}
+		return;
 	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);

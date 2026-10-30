@@ -533,6 +533,20 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		}
 		m_external_waited = m_external_wait_value;
 	}
+	if (m_graphics.host_memory_import_enabled) {
+		// KYTY_MEM_IMPORT: buffers are guest memory; their GPU writes become visible to the host
+		// by the time the tick is signalled (guest readers wait for the tick, see BufferCache).
+		m_command.EndRendering();
+		vk::MemoryBarrier2 host {};
+		host.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+		host.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+		host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+		host.dstAccessMask = vk::AccessFlagBits2::eHostRead | vk::AccessFlagBits2::eHostWrite;
+		vk::DependencyInfo dependency {};
+		dependency.memoryBarrierCount = 1;
+		dependency.pMemoryBarriers    = &host;
+		m_command.Handle().pipelineBarrier2(dependency);
+	}
 	m_command.End();
 	if (m_record_main) {
 		CmdRecord::SetTarget(nullptr);
