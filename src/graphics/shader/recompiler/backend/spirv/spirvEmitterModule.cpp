@@ -606,9 +606,10 @@ void DefineInputs(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
 		}
 	}
-	// Packed wave32 votes are ballots, so they exclude helpers like other ballots.
+	// Packed wave32 votes are ballots, so they exclude helpers like other ballots. The live mask
+	// (pixel EXEC words) is a ballot of the non-helper lanes.
 	if (state.program.stage == ShaderType::Pixel &&
-	    (state.program.info.subgroup_ballot ||
+	    (state.program.info.subgroup_ballot || state.program.info.helper_invocation ||
 	     (state.packed_wave32 && state.program.info.subgroup_vote))) {
 		const auto variable = DefineInterfaceVariable(
 		    state, TypeBool(state), spv::StorageClassInput, "gl_HelperInvocation");
@@ -712,13 +713,15 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool uint_output =
-				    binding.kind == IR::StageOutputKind::Mrt &&
-				    state.program.stage == ShaderType::Pixel &&
-				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
-				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
-				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
-				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
+				auto type = TypeF32Vector(state, 4);
+				if (binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel && binding.index < 8u) {
+					// Packed UNorm stores its encoded bits.
+					const auto bit = 1u << binding.index;
+					type = (state.input_info.pixel->target_packed_unorm_mask & bit) != 0u
+					           ? TypeU32Vector(state, 4)
+					           : MrtOutputType(state, binding.index);
+				}
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&

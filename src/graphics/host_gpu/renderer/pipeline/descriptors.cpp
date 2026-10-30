@@ -621,11 +621,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base + resource.view_min_level;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	desc.heap = resource.heap;
 
 	auto id = [&] {
 		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
 		return texture_cache.FindImage(desc, shader_conversion);
 	}();
+	if (!id) {
+		// Another extent at the address holds it; the heap retries once an image is created.
+		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -852,6 +857,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
+		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
+		prepared.shader_data[layout.MemorySizeDword() + index] =
+		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
 	PerfStats::ScopedTimer upload_timer(PerfStats::Counter::BindUploadNs, PerfStats::SrtProfEnabled());
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
