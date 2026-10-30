@@ -570,6 +570,7 @@ struct Ngs2VoiceInternal {
 	uint32_t                        output_id       = 0;
 	float                           fbw_level       = 1.0f;
 	float                           lfe_level       = 1.0f;
+	float                           dry_level       = 0.0f;
 	bool                            rendering       = false;
 	bool                            rendered        = false;
 	bool                            has_samples     = false;
@@ -1869,6 +1870,11 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				voice.has_samples = true;
 			}
 		}
+		if (voice.has_samples && voice.rack->type == Ngs2RackType::Reverb) {
+			for (auto& sample: voice.samples) {
+				sample *= voice.dry_level;
+			}
+		}
 		if (voice.has_samples) {
 			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
 			const auto  rate   = voice.rack->ngs->option.sample_rate;
@@ -2472,7 +2478,31 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 				}
 				break;
 			}
-			case 0x2001: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb); break;
+			case 0x2001: {
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb);
+				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
+				switch (param->id & 0xffffu) {
+					case 0:
+						// Input and output channels, flags; channel conversion stays silent.
+						EXIT_NOT_IMPLEMENTED(values[0] == 0 || values[2] != 0);
+						voice->ResetSetupState();
+						voice->channels = values[1] == values[0] ? values[0] : 0;
+						break;
+					case 1: {
+						// The reverb parameters start with the wet and dry levels.
+						const auto* levels = reinterpret_cast<const float*>(values);
+						voice->dry_level   = std::clamp(levels[1], 0.0f, 1.0f);
+
+						static std::atomic_bool wet_warned = false;
+						if (levels[0] != 0.0f && !wet_warned.exchange(true)) {
+							Log::WriteToConsoleAndLog("warning: NGS2 reverb wet signal is muted\n");
+						}
+						break;
+					}
+					default: EXIT("unsupported reverb control: 0x%08" PRIx32 "\n", param->id);
+				}
+				break;
+			}
 			case 0x3000: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering);
 				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);

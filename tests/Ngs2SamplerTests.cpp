@@ -854,6 +854,29 @@ void TestMasteringGain() {
 	      "mastering gain was not clamped or applied per full band and LFE channel");
 }
 
+void TestReverbDryLevel() {
+	Fixture          f(48000);
+	Ngs2RackInternal reverb_rack {};
+	reverb_rack.ngs  = &f.system;
+	reverb_rack.type = Ngs2RackType::Reverb;
+	Ngs2VoiceInternal reverb;
+	reverb.rack = &reverb_rack;
+	f.voice.ports.push_back({&reverb, 0, 1.0f, -1});
+	const int16_t pcm = 8192;
+	f.Queue(&pcm, 1, 0);
+	struct {
+		Ngs2VoiceParamHeader header {24, 24, 0x20010000};
+		uint32_t             channels[4] = {1, 1, 0, 0};
+		Ngs2VoiceParamHeader levels_header {96, 0, 0x20010001};
+		float                levels[22] = {0.6f, 0.4f};
+	} setup;
+	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
+	reverb.SetEvent(1);
+	Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
+	Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
+	      "reverb did not pass its dry signal");
+}
+
 void TestCustomMasteringChannelMixer() {
 	Ngs2Internal system;
 	system.option = Ngs2DefaultSystemOption();
@@ -1875,6 +1898,7 @@ int main() {
 	TestPcm16RenderOutput();
 	TestPatchToRackHandle();
 	TestMasteringGain();
+	TestReverbDryLevel();
 	TestCustomMasteringChannelMixer();
 	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
