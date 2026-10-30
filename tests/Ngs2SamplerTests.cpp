@@ -1210,6 +1210,15 @@ void TestDeferredSamplerSetup() {
 	      "sampler did not play after deferred stream setup");
 }
 
+void TestClearReopensClosedList() {
+	Fixture       f(48000);
+	const int16_t first = 8192, second = -16384;
+	f.Queue(&first, 1, 0);
+	f.Queue(&second, 1, 4);
+	f.Render(1);
+	Check(f.voice.samples[0] == -0.5f, "CLEAR did not reopen a closed waveform list");
+}
+
 void TestSetupQuery() {
 	Fixture  f(48000, 2);
 	uint32_t info[2] = {99, 99};
@@ -1965,6 +1974,7 @@ int main() {
 	TestDefaultMatrix();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
+	TestClearReopensClosedList();
 	TestSetupQuery();
 	TestPortInfo();
 	TestPlayStateBeforeRender();
