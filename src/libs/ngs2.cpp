@@ -2802,6 +2802,31 @@ int KYTY_SYSV_ABI Ngs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t query_id, 
 	return OK;
 }
 
+int KYTY_SYSV_ABI Ngs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port, void* info,
+                                       size_t info_size) {
+	PRINT_NAME();
+
+	struct PortInfo {
+		int32_t   matrix;
+		float     volume;
+		uint32_t  delay_samples, input;
+		uintptr_t dest;
+	};
+	EXIT_NOT_IMPLEMENTED(voice_handle == 0 || info == nullptr || info_size != sizeof(PortInfo));
+
+	auto* voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
+
+	Common::LockGuard lock(voice->rack->ngs->mutex);
+
+	EXIT_NOT_IMPLEMENTED(port >= voice->ports.size());
+	const auto& p = voice->ports[port];
+
+	*static_cast<PortInfo*>(info) = {p.matrix, p.volume, 0, p.input,
+	                                 reinterpret_cast<uintptr_t>(p.dest)};
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle) {
 	PRINT_NAME();
 

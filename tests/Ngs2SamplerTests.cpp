@@ -1165,6 +1165,22 @@ void TestSetupQuery() {
 	Check(info[0] == 2 && info[1] == 0, "setup query did not report the voice channels");
 }
 
+void TestPortInfo() {
+	Fixture           f(48000);
+	Ngs2VoiceInternal dest;
+	f.voice.ports.push_back({&dest, 1, 0.5f, 0});
+	struct {
+		int32_t   matrix;
+		float     volume;
+		uint32_t  delay_samples, input;
+		uintptr_t dest;
+	} info {99, 99, 99, 99, 99};
+	Ngs2VoiceGetPortInfo(reinterpret_cast<uintptr_t>(&f.voice), 0, &info, sizeof(info));
+	Check(info.matrix == 0 && info.volume == 0.5f && info.delay_samples == 0 && info.input == 1 &&
+	          info.dest == reinterpret_cast<uintptr_t>(&dest),
+	      "port info did not report the port routing and volume");
+}
+
 void TestPlayStateBeforeRender() {
 	Fixture       f(48000);
 	const int16_t pcm[] = {8192, -16384};
@@ -1896,6 +1912,7 @@ int main() {
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestSetupQuery();
+	TestPortInfo();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
