@@ -15,6 +15,10 @@ namespace Libs::Graphics::CmdRecord {
 void Report(double seconds); // cmdRecord.h (KYTY_CP_RECORD_THREAD)
 } // namespace Libs::Graphics::CmdRecord
 
+namespace Libs::Graphics::EopAtGpu {
+void Report(double seconds); // graphicsRun.cpp (KYTY_EOP_AT_GPU)
+} // namespace Libs::Graphics::EopAtGpu
+
 namespace Libs::Graphics::PerfStats {
 
 namespace {
@@ -176,6 +180,7 @@ void MaybeReport() noexcept {
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
 	}
 	CmdRecord::Report(seconds);
+	EopAtGpu::Report(seconds);
 	GuestStacks::Report();
 	std::fflush(stdout);
 }
