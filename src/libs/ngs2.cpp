@@ -1803,6 +1803,18 @@ static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
 	voice.has_samples = output != 0;
 }
 
+// Mono and stereo convert at -3 dB, mono feeds the surround front center, others map 1:1.
+static float Ngs2DefaultMatrixLevel(uint32_t src_channels, uint32_t src, uint32_t dst_channels,
+                                    size_t dst) {
+	if ((src_channels == 1 && dst_channels == 2) || (src_channels == 2 && dst_channels == 1)) {
+		return std::numbers::sqrt2_v<float> / 2;
+	}
+	if (src_channels == 1 && dst_channels > 2) {
+		return dst == 2 ? 1.0f : 0.0f;
+	}
+	return src == dst ? 1.0f : 0.0f;
+}
+
 static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
                             uint32_t grain) {
 	if (voice.rendered) {
@@ -1851,7 +1863,11 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 				EXIT_NOT_IMPLEMENTED(port.input >= voice.rack->NumBuffers());
 				const auto* input  = source->Buffer(source->rack->PortBufferId(p), grain);
 				auto*       output = voice.Buffer(port.input, grain);
+				// A port without a matrix, or whose matrix has no levels, uses the default mix.
 				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
+				if (matrix != nullptr && matrix->empty()) {
+					matrix = nullptr;
+				}
 				const size_t output_channels =
 				    matrix == nullptr
 				        ? voice.channels
@@ -1860,7 +1876,8 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 					for (uint32_t src = 0; src < source->channels; ++src) {
 						const float level =
 						    port.volume * (matrix == nullptr
-						                       ? (src == dst ? 1.0f : 0.0f)
+						                       ? Ngs2DefaultMatrixLevel(source->channels, src,
+						                                                voice.channels, dst)
 						                       : (*matrix)[dst * source->channels + src]);
 						for (uint32_t i = 0; i < grain; ++i) {
 							output[dst * grain + i] += input[src * grain + i] * level;

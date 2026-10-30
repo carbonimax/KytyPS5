@@ -1096,6 +1096,35 @@ void TestMonoRateAndRouting() {
 	      "22.05 kHz effect duration was incorrect");
 }
 
+void TestDefaultMatrix() {
+	struct Case {
+		uint32_t           src_channels;
+		int32_t            matrix;
+		uint32_t           dst_channels;
+		std::vector<float> expected;
+	};
+	constexpr float minus_3db = std::numbers::sqrt2_v<float> / 2;
+	const int16_t   pcm[]     = {8192, -16384};
+	for (const auto& c: {Case {1, -1, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
+	                     Case {1, 0, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
+	                     Case {2, -1, 1, {0.25f * minus_3db + -0.5f * minus_3db}},
+	                     Case {1, -1, 6, {0, 0, 0.25f, 0, 0, 0}}}) {
+		Fixture          f(48000, c.src_channels);
+		Ngs2RackInternal rack {};
+		rack.ngs  = &f.system;
+		rack.type = Ngs2RackType::Mastering;
+		Ngs2VoiceInternal dest;
+		dest.rack     = &rack;
+		dest.channels = c.dst_channels;
+		dest.state    = Ngs2VoicePlayState::Playing;
+		f.voice.matrices.resize(1);
+		f.voice.ports.push_back({&dest, 0, 1.0f, c.matrix});
+		f.Queue(pcm, 1, 0);
+		Ngs2RenderVoice(dest, {&f.voice, &dest}, 1);
+		Check(dest.samples == c.expected, "default port mix produced the wrong channel levels");
+	}
+}
+
 void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
@@ -1933,6 +1962,7 @@ int main() {
 	TestPcmSkipAcrossBlocks();
 	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
+	TestDefaultMatrix();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestSetupQuery();
