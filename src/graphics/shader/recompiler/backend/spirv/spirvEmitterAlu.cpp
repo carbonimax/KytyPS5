@@ -55,9 +55,30 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 	return result;
 }
 
-uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
+uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
+	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
+	// float below the integer limit are selected afterwards.
+	const auto clamped =
+	    EmitExt(state, TypeF32(state), GLSLstd450NClamp,
+	            {src, ConstantF32(state, signed_value ? 0xcf000000u : 0u),
+	             ConstantF32(state, signed_value ? 0x4effffffu : 0x4f7fffffu)});
+	const auto converted = signed_value
+	                           ? Unary(state, spv::OpBitcast, TypeU32(state),
+	                                   Unary(state, spv::OpConvertFToS, TypeI32(state), clamped))
+	                           : Unary(state, spv::OpConvertFToU, TypeU32(state), clamped);
+	const auto above     = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
+	                              ConstantF32(state, signed_value ? 0x4f000000u : 0x4f800000u));
+	const auto high =
+	    Select(state, TypeU32(state), above,
+	           ConstantU32(state, signed_value ? 0x7fffffffu : 0xffffffffu), converted);
+	return Select(state, TypeU32(state), Unary(state, spv::OpIsNan, TypeBool(state), src),
+	              ConstantU32(state, 0), high);
+}
+
+} // namespace
+
+uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	// Native half conversion causes regressions; use compact integer RTZ conversion.
-	const auto bits = EmitBitcastF32ToU32(state, value);
 	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
 	const auto sign = EmitAndConstant(
 	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, ConstantU32(state, 16)),
@@ -93,25 +114,7 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
-uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
-	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
-	// float below the integer limit are selected afterwards.
-	const auto clamped =
-	    EmitExt(state, TypeF32(state), GLSLstd450NClamp,
-	            {src, ConstantF32(state, signed_value ? 0xcf000000u : 0u),
-	             ConstantF32(state, signed_value ? 0x4effffffu : 0x4f7fffffu)});
-	const auto converted = signed_value
-	                           ? Unary(state, spv::OpBitcast, TypeU32(state),
-	                                   Unary(state, spv::OpConvertFToS, TypeI32(state), clamped))
-	                           : Unary(state, spv::OpConvertFToU, TypeU32(state), clamped);
-	const auto above     = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-	                              ConstantF32(state, signed_value ? 0x4f000000u : 0x4f800000u));
-	const auto high =
-	    Select(state, TypeU32(state), above,
-	           ConstantU32(state, signed_value ? 0x7fffffffu : 0xffffffffu), converted);
-	return Select(state, TypeU32(state), Unary(state, spv::OpIsNan, TypeBool(state), src),
-	              ConstantU32(state, 0), high);
-}
+namespace {
 
 // On Apple, fuse legacy MAD to avoid SPIRV-Cross NoContraction helpers; this changes rounding (KhronosGroup/SPIRV-Cross#1999, #2156).
 bool MadSeparateRounding() {
@@ -219,7 +222,8 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
-	    state, EmitF32ToF16RtzBits(state, arg0), EmitF32ToF16RtzBits(state, arg1),
+	    state, EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg0)),
+	    EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg1)),
 	    ConstantU32(state, 16), ConstantU32(state, 16));
 }
 

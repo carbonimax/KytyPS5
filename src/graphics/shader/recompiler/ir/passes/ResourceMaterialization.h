@@ -62,6 +62,14 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
 bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
+// KYTY_SRT_PROF measurement: while enabled on the calling thread, MaterializeResources adds the time
+// of its walk, its descriptor evaluation and its specialization build.
+struct MaterializeTimes {
+	bool     enabled = false;
+	uint64_t walk_ns = 0, eval_ns = 0, spec_ns = 0;
+};
+inline thread_local MaterializeTimes t_materialize_times;
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, ResourceSpecialization& specialization, bool emulate_image_min_lod = false);
 

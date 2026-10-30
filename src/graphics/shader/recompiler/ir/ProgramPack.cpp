@@ -278,13 +278,14 @@ bool ProgramPacker::Pack(PackedProgram& out, Program& program) {
 		}
 	});
 	shell.control_phi_predecessors.clear();
-	// Same teardown as ~Program: detach every argument while all definitions are alive.
+	// Same teardown as ~Program: every instruction goes, so drop the arguments without updating
+	// use lists (Invalidate would search each use list, quadratic on large programs).
 	for (auto& inst: shell.value_storage) {
-		inst.Invalidate();
+		inst.DropArgs();
 	}
 	for (auto& block: shell.block_storage) {
 		for (auto& inst: block->Instructions()) {
-			inst.Invalidate();
+			inst.DropArgs();
 		}
 	}
 	shell.value_storage.clear();

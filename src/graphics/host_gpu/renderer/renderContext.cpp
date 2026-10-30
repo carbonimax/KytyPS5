@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -62,6 +63,8 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// Only reads and writes are tracking faults: an execute or unknown access is not resolved here
 	// (it would otherwise publish GPU bytes as a read and report the fault handled).
 	constexpr uint64_t fault_size = 1;
+	// KYTY_CP_PIPELINE: a GPU-thread fault resolves through the caches the back thread uses.
+	CpPipeline::Drain();
 	if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) || !IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
@@ -147,6 +150,7 @@ void RenderContext::RunGarbageCollector() {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
+	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();

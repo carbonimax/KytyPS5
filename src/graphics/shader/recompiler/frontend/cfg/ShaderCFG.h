@@ -114,13 +114,13 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
-bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
 // Returns the unique reaching definition of a scalar register (UINT32_MAX: the entry value),
 // or nothing when paths disagree or cross a scalar call. With crossed_calls, a path may cross an
 // S_SWAPPC_B64 that does not itself write the register: the call's instruction index is recorded
 // so that the caller can check that the linked callee preserves the register.
 std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                                             uint32_t before, uint32_t code,
+                                             uint32_t before, uint32_t code, uint32_t wave_size,
                                              std::vector<uint32_t>* crossed_calls = nullptr);
 // Returns structured control flow or failure diagnostics without changing the native graph.
 // On failure, failure_block is an original block ID or UINT32_MAX.
