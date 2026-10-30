@@ -37,13 +37,28 @@ inline constexpr vk::BufferUsageFlags ReadFlags =
 inline constexpr vk::BufferUsageFlags AllFlags =
     ReadFlags | vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer;
 
+// KYTY_MEM_IMPORT: device memory imported from host memory (VK_EXT_external_memory_host) that a
+// buffer is bound to at `offset`; `owned` memory is freed with the buffer.
+struct ImportedMemory {
+	vk::DeviceMemory memory = nullptr;
+	uint64_t         offset = 0;
+	bool             owned  = false;
+};
+
 class Buffer {
 public:
 	// prefer_device: host-written memory placed in device-local memory (ReBAR staging ring).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
 	       bool prefer_device = false);
+	// A buffer whose bytes are the guest's own memory (KYTY_MEM_IMPORT).
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       vk::BufferUsageFlags flags, uint64_t size, const ImportedMemory& imported);
 	~Buffer();
+	// Requirements of an imported buffer with these flags and size (same create info as above).
+	[[nodiscard]] static vk::MemoryRequirements ImportedRequirements(GraphicContext&      graphics,
+	                                                                 vk::BufferUsageFlags flags,
+	                                                                 uint64_t             size);
 	KYTY_CLASS_NO_COPY(Buffer);
 
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
@@ -51,6 +66,7 @@ public:
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
+	[[nodiscard]] bool               IsImported() const noexcept { return m_import_memory != nullptr; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
 		EXIT_IF(m_device_address == 0);
@@ -95,6 +111,8 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	vk::DeviceMemory              m_import_memory = nullptr;
+	bool                          m_owns_import   = false;
 };
 
 class StreamBuffer final: public Buffer {

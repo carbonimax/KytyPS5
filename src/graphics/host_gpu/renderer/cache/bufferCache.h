@@ -161,9 +161,28 @@ public:
 	void                   FlushBatchedUploads();
 	[[nodiscard]] static bool ReprotectBatchEnabled() noexcept;
 	void               RunGarbageCollector();
+	// KYTY_MEM_IMPORT (GPU thread, RenderContext::UnmapMemory after the range was published): the
+	// imported buffers touching the range are deleted, their physical pages may be mapped elsewhere.
+	void               DropImported(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool ImportActive() const noexcept { return m_import != nullptr; }
+	// KYTY_MEM_IMPORT (GPU thread): the command processor is about to write [vaddr, vaddr + size)
+	// with the CPU (WRITE_DATA, DMA fill/copy), ahead of the GPU work recorded before it. On imported
+	// memory that work reads the guest's bytes when it runs, so the write first waits for every
+	// earlier GPU access to those bytes (64 KiB granularity). No-op without imported memory.
+	void BeforeCpuWrite(uint64_t vaddr, uint64_t size);
+	static void        ReportImport(double seconds);
 
 private:
 	friend struct BufferCacheTestAccess;
+	class HostImport;
+
+	// KYTY_MEM_IMPORT (GPU thread): the bytes of an imported buffer are guest memory, so publishing
+	// GPU writes is only waiting for them. Drops the GPU ownership of [vaddr, vaddr + size) once every
+	// GPU write to it completed; when one is still running, waits for it if `may_wait`, else stores
+	// its tick in `wait_tick` (submitted) and returns false.
+	[[nodiscard]] bool PublishImported(uint64_t vaddr, uint64_t size, bool may_wait,
+	                                   uint64_t* wait_tick);
+	[[nodiscard]] bool IsImportedRange(uint64_t vaddr, uint64_t size);
 
 	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
@@ -284,6 +303,8 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
+	// Declared first among the owners: imported chunks outlive every buffer bound to them.
+	std::unique_ptr<HostImport>                       m_import;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
@@ -301,6 +322,8 @@ private:
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_write_ticks;
+	// KYTY_MEM_IMPORT: latest tick that may read each 64 KiB of imported memory (BeforeCpuWrite).
+	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_read_ticks;
 	struct SideCopy {
 		uint64_t begin = 0, end = 0, tick = 0;
 	};

@@ -132,6 +132,12 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// KYTY_MEM_IMPORT: host address of the writable backing alias of [vaddr, vaddr + size) when the whole
+// range is mapped from one contiguous run of direct memory (never protected: importable by the GPU);
+// 0 otherwise. BackingAliasBase/Size: the whole alias (0 when there is no backing).
+[[nodiscard]] uint64_t BackingHostAddress(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t BackingAliasBase();
+[[nodiscard]] uint64_t BackingAliasSize();
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: the tracker page of vaddr may hold GPU-written bytes (the tracker protects such pages
 // against guest reads). False on other threads and outside GPU-tracked memory.

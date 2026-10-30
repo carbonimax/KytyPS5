@@ -875,6 +875,22 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+uint64_t BackingHostAddress(uint64_t vaddr, uint64_t size) {
+	uint64_t offset = 0;
+	if (g_guest_address_space == nullptr || !g_guest_address_space->BackingOffsetOf(vaddr, size, &offset)) {
+		return 0;
+	}
+	return g_guest_address_space->GetBackingBase() + offset;
+}
+
+uint64_t BackingAliasBase() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0;
+}
+
+uint64_t BackingAliasSize() {
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
+}
+
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||

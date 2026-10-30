@@ -1280,6 +1280,27 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 			}
 		}
+		// KYTY_MEM_IMPORT (default 0) needs labels/EOP written at host GPU completion
+		// (KYTY_EOP_AT_GPU=1): a guest that sees a label then reads bytes the GPU already wrote.
+		if (const char* import = std::getenv("KYTY_MEM_IMPORT");
+		    import != nullptr && std::strtol(import, nullptr, 10) != 0) {
+			const char* eop      = std::getenv("KYTY_EOP_AT_GPU");
+			const bool  eop_ok   = eop != nullptr && std::strtol(eop, nullptr, 10) == 1;
+			const bool  ext_ok   = HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			if (eop_ok && ext_ok) {
+				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+				vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_props {};
+				vk::PhysicalDeviceProperties2 props2 {};
+				props2.pNext = &host_props;
+				graphic_ctx.physical_device.getProperties2(&props2);
+				graphic_ctx.host_memory_import_enabled = true;
+				graphic_ctx.host_import_alignment      = host_props.minImportedHostPointerAlignment;
+			}
+			Log::WriteToConsoleAndLog(
+			    eop_ok && ext_ok ? "GPU: KYTY_MEM_IMPORT on: buffers over guest direct memory use imported host memory.\n"
+			    : !eop_ok        ? "GPU: KYTY_MEM_IMPORT unavailable: needs KYTY_EOP_AT_GPU=1; buffers stay in device memory.\n"
+			                     : "GPU: KYTY_MEM_IMPORT unavailable: no VK_EXT_external_memory_host; buffers stay in device memory.\n");
+		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
 

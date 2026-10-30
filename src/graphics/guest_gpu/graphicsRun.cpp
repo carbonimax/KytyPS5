@@ -732,6 +732,9 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		}
 	}
 
+	m_renderer.GetBufferCache().BeforeCpuWrite(
+	    reinterpret_cast<uint64_t>(dst),
+	    write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t));
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -748,6 +751,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 	GpuCapture::Touch(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
+	m_renderer.GetBufferCache().BeforeCpuWrite(dst_address, num_bytes);
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {

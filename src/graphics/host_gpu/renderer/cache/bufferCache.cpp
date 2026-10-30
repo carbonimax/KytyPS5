@@ -18,9 +18,13 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <optional>
+#include <unordered_map>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -242,6 +246,316 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 
 } // namespace
 
+// KYTY_MEM_IMPORT counters ("PERF import" lines, KYTY_PERF_STATS=1).
+namespace {
+
+struct ImportStats {
+	std::atomic<uint64_t> imported {0};     // cache buffers created on imported memory
+	std::atomic<uint64_t> device {0};       // ... in device memory: range not one backing run
+	std::atomic<uint64_t> failed {0};       // ... in device memory: import or binding refused
+	std::atomic<uint64_t> chunks {0};       // 64 MiB backing chunks imported
+	std::atomic<uint64_t> own {0};          // large buffers importing their own range
+	std::atomic<uint64_t> import_ns {0};    // time in vkAllocateMemory (imports)
+	std::atomic<uint64_t> read_syncs {0};   // read synchronizations: nothing to upload
+	std::atomic<uint64_t> write_syncs {0};  // write synchronizations: ownership only, no copy
+	std::atomic<uint64_t> published {0};    // GPU writes published without a copy, already complete
+	std::atomic<uint64_t> waited {0};       // ... after the GPU thread waited for the writer
+	std::atomic<uint64_t> wait_ns {0};
+	std::atomic<uint64_t> replayed {0};     // guest faults that waited for the writer themselves
+	std::atomic<uint64_t> stream_skips {0}; // small reads bound directly instead of stream copies
+	std::atomic<uint64_t> join_copies {0};  // GPU-written ranges copied into a new imported buffer
+	std::atomic<uint64_t> dropped {0};      // imported buffers deleted at unmap
+	std::atomic<uint64_t> image_syncs {0};  // texel buffers filled from an image (guest memory written)
+	std::atomic<uint64_t> owned_labels {0}; // GPU-owned labels written in the stream only
+	std::atomic<uint64_t> cp_writes {0};    // command-processor CPU writes into imported memory
+	std::atomic<uint64_t> cp_waits {0};     // ... that waited for earlier GPU work
+	std::atomic<uint64_t> cp_wait_ns {0};
+};
+
+ImportStats g_import_stats;
+
+uint64_t ImportNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+// Imports the writable backing alias of guest direct memory (never protected, so always importable)
+// in 64 MiB chunks every 32 MiB: a range of up to 32 MiB always fits in one chunk. Chunks stay
+// imported until shutdown. Larger buffers import their own range.
+class BufferCache::HostImport {
+public:
+	static constexpr uint64_t ChunkStride = 32ull * 1024 * 1024;
+	static constexpr uint64_t ChunkSize   = 2 * ChunkStride;
+	static constexpr uint64_t ImportSlack = 64ull * 1024; // > one caching page (16 KiB)
+
+	explicit HostImport(GraphicContext& graphics)
+	    : m_graphics(graphics), m_base(LibKernel::Memory::BackingAliasBase()),
+	      m_size(LibKernel::Memory::BackingAliasSize()) {}
+	~HostImport() {
+		for (auto& [index, memory]: m_chunks) {
+			(void)index;
+			if (memory != nullptr) {
+				m_graphics.device.freeMemory(memory);
+			}
+		}
+	}
+	KYTY_CLASS_NO_COPY(HostImport);
+
+	[[nodiscard]] bool Valid() const noexcept { return m_base != 0 && m_size != 0; }
+
+	// Memory for a buffer of `size` bytes whose guest bytes start at host address `host` (inside the
+	// alias); nullopt when it cannot be imported.
+	std::optional<ImportedMemory> Acquire(uint64_t host, uint64_t size, vk::BufferUsageFlags flags) {
+		if (host < m_base || size == 0 || host - m_base > m_size || size > m_size - (host - m_base)) {
+			return std::nullopt;
+		}
+		const auto requirements = Buffer::ImportedRequirements(m_graphics, flags, size);
+		const auto offset       = host - m_base;
+		std::lock_guard lock(m_mutex);
+		if (m_type == UINT32_MAX) {
+			m_type = PickType(requirements.memoryTypeBits);
+		}
+		if (m_type == UINT32_MAX || (requirements.memoryTypeBits & (1u << m_type)) == 0) {
+			return std::nullopt;
+		}
+		// BDA shaders address whole caching pages from a buffer's device address: keep the imported
+		// memory mapped past the buffer's end, or a read of its last page leaves the allocation.
+		const auto needed      = requirements.size + ImportSlack;
+		const auto index       = offset / ChunkStride;
+		const auto chunk_begin = index * ChunkStride;
+		const auto chunk_size  = std::min(ChunkSize, m_size - chunk_begin);
+		const auto in_chunk    = offset - chunk_begin;
+		if (needed <= chunk_size && in_chunk <= chunk_size - needed &&
+		    in_chunk % std::max<uint64_t>(requirements.alignment, 1) == 0) {
+			auto [it, inserted] = m_chunks.try_emplace(index, nullptr);
+			if (inserted) {
+				it->second = Import(m_base + chunk_begin, chunk_size);
+				if (it->second != nullptr) {
+					g_import_stats.chunks.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			if (it->second == nullptr) {
+				return std::nullopt;
+			}
+			return ImportedMemory {it->second, in_chunk, false};
+		}
+		// Larger than a chunk stride (or past the last chunk): import exactly this range.
+		const auto alignment = std::max<uint64_t>(m_graphics.host_import_alignment, 1);
+		const auto bytes     = Common::AlignUp(needed, alignment);
+		if (host % alignment != 0 || bytes > m_size - offset) {
+			return std::nullopt;
+		}
+		auto memory = Import(host, bytes);
+		if (memory == nullptr) {
+			return std::nullopt;
+		}
+		g_import_stats.own.fetch_add(1, std::memory_order_relaxed);
+		return ImportedMemory {memory, 0, true};
+	}
+
+private:
+	[[nodiscard]] uint32_t PickType(uint32_t buffer_bits) {
+		vk::MemoryHostPointerPropertiesEXT properties {};
+		const auto result = m_graphics.device.getMemoryHostPointerPropertiesEXT(
+		    vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
+		    reinterpret_cast<const void*>(m_base), &properties);
+		if (result != vk::Result::eSuccess) {
+			return UINT32_MAX;
+		}
+		const auto  bits  = properties.memoryTypeBits & buffer_bits;
+		const auto& types = m_graphics.physical_device_memory_properties;
+		uint32_t    any   = UINT32_MAX;
+		for (uint32_t i = 0; i < types.memoryTypeCount; i++) {
+			if ((bits & (1u << i)) == 0) {
+				continue;
+			}
+			if (types.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCoherent) {
+				return i;
+			}
+			any = std::min(any, i);
+		}
+		return any;
+	}
+
+	[[nodiscard]] vk::DeviceMemory Import(uint64_t host, uint64_t size) {
+		vk::ImportMemoryHostPointerInfoEXT import {};
+		import.handleType   = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+		import.pHostPointer = reinterpret_cast<void*>(host);
+		vk::MemoryAllocateFlagsInfo flags {};
+		flags.pNext = &import;
+		flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+		vk::MemoryAllocateInfo allocate {};
+		allocate.pNext           = &flags;
+		allocate.allocationSize  = size;
+		allocate.memoryTypeIndex = m_type;
+		vk::DeviceMemory memory  = nullptr;
+		const auto       start   = ImportNowNs();
+		const auto       result  = m_graphics.device.allocateMemory(&allocate, nullptr, &memory);
+		g_import_stats.import_ns.fetch_add(ImportNowNs() - start, std::memory_order_relaxed);
+		if (result != vk::Result::eSuccess) {
+			LOGF("BufferCache: host memory import refused (%d) host=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+			     static_cast<int>(result), host, size);
+			return nullptr;
+		}
+		return memory;
+	}
+
+	GraphicContext&                                m_graphics;
+	uint64_t                                       m_base = 0;
+	uint64_t                                       m_size = 0;
+	uint32_t                                       m_type = UINT32_MAX;
+	std::mutex                                     m_mutex;
+	std::unordered_map<uint64_t, vk::DeviceMemory> m_chunks;
+};
+
+void BufferCache::ReportImport(double seconds) {
+	if (seconds <= 0.0) {
+		return;
+	}
+	auto&      st           = g_import_stats;
+	const auto take         = [](std::atomic<uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
+	const auto imported     = take(st.imported);
+	const auto device       = take(st.device);
+	const auto failed       = take(st.failed);
+	const auto chunks       = take(st.chunks);
+	const auto own          = take(st.own);
+	const auto import_ns    = take(st.import_ns);
+	const auto read_syncs   = take(st.read_syncs);
+	const auto write_syncs  = take(st.write_syncs);
+	const auto published    = take(st.published);
+	const auto waited       = take(st.waited);
+	const auto wait_ns      = take(st.wait_ns);
+	const auto replayed     = take(st.replayed);
+	const auto stream_skips = take(st.stream_skips);
+	const auto join_copies  = take(st.join_copies);
+	const auto dropped      = take(st.dropped);
+	const auto image_syncs  = take(st.image_syncs);
+	const auto owned_labels = take(st.owned_labels);
+	const auto cp_writes    = take(st.cp_writes);
+	const auto cp_waits     = take(st.cp_waits);
+	const auto cp_wait_ns   = take(st.cp_wait_ns);
+	if (imported + device + failed + read_syncs + write_syncs + published + waited == 0) {
+		return;
+	}
+	std::printf("PERF import %.1fs: buffers imported=%" PRIu64 " device=%" PRIu64 " failed=%" PRIu64
+	            " chunks=%" PRIu64 " own=%" PRIu64 " import=%.1fms | syncs read=%.0f/s write=%.0f/s"
+	            " stream_skips=%.0f/s | publish now=%.0f/s waited=%.0f/s(%.2fms/s) replayed=%.0f/s"
+	            " | join_copies=%" PRIu64 " dropped=%" PRIu64 " image_syncs=%.0f/s owned_labels=%.0f/s"
+	            " | cp_writes=%.0f/s cp_waits=%.0f/s(%.2fms/s)\n",
+	            seconds, imported, device, failed, chunks, own, static_cast<double>(import_ns) / 1e6,
+	            static_cast<double>(read_syncs) / seconds, static_cast<double>(write_syncs) / seconds,
+	            static_cast<double>(stream_skips) / seconds, static_cast<double>(published) / seconds,
+	            static_cast<double>(waited) / seconds, static_cast<double>(wait_ns) / 1e6 / seconds,
+	            static_cast<double>(replayed) / seconds, join_copies, dropped,
+	            static_cast<double>(image_syncs) / seconds, static_cast<double>(owned_labels) / seconds,
+	            static_cast<double>(cp_writes) / seconds, static_cast<double>(cp_waits) / seconds,
+	            static_cast<double>(cp_wait_ns) / 1e6 / seconds);
+}
+
+void BufferCache::BeforeCpuWrite(uint64_t vaddr, uint64_t size) {
+	if (!m_import || size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	uint64_t latest = 0;
+	bool     any    = false;
+	for (auto chunk = vaddr >> 16; chunk <= (vaddr + size - 1) >> 16; chunk++) {
+		if (!decltype(m_read_ticks)::IsValidPage(chunk)) {
+			return;
+		}
+		if (const auto* tick = m_read_ticks.Find(chunk); tick != nullptr && *tick != 0) {
+			latest = std::max(latest, *tick);
+			any    = true;
+		}
+		if (const auto* tick = m_write_ticks.Find(chunk); tick != nullptr) {
+			latest = std::max(latest, *tick);
+		}
+	}
+	if (!any) {
+		return; // never bound from imported memory
+	}
+	g_import_stats.cp_writes.fetch_add(1, std::memory_order_relaxed);
+	if (latest == 0 || m_scheduler.IsFree(latest)) {
+		return;
+	}
+	const auto start = ImportNowNs();
+	if (latest >= m_scheduler.CurrentTick()) {
+		latest = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+	}
+	m_scheduler.Wait(latest);
+	g_import_stats.cp_wait_ns.fetch_add(ImportNowNs() - start, std::memory_order_relaxed);
+	g_import_stats.cp_waits.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool BufferCache::IsImportedRange(uint64_t vaddr, uint64_t size) {
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	return buffer.IsImported() && buffer.IsInBounds(vaddr, size);
+}
+
+bool BufferCache::PublishImported(uint64_t vaddr, uint64_t size, bool may_wait, uint64_t* wait_tick) {
+	auto tick = LatestWriteTick(vaddr, size);
+	if (tick == UINT64_MAX) {
+		// Written by the command buffer being recorded: submit it first.
+		tick = m_scheduler.CurrentTick();
+		m_scheduler.Flush();
+	}
+	if (tick != 0 && !m_scheduler.IsFree(tick)) {
+		if (!may_wait) {
+			*wait_tick = tick;
+			return false;
+		}
+		const auto start = ImportNowNs();
+		m_scheduler.Wait(tick);
+		g_import_stats.wait_ns.fetch_add(ImportNowNs() - start, std::memory_order_relaxed);
+		g_import_stats.waited.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		g_import_stats.published.fetch_add(1, std::memory_order_relaxed);
+	}
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    {
+			    std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+			    m_gpu_modified_ranges.Subtract(address, bytes);
+		    }
+		    ForgetColorMetadataChecks(address, bytes);
+	    });
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	return true;
+}
+
+void BufferCache::DropImported(uint64_t vaddr, uint64_t size) {
+	if (!m_import) {
+		return;
+	}
+	std::vector<BufferId> drop;
+	auto                  it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsImported() && buffer.CpuAddress() + buffer.Size() > vaddr) {
+			drop.push_back(it->second);
+		}
+	}
+	for (const auto id: drop) {
+		auto& buffer = m_slot_buffers[id];
+		WaitPendingPublishes(buffer.CpuAddress(), buffer.Size());
+		if (m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			(void)PublishImported(buffer.CpuAddress(), buffer.Size(), true, nullptr);
+		}
+		DeleteBuffer(id);
+		g_import_stats.dropped.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
 	auto* bytes = static_cast<const uint8_t*>(source);
@@ -398,10 +712,10 @@ void BufferCache::WaitPendingPublishes(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::NoteBufferWrite(uint64_t vaddr, uint64_t size, bool cpu_upload) {
-	if (m_readback_queue == nullptr || size == 0) {
+	if ((m_readback_queue == nullptr && !m_import) || size == 0) {
 		return;
 	}
-	if (!m_side_copies.empty()) {
+	if (m_readback_queue != nullptr && !m_side_copies.empty()) {
 		// A write recorded now runs after an earlier readback-queue copy of the same bytes only
 		// if the main queue waits for it (write after read across queues).
 		uint64_t wait = 0;
@@ -473,6 +787,11 @@ static uint32_t SyncSideReads() {
 }
 
 bool BufferCache::ReadWindowOnSideQueue(Buffer& buffer, uint64_t begin, uint64_t size) {
+	if (buffer.IsImported()) {
+		WaitPendingPublishes(begin, size);
+		(void)PublishImported(begin, size, true, nullptr);
+		return true;
+	}
 	const auto mode = SyncSideReads();
 	if (mode == 0 || m_readback_queue == nullptr) {
 		return false;
@@ -527,6 +846,9 @@ bool BufferCache::WritesComplete(uint64_t vaddr, uint64_t size) {
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	WaitPendingPublishes(vaddr, size);
+	if (buffer.IsImported()) {
+		return PublishImported(vaddr, size, true, nullptr);
+	}
 	Common::UniqueFunction<void> publish;
 	if (!RecordDownload(buffer, vaddr, size, publish)) {
 		return false;
@@ -787,6 +1109,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (ReprotectBatchMode() == 2) {
 		PageManager::SetDeferredVerify(true);
 	}
+	if (graphics.host_memory_import_enabled) {
+		m_import = std::make_unique<HostImport>(graphics);
+		if (!m_import->Valid()) {
+			m_import.reset();
+		}
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -942,10 +1270,12 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		// The GPU thread only records and submits the copy; this thread waits for the
 		// publication, so other GPU work is not stalled behind the readback.
 		std::shared_ptr<ReadbackCompletion> wait_for;
-		bool                                own_side   = false;
+		bool                                own_side    = false;
+		uint64_t                            import_wait = 0;
 		const auto                          send_start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
+		const auto                          publish    = [&] {
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write, &wait_for,
-		                                                &own_side] {
+		                                                &own_side, &import_wait] {
 			MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
 			if (is_write && !IsRegionRegistered(vaddr, 1)) {
 				// Cache buffers cover whole tracker pages, so this page has nothing to download.
@@ -967,6 +1297,12 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 			if ((wait_for = FindPendingPublish(begin, last - begin)) != nullptr) {
 				return;
 			}
+			if (buffer.IsImported()) {
+				// KYTY_MEM_IMPORT: no copy, the bytes are in guest memory once the writers
+				// completed. When they have not, this thread waits for them itself and retries.
+				(void)PublishImported(begin, last - begin, false, &import_wait);
+				return;
+			}
 			// Every GPU write to the window already completed: the readback queue copies it
 			// at once instead of behind the work queued on the main queue.
 			const bool side_ok = m_readback_queue != nullptr && WritesComplete(begin, last - begin);
@@ -983,6 +1319,14 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 			}
 		});
+		};
+		publish();
+		while (import_wait != 0) {
+			// The writer was submitted by the command: no lock is held while waiting for it.
+			g_import_stats.replayed.fetch_add(1, std::memory_order_relaxed);
+			m_scheduler.GetMasterSemaphore().Wait(std::exchange(import_wait, 0));
+			publish();
+		}
 		const auto wait_start = send_start != 0 ? MemTrackProf::NowNs() : 0;
 		if (send_start != 0) {
 			MemTrackProf::Add(MemTrackProf::Counter::FaultSendNs, wait_start - send_start);
@@ -1060,8 +1404,18 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	// A fault readback of these bytes either completes first (they are published and not
 	// GPU-owned any more) or has not been recorded yet and copies the buffer with this write.
 	WaitPendingPublishes(vaddr, size);
-	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
-	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (buffer.IsImported()) {
+		// The buffer is the guest memory: the bytes land there at this point of the stream, and
+		// guest readers wait for it (PublishImported).
+		WriteDataBuffer(buffer, vaddr, data, size);
+		NoteBufferWrite(vaddr, size);
+		g_import_stats.owned_labels.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		return false;
 	}
 	// The pages stay GPU-modified: a later readback copies the cached buffer, which then holds
@@ -1158,17 +1512,41 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 			// Reserve space in the incoming stream's direction of growth.
 			// The old buffer extending left of the request predicts growth to the right, and vice
 			// versa.
+			// KYTY_MEM_IMPORT: a leap stays inside the run of direct memory the range is mapped from,
+			// or the buffer could not use the guest's memory; it shrinks (halving) until it fits.
+			// KYTY_MEM_IMPORT=2 only: imported rings are read live by work recorded earlier (device
+			// lost observed); with 1 the leaped stream buffers stay in device memory.
+			static const bool import_leaps = [] {
+				const char* value = std::getenv("KYTY_MEM_IMPORT");
+				return value != nullptr && std::strtol(value, nullptr, 10) == 2;
+			}();
+			const bool clamp_leap = m_import != nullptr && import_leaps &&
+			                        LibKernel::Memory::BackingHostAddress(begin, end - begin) != 0;
+			const auto fitting_leap = [&](uint64_t leap, bool right) {
+				if (!clamp_leap) {
+					return leap;
+				}
+				for (; leap >= TRACKER_PAGE_SIZE; leap /= 2) {
+					if (LibKernel::Memory::BackingHostAddress(right ? begin - leap : begin,
+					                                          end - begin + leap) != 0) {
+						return leap;
+					}
+				}
+				return uint64_t {0};
+			};
 			if (expands_left) {
-				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
-				                                       : LibKernel::Memory::kExtendedMemoryBase +
-				                                             LibKernel::Memory::kExtendedMemorySize) - end);
+				end += fitting_leap(std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
+				                                               : LibKernel::Memory::kExtendedMemoryBase +
+				                                                     LibKernel::Memory::kExtendedMemorySize) -
+				                                                  end),
+				                    false);
 			}
 			if (expands_right) {
 				const auto minimum = vaddr < LOWER_ADDRESS_SIZE
 				                         ? CACHING_PAGESIZE * 2
 				                         : LibKernel::Memory::kExtendedMemoryBase;
 				if (begin > minimum) {
-					begin -= std::min(StreamLeapSize, begin - minimum);
+					begin -= fitting_leap(std::min(StreamLeapSize, begin - minimum), true);
 				}
 				first = find_first(begin);
 				begin = std::min(begin, first->first);
@@ -1184,8 +1562,26 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
-	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
-	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	if (!new_buffer.IsImported()) {
+		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	} else if (!overlap.IsImported()) {
+		// The new buffer is guest memory: only the GPU-written bytes of the old one are newer (the
+		// rest is already there, or older than the guest's own writes).
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		{
+			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+			m_gpu_modified_ranges.ForEachInRange(overlap.CpuAddress(), overlap.Size(),
+			                                     [&](uint64_t start, uint64_t end) {
+				                                     ranges.emplace_back(start, end);
+			                                     });
+		}
+		for (const auto& [start, end]: ranges) {
+			new_buffer.CopyFrom(m_scheduler.Current(), overlap, start - overlap.CpuAddress(),
+			                    start - new_buffer.CpuAddress(), end - start);
+		}
+		g_import_stats.join_copies.fetch_add(ranges.size(), std::memory_order_relaxed);
+	}
 	DeleteBuffer(overlap_id);
 }
 
@@ -1195,14 +1591,35 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
+	const auto flags   = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	const auto bytes   = overlap.end - overlap.begin;
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	// KYTY_MEM_IMPORT: a range mapped from one run of direct memory gets the guest's own bytes.
+	std::optional<ImportedMemory> imported;
+	if (m_import) {
+		const auto host = LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
+		if (host != 0) {
+			imported = m_import->Acquire(host, bytes, flags);
+		}
+		(imported ? g_import_stats.imported : host != 0 ? g_import_stats.failed : g_import_stats.device)
+		    .fetch_add(1, std::memory_order_relaxed);
+		static std::atomic<uint32_t> logged {0};
+		if (!imported && logged.fetch_add(1, std::memory_order_relaxed) < 256) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT device buffer guest=0x%016" PRIx64 " size=0x%" PRIx64
+			     " request=0x%016" PRIx64 "+0x%" PRIx64 " backed=%d leap=%d joined=%d\n",
+			     overlap.begin, bytes, vaddr, size,
+			     static_cast<int>(LibKernel::Memory::BackingHostAddress(vaddr, size) != 0),
+			     static_cast<int>(overlap.has_stream_leap), static_cast<int>(overlap.first != overlap.last));
+		}
+	}
+	const auto id =
+	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
+	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
+	                                     overlap.begin, flags, bytes);
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
-	                     overlap.end - overlap.begin);
+	                     "Kyty.GameBuffer{}[guest=0x{:016x} size=0x{:x}]",
+	                     buffer.IsImported() ? ".Imported" : "", overlap.begin, bytes);
 	if (overlap.first != overlap.last) {
 		NoteBufferWrite(overlap.begin, overlap.end - overlap.begin);
 	}
@@ -1260,6 +1677,32 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		EnsureReprotectBatch();
 	}
 	MemTrackProf::Timer         prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
+	if (buffer.IsImported()) {
+		// The GPU reads the guest's bytes at execution: nothing to upload, no re-protection. A
+		// write only takes GPU ownership (CPU readers wait for the writer, see PublishImported).
+		const auto tick = m_scheduler.CurrentTick();
+		for (auto chunk = vaddr >> 16; chunk <= (vaddr + size - 1) >> 16; chunk++) {
+			if (decltype(m_read_ticks)::IsValidPage(chunk)) {
+				m_read_ticks[chunk] = tick;
+			}
+		}
+		if (is_written) {
+			m_memory_tracker.ForEachUploadRange(
+			    vaddr, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+			g_import_stats.write_syncs.fetch_add(1, std::memory_order_relaxed);
+			return false;
+		}
+		g_import_stats.read_syncs.fetch_add(1, std::memory_order_relaxed);
+		if (is_texel_buffer) {
+			NoteBufferWrite(vaddr, size);
+			const bool filled = SynchronizeBufferFromImage(buffer, vaddr, size);
+			if (filled) {
+				g_import_stats.image_syncs.fetch_add(1, std::memory_order_relaxed);
+			}
+			return filled;
+		}
+		return false;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1500,7 +1943,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
+	const bool imported_range = m_import && !is_written && size <= CACHING_PAGESIZE &&
+	                            IsImportedRange(vaddr, size);
+	if (imported_range) {
+		g_import_stats.stream_skips.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (!is_written && size <= CACHING_PAGESIZE && !imported_range &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -1575,6 +2023,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
+		BeforeCpuWrite(vaddr, size);
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
@@ -1607,6 +2056,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		BeforeCpuWrite(dst_vaddr, size);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
 		return;
