@@ -16,6 +16,8 @@
 #include <unordered_set>
 #include <vector>
 
+struct ZSTD_CCtx_s;
+
 namespace Libs::Graphics {
 
 // The per-title shader store, _PipelineCache/<title>.shaders: a header naming everything the
@@ -111,6 +113,9 @@ public:
 	// The prewarm creates the pipelines of records that this many launches wrote or used; the
 	// others, often variants of one launch only, are created when a draw needs them.
 	static constexpr uint32_t PrewarmUses = 2;
+	// Records waiting for the store thread are held to this many bytes; the GPU thread leaves the
+	// others to a later launch rather than wait.
+	static constexpr uint64_t MaxPendingBytes = 64'000'000;
 
 	ShaderStore();
 	~ShaderStore();
@@ -122,9 +127,10 @@ public:
 	[[nodiscard]] bool IsOpen() const { return m_thread.joinable(); }
 
 	// Encode on the calling thread; compression and writes run on the store thread, in order.
-	// Records the store holds already are not written again, nor pipelines whose modules it does
-	// not hold. Call these and the Note functions from one thread at a time.
-	void AppendProgram(const ShaderStoreProgram& program);
+	// Records the store holds already are not written again, nor modules whose program or
+	// pipelines whose modules it does not hold, nor records past MaxPendingBytes. Call these and
+	// the Note functions from one thread at a time. AppendProgram: whether the store holds it.
+	bool AppendProgram(const ShaderStoreProgram& program);
 	void AppendModule(const ShaderStoreModule& module);
 	void AppendPipeline(const ShaderStorePipeline& pipeline);
 	// A loaded module or pipeline was used in this launch; later calls for it do nothing.
@@ -154,9 +160,10 @@ private:
 		std::vector<uint8_t> raw;
 	};
 
+	bool Admit(size_t bytes);
 	void Post(uint8_t type, uint64_t id, std::vector<uint8_t>&& raw);
 	void Run();
-	void WriteFrame(uint8_t type, uint64_t id, std::span<const uint8_t> raw,
+	void WriteFrame(ZSTD_CCtx_s* context, uint8_t type, uint64_t id, std::span<const uint8_t> raw,
 	                std::vector<uint8_t>& frame_bytes);
 	bool Compact();
 	// Reads and checks the frame at offsets[index]; `frame` is a Frame.
@@ -196,6 +203,10 @@ private:
 	bool                    m_flush = false;
 	bool                    m_stop  = false;
 	std::atomic<bool>       m_abort {false};
+	// Bytes posted and not written yet; the GPU thread's last logged level and dropped records.
+	std::atomic<uint64_t>   m_pending_bytes {0};
+	uint64_t                m_logged_pending = 0;
+	uint64_t                m_dropped        = 0;
 	std::thread             m_thread;
 };
 

@@ -686,13 +686,12 @@ struct PipelineCache::ProgramCache {
 		store_record.code_size       = lookup_key.code_size;
 		store_record.static_state    = lookup_key.static_state;
 		if (!entry.plan_stored) {
-			store->AppendProgram({.stage           = lookup_key.stage,
+			entry.plan_stored = store->AppendProgram({.stage           = lookup_key.stage,
 			                      .hash            = lookup_key.hash,
 			                      .user_data_count = lookup_key.user_data_count,
 			                      .code_size       = lookup_key.code_size,
 			                      .static_state    = lookup_key.static_state,
 			                      .plan = ShaderRecompiler::IR::SaveResourcePlan(entry.resource_plan)});
-			entry.plan_stored = true;
 		}
 		store_record.module.handle          = module.handle;
 		store_record.module.program         = module.program;

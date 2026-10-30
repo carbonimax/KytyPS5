@@ -68,6 +68,7 @@ static_assert(sizeof(Frame) == 32);
 
 // Larger frames are damage.
 constexpr uint32_t MaxFrameBytes = 1u << 30u;
+constexpr double   Megabytes     = 1'000'000.0;
 
 // Dead records start a compaction once they are this part of the file.
 constexpr uint64_t CompactDeadDivisor = 4;
@@ -614,27 +615,47 @@ ShaderStore::~ShaderStore() {
 	m_read.Close();
 }
 
-void ShaderStore::AppendProgram(const ShaderStoreProgram& program) {
+bool ShaderStore::Admit(size_t bytes) {
+	if (m_pending_bytes.load(std::memory_order_relaxed) + bytes <= MaxPendingBytes) {
+		return true;
+	}
+	if (const auto dropped = ++m_dropped; (dropped & (dropped - 1)) == 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader store: write queue full, {} records left for a later launch\n", dropped));
+	}
+	return false;
+}
+
+bool ShaderStore::AppendProgram(const ShaderStoreProgram& program) {
 	if (!IsOpen()) {
-		return;
+		return false;
 	}
 	const auto id = ProgramId(program);
-	if (!m_known_programs.insert(id).second) {
-		return;
+	if (m_known_programs.contains(id)) {
+		return true;
 	}
 	Writer record;
 	IoProgram(record, program);
+	if (!Admit(record.bytes.size())) {
+		return false;
+	}
+	m_known_programs.insert(id);
 	Post(static_cast<uint8_t>(Record::Program), id, std::move(record.bytes));
+	return true;
 }
 
 void ShaderStore::AppendModule(const ShaderStoreModule& module) {
 	const auto id = module.module.handle.id;
 	if (!IsOpen() || module.spirv.empty() || id == 0 ||
-	    !m_known_programs.contains(ProgramId(module)) || !m_known_modules.insert(id).second) {
+	    !m_known_programs.contains(ProgramId(module)) || m_known_modules.contains(id)) {
 		return;
 	}
 	Writer record;
 	IoModule(record, module);
+	if (!Admit(record.bytes.size() + module.spirv.size() * sizeof(uint32_t))) {
+		return;
+	}
+	m_known_modules.insert(id);
 	Post(static_cast<uint8_t>(Record::Module), id, std::move(record.bytes));
 	std::vector<uint8_t> spirv(module.spirv.size() * sizeof(uint32_t));
 	std::memcpy(spirv.data(), module.spirv.data(), spirv.size());
@@ -654,11 +675,15 @@ void ShaderStore::AppendPipeline(const ShaderStorePipeline& pipeline) {
 	Writer record;
 	IoPipeline(record, pipeline);
 	const auto id = XXH3_64bits(record.bytes.data(), record.bytes.size());
-	if (!m_known_pipelines.insert(id).second) {
+	if (m_known_pipelines.contains(id)) {
 		// Loaded but not prewarmed: it stays while it is used.
 		NoteUsedPipeline(id);
 		return;
 	}
+	if (!Admit(record.bytes.size())) {
+		return;
+	}
+	m_known_pipelines.insert(id);
 	Post(static_cast<uint8_t>(Record::GraphicsPipeline), id, std::move(record.bytes));
 }
 
@@ -741,6 +766,13 @@ void ShaderStore::WaitForWrites() {
 }
 
 void ShaderStore::Post(uint8_t type, uint64_t id, std::vector<uint8_t>&& raw) {
+	const auto pending = m_pending_bytes.fetch_add(raw.size(), std::memory_order_relaxed) + raw.size();
+	// The GPU thread is the only producer.
+	if (pending >= m_logged_pending + 16'000'000) {
+		m_logged_pending = pending;
+		Log::WriteToConsoleAndLog(fmt::format("Shader store: write queue at {:.1f} MB\n",
+		                                      static_cast<double>(pending) / Megabytes));
+	}
 	{
 		std::scoped_lock lock(m_mutex);
 		m_records.push_back({.type = type, .id = id, .raw = std::move(raw)});
@@ -748,14 +780,15 @@ void ShaderStore::Post(uint8_t type, uint64_t id, std::vector<uint8_t>&& raw) {
 	m_ready.notify_one();
 }
 
-void ShaderStore::WriteFrame(uint8_t type, uint64_t id, std::span<const uint8_t> raw,
-                             std::vector<uint8_t>& frame_bytes) {
-	if (m_file.IsInvalid()) {
+void ShaderStore::WriteFrame(ZSTD_CCtx_s* context, uint8_t type, uint64_t id,
+                             std::span<const uint8_t> raw, std::vector<uint8_t>& frame_bytes) {
+	if (m_file.IsInvalid() || context == nullptr) {
 		return;
 	}
 	frame_bytes.resize(sizeof(Frame) + ZSTD_compressBound(raw.size()));
-	const auto size = ZSTD_compress(frame_bytes.data() + sizeof(Frame),
-	                                frame_bytes.size() - sizeof(Frame), raw.data(), raw.size(), 3);
+	const auto size = ZSTD_compressCCtx(context, frame_bytes.data() + sizeof(Frame),
+	                                    frame_bytes.size() - sizeof(Frame), raw.data(), raw.size(),
+	                                    3);
 	if (ZSTD_isError(size) || size > MaxFrameBytes) {
 		return;
 	}
@@ -873,6 +906,8 @@ void ShaderStore::Run() {
 		        .count()));
 		m_compaction.reset();
 	}
+	const std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)> context(ZSTD_createCCtx(),
+	                                                                  ZSTD_freeCCtx);
 	std::vector<uint8_t>  frame_bytes;
 	std::deque<Pending>   batch;
 	std::vector<uint64_t> used_modules;
@@ -897,13 +932,20 @@ void ShaderStore::Run() {
 		used_modules.swap(m_used_modules);
 		used_pipelines.swap(m_used_pipelines);
 		lock.unlock();
-		for (const auto& record: batch) {
-			WriteFrame(record.type, record.id, record.raw, frame_bytes);
+		// Each record is freed once written.
+		for (; !batch.empty(); batch.pop_front()) {
+			const auto& record = batch.front();
+			WriteFrame(context.get(), record.type, record.id, record.raw, frame_bytes);
+			m_pending_bytes.fetch_sub(record.raw.size(), std::memory_order_relaxed);
 		}
 		if (!used_modules.empty() || !used_pipelines.empty()) {
 			Writer used;
 			IoAll(used, used_modules, used_pipelines);
-			WriteFrame(static_cast<uint8_t>(Record::Used), 0, used.bytes, frame_bytes);
+			WriteFrame(context.get(), static_cast<uint8_t>(Record::Used), 0, used.bytes,
+			           frame_bytes);
+		}
+		if (frame_bytes.capacity() > 4'000'000) {
+			frame_bytes = {};
 		}
 		if (!m_file.IsInvalid()) {
 			m_file.Flush();

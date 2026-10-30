@@ -1890,8 +1890,16 @@ void CheckShaderStore() {
     store.AppendPipeline(pipeline); // Its pixel module is not stored yet.
     store.AppendModule(orphan);
     store.AppendPipeline(orphan_pipeline);
-    store.AppendProgram(pixel_program);
-    store.AppendProgram(pixel_program);
+    // Records past the write queue bound are left for a later launch, and not taken as held.
+    auto huge_program = pixel_program;
+    huge_program.plan.resize(ShaderStore::MaxPendingBytes + 1);
+    Require(name, "queue bound", !store.AppendProgram(huge_program),
+            "a record larger than the write queue was taken");
+    Require(name, "queue bound", store.AppendProgram(pixel_program) &&
+                                     store.AppendProgram(pixel_program),
+            "a program left for later was taken as held");
+    store.AppendModule(make_module(13, pixel_program,
+                                  static_cast<uint32_t>(ShaderStore::MaxPendingBytes / 4 + 1)));
     store.AppendModule(second);
     store.AppendPipeline(pipeline);
     store.AppendPipeline(pipeline);
