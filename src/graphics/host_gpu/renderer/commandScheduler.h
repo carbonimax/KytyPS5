@@ -72,6 +72,8 @@ public:
 	[[nodiscard]] bool        IdleSubmitDue();
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
+	// KYTY_CP_PIPELINE front: the same buffer without the validity check (the back may be switching it).
+	CommandBuffer& CurrentUnchecked() noexcept { return m_command; }
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }

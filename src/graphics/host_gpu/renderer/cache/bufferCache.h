@@ -256,6 +256,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
+	std::mutex                                        m_gpu_ranges_mutex;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::mutex                                        m_pending_mutex;

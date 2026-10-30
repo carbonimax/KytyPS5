@@ -23,6 +23,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <deque>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -38,6 +39,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -249,9 +251,7 @@ struct PipelineCache::ProgramCache {
 	struct SourceEntry {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
-		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
-		}
+		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {}
 
 		std::span<const uint32_t> FunctionCode() const {
 			return call_source
@@ -290,9 +290,127 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque: KYTY_CP_PIPELINE records keep pointers to permutations while later lookups add some.
+		std::deque<Permutation>                     permutations;
 		bool                                       skip_dispatch = false;
+		// KYTY_SRT_PROF: the previous lookup's permutation and input/output hashes.
+		size_t   prof_permutation = SIZE_MAX;
+		uint64_t prof_user_hash = 0, prof_desc_hash = 0, prof_flat_hash = 0;
+		int64_t  prof_flat_needed = -1;
 	};
+
+	// KYTY_SRT_PROF: flattened SRT reads that descriptors, indirect selectors, resource-flow
+	// conditions or uniform fills depend on; the others only feed values the shader reads.
+	static uint32_t CountNeededFlatReads(const ShaderRecompiler::IR::ResourcePlan& plan) {
+		using ShaderRecompiler::IR::Inst;
+		using ShaderRecompiler::IR::Value;
+		std::unordered_set<const Inst*> needed;
+		std::vector<const Inst*>        stack;
+		const auto push = [&](Value value) {
+			if (value.IsEmpty()) return;
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst != nullptr && needed.insert(inst).second) stack.push_back(inst);
+		};
+		for (const auto& source: plan.descriptor_sources) {
+			for (uint32_t i = 0; i < source.dword_count && i < source.dwords.size(); ++i) push(source.dwords[i]);
+			if (source.indirect_descriptor) {
+				push(source.indirect_descriptor->key_count);
+				push(source.indirect_descriptor->selector_first);
+				push(source.indirect_descriptor->selector_mask);
+			}
+		}
+		for (const auto& block: plan.control_flow) push(block.condition);
+		const auto& fill = plan.uniform_fill;
+		push(fill.pattern_size);
+		push(fill.element_count);
+		for (const auto value: fill.values) push(value);
+		while (!stack.empty()) {
+			const auto* inst = stack.back();
+			stack.pop_back();
+			for (size_t i = 0; i < inst->NumArgs(); ++i) push(inst->Arg(i));
+		}
+		uint32_t count = 0;
+		for (const auto& read: plan.srt_reads) {
+			const auto* inst = read.value.IsEmpty() ? nullptr : read.value.Resolve().TryInstruction();
+			count += inst != nullptr && needed.contains(inst) ? 1u : 0u;
+		}
+		return count;
+	}
+
+	// KYTY_SRT_PROF: accounts one lookup of a cached source (GPU thread).
+	static void ProfileLookup(SourceEntry& entry, const Permutation* permutation,
+	                          std::span<const uint32_t> user_data, uint64_t total_ns, uint64_t refresh_ns) {
+		using PerfStats::Add;
+		using PerfStats::Counter;
+		auto& times = ShaderRecompiler::IR::t_materialize_times;
+		Add(Counter::SrtLookups, 1);
+		Add(Counter::SrtRefreshNs, refresh_ns);
+		Add(Counter::SrtWalkNs, times.walk_ns);
+		Add(Counter::SrtEvalNs, times.eval_ns);
+		Add(Counter::SrtSpecNs, times.spec_ns);
+		const auto split = refresh_ns + times.walk_ns + times.eval_ns + times.spec_ns;
+		Add(Counter::SrtMatchNs, total_ns > split ? total_ns - split : 0);
+		times = {};
+		size_t index = SIZE_MAX;
+		for (size_t i = 0; permutation != nullptr && i < entry.permutations.size(); i++) {
+			if (&entry.permutations[i] == permutation) index = i;
+		}
+		Add(Counter::SrtMiss, permutation == nullptr ? 1 : 0);
+		Add(Counter::SrtSamePerm, index != SIZE_MAX && index == entry.prof_permutation ? 1 : 0);
+		Add(Counter::SrtMultiPerm, entry.permutations.size() > 1 ? 1 : 0);
+		entry.prof_permutation = index;
+		const auto& snapshot = entry.resources;
+		const auto hash_values = [](const std::vector<ShaderRecompiler::IR::DescriptorValue>& values, uint64_t seed) {
+			for (const auto& value: values) {
+				seed = XXH3_64bits_withSeed(value.dwords.data(), sizeof(uint32_t) * value.dword_count, seed);
+			}
+			return seed;
+		};
+		const auto user_hash = XXH3_64bits(user_data.data(), user_data.size_bytes());
+		const auto desc_hash = hash_values(snapshot.samplers, hash_values(snapshot.images, hash_values(snapshot.buffers, 1)));
+		const auto flat_hash = XXH3_64bits(snapshot.flattened_srt.data(), snapshot.flattened_srt.size() * sizeof(uint32_t));
+		Add(Counter::SrtUserSame, user_hash == entry.prof_user_hash ? 1 : 0);
+		Add(Counter::SrtDescSame, desc_hash == entry.prof_desc_hash ? 1 : 0);
+		Add(Counter::SrtFlatSame, flat_hash == entry.prof_flat_hash ? 1 : 0);
+		entry.prof_user_hash = user_hash;
+		entry.prof_desc_hash = desc_hash;
+		entry.prof_flat_hash = flat_hash;
+		const auto& plan  = entry.resource_plan;
+		const auto  loads = plan.srt_memo_loads != UINT32_MAX ? plan.srt_memo_loads : 0u;
+		Add(Counter::SrtLoads, loads);
+		Add(Counter::SrtNoLoad, plan.srt_memo_loads == 0u ? 1 : 0);
+		Add(Counter::SrtFlatWords, snapshot.flattened_srt.size());
+		if (entry.prof_flat_needed < 0) entry.prof_flat_needed = CountNeededFlatReads(plan);
+		Add(Counter::SrtFlatNeeded, static_cast<uint64_t>(entry.prof_flat_needed));
+		Add(Counter::SrtFlatPlan, plan.srt_reads.size());
+		const auto& info = plan.info;
+		const auto& specialization = entry.specialization;
+		uint64_t heap_images = 0, conv_images = 0;
+		bool format_spec = false;
+		for (const auto& image: info.images) heap_images += image.heap ? 1u : 0u;
+		for (const auto& image: specialization.images) {
+			conv_images += image.conversion_format != Prospero::BufferFormat::kInvalid ? 1u : 0u;
+			format_spec |= image.conversion_format != Prospero::BufferFormat::kInvalid || image.cube ||
+			               image.numeric_class != Prospero::TextureNumericClass::Unsupported;
+		}
+		for (const auto& buffer: specialization.buffers) {
+			format_spec |= buffer.descriptor_format != Prospero::BufferFormat::kInvalid || buffer.packed_stride != 0u;
+		}
+		const auto buffers  = info.buffers.size();
+		const auto images   = info.images.size();
+		const auto samplers = info.samplers.size();
+		Add(Counter::SrtBuffers, buffers);
+		Add(Counter::SrtImages, images);
+		Add(Counter::SrtHeapImages, heap_images);
+		Add(Counter::SrtConvImages, conv_images);
+		Add(Counter::SrtSamplers, samplers);
+		Add(Counter::SrtNoResources, buffers + images + samplers == 0 ? 1 : 0);
+		Add(Counter::SrtHeapOnly, images != 0 && heap_images == images && buffers + samplers == 0 ? 1 : 0);
+		Add(Counter::SrtWithBuffers, buffers != 0 ? 1 : 0);
+		Add(Counter::SrtWithImages, images > heap_images ? 1 : 0);
+		Add(Counter::SrtWithSamplers, samplers != 0 ? 1 : 0);
+		Add(Counter::SrtFormatSpec, format_spec ? 1 : 0);
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -405,13 +523,27 @@ struct PipelineCache::ProgramCache {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
 			PerfStats::ScopedTimer srt_timer(PerfStats::Counter::SrtNs);
+			const bool prof = PerfStats::SrtProfEnabled();
+			const auto prof_start = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+			uint64_t   refresh_ns = 0;
+			ShaderRecompiler::IR::t_materialize_times = {.enabled = prof};
 			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
+				if (prof) {
+					refresh_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                                       std::chrono::steady_clock::now() - prof_start).count());
+				}
 				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled);
 			} else {
 				permutation = cached.FindPermutation<false>(runtime, push_data_cursor,
 				                                            !graphics.image_view_min_lod_enabled);
+			}
+			if (prof) {
+				ProfileLookup(cached, permutation, user_data,
+				              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                                        std::chrono::steady_clock::now() - prof_start).count()),
+				              refresh_ns);
 			}
 			if (permutation != nullptr) return bind(*permutation);
 		}
