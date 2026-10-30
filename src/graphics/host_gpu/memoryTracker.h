@@ -26,6 +26,9 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// KYTY_MEMTRACK_PROF: the page of vaddr has a region and is write-tracked (CPU-clean) or
+	// GPU-modified, i.e. a guest write to it faults for this tracker. Creates nothing.
+	[[nodiscard]] bool IsPageWatched(uint64_t vaddr);
 	// GPU-thread only: GPU-dirty page bits change only on that thread, so they can be read
 	// without the region lock. False means no byte of the range can be GPU-dirty.
 	[[nodiscard]] bool MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size);

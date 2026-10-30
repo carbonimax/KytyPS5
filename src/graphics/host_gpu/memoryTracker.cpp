@@ -101,6 +101,14 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+bool MemoryTracker::IsPageWatched(uint64_t vaddr) {
+	return Iterate<false>(vaddr, 1, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->IsModified<DirtySource::Cpu>(offset, bytes) ||
+		       manager->IsModified<DirtySource::Gpu>(offset, bytes);
+	});
+}
+
 bool MemoryTracker::MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size) {
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);

@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/host_gpu/memTrackProf.h"
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
@@ -236,9 +237,16 @@ struct PageManager::Impl {
 			return;
 		}
 		ForEachOutsideStacks(vaddr, size, mode, [](uint64_t begin, uint64_t bytes, Common::VirtualMemory::Mode m) {
+			const auto start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
 			if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(begin, bytes, m)) {
 				Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, begin,
 				      static_cast<uint32_t>(m));
+			}
+			if (start != 0) {
+				MemTrackProf::NoteProtect(m == Common::VirtualMemory::Mode::NoAccess ? MemTrackProf::Prot::NoAccess
+				                          : m == Common::VirtualMemory::Mode::Read  ? MemTrackProf::Prot::Read
+				                                                                    : MemTrackProf::Prot::ReadWrite,
+				                          bytes, MemTrackProf::NowNs() - start);
 			}
 		});
 	}

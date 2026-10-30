@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -688,6 +689,20 @@ static void WriteFaultMinidump(const Common::HostException::ExceptionInfo* info)
 	(void)Common::HostException::WriteMinidump(*info);
 }
 
+// KYTY_MEMTRACK_PROF: names the profile slot of a guest thread from its pthread name.
+static bool MemTrackThreadName(char* name, size_t size) {
+	auto self = Libs::LibKernel::PthreadSelfOrNull();
+	if (self == nullptr) {
+		return false;
+	}
+	char thread_name[64] = {};
+	if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+		std::snprintf(thread_name, sizeof(thread_name), "guest");
+	}
+	std::snprintf(name, size, "%s", thread_name);
+	return true;
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -707,8 +722,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// KYTY_MEMTRACK_PROF: time spent here per resolved fault, by path.
+		namespace Prof        = Libs::Graphics::MemTrackProf;
+		const auto prof_start = Prof::Enabled() ? Prof::NowNs() : 0;
+		const auto prof_note  = [&](Prof::Fault path) {
+			if (prof_start != 0) {
+				Prof::NoteFault(path, info->access_violation_vaddr, Prof::NowNs() - prof_start);
+			}
+		};
+		if (prof_start != 0) {
+			Prof::BeginFault();
+		}
 		if (access != GpuAccess::Execute &&
 		    Libs::LibKernel::Memory::WaitBackingRemap(info->access_violation_vaddr)) {
+			prof_note(Prof::Fault::Remap);
 			return true;
 		}
 		// A guest load of the SRT walker on the GPU thread that hits a tracker-protected page reads
@@ -726,6 +753,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);
 					Libs::Graphics::ShaderRecompiler::IR::NoteProtectedLoad(
 					    Loader::X64InstructionEmulator::LoadBaseR10(info->native_context));
+					prof_note(Prof::Fault::WalkerRead);
 					return true;
 				}
 			}
@@ -736,11 +764,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0) {
 				Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(false);
 			}
+			prof_note(access == GpuAccess::Write ? Prof::Fault::Write : Prof::Fault::Read);
 			return true;
 		}
 		if (const auto length =
 		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
 			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+			prof_note(Prof::Fault::Skip);
 			return true;
 		}
 	}
@@ -1849,6 +1879,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
+	Libs::Graphics::MemTrackProf::SetNamer(&MemTrackThreadName);
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
 	uint64_t                                   eh_frame_header_addr = 0;

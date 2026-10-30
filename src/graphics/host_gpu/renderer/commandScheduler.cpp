@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
@@ -316,6 +317,7 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	MemTrackProf::SetThreadKind(MemTrackProf::ThreadKind::Deferred, "deferred");
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
