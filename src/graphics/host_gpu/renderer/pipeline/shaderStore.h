@@ -128,8 +128,9 @@ public:
 
 	// Encode on the calling thread; compression and writes run on the store thread, in order.
 	// Records the store holds already are not written again, nor modules whose program or
-	// pipelines whose modules it does not hold, nor records past MaxPendingBytes. Call these and
-	// the Note functions from one thread at a time. AppendProgram: whether the store holds it.
+	// pipelines whose modules it does not hold, nor records past MaxPendingBytes. These and the
+	// Note functions may run on several threads (KYTY_CP_PIPELINE: programs and modules from the
+	// GPU thread, pipelines from the back thread). AppendProgram: whether the store holds it.
 	bool AppendProgram(const ShaderStoreProgram& program);
 	void AppendModule(const ShaderStoreModule& module);
 	void AppendPipeline(const ShaderStorePipeline& pipeline);
@@ -161,6 +162,7 @@ private:
 	};
 
 	bool Admit(size_t bytes);
+	void NoteUsedPipelineLocked(uint64_t id);
 	void Post(uint8_t type, uint64_t id, std::vector<uint8_t>&& raw);
 	void Run();
 	void WriteFrame(ZSTD_CCtx_s* context, uint8_t type, uint64_t id, std::span<const uint8_t> raw,
@@ -183,7 +185,8 @@ private:
 	std::vector<uint64_t> m_program_offsets;
 
 	// What the file holds, and the loaded modules and pipelines not used yet (Append and Note
-	// callers).
+	// callers, under m_append_mutex once the store thread runs).
+	std::mutex                   m_append_mutex;
 	std::unordered_set<uint64_t> m_known_programs;
 	std::unordered_set<uint64_t> m_known_modules;
 	std::unordered_set<uint64_t> m_known_pipelines;
@@ -203,7 +206,7 @@ private:
 	bool                    m_flush = false;
 	bool                    m_stop  = false;
 	std::atomic<bool>       m_abort {false};
-	// Bytes posted and not written yet; the GPU thread's last logged level and dropped records.
+	// Bytes posted and not written yet; the last logged level and dropped records (m_append_mutex).
 	std::atomic<uint64_t>   m_pending_bytes {0};
 	uint64_t                m_logged_pending = 0;
 	uint64_t                m_dropped        = 0;

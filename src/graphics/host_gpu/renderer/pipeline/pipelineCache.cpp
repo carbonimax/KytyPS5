@@ -1270,7 +1270,9 @@ void PipelineCache::LoadStoredModule(const ShaderModule* stage) {
 		     "file in _PipelineCache\n",
 		     module.handle.id);
 	}
-	// Program cache modules are not const; only their handle changes.
+	// Program cache modules are not const; only their handle changes. With KYTY_CP_PIPELINE the
+	// back thread sets it while the GPU thread may copy the handle in a lookup: pipelines read the
+	// module itself (CreatePipelineInternal), never that copy's handle module.
 	const_cast<ShaderModule&>(module).handle.module = CompileSPV(spirv, m_graphics.device);
 	EXIT_IF(module.handle.module == nullptr);
 	if ((++m_stored_modules_created & 255u) == 1) {

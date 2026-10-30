@@ -217,7 +217,8 @@ private:
 	// function waits for the warm-up first.
 	std::unique_ptr<ShaderStore>  m_store;
 	std::thread                   m_warm_up;
-	// Loaded modules whose handle module a new pipeline needed (GPU thread).
+	// Loaded modules whose handle module a new pipeline needed (the thread creating pipelines: the
+	// GPU thread, or the KYTY_CP_PIPELINE back thread while the GPU thread only looks up programs).
 	uint64_t                      m_stored_modules_created = 0;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;

@@ -36,7 +36,7 @@ using ShaderRecompiler::IR::Writer;
 
 constexpr std::array<char, 8> StoreMagic {'K', 'Y', 'S', 'H', 'S', 'T', 'O', 'R'};
 // Bumped when the frame or record encoding changes.
-constexpr uint32_t StoreFormatVersion = 2;
+constexpr uint32_t StoreFormatVersion = 3;
 
 enum class Record : uint8_t {
 	Program          = 1,
@@ -630,7 +630,8 @@ bool ShaderStore::AppendProgram(const ShaderStoreProgram& program) {
 	if (!IsOpen()) {
 		return false;
 	}
-	const auto id = ProgramId(program);
+	const auto       id = ProgramId(program);
+	std::scoped_lock append(m_append_mutex);
 	if (m_known_programs.contains(id)) {
 		return true;
 	}
@@ -645,7 +646,8 @@ bool ShaderStore::AppendProgram(const ShaderStoreProgram& program) {
 }
 
 void ShaderStore::AppendModule(const ShaderStoreModule& module) {
-	const auto id = module.module.handle.id;
+	const auto       id = module.module.handle.id;
+	std::scoped_lock append(m_append_mutex);
 	if (!IsOpen() || module.spirv.empty() || id == 0 ||
 	    !m_known_programs.contains(ProgramId(module)) || m_known_modules.contains(id)) {
 		return;
@@ -666,6 +668,7 @@ void ShaderStore::AppendPipeline(const ShaderStorePipeline& pipeline) {
 	if (!IsOpen()) {
 		return;
 	}
+	std::scoped_lock append(m_append_mutex);
 	// A pipeline with a module the store lacks (a program with calls) could never be prewarmed.
 	const auto known = [this](uint64_t id) { return id == 0 || m_known_modules.contains(id); };
 	if (pipeline.vertex_ids[0] == 0 || !std::ranges::all_of(pipeline.vertex_ids, known) ||
@@ -677,7 +680,7 @@ void ShaderStore::AppendPipeline(const ShaderStorePipeline& pipeline) {
 	const auto id = XXH3_64bits(record.bytes.data(), record.bytes.size());
 	if (m_known_pipelines.contains(id)) {
 		// Loaded but not prewarmed: it stays while it is used.
-		NoteUsedPipeline(id);
+		NoteUsedPipelineLocked(id);
 		return;
 	}
 	if (!Admit(record.bytes.size())) {
@@ -688,7 +691,11 @@ void ShaderStore::AppendPipeline(const ShaderStorePipeline& pipeline) {
 }
 
 void ShaderStore::NoteUsedModule(uint64_t id) {
-	if (!IsOpen() || m_unused_modules.erase(id) == 0) {
+	if (!IsOpen()) {
+		return;
+	}
+	std::scoped_lock append(m_append_mutex);
+	if (m_unused_modules.erase(id) == 0) {
 		return;
 	}
 	std::scoped_lock lock(m_mutex);
@@ -696,7 +703,15 @@ void ShaderStore::NoteUsedModule(uint64_t id) {
 }
 
 void ShaderStore::NoteUsedPipeline(uint64_t id) {
-	if (!IsOpen() || m_unused_pipelines.erase(id) == 0) {
+	if (!IsOpen()) {
+		return;
+	}
+	std::scoped_lock append(m_append_mutex);
+	NoteUsedPipelineLocked(id);
+}
+
+void ShaderStore::NoteUsedPipelineLocked(uint64_t id) {
+	if (m_unused_pipelines.erase(id) == 0) {
 		return;
 	}
 	std::scoped_lock lock(m_mutex);
@@ -767,7 +782,7 @@ void ShaderStore::WaitForWrites() {
 
 void ShaderStore::Post(uint8_t type, uint64_t id, std::vector<uint8_t>&& raw) {
 	const auto pending = m_pending_bytes.fetch_add(raw.size(), std::memory_order_relaxed) + raw.size();
-	// The GPU thread is the only producer.
+	// Producers hold m_append_mutex (Open runs before the store thread).
 	if (pending >= m_logged_pending + 16'000'000) {
 		m_logged_pending = pending;
 		Log::WriteToConsoleAndLog(fmt::format("Shader store: write queue at {:.1f} MB\n",
