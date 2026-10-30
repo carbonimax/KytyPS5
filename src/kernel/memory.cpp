@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
@@ -1095,9 +1096,26 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	if (Graphics::MemTrackProf::Enabled()) {
+		using Graphics::MemTrackProf::Mapping;
+		Graphics::MemTrackProf::SetClassifier([](uint64_t vaddr) {
+			const int kind = g_guest_address_space != nullptr ? g_guest_address_space->MappingKindOf(vaddr) : 2;
+			return kind == 0 ? Mapping::Backing : kind == 1 ? Mapping::Private : Mapping::Unknown;
+		});
+		Graphics::MemTrackProf::SetMapStats([] {
+			Graphics::MemTrackProf::MapStats stats;
+			if (g_guest_address_space != nullptr) {
+				g_guest_address_space->MapStats(&stats.backing_bytes, &stats.backing_views, &stats.aliased_bytes,
+				                                &stats.private_bytes);
+			}
+			return stats;
+		});
+	}
 }
 
 void Shutdown() {
+	Graphics::MemTrackProf::SetClassifier(nullptr);
+	Graphics::MemTrackProf::SetMapStats(nullptr);
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();

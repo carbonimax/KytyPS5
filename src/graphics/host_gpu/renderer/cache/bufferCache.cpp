@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/memTrackProf.h"
 
 #include "common/alignment.h"
 #include "graphics/guest_gpu/gpuCapture.h"
@@ -534,8 +535,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		{
+			MemTrackProf::Timer timer(MemTrackProf::Counter::DownloadSyncNs, MemTrackProf::Counter::DownloadSyncCount);
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		publish();
 	}
 	return true;
@@ -675,6 +679,8 @@ void BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	    });
 	if (!copies.empty()) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+		MemTrackProf::Add(MemTrackProf::Counter::DownloadBytes, total_size);
+		MemTrackProf::Add(MemTrackProf::Counter::DownloadCount, 1);
 	}
 }
 
@@ -809,6 +815,8 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	MemTrackProf::Add(MemTrackProf::Counter::InvalidateCount, 1);
+	MemTrackProf::Add(MemTrackProf::Counter::InvalidateBytes, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
@@ -821,6 +829,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			// Cache buffers cover whole tracker pages, so this range has nothing to download.
 			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
@@ -887,12 +896,18 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	if (!GuestRange {vaddr, 1}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	if (MemTrackProf::Enabled() && MemTrackProf::InFault() && m_memory_tracker.IsPageWatched(vaddr)) {
+		MemTrackProf::NoteBufferHit();
+	}
 	bool flushed = false;
 	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr, &flushed] {
 		flushed = true;
 		PublishFaultWindow(vaddr, true);
 	});
 	QueueBdaSync(vaddr, 1);
+	if (flushed) {
+		MemTrackProf::Add(MemTrackProf::Counter::WriteFlushCount, 1);
+	}
 	// KYTY_WRITE_FAULT_READAHEAD=N (pages, default 15; 0 disables): a guest thread that write-
 	// faults on the page after its previous write fault (a sequential writer, e.g. a constant
 	// ring) also gets the next N CPU-clean pages unprotected and marked CPU-modified, up to the
@@ -917,6 +932,7 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	                                                       readahead * TRACKER_PAGE_SIZE);
 	if (marked != 0) {
 		QueueBdaSync((page + 1) * TRACKER_PAGE_SIZE, marked);
+		MemTrackProf::Add(MemTrackProf::Counter::ReadAheadPages, marked / TRACKER_PAGE_SIZE);
 	}
 	next_page         = page + 1 + marked / TRACKER_PAGE_SIZE;
 }
@@ -926,9 +942,11 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		// The GPU thread only records and submits the copy; this thread waits for the
 		// publication, so other GPU work is not stalled behind the readback.
 		std::shared_ptr<ReadbackCompletion> wait_for;
-		bool                                own_side = false;
+		bool                                own_side   = false;
+		const auto                          send_start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write, &wait_for,
 		                                                &own_side] {
+			MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
 			if (is_write && !IsRegionRegistered(vaddr, 1)) {
 				// Cache buffers cover whole tracker pages, so this page has nothing to download.
 				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
@@ -965,6 +983,10 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 			}
 		});
+		const auto wait_start = send_start != 0 ? MemTrackProf::NowNs() : 0;
+		if (send_start != 0) {
+			MemTrackProf::Add(MemTrackProf::Counter::FaultSendNs, wait_start - send_start);
+		}
 		if (own_side) {
 			// Copied on the readback queue: this thread publishes once the copy completed.
 			m_readback_queue->Wait(wait_for->side_tick);
@@ -972,10 +994,15 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		} else if (wait_for != nullptr) {
 			wait_for->Wait();
 		}
+		if (wait_start != 0 && wait_for != nullptr) {
+			MemTrackProf::NoteFaultWait(MemTrackProf::NowNs() - wait_start);
+		}
 		// A write retries against the now write-protected page and takes the CPU-dirty path.
 		return;
 	}
+	const auto send_start = MemTrackProf::Enabled() ? MemTrackProf::NowNs() : 0;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write] {
+		MemTrackProf::Timer timer(MemTrackProf::Counter::FaultCmdNs, MemTrackProf::Counter::FaultCmdCount);
 		if (is_write && !IsRegionRegistered(vaddr, 1)) {
 			// Cache buffers cover whole tracker pages, so this page has nothing to download.
 			{
@@ -1008,6 +1035,9 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 			QueueBdaSync(vaddr, 1);
 		}
 	});
+	if (send_start != 0) {
+		MemTrackProf::Add(MemTrackProf::Counter::FaultSendNs, MemTrackProf::NowNs() - send_start);
+	}
 }
 
 bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {
@@ -1229,6 +1259,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (m_reprotect_batch && !is_written) {
 		EnsureReprotectBatch();
 	}
+	MemTrackProf::Timer         prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1386,6 +1417,7 @@ void BufferCache::FlushDeferredUploads() {
 	// One flush at a time: the protections of everything recorded so far, then all their copies.
 	std::lock_guard lock(m_deferred_mutex);
 	PageManager::FlushDeferredProtect();
+	MemTrackProf::Timer timer(MemTrackProf::Counter::UploadCopyNs);
 	PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs);
 	for (const auto& copy: m_deferred_copies) {
 		PerfStats::Add(PerfStats::Counter::StagingWriteBytes, copy.size);
@@ -1423,6 +1455,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	MemTrackProf::Add(MemTrackProf::Counter::UploadBytes, total_size);
+	MemTrackProf::Add(MemTrackProf::Counter::UploadCopies, copies.size());
 	// Only a thread whose re-protections were deferred defers the copy (its protections are
 	// applied by the flush, before the copy).
 	if (PageManager::DeferringProtect() && m_deferring_uploads && may_defer) {
@@ -1444,6 +1478,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	const auto source = UploadMemory(m_graphics, m_scheduler, m_staging_buffer, total_size, 4,
 	    vk::BufferUsageFlagBits::eTransferSrc, [&](uint8_t* mapped, uint64_t base_offset) {
+		MemTrackProf::Timer timer(MemTrackProf::Counter::UploadCopyNs);
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {

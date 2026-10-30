@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -2568,6 +2569,9 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size, uint8_t rea
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
 		auto& owner = m_slot_images[id];
+		if (MemTrackProf::Enabled()) {
+			MemTrackProf::NoteTextureHit();
+		}
 		if (owner.Overlaps(address, size)) {
 			if (RefreshProf::Enabled()) [[unlikely]] {
 				RefreshProf::NoteDirty(owner, reason, address, size);

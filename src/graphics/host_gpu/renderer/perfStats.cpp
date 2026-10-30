@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
+#include "graphics/host_gpu/memTrackProf.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -98,6 +99,7 @@ void Add(Counter counter, uint64_t value) noexcept {
 
 void MarkGpuThread() noexcept {
 	g_gpu_thread = true;
+	MemTrackProf::SetThreadKind(MemTrackProf::ThreadKind::Gpu, "gpu");
 	if (Enabled()) {
 		ShaderRecompiler::IR::EnableWalkStats();
 	}
@@ -348,6 +350,7 @@ void MaybeReport() noexcept {
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
+	MemTrackProf::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);
