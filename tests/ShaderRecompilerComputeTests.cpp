@@ -47,6 +47,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/ProgramPack.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -1809,6 +1810,17 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
 
   auto translated = ShaderRecompiler::TranslateProgram(test.code, options);
+  {
+    // Every case also runs from a packed and restored program (shader pretranslation).
+    const auto before = ShaderRecompiler::IR::ProgramToString(translated.program);
+    ShaderRecompiler::IR::PackedProgram packed;
+    Require(test.name, "IR pack", packed.Pack(translated.program),
+            "translated program could not be packed");
+    translated.program = packed.Unpack();
+    Require(test.name, "IR pack",
+            ShaderRecompiler::IR::ProgramToString(translated.program) == before,
+            "unpacked program differs from the translated one");
+  }
   auto resource_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;

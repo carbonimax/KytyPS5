@@ -9,11 +9,14 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderPretranslate.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -74,7 +77,15 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		     addr, data.code_size_bytes);
 	}
 	const auto hash = XXH3_64bits(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+	if (PerfStats::CompileLogEnabled()) {
+		PerfStats::CompileLogLine("R %" PRIu64 " %016" PRIx64 " %u %u", PerfStats::SteadyUs(), hash,
+		                          static_cast<uint32_t>(data.type), data.code_size_bytes / 4u);
+	}
+	ShaderPretranslate::OnShaderRegistered(addr, hash, data);
 	ShaderMapData mapped {data};
+	// The register pointers are only valid during this call.
+	mapped.cx_registers = mapped.sh_registers = nullptr;
+	mapped.num_cx_registers = mapped.num_sh_registers = 0;
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
 	std::scoped_lock lock(g_shader_map_mutex);
@@ -216,7 +227,15 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 	}
 }
 
-static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
+static constexpr uint32_t PsInputSupportedBits = 0x0000ffffu;
+
+// SPI_PS_INPUT_ENA/ADDR combinations the pixel input layout supports.
+static bool ShaderPsInputsSupported(uint32_t ps_input_ena, uint32_t ps_input_addr) {
+	return (ps_input_ena & ~PsInputSupportedBits) == 0 && (ps_input_addr & ~PsInputSupportedBits) == 0 &&
+	       ps_input_ena == ps_input_addr;
+}
+
+static uint32_t ShaderCalcPsSystemInputBase(uint32_t ps_input_ena, uint32_t ps_input_addr) {
 	constexpr uint32_t ps_input_persp_sample    = 0x00000001u;
 	constexpr uint32_t ps_input_persp_center    = 0x00000002u;
 	constexpr uint32_t ps_input_persp_centroid  = 0x00000004u;
@@ -239,11 +258,12 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	    ps_input_pos_w | ps_input_front_face | ps_input_ancillary | ps_input_sample_coverage |
 	    ps_input_pos_fixed_pt;
 
-	EXIT_NOT_IMPLEMENTED((regs.ps_input_ena & ~supported_ps_input_bits) != 0);
-	EXIT_NOT_IMPLEMENTED((regs.ps_input_addr & ~supported_ps_input_bits) != 0);
-	EXIT_NOT_IMPLEMENTED(regs.ps_input_ena != regs.ps_input_addr);
+	static_assert(supported_ps_input_bits == PsInputSupportedBits);
+	EXIT_NOT_IMPLEMENTED((ps_input_ena & ~supported_ps_input_bits) != 0);
+	EXIT_NOT_IMPLEMENTED((ps_input_addr & ~supported_ps_input_bits) != 0);
+	EXIT_NOT_IMPLEMENTED(ps_input_ena != ps_input_addr);
 
-	const uint32_t inputs = regs.ps_input_addr;
+	const uint32_t inputs = ps_input_addr;
 	uint32_t       reg    = 0;
 	if ((inputs & ps_input_persp_sample) != 0) {
 		reg += 2;
@@ -270,6 +290,34 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 		reg += 1;
 	}
 	return reg;
+}
+
+// The pixel input VGPR layout (what translation reads, see BuildStageTranslationKey) from
+// SPI_PS_INPUT_ENA, SPI_PS_INPUT_ADDR and SPI_PS_IN_CONTROL.
+static void ShaderSetPixelInputLayout(uint32_t ps_input_ena, uint32_t ps_input_addr,
+                                      uint32_t ps_in_control, ShaderPixelInputInfo& ps_info) {
+	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
+	ps_info.input_num = ps_in_control & 0x3fu;
+	if ((ps_in_control & 0x8000u) != 0) {
+		ps_info.wave_size = 32;
+	}
+	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(ps_input_ena, ps_input_addr);
+	const uint32_t active_inputs = ps_input_ena & ps_input_addr;
+	if ((active_inputs & 0x00000001u) != 0) {
+		ps_info.ps_perspective_sample_vgpr = 0;
+	}
+	if ((active_inputs & 0x00000002u) != 0) {
+		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
+	}
+	if ((active_inputs & 0x00000004u) != 0) {
+		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
+	}
+	ps_info.ps_pos_x      = (active_inputs & 0x00000100u) != 0;
+	ps_info.ps_pos_y      = (active_inputs & 0x00000200u) != 0;
+	ps_info.ps_pos_z      = (active_inputs & 0x00000400u) != 0;
+	ps_info.ps_pos_w      = (active_inputs & 0x00000800u) != 0;
+	ps_info.ps_front_face = (active_inputs & 0x00001000u) != 0;
+	ps_info.ps_ancillary  = (active_inputs & 0x00002000u) != 0;
 }
 
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
@@ -363,37 +411,17 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 	ps_info.lds_size_dwords     = static_cast<uint32_t>(regs.ps_regs.rsrc2.extra_lds_size) * 128u;
 
-	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
-	ps_info.input_num            = sh.ps_in_control & 0x3fu;
-	if ((sh.ps_in_control & 0x8000u) != 0) {
-		ps_info.wave_size = 32;
-	}
+	ShaderSetPixelInputLayout(sh.ps_input_ena, sh.ps_input_addr, sh.ps_in_control, ps_info);
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
-	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
-	if ((active_inputs & 0x00000001u) != 0) {
-		ps_info.ps_perspective_sample_vgpr = 0;
-	}
-	if ((active_inputs & 0x00000002u) != 0) {
-		ps_info.ps_perspective_center_vgpr = (active_inputs & 0x00000001u) != 0 ? 2u : 0u;
-	}
-	if ((active_inputs & 0x00000004u) != 0) {
-		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
-	}
 	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
 		const auto& semantic = data.input_semantics[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
 	}
-	ps_info.ps_pos_x                     = (active_inputs & 0x00000100u) != 0;
-	ps_info.ps_pos_y                     = (active_inputs & 0x00000200u) != 0;
-	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
-	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
-	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
 	// SPI_BARYC_CNTL.FRONT_FACE_ALL_BITS selects integer masks instead of float +/-1.
 	ps_info.ps_front_face_all_bits       = (sh.baryc_cntl & 0x01000000u) != 0;
-	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
@@ -576,6 +604,107 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+}
+
+void BuildStageTranslationKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
+	// The static key without the fields only the SPIR-V emission reads: the pixel interpolation
+	// (pixel_input), PA_CL_VS_OUT_CNTL, user clip planes and the clip-space transform.
+	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
+	key.clear();
+	key.push_back(static_cast<uint32_t>(info.logical_stage));
+	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
+	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
+	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
+	key.push_back(info.resources_num);
+	key.push_back(info.wave_size);
+	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.lds_size_dwords);
+	key.push_back(info.mesh.threads_num[0]);
+	if (info.mesh.threads_num[0] != 0) {
+		const auto& mesh = info.mesh;
+		key.insert(key.end(), {mesh.threads_num[1], mesh.threads_num[2], mesh.wave_size,
+		                       mesh.host_subgroup_size, mesh.lds_size_dwords,
+		                       mesh.scratch_size_dwords, mesh.input_primitive,
+		                       mesh.primitives_per_group, mesh.vertices_per_group,
+		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
+		                       static_cast<uint32_t>(mesh.fast_launch)});
+	}
+	key.push_back(info.tess.input_control_points);
+	if (info.tess.input_control_points != 0) {
+		const auto& tess = info.tess;
+		key.insert(key.end(), {tess.output_control_points, tess.ls_stride, tess.hs_stride,
+		                       tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
+		                       tess.output_topology});
+	}
+	for (int i = 0; i < info.resources_num; i++) {
+		const auto& resource    = info.resources[i];
+		const auto& destination = info.resources_dst[i];
+		key.push_back(destination.registers_num);
+		key.push_back(static_cast<uint32_t>(destination.attr_id));
+		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+	}
+}
+
+void BuildStageTranslationKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
+	// Translation reads the pixel input VGPR layout; exports, interpolation and the render-target
+	// state are read by the SPIR-V emission only.
+	key.clear();
+	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.lds_size_dwords);
+	key.push_back(info.wave_size);
+	key.push_back(info.ps_system_input_base);
+	key.push_back(info.ps_perspective_center_vgpr);
+	key.push_back(info.ps_perspective_sample_vgpr);
+	key.push_back(info.ps_perspective_centroid_vgpr);
+	key.push_back(static_cast<uint32_t>(info.ps_pos_x) | (static_cast<uint32_t>(info.ps_pos_y) << 1u) |
+	              (static_cast<uint32_t>(info.ps_pos_z) << 2u) |
+	              (static_cast<uint32_t>(info.ps_pos_w) << 3u) |
+	              (static_cast<uint32_t>(info.ps_front_face) << 4u) |
+	              (static_cast<uint32_t>(info.ps_ancillary) << 5u));
+}
+
+void BuildStageTranslationKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
+	BuildStageStaticKey(info, key);
+}
+
+void AppendProgramTranslationKey(std::vector<uint32_t>& key, ShaderType stage,
+                                 uint32_t user_data_count, size_t code_words, size_t back_code_words,
+                                 uint32_t wave_size, uint32_t user_data_base) {
+	key.insert(key.end(), {static_cast<uint32_t>(stage), user_data_count,
+	                       static_cast<uint32_t>(code_words), static_cast<uint32_t>(back_code_words),
+	                       wave_size, user_data_base});
+}
+
+static const ShaderRegister* FindMappedRegister(const ShaderRegister* regs, uint32_t count,
+                                                uint32_t offset) {
+	for (uint32_t i = 0; regs != nullptr && i < count; i++) {
+		if (regs[i].offset == offset) {
+			return regs + i;
+		}
+	}
+	return nullptr;
+}
+
+bool ShaderPredictPixelProgram(const ShaderMappedData& data, ShaderPixelInputInfo& info,
+                               uint32_t& user_data_count) {
+	const auto* ena     = FindMappedRegister(data.cx_registers, data.num_cx_registers, Pm4::SPI_PS_INPUT_ENA);
+	const auto* addr    = FindMappedRegister(data.cx_registers, data.num_cx_registers, Pm4::SPI_PS_INPUT_ADDR);
+	const auto* control = FindMappedRegister(data.cx_registers, data.num_cx_registers, Pm4::SPI_PS_IN_CONTROL);
+	const auto* rsrc2   = FindMappedRegister(data.sh_registers, data.num_sh_registers,
+	                                         Pm4::SPI_SHADER_PGM_RSRC2_PS);
+	if (data.type != Prospero::ShaderBinaryType::kPs || ena == nullptr || addr == nullptr ||
+	    control == nullptr || rsrc2 == nullptr ||
+	    !ShaderPsInputsSupported(ena->value, addr->value)) {
+		return false;
+	}
+	info                     = {};
+	info.scratch_size_dwords = data.scratch_size_dwords;
+	info.lds_size_dwords =
+	    static_cast<uint32_t>(KYTY_PM4_GET(rsrc2->value, SPI_SHADER_PGM_RSRC2_PS, EXTRA_LDS_SIZE)) * 128u;
+	ShaderSetPixelInputLayout(ena->value, addr->value, control->value, info);
+	user_data_count = KYTY_PM4_GET(rsrc2->value, SPI_SHADER_PGM_RSRC2_PS, USER_SGPR) +
+	                  (KYTY_PM4_GET(rsrc2->value, SPI_SHADER_PGM_RSRC2_PS, USER_SGPR_MSB) << 5u);
+	return user_data_count <= HW::UserSgprInfo::SGPRS_MAX;
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

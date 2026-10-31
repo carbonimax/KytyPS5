@@ -71,10 +71,8 @@ public:
 	Value      condition;
 	Value      indirect_target;
 
-	std::array<Value, NumScalarRegs> ssa_sreg_values {};
-	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
-	std::array<Value, NumScalarRegs> ssa_sreg_mask_tags {};
-	std::array<Value, NumVectorRegs> ssa_vreg_values {};
+	// Index of the block in the SSA rewrite's definition tables (owned by that pass).
+	uint32_t ssa_index = 0;
 
 private:
 	InstructionList     instructions;

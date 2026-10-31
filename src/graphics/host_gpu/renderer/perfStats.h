@@ -117,6 +117,13 @@ void NoteFlipArg(int64_t arg) noexcept;
 // Smoothed interval between presented frames in microseconds (0 before the second frame).
 [[nodiscard]] uint64_t RecentFrameUs() noexcept;
 
+// KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
+// translation miss and pipeline creation, each starting with a kind letter and its steady-clock time
+// in microseconds (same clock and "# start" header as KYTY_FRAME_TIMES). Safe on any host thread.
+[[nodiscard]] bool     CompileLogEnabled() noexcept;
+[[nodiscard]] uint64_t SteadyUs() noexcept;
+void                   CompileLogLine(const char* format, ...) noexcept;
+
 // Draws and dispatches recorded (GPU thread, and the KYTY_CP_PIPELINE back thread), always counted:
 // KYTY_IDLE_SUBMIT reads it (CommandScheduler::IdleSubmitDue).
 inline std::atomic<uint64_t> t_work_recorded {0};

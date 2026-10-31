@@ -1,3 +1,4 @@
+#include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -37,7 +38,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +51,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -17923,6 +17927,38 @@ void TestLegacyMadRoundingPolicy(bool separate) {
 
 #include "ShaderRayTracingTests.inc"
 
+// Speculative host work (shader pretranslation): a fatal check on a thread with a retire handler
+// reports to the handler and blocks that thread, without unwinding it and without ending the process.
+std::atomic<int> g_retire_calls {0};
+std::atomic<bool> g_retire_unwound {false};
+std::string g_retire_report;
+
+void TestFatalCheckRetiresSpeculativeThread() {
+  struct Sentinel {
+    ~Sentinel() { g_retire_unwound = true; }
+  };
+  std::thread([] {
+    Common::SetFatalRetiresThread([](std::string_view report) {
+      g_retire_report = std::string(report);
+      g_retire_calls++;
+    });
+    Sentinel sentinel;
+    const int value = 7;
+    EXIT_IF(value == 7);
+    g_retire_calls += 100; // not reached
+  }).detach();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (g_retire_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  Check(g_retire_calls.load() == 1, "fatal check on a speculative thread calls the retire handler once");
+  Check(g_retire_report.find("value == 7") != std::string::npos, "retire report names the failed check");
+  Check(g_retire_report.find("shaderCfgTests.cpp") != std::string::npos, "retire report names the source file");
+  Check(!g_retire_unwound.load(), "retired thread is not unwound");
+  std::printf("fatal check on a speculative thread: retired without unwinding, process alive\n");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -17933,6 +17969,10 @@ int main(int argc, char **argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--mad-rounding-only") == 0) {
     Check(argc == 3 && (std::strcmp(argv[2], "separate") == 0 || std::strcmp(argv[2], "fused") == 0), "MAD rounding expectation must be separate or fused");
     TestLegacyMadRoundingPolicy(std::strcmp(argv[2], "separate") == 0);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fatal-retire-only") == 0) {
+    TestFatalCheckRetiresSpeculativeThread();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave32-readfirst-only") == 0) {
@@ -18159,6 +18199,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
+  TestFatalCheckRetiresSpeculativeThread();
 
   return 0;
 }

@@ -350,6 +350,11 @@ struct ShaderMappedData {
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// Register defaults of the shader binary. Only valid during ShaderMapUserData (not stored).
+	const ShaderRegister* cx_registers     = nullptr;
+	const ShaderRegister* sh_registers     = nullptr;
+	uint32_t              num_cx_registers = 0;
+	uint32_t              num_sh_registers = 0;
 };
 
 void ShaderInit();
