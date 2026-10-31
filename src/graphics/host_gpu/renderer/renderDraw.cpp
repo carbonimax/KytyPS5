@@ -1524,7 +1524,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// As for dispatches, buffer writes wait for earlier accesses to the memory. Each
 			// aliased-target pass reruns the shaders, so every pass waits for the previous one.
 			m_context.GetCommandScheduler().EndRendering();
-			ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
+			// A chain's later draws skip this barrier and may write from other stages than the
+			// first one, so the barrier that opens a chain covers every graphics stage.
+			const auto hazard_stages = chain_writes ? vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllGraphics}
+			                                        : shader_write_stages;
+			ShaderWriteHazardBarrier(vk_buffer, hazard_stages);
 		}
 		LogDrawPhase(draw.Name(), "BeginRendering");
 		if (!draw.IsIndexed()) {
