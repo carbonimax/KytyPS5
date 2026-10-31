@@ -686,7 +686,6 @@ struct UniformFillPlan {
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
 	struct SelectorKeys {
-		uint32_t              source = UINT32_MAX;
 		std::vector<uint32_t> values;
 		bool                  resolved = false;
 	};

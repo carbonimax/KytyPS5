@@ -31,6 +31,8 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -77,6 +79,7 @@
 
 #include <algorithm>
 #include <array>
+#include <filesystem>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -1621,18 +1624,12 @@ void CheckRectListShaders() {
   program.info.inputs.push_back(
       {ShaderRecompiler::IR::StageInputKind::Parameter, 1, 4, "in_param_1"});
 
-  ShaderVertexInputInfo vertex{};
-  ShaderRecompiler::IR::CompiledShaderInfo vertex_program{.param_export_mask = 1u};
-  ShaderRecompiler::IR::ResourceSnapshot empty_snapshot;
-  vertex.stage.program = &vertex_program;
-  vertex.stage.resources = &empty_snapshot;
+  constexpr uint32_t param_export_mask = 1u;
   ShaderPixelInputInfo pixel{};
   pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
-  pixel.stage.program = &program;
-  pixel.stage.resources = &empty_snapshot;
   std::vector<uint32_t> perspective_specialization;
   BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
@@ -1651,7 +1648,8 @@ void CheckRectListShaders() {
           "duplicate pixel mappings must receive distinct effective output "
           "locations");
 
-  const auto shaders = BuildRectListShaders(vertex, &pixel);
+  const auto shaders =
+      BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
   Require(name, "SPIR-V version",
           shaders.control.size() > 1 && shaders.control[1] == 0x00010500u &&
               shaders.evaluation.size() > 1 &&
@@ -1700,7 +1698,8 @@ void CheckRectListShaders() {
   for (const auto flat : {0u, 0x400u}) {
     pixel.interpolator_settings[0] = flat;
     pixel.interpolator_settings[1] = flat;
-    const auto shared = BuildRectListShaders(vertex, &pixel);
+    const auto shared =
+        BuildRectListShaders(RectListParameters(pixel, program), param_export_mask);
     ValidateSpirv(name, shared.control);
     ValidateSpirv(name, shared.evaluation);
     Require(name, "same-mode alias disassembly",
@@ -1716,9 +1715,329 @@ void CheckRectListShaders() {
             "the shared location in each rectangle-list stage");
   }
 
-  const auto position_only = BuildRectListShaders(vertex, nullptr);
+  const auto position_only = BuildRectListShaders({}, param_export_mask);
   ValidateSpirv(name, position_only.control);
   ValidateSpirv(name, position_only.evaluation);
+}
+
+// Shader store: records survive a reopen and their SPIR-V reads back; records are written once;
+// a store cut short keeps its complete records, a damaged record ends it and another host key
+// starts it over; records unused for ShaderStore::RetainedLaunches launches are dropped by a
+// compaction, which a temporary file left by an earlier one cut short does not disturb.
+void CheckShaderStore() {
+  constexpr const char *name = "ShaderStore";
+  EnsureConfigInitialized();
+  using ShaderRecompiler::IR::IoAll;
+  using ShaderRecompiler::IR::Writer;
+  std::error_code error;
+  const auto directory = std::filesystem::temp_directory_path(error);
+  const auto stem = "kyty_shader_store_test_" + std::to_string(std::rand());
+  const auto path = directory / (stem + ".shaders");
+  const auto other_path = directory / (stem + "_cut.shaders");
+  auto temp = path;
+  temp += ".tmp";
+  for (const auto &file : {path, other_path, temp}) {
+    std::filesystem::remove(file, error);
+  }
+  const std::vector<uint8_t> host_key{1, 2, 3, 4};
+  const std::vector<uint8_t> other_key{1, 2, 3, 5};
+
+  // Words that do not compress, so that a module's SPIR-V is most of its bytes.
+  const auto make_spirv = [](uint64_t seed, uint32_t words) {
+    std::vector<uint32_t> spirv(words);
+    uint64_t state = seed * 0x9e3779b97f4a7c15ull + 1;
+    for (auto &word : spirv) {
+      state ^= state << 13u;
+      state ^= state >> 7u;
+      state ^= state << 17u;
+      word = static_cast<uint32_t>(state);
+    }
+    spirv[0] = 0x07230203u;
+    return spirv;
+  };
+  const auto make_program = [](uint64_t id, ShaderType stage) {
+    ShaderStoreProgram program;
+    program.stage = stage;
+    program.hash = 0x1234567800000000ull | id;
+    program.user_data_count = 16;
+    program.code_size = 40;
+    program.static_state = {7, 8, 9, static_cast<uint32_t>(id)};
+    program.plan = {1, 2, 3, static_cast<uint8_t>(id)};
+    return program;
+  };
+  const auto make_module = [&](uint64_t id, const ShaderStoreProgram &program, uint32_t words) {
+    ShaderStoreModule module;
+    module.stage = program.stage;
+    module.hash = program.hash;
+    module.user_data_count = program.user_data_count;
+    module.code_size = program.code_size;
+    module.static_state = program.static_state;
+    module.module.handle.id = id;
+    module.module.program.stage = program.stage;
+    module.module.program.wave_size = 32;
+    module.module.program.param_export_mask = 5;
+    module.module.program.bindings.push_data_start_dword = 4;
+    module.module.specialization.buffers.push_back({.packed_stride = 16});
+    module.module.vertex_formats = {vk::Format::eR32G32Sfloat};
+    module.module.rect_parameters = {{.input_location = 1, .output_location = 2, .flat = true}};
+    module.translation_id = id * 3;
+    module.spirv = make_spirv(id, words);
+    return module;
+  };
+  // A module record without its SPIR-V.
+  const auto module_bytes = [](const ShaderStoreModule &module) {
+    Writer bytes;
+    IoAll(bytes, module.stage, module.hash, module.user_data_count, module.code_size,
+          module.static_state, module.module.handle.id, module.module.program,
+          module.module.specialization, module.module.vertex_formats,
+          module.module.rect_parameters, module.translation_id);
+    return bytes.bytes;
+  };
+  const auto vertex_program = make_program(1, ShaderType::Vertex);
+  const auto pixel_program = make_program(2, ShaderType::Pixel);
+  const auto first = make_module(11, vertex_program, 300);
+  const auto second = make_module(12, pixel_program, 5000);
+  // Its program is never stored.
+  const auto orphan = make_module(13, make_program(3, ShaderType::Pixel), 100);
+  ShaderStorePipeline pipeline;
+  pipeline.rendering.color_count = 2;
+  pipeline.rendering.color_formats[1] = vk::Format::eR8G8B8A8Unorm;
+  pipeline.rendering.depth_feedback = true;
+  pipeline.vertex_ids = {11, 0, 0};
+  pipeline.ps_id = 12;
+  pipeline.vertex_input.binding_count = 1;
+  pipeline.vertex_input.bindings[0] = {.stride = 24, .instance = true};
+  pipeline.vertex_input.attribute_count = 1;
+  pipeline.vertex_input.attributes[0] = {.offset = 8, .binding = 0};
+  pipeline.static_params.samples = 4;
+  pipeline.static_params.patch_control_points = 3;
+  pipeline.static_params.color_mask[1] = 0xf;
+  auto orphan_pipeline = pipeline;
+  orphan_pipeline.ps_id = 13;
+
+  const auto read_file = [&](const std::filesystem::path &file_path) {
+    std::error_code size_error;
+    const auto size = std::filesystem::file_size(file_path, size_error);
+    std::vector<uint8_t> bytes(size_error ? 0 : size);
+    std::FILE *file = std::fopen(file_path.string().c_str(), "rb");
+    Require(name, "read", file != nullptr &&
+                              std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size(),
+            "cannot read the store back");
+    std::fclose(file);
+    return bytes;
+  };
+  const auto write_file = [&](const std::filesystem::path &file_path,
+                              std::span<const uint8_t> bytes) {
+    std::FILE *file = std::fopen(file_path.string().c_str(), "wb");
+    Require(name, "write", file != nullptr &&
+                               std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size(),
+            "cannot rewrite the store");
+    std::fclose(file);
+  };
+  const auto check_contents = [&](const char *stage, const ShaderStoreContents &contents,
+                                  std::vector<const ShaderStoreModule *> modules,
+                                  size_t pipelines) {
+    Require(name, stage,
+            contents.header_match && contents.modules.size() == modules.size() &&
+                contents.programs.size() == modules.size() &&
+                contents.pipelines.size() == pipelines,
+            "expected " + std::to_string(modules.size()) + " programs and modules and " +
+                std::to_string(pipelines) + " pipelines, got " +
+                std::to_string(contents.programs.size()) + ", " +
+                std::to_string(contents.modules.size()) + " and " +
+                std::to_string(contents.pipelines.size()));
+    for (size_t i = 0; i < modules.size(); i++) {
+      const auto &loaded = contents.modules[i];
+      const auto &program = modules[i] == &first ? vertex_program : pixel_program;
+      Require(name, stage,
+              module_bytes(loaded) == module_bytes(*modules[i]) && loaded.spirv.empty() &&
+                  contents.programs[i].hash == program.hash &&
+                  contents.programs[i].plan.empty() && contents.programs[i].plan_index == i &&
+                  contents.programs[i].static_state == program.static_state,
+              "a program or module record changed through the store");
+    }
+    for (const auto &loaded : contents.pipelines) {
+      Require(name, stage,
+              loaded.id != 0 && loaded.rendering == pipeline.rendering &&
+                  loaded.vertex_ids == pipeline.vertex_ids && loaded.ps_id == pipeline.ps_id &&
+                  loaded.vertex_input == pipeline.vertex_input &&
+                  loaded.static_params == pipeline.static_params,
+              "a pipeline record changed through the store");
+    }
+  };
+  const auto check_spirv = [&](const char *stage, ShaderStore &store,
+                               const ShaderStoreContents &contents) {
+    for (const auto &loaded : contents.modules) {
+      const auto &expected = loaded.module.handle.id == first.module.handle.id ? first : second;
+      Require(name, stage,
+              store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id) == expected.spirv &&
+                  store.ReadSpirv(loaded.spirv_index, loaded.module.handle.id + 1).empty(),
+              "a module's SPIR-V did not read back");
+    }
+    // Plans are read back on demand too.
+    for (const auto &loaded : contents.programs) {
+      const auto &expected = loaded.hash == vertex_program.hash ? vertex_program : pixel_program;
+      Require(name, stage,
+              store.ReadPlan(loaded.plan_index) == expected.plan &&
+                  store.ReadPlan(static_cast<uint32_t>(contents.programs.size())).empty(),
+              "a program's plan did not read back");
+    }
+  };
+
+  // Launch 1. Records the store holds are not written again, nor what could never load.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "create", store.IsOpen() && !contents.header_match &&
+                                contents.modules.empty() && contents.kept_bytes == 0 &&
+                                contents.launch == 1,
+            "a missing store did not start empty at launch 1");
+    store.AppendProgram(vertex_program);
+    store.AppendModule(first);
+    store.AppendModule(first);
+    store.AppendPipeline(pipeline); // Its pixel module is not stored yet.
+    store.AppendModule(orphan);
+    store.AppendPipeline(orphan_pipeline);
+    // Records past the write queue bound are left for a later launch, and not taken as held.
+    auto huge_program = pixel_program;
+    huge_program.plan.resize(ShaderStore::MaxPendingBytes + 1);
+    Require(name, "queue bound", !store.AppendProgram(huge_program),
+            "a record larger than the write queue was taken");
+    Require(name, "queue bound", store.AppendProgram(pixel_program) &&
+                                     store.AppendProgram(pixel_program),
+            "a program left for later was taken as held");
+    store.AppendModule(make_module(13, pixel_program,
+                                  static_cast<uint32_t>(ShaderStore::MaxPendingBytes / 4 + 1)));
+    store.AppendModule(second);
+    store.AppendPipeline(pipeline);
+    store.AppendPipeline(pipeline);
+  }
+  const auto complete = read_file(path);
+  {
+    const auto contents = ShaderStore::Parse(complete, host_key);
+    check_contents("round trip", contents, {&first, &second}, 1);
+    // Only the launch record is dead: nothing was written twice.
+    Require(name, "written once",
+            contents.launch == 2 && contents.dead_records == 1 &&
+                contents.modules[0].uses == 1 && contents.pipelines[0].uses == 1 &&
+                contents.kept_bytes == complete.size() && contents.live_bytes < complete.size(),
+            "duplicates or records that cannot load reached the store (" +
+                std::to_string(contents.dead_records) + " dead records)");
+  }
+
+  // Launch 2 reads everything back and uses the vertex module only.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    check_contents("reopen", contents, {&first, &second}, 1);
+    Require(name, "reopen launch", contents.launch == 2 && !contents.compacting,
+            "the second launch is not launch 2 or compacts a live store");
+    check_spirv("reopen", store, contents);
+    store.NoteUsedModule(first.module.handle.id);
+    store.NoteUsedModule(first.module.handle.id);
+    // Known already: not written again.
+    store.AppendModule(second);
+    store.AppendPipeline(pipeline);
+  }
+
+  const auto other = ShaderStore::Parse(complete, other_key);
+  Require(name, "host key", !other.header_match && other.modules.empty() &&
+                                other.pipelines.empty() && other.kept_bytes == 0,
+          "a store written for another host key was loaded");
+
+  // A partial last record (the pipeline): the earlier records stay, and the reopened store
+  // appends after them.
+  const auto cut = std::span(complete).first(complete.size() - 7);
+  const auto truncated = ShaderStore::Parse(cut, host_key);
+  check_contents("truncated", truncated, {&first, &second}, 0);
+  Require(name, "truncated tail", truncated.kept_bytes < cut.size(),
+          "the partial record was kept");
+  write_file(other_path, cut);
+  {
+    ShaderStore store;
+    const auto contents = store.Open(other_path, host_key);
+    check_contents("reopen truncated", contents, {&first, &second}, 0);
+    check_spirv("reopen truncated", store, contents);
+    store.AppendPipeline(pipeline);
+  }
+  check_contents("append after truncation", ShaderStore::Parse(read_file(other_path), host_key),
+                 {&first, &second}, 1);
+
+  // A damaged byte in the pixel module's SPIR-V ends the store there: that module, its program
+  // and the pipeline go.
+  auto damaged = complete;
+  damaged[complete.size() - 2000] ^= 0x40u;
+  check_contents("damaged", ShaderStore::Parse(damaged, host_key), {&first}, 0);
+
+  // Launch 3 uses the vertex module again. Then at launch 4 the pixel module, its program and
+  // the pipeline were last used at launch 1: dead, and most of the file, so the store compacts.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "launch 3", contents.launch == 3 && !contents.compacting &&
+                                  contents.modules.size() == 2 && contents.pipelines.size() == 1,
+            "launch 3 did not keep the records of launch 1");
+    // Launch 2 used the vertex module and the pipeline, once each however often it noted them.
+    Require(name, "uses", contents.modules[0].uses == 2 && contents.modules[1].uses == 1 &&
+                              contents.pipelines[0].uses == 2,
+            "the launches that used each record were not counted");
+    store.NoteUsedModule(first.module.handle.id);
+  }
+  const auto before_compaction = read_file(path);
+  // A compaction cut short leaves its temporary file next to the whole store.
+  write_file(temp, std::span(before_compaction).first(before_compaction.size() / 3));
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    check_contents("expired", contents, {&first}, 0);
+    Require(name, "compacting", contents.launch == 4 && contents.compacting,
+            "dead records did not start a compaction");
+    store.WaitForWrites();
+    Require(name, "compacted", !std::filesystem::exists(temp, error),
+            "the compaction left its temporary file");
+    check_spirv("compacted", store, contents);
+  }
+  Require(name, "compacted size", read_file(path).size() < before_compaction.size() / 2,
+          "the compaction did not replace the store with a smaller file");
+  {
+    // The compacted file keeps the last use of each record (launch 3) and counts launch 4.
+    const auto contents = ShaderStore::Parse(read_file(path), host_key);
+    check_contents("after compaction", contents, {&first}, 0);
+    Require(name, "after compaction",
+            contents.launch == 5 && contents.dead_records == 1 &&
+                contents.modules[0].uses == 3,
+            "the compacted store lost its launch count, its use counts or kept dead records");
+  }
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    check_contents("launch 5", contents, {&first}, 0);
+    check_spirv("launch 5", store, contents);
+  }
+  {
+    // Unused at launches 4 and 5.
+    ShaderStore store;
+    const auto contents = store.Open(path, host_key);
+    Require(name, "launch 6", contents.launch == 6 && contents.modules.empty() &&
+                                  contents.programs.empty() && contents.compacting,
+            "a module unused for two launches was kept");
+  }
+
+  // Another host key starts the store over.
+  {
+    ShaderStore store;
+    const auto contents = store.Open(path, other_key);
+    Require(name, "start over", !contents.header_match && contents.modules.empty(),
+            "a store of another host key was kept");
+  }
+  Require(name, "start over file",
+          ShaderStore::Parse(read_file(path), host_key).modules.empty() &&
+              ShaderStore::Parse(read_file(path), other_key).header_match,
+          "the store was not rewritten for the new host key");
+  for (const auto &file : {path, other_path, temp}) {
+    std::filesystem::remove(file, error);
+  }
+  std::printf("[host]    ShaderStore                       ok\n");
 }
 
 // Words without OpName/OpString/OpLine, which only graphics debug dumps emit.
@@ -1771,11 +2090,15 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-// Upstream round-trips the plan through its shader cache bytes here; the fork has no resource
-// plan serialization yet, so the extracted plan is used directly.
-ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char * /*name*/,
+// The plan a restarted game loads from the shader cache, which saves back to the same bytes.
+ShaderRecompiler::IR::ResourcePlan LoadedResourcePlan(const char *name,
                                                       const ShaderRecompiler::IR::Program &program) {
-  return ShaderRecompiler::IR::ExtractResourcePlan(program);
+  using namespace ShaderRecompiler::IR;
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
+  ResourcePlan plan;
+  Require(name, "resource plan cache", LoadResourcePlan(bytes, plan) && SaveResourcePlan(plan) == bytes,
+          "resource plan did not round-trip through its cache bytes");
+  return plan;
 }
 
 CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
@@ -1821,8 +2144,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             ShaderRecompiler::IR::ProgramToString(translated.program) == before,
             "unpacked program differs from the translated one");
   }
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};
@@ -2029,8 +2351,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   auto translated =
       ShaderRecompiler::TranslateProgram(test.fragment_code, options);
-  auto resource_plan =
-      ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  auto resource_plan = LoadedResourcePlan(test.name, translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
   const ShaderRecompiler::IR::SrtRuntime runtime{
@@ -19494,8 +19815,8 @@ public:
     AppendEnd(&test.fragment_code);
     auto fragment = CompileFragmentCase(test);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
-    ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
-    ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
+    ShaderModule vertex_shader{.handle = {1, CreateShaderModule(name, vertex_spirv)}};
+    ShaderModule pixel_shader{.handle = {2, CreateShaderModule(name, fragment.spirv)}};
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.info.vertex_fetch_components[0] = 2;
@@ -19522,6 +19843,9 @@ public:
     ShaderPixelInputInfo pixel{};
     pixel.stage.program = &pixel_program;
     pixel.stage.resources = &fragment.resources;
+    vertex_shader.program = vertex_program;
+    vertex_shader.vertex_formats = VertexInputFormats(vertex, vertex_program);
+    pixel_shader.program = pixel_program;
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -19568,8 +19892,10 @@ public:
       DrawRenderState state{.depth_info = depth, .color_info = {color}, .color_count = 1,
                             .topology = topology, .ps_active = true,
                             .vertex_info = {vertex}, .ps_input_info = pixel};
-      state.vertex_info[0].stage.handle = &vertex_shader;
-      state.ps_input_info.stage.handle = &pixel_shader;
+      state.vertex_info[0].stage.handle = &vertex_shader.handle;
+      state.vertex_info[0].stage.module = &vertex_shader;
+      state.ps_input_info.stage.handle = &pixel_shader.handle;
+      state.ps_input_info.stage.module = &pixel_shader;
       return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
     };
     auto &filled = pipeline(true, 2, 2);
@@ -19611,6 +19937,10 @@ public:
       cmd.setViewportWithCount(1, &viewport);
       cmd.setScissorWithCount(1, &scissor);
       cmd.setLineWidth(1);
+      cmd.setCullMode(vk::CullModeFlagBits::eNone);
+      cmd.setFrontFace(registers.GetModeControl().face
+                           ? vk::FrontFace::eClockwise
+                           : vk::FrontFace::eCounterClockwise);
       cmd.setDepthTestEnable(depth.depth_test_enable);
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
@@ -19808,6 +20138,9 @@ public:
       const std::array stencil_pipelines{
           pipeline(true, 2, 2, false, true).pipeline,
           pipeline(true, 2, 2, false, false).pipeline};
+      Require(name, "dynamic winding pipeline reuse",
+              stencil_pipelines[0] == stencil_pipelines[1],
+              "the winding changed the graphics pipeline");
       const auto check_stencil = [&](const char *label, bool back_face,
                                      uint8_t initial, uint8_t written) {
         vk::ClearValue clear{};
@@ -19938,8 +20271,8 @@ public:
         const auto native = refresh();
         vertex = native.vertex_info[0];
         pixel = native.ps_input_info;
-        vertex_shader = *vertex.stage.handle;
-        pixel_shader = *pixel.stage.handle;
+        vertex_shader = *vertex.stage.module;
+        pixel_shader = *pixel.stage.module;
       };
       const auto silent = refresh();
       registers.SetDepthShaderControl({.shader_kill_enable = true});
@@ -19981,10 +20314,10 @@ public:
         BuildStageStaticKey(pixel, key);
         if (wave_ids[index] != 0) {
           Require(name, "pixel wave cache reuse",
-                  pixel_shader.id == wave_ids[index] && key == wave_keys[index],
+                  pixel_shader.handle.id == wave_ids[index] && key == wave_keys[index],
                   "restoring wave64 did not reuse its original program");
         }
-        wave_ids[index] = pixel_shader.id;
+        wave_ids[index] = pixel_shader.handle.id;
         wave_keys[index] = std::move(key);
         draw(pipeline(true, 2, 2));
         const auto wave_pixels = read_color();
@@ -20107,10 +20440,10 @@ public:
         auto &selected = pipeline(true, 2, 2);
         if (test.mode == ShaderAlphaBlendSource::SourceAlpha) {
           Require(name, "equal blend equation cache reuse",
-                  broadcast_program == 0 || (pixel_shader.id == broadcast_program &&
+                  broadcast_program == 0 || (pixel_shader.handle.id == broadcast_program &&
                                               selected.pipeline == broadcast_pipeline),
                   "equivalent separate alpha state created another shader or pipeline");
-          broadcast_program = pixel_shader.id;
+          broadcast_program = pixel_shader.handle.id;
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
@@ -20444,6 +20777,22 @@ public:
                   "native vertex or instance offset was applied twice");
         }
       }
+      // With back faces culled, the triangle draws for exactly one winding.
+      const auto draws_with_back_cull = [&](bool clockwise) {
+        registers.SetModeControl({.cull_back = true, .face = clockwise});
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+            {.vertex_count = 3, .instance_count = 1, .first_vertex = 7, .first_instance = 5,
+             .offset_source = DrawOffsetSource::IndirectArgs});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        return std::ranges::any_of(pixels, [](u32 word) { return word != 0; });
+      };
+      Require("DynamicCullMode", "back faces culled by winding",
+              draws_with_back_cull(false) != draws_with_back_cull(true),
+              "the draw's cull mode or front face did not reach the host GPU");
+      registers.SetModeControl({});
 
       // Indirect records come from the GPU copy; the CPU backing holds zeros. In each pair the
       // first record draws nothing and the second covers the target, through vertex offset 7
@@ -20582,12 +20931,13 @@ public:
       registers.SetPsInputEna(2);
       registers.SetPsInputAddr(2);
       registers.SetPsInputSettings(0, 0);
+      // Rect lists are drawn without culling.
       for (const auto primitive : {Prospero::PrimitiveType::kRectList,
                                     Prospero::PrimitiveType::kRectListLegacy}) {
         const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
                                     ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
         user_config.SetPrimitiveType(primitive);
-        registers.SetModeControl({});
+        registers.SetModeControl({.cull_front = true, .cull_back = true});
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
         RenderExecutorTestAccess::DrawAuto(
@@ -20716,9 +21066,9 @@ public:
                 "packed conversion or rounding contaminated another MRT or followed a physical slot");
         if (test.slot == 2) {
           auto &id = test.truncate ? truncate_program : half_up_program;
-          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.id,
+          Require(name, "packed rounding program reuse", id == 0 || id == pixel_shader.handle.id,
                   "restoring half-up rounding failed to reuse its program");
-          id = pixel_shader.id;
+          id = pixel_shader.handle.id;
         }
         RenderColorInfo packed_target{}, float_target{};
         RenderExecutorTestAccess::ResolveRenderColorTarget(
@@ -20817,8 +21167,8 @@ public:
     resources.UnmapMemory(depth_address, allocation_size);
     scheduler.Finish();
     DestroyBuffer(&buffer);
-    m_device.destroyShaderModule(pixel_shader.module);
-    m_device.destroyShaderModule(vertex_shader.module);
+    m_device.destroyShaderModule(pixel_shader.handle.module);
+    m_device.destroyShaderModule(vertex_shader.handle.module);
     Require(name, "release depth memory",
               Libs::LibKernel::Memory::KernelMunmap(depth_address, allocation_size) == 0 &&
                   Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -55384,6 +55734,10 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-store-only") == 0) {
+    CheckShaderStore();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
@@ -55676,6 +56030,7 @@ int main(int argc, char **argv) {
   CheckPixelParameterAliases();
   CheckPixelFrontFaceModes();
   CheckRectListShaders();
+  CheckShaderStore();
   CheckSigned16ImageStore(vulkan);
   CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
