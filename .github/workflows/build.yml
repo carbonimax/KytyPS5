@@ -222,9 +222,27 @@ jobs:
       - name: Bundle MoltenVK
         shell: bash
         env:
-          MOLTENVK_VERSION: v1.4.2
-          MOLTENVK_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
+          # carbonimax/MoltenVK carries PerVertex and mesh, behind KYTY_PERVERTEX_EXPERIMENTAL and
+          # KYTY_MESH_EXPERIMENTAL. Set the repository variable MOLTENVK_SOURCE to "official" to bundle
+          # the KhronosGroup release instead.
+          MOLTENVK_SOURCE: ${{ vars.MOLTENVK_SOURCE || 'fork' }}
+          MOLTENVK_FORK_TAG: v1.4.2-kyty.1
+          MOLTENVK_FORK_SHA256: 1d9d44257a7d190b59f43e4f79315366ff3e42beb0b932a1529c7c82e3266c29
+          MOLTENVK_OFFICIAL_VERSION: v1.4.2
+          MOLTENVK_OFFICIAL_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
         run: |
+          case "$MOLTENVK_SOURCE" in
+            fork)
+              url="https://github.com/carbonimax/MoltenVK/releases/download/$MOLTENVK_FORK_TAG/MoltenVK-macos.tar"
+              sha256="$MOLTENVK_FORK_SHA256" ;;
+            official)
+              url="https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_OFFICIAL_VERSION/MoltenVK-macos.tar"
+              sha256="$MOLTENVK_OFFICIAL_SHA256" ;;
+            *)
+              echo "MOLTENVK_SOURCE must be fork or official, got '$MOLTENVK_SOURCE'" >&2
+              exit 1 ;;
+          esac
+          echo "Bundling MoltenVK ($MOLTENVK_SOURCE): $url"
           archive="$RUNNER_TEMP/MoltenVK-macos.tar"
           package="$RUNNER_TEMP/MoltenVK"
           install_dir="_Build/macos/install"
@@ -232,8 +250,8 @@ jobs:
           moltenvk="$install_dir/libMoltenVK.dylib"
           curl --fail --location --retry 3 \
             --output "$archive" \
-            "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
-          echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
+            "$url"
+          echo "$sha256  $archive" | shasum -a 256 --check
           tar -xf "$archive" -C "$RUNNER_TEMP"
           test -d "$app_dir"
           install -m 755 \
