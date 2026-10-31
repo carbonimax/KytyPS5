@@ -457,6 +457,15 @@ static bool KeepDepthAttachmentLayout() {
 	return enabled;
 }
 
+// KYTY_DRAW_WRITE_CHAIN=0 restores one pass and one pair of barriers per buffer-writing draw.
+static bool DrawWriteChaining() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DRAW_WRITE_CHAIN");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -1452,6 +1461,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages) {
 		CpSplitProf::NoteItemWrites();
 	}
+	// Buffer-writing draws between two guest sync points share their pass and one pair of
+	// barriers, as their shader writes are unordered on the guest GPU too: the first draw waits
+	// for earlier accesses, the pass end makes all the writes visible to later work.
+	const auto sync_epoch   = GuestSyncEpoch();
+	const bool chain_writes = shader_write_stages && pass_count == 1 && DrawWriteChaining();
+	const bool chained      = chain_writes && buffer.DrawWritesChained(sync_epoch);
+	if (buffer.DrawWritesStale(sync_epoch)) {
+		m_context.GetCommandScheduler().EndRendering();
+	}
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto& pipeline = *pipelines[pass];
 		SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
@@ -1502,7 +1520,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			m_context.GetCommandScheduler().EndRendering();
 			ColorAttachmentPassBarrier(vk_buffer);
 		}
-		if (shader_write_stages) {
+		if (shader_write_stages && !chained) {
 			// As for dispatches, buffer writes wait for earlier accesses to the memory. Each
 			// aliased-target pass reruns the shaders, so every pass waits for the previous one.
 			m_context.GetCommandScheduler().EndRendering();
@@ -1539,7 +1557,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}
-	if (shader_write_stages) {
+	if (chain_writes) {
+		buffer.DeferDrawWrites(shader_write_stages, sync_epoch);
+	} else if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}

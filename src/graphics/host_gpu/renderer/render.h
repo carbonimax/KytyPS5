@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <vector>
@@ -125,6 +126,17 @@ private:
 	RegisterOverride m_previous;
 };
 
+// Guest synchronization points seen by the command processors: cache flush and invalidate events,
+// releases, acquires, waits, semaphores, flips and CP memory reads or writes. Draws between two of
+// them are unordered on the guest GPU, so their buffer writes need no barrier between each other.
+inline std::atomic<uint64_t> g_guest_sync_epoch {0};
+inline void                  NoteGuestSync() noexcept {
+    g_guest_sync_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+[[nodiscard]] inline uint64_t GuestSyncEpoch() noexcept {
+	return g_guest_sync_epoch.load(std::memory_order_relaxed);
+}
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -138,6 +150,22 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 	[[nodiscard]] bool Rendering() const noexcept { return m_rendering; }
+	// Buffer writes of draws recorded in the open pass, made visible to later work when the pass
+	// ends (EndRendering records the barrier). Nothing that runs outside a pass can be recorded
+	// before that, so only draws see the writes late, and only draws of the same sync epoch.
+	void DeferDrawWrites(vk::PipelineStageFlags stages, uint64_t sync_epoch) const noexcept {
+		m_draw_write_stages |= stages;
+		m_draw_write_epoch   = sync_epoch;
+	}
+	// The open pass holds buffer-writing draws of this sync epoch: a later buffer-writing draw of
+	// the same epoch needs no hazard barrier (the first one of the pass ordered it after earlier work).
+	[[nodiscard]] bool DrawWritesChained(uint64_t sync_epoch) const noexcept {
+		return m_rendering && m_draw_write_stages && m_draw_write_epoch == sync_epoch;
+	}
+	// The open pass holds buffer writes of an earlier sync epoch, which the next draw may read.
+	[[nodiscard]] bool DrawWritesStale(uint64_t sync_epoch) const noexcept {
+		return m_draw_write_stages && m_draw_write_epoch != sync_epoch;
+	}
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	// Buffer-cache upload batches: the trailing barrier of an upload is deferred. Every Handle()
@@ -183,6 +211,8 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_upload_post_pending = false;
+	mutable vk::PipelineStageFlags m_draw_write_stages {};
+	mutable uint64_t               m_draw_write_epoch = 0;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
