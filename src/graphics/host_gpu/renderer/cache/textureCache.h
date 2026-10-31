@@ -51,7 +51,19 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
-	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// What FindImage resolved a description to, kept by the caller next to a description it
+	// reuses as is (KYTY_FIND_IMAGE_MEMO).
+	struct FindImageMemo {
+		ImageId  id {};
+		uint64_t epoch = 0;
+	};
+	// KYTY_FIND_IMAGE_MEMO: 1 (default) reuse a FindImageMemo, 0 off, 2 search anyway and exit if
+	// the search does not give the kept image.
+	[[nodiscard]] static uint32_t FindImageMemoMode() noexcept;
+
+	// memo: kept for a description identical to desc (or empty); FindImage fills it.
+	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
+	                                      FindImageMemo* memo = nullptr);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -167,6 +179,8 @@ private:
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
+	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
+	                        FindImageMemo* memo);
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
