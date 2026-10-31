@@ -662,6 +662,7 @@ void BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	const auto buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
@@ -812,7 +813,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			// Cache buffers cover whole tracker pages, so this range has nothing to download.
 			const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-			m_gpu_modified_ranges.Subtract(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
+			{
+				std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+				m_gpu_modified_ranges.Subtract(begin, Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - begin);
+			}
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, size);
 			QueueBdaSync(vaddr, size);
 			return;
@@ -963,8 +967,11 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write] {
 		if (is_write && !IsRegionRegistered(vaddr, 1)) {
 			// Cache buffers cover whole tracker pages, so this page has nothing to download.
-			m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
-			                               TRACKER_PAGE_SIZE);
+			{
+				std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+				                               TRACKER_PAGE_SIZE);
+			}
 			m_memory_tracker.ReleaseUnownedRegion(vaddr, 1);
 			QueueBdaSync(vaddr, 1);
 			return;
@@ -1405,7 +1412,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+		{
+			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+			m_gpu_modified_ranges.Add(vaddr, size);
+		}
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
 	}
@@ -1545,7 +1555,12 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 		return false;
 	}
 	// Bytes of a fault readback still in flight left the dirty set but are not published yet.
-	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	bool intersects = false;
+	{
+		std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+		intersects = m_gpu_modified_ranges.Intersects(vaddr, size);
+	}
+	return intersects ||
 	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
 }
 

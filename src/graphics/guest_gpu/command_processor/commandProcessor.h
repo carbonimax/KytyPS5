@@ -129,6 +129,8 @@ private:
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	// Direct draws: with KYTY_CP_PIPELINE the back thread may be switching the command buffer.
+	CommandBuffer&      DrawBuffer();
 
 	RenderContext& m_renderer;
 	HW::Context    m_ctx;

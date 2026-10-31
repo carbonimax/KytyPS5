@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 namespace Libs::Graphics {
@@ -54,6 +56,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const bool             gpu_thread = PerfStats::IsGpuThread();
+	if (gpu_thread) {
+		CpSplitProf::NoteSubmitOrWait();
+		CpPipeline::Drain();
+	}
 	PerfStats::ScopedTimer perf_timer(
 	    gpu_thread ? PerfStats::Counter::WaitGpuThreadNs : PerfStats::Counter::WaitOtherNs,
 	    gpu_thread ? PerfStats::Counter::WaitGpuThreadCount : PerfStats::Counter::WaitOtherCount);

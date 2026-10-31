@@ -1,4 +1,6 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -55,6 +57,22 @@ bool Enabled() noexcept {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PERF_STATS");
 		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+bool BindProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BIND_PROF");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+bool SrtProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_PROF");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
 	}();
 	return enabled;
 }
@@ -170,6 +188,33 @@ void MaybeReport() noexcept {
 	            n(Counter::WaitOtherCount), ms(Counter::SideReadNs), n(Counter::SideReadCount),
 	            static_cast<double>(n(Counter::Submits)) / seconds,
 	            static_cast<double>(n(Counter::IdleSubmits)) / seconds);
+	if (BindProfEnabled()) {
+		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
+		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
+		            " descriptors=%" PRIu64 "\n",
+		            seconds, ms(Counter::BindPrepareNs), ms(Counter::BindFindBuffersNs), ms(Counter::BindHeapNs),
+		            ms(Counter::BindImagesNs), ms(Counter::BindBuffersNs), ms(Counter::BindCommitNs),
+		            n(Counter::BindCommitCount), ms(Counter::BindCheckNs), ms(Counter::BindTransitNs),
+		            ms(Counter::BindPushNs), n(Counter::BindWriteCount), n(Counter::BindDescriptorCount));
+	}
+	if (SrtProfEnabled()) {
+		std::printf("PERF srtsplit %.1fs: lookups=%" PRIu64 " refresh=%.0fms walk=%.0fms eval=%.0fms spec=%.0fms match=%.0fms"
+		            " same_perm=%" PRIu64 " multi_perm=%" PRIu64 " miss=%" PRIu64 " user_same=%" PRIu64
+		            " desc_same=%" PRIu64 " flat_same=%" PRIu64 " no_load=%" PRIu64 " loads=%" PRIu64
+		            " flat_words=%" PRIu64 " flat_needed=%" PRIu64 "/%" PRIu64 " buffers=%" PRIu64 " images=%" PRIu64 " heap_images=%" PRIu64
+		            " conv_images=%" PRIu64 " samplers=%" PRIu64 " no_res=%" PRIu64 " heap_only=%" PRIu64
+		            " with_buf=%" PRIu64 " with_img=%" PRIu64 " with_samp=%" PRIu64 " format_spec=%" PRIu64
+		            " find_image=%.0fms sampler=%.0fms obtain=%.0fms upload=%.0fms view=%.0fms\n",
+		            seconds, n(Counter::SrtLookups), ms(Counter::SrtRefreshNs), ms(Counter::SrtWalkNs),
+		            ms(Counter::SrtEvalNs), ms(Counter::SrtSpecNs), ms(Counter::SrtMatchNs), n(Counter::SrtSamePerm),
+		            n(Counter::SrtMultiPerm), n(Counter::SrtMiss), n(Counter::SrtUserSame), n(Counter::SrtDescSame),
+		            n(Counter::SrtFlatSame), n(Counter::SrtNoLoad), n(Counter::SrtLoads), n(Counter::SrtFlatWords), n(Counter::SrtFlatNeeded), n(Counter::SrtFlatPlan),
+		            n(Counter::SrtBuffers), n(Counter::SrtImages), n(Counter::SrtHeapImages), n(Counter::SrtConvImages),
+		            n(Counter::SrtSamplers), n(Counter::SrtNoResources), n(Counter::SrtHeapOnly),
+		            n(Counter::SrtWithBuffers), n(Counter::SrtWithImages), n(Counter::SrtWithSamplers),
+		            n(Counter::SrtFormatSpec), ms(Counter::BindFindImageNs), ms(Counter::BindSamplerNs),
+		            ms(Counter::BindObtainNs), ms(Counter::BindUploadNs), ms(Counter::BindViewNs));
+	}
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64
@@ -181,6 +226,8 @@ void MaybeReport() noexcept {
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
+	CpSplitProf::Report(seconds);
+	CpPipeline::Report(seconds);
 	GuestStacks::Report();
 	std::fflush(stdout);
 }

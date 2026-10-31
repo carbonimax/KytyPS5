@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -622,7 +623,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
 
-	auto id = texture_cache.FindImage(desc, shader_conversion);
+	auto id = [&] {
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
+		return texture_cache.FindImage(desc, shader_conversion);
+	}();
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
 		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
@@ -699,6 +703,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindPrepareNs, PerfStats::BindProfEnabled());
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
@@ -731,6 +736,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.images[i] = std::move(binding);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
+	PerfStats::ScopedTimer sampler_timer(PerfStats::Counter::BindSamplerNs,
+	                                     PerfStats::SrtProfEnabled() && !program.info.samplers.empty());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(
 		    m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index]));
@@ -747,6 +754,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindFindBuffersNs, PerfStats::BindProfEnabled());
 	auto& cache = m_context.GetBufferCache();
 	BufferCache::UploadBatch upload_batch(cache);
 	for (auto* stage: stages) {
@@ -825,6 +833,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindBuffersNs, PerfStats::BindProfEnabled());
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
@@ -844,6 +853,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
+		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
@@ -851,6 +861,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
+	PerfStats::ScopedTimer upload_timer(PerfStats::Counter::BindUploadNs, PerfStats::SrtProfEnabled());
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
@@ -861,6 +872,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindImagesNs, PerfStats::BindProfEnabled());
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
@@ -894,6 +906,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
+			PerfStats::ScopedTimer view_timer(PerfStats::Counter::BindViewNs, PerfStats::SrtProfEnabled());
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
@@ -915,6 +928,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		m_context.PrepareBda();
 	}
 	if (uses_image_heap) {
+		PerfStats::ScopedTimer heap_timer(PerfStats::Counter::BindHeapNs, PerfStats::BindProfEnabled());
 		m_context.GetImageHeap().Rebind(*this);
 	}
 	for (auto* stage: stages) {
@@ -944,6 +958,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	const bool             bind_prof = PerfStats::BindProfEnabled();
+	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindCommitNs, bind_prof);
+	using BindClock      = std::chrono::steady_clock;
+	const auto bind_ns   = [](BindClock::time_point start) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(BindClock::now() - start).count());
+	};
+	const auto check_start = bind_prof ? BindClock::now() : BindClock::time_point {};
 	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;
 	size_t write_count      = 0;
@@ -1047,6 +1069,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
+	if (bind_prof) {
+		PerfStats::Add(PerfStats::Counter::BindCheckNs, bind_ns(check_start));
+		PerfStats::Add(PerfStats::Counter::BindCommitCount, 1);
+	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	m_descriptor_writes.reserve(write_count);
@@ -1068,6 +1094,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		const auto transit_start = bind_prof ? BindClock::now() : BindClock::time_point {};
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& binding = descriptors.images[i];
 			if (!binding.image_id) continue;
@@ -1107,6 +1134,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image.Transit(image.ReadLayout(), vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
 			}
 			binding.layout = image.backing.state.layout;
+		}
+		if (bind_prof) {
+			PerfStats::Add(PerfStats::Counter::BindTransitNs, bind_ns(transit_start));
 		}
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
@@ -1205,6 +1235,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        push_data.dwords.data());
 	}
 
+	const auto push_start = bind_prof ? BindClock::now() : BindClock::time_point {};
+	if (bind_prof) {
+		uint64_t descriptors = 0;
+		for (const auto& write: m_descriptor_writes) {
+			descriptors += write.descriptorCount;
+		}
+		PerfStats::Add(PerfStats::Counter::BindWriteCount, m_descriptor_writes.size());
+		PerfStats::Add(PerfStats::Counter::BindDescriptorCount, descriptors);
+	}
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
@@ -1222,6 +1261,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (bind_prof) {
+		PerfStats::Add(PerfStats::Counter::BindPushNs, bind_ns(push_start));
 	}
 }
 
