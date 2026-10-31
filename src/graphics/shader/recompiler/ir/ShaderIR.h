@@ -718,7 +718,7 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 	// x86 walker over the retained SRT, descriptor and condition values.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
-	// KYTY_SRT_WALK_FAST=2 only: the classic walker of the same plan, for comparison.
+	// KYTY_SRT_WALK_FAST=2 or KYTY_SRT_FLAT_RUNS=2 only: the classic walker of the same plan, for comparison.
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code_check;
 	uint32_t                              srt_user_data = 0; // User-data DWORDs the walker reads.
 	uint32_t                              srt_captures  = 0; // Scratch offset of loaded addresses.

@@ -90,7 +90,7 @@ struct WalkStats {
 	// KYTY_SRT_WALK_REUSE: walks whose inputs matched the plan's last walk (checks), of which every
 	// guest load still read the same value (hits); validation time; verify-mode mismatches.
 	uint64_t reuse_checks = 0, reuse_hits = 0, reuse_ns = 0, reuse_diffs = 0;
-	// KYTY_SRT_WALK_FAST=2: walks compared with the classic walker, and those that differed.
+	// KYTY_SRT_WALK_FAST=2 or KYTY_SRT_FLAT_RUNS=2: walks compared with the classic walker, and those that differed.
 	uint64_t fast_checks = 0, fast_diffs = 0;
 };
 // KYTY_SRT_WALK_REUSE (default 1; x86-64 walker; 0 = off): a walk whose user data and shader base equal the
@@ -108,6 +108,13 @@ struct WalkStats {
 // run after each walk on the same inputs; any difference in the result, scratch or flat buffer is
 // counted (PERF srtwalk fast_diffs=diffs/checks) and logged.
 [[nodiscard]] uint32_t WalkFastMode() noexcept;
+// KYTY_SRT_FLAT_RUNS (default 1; 0 = one thunk call per read): in the flat pass, consecutive flat
+// reads of one buffer or address handle (same opcode and operands, immediate offsets within 4 KiB)
+// evaluate the handle once and check the protected-page list once for the first and last address;
+// each read is then inline: state test, bounds, direct load, capture and store, as its thunk would
+// do them. An unknown operand or a listed page takes the classic per-read sequence. 2 = verify, as
+// KYTY_SRT_WALK_FAST=2 (the comparison walker has both off).
+[[nodiscard]] uint32_t FlatRunsMode() noexcept;
 // KYTY_SRT_PROTECTED_LOADS (default 1): the fault handler lists the page of a walker load it
 // completed from the backing (NoteProtectedLoad); later walker loads from a listed page call the
 // reader (GPU thread: the backing, synchronizing GPU-written bytes) instead of faulting. The reader

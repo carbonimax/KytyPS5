@@ -500,8 +500,9 @@ class WalkerCompiler {
 public:
 	// fast (KYTY_SRT_WALK_FAST): callers skip the call to a thunk whose value is already known, and
 	// loads share one protected-load call sequence. Same layout, loads and results either way.
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool fast)
-	    : m_plan(plan), m_code(code), m_fast(fast) {}
+	// runs (KYTY_SRT_FLAT_RUNS): see the flat pass in Compile.
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool fast, bool runs)
+	    : m_plan(plan), m_code(code), m_fast(fast), m_runs(runs) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -573,6 +574,7 @@ private:
 	Xbyak::Label                                      m_ret;
 	Xbyak::Label                                      m_protected_stub;
 	const bool                                        m_fast;
+	const bool                                        m_runs;
 	uint32_t m_shader_base = 0, m_reach = 0, m_restart = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -1427,15 +1429,171 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 			Fetch(reads[slot], fail);
 			c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
 		};
+		// KYTY_SRT_FLAT_RUNS: the read node of a slot that can join a run, else UINT32_MAX.
+		const auto run_node = [&](uint32_t slot) {
+			if (!m_runs || slot >= reads.size() || m_plan.srt_reads[slot].flat_offset >= reads.size() ||
+			    reads[slot].kind != Kind::Node) {
+				return UINT32_MAX;
+			}
+			const auto  index = static_cast<uint32_t>(reads[slot].value);
+			const auto& node  = m_nodes[index];
+			const auto  op    = node.inst->GetOpcode();
+			if (node.result != reads[slot] ||
+			    !((op == ValueOpcode::LoadAddressU32 && node.args.size() == 3u) ||
+			      (op == ValueOpcode::ReadConstBuffer && node.args.size() == 5u))) {
+				return UINT32_MAX;
+			}
+			return index;
+		};
+		const auto read_offset = [&](uint32_t index) {
+			const auto& inst = *m_nodes[index].inst;
+			return static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
+			       ~int64_t {3};
+		};
+		// Reads of one handle (same opcode and operands) at immediate offsets within 4 KiB: the
+		// handle is evaluated once, the protected-page list is checked once for the first and last
+		// address, and each read is inline (state test, bounds, direct load, capture, store). Each
+		// read loads, captures, stores and fails exactly as its thunk would; an unknown operand or a
+		// listed page runs the classic sequence instead.
+		const auto run = [&](std::span<const uint32_t> slots) {
+			const auto& first   = m_nodes[run_node(slots[0])];
+			const bool  address = first.inst->GetOpcode() == ValueOpcode::LoadAddressU32;
+			const auto& args    = first.args;
+			int64_t     low = INT64_MAX, high = INT64_MIN;
+			for (const auto slot: slots) {
+				low  = std::min(low, read_offset(run_node(slot)));
+				high = std::max(high, read_offset(run_node(slot)));
+			}
+			Xbyak::Label slow, end;
+			for (const auto& arg: args) Branch(arg, slow);
+			// r11 = the 48-bit base plus the dynamic offset (r9, low two bits clear).
+			Load(c.rax, args[1]);
+			c.shl(c.rax, 48);
+			c.shr(c.rax, 16);
+			Load(c.rcx, args[0]);
+			c.and_(c.ecx, ~3u);
+			c.or_(c.rax, c.rcx);
+			Load(c.r9, args[2]);
+			c.and_(c.r9d, ~3u);
+			c.lea(c.r11, c.ptr[c.rax + c.r9]);
+			if (ProtectedLoadsEnabled()) {
+				for (const auto offset: {low, high}) {
+					c.lea(c.rax, c.ptr[c.r11 + static_cast<size_t>(offset)]);
+					c.shr(c.rax, ProtectedPageShift);
+					c.inc(c.rax);
+					c.mov(c.ecx, c.eax);
+					c.and_(c.ecx, ProtectedPageSlots - 1u);
+					c.mov(c.r10, reinterpret_cast<uint64_t>(g_protected_pages.data()));
+					c.cmp(c.qword[c.r10 + c.rcx * 8], c.rax);
+					c.je(slow, Near);
+				}
+			}
+			if (!address) {
+				// rcx = the buffer size in bytes (records times stride, or records).
+				Xbyak::Label sized;
+				Load(c.rax, args[1]);
+				c.shr(c.eax, 16);
+				c.and_(c.eax, 0x3fffu);
+				Load(c.rcx, args[3]);
+				c.test(c.eax, c.eax);
+				c.jz(sized, Near);
+				c.imul(c.rcx, c.rax);
+				c.L(sized);
+			}
+			for (const auto slot: slots) {
+				const auto& node   = m_nodes[run_node(slot)];
+				const auto  offset = read_offset(run_node(slot));
+				const auto  state  = c.byte[c.rdx + node.state];
+				Xbyak::Label known, zero, store, write;
+				c.cmp(state, 2);
+				c.je(known, Near);
+				c.cmp(state, 0);
+				c.jne(fail, Near);
+				if (address) {
+					Xbyak::Label valid;
+					c.lea(c.r10, c.ptr[c.r11 + static_cast<size_t>(offset)]);
+					c.mov(c.rax, c.r10);
+					c.shr(c.rax, 48);
+					c.jz(valid, Near);
+					c.mov(state, 1);
+					c.jmp(fail, Near);
+					c.L(valid);
+				} else {
+					c.lea(c.rax, c.ptr[c.r9 + static_cast<size_t>(offset) + 4u]);
+					c.cmp(c.rax, c.rcx);
+					c.ja(zero, Near);
+					c.lea(c.r10, c.ptr[c.r11 + static_cast<size_t>(offset)]);
+				}
+				c.mov(c.eax, c.dword[c.r10]); // a walker load (41 8b 02)
+				c.mov(c.qword[c.r8], c.r10);
+				if (WalkReuseMode() != 0) {
+					c.mov(c.qword[c.r8 + 8], c.rax);
+					c.add(c.r8, 16);
+				} else {
+					c.add(c.r8, 8);
+				}
+				c.jmp(store, Near);
+				c.L(zero);
+				c.xor_(c.eax, c.eax);
+				c.L(store);
+				c.mov(c.qword[c.rdx + node.slot], c.rax);
+				c.mov(state, 2);
+				c.jmp(write, Near);
+				c.L(known);
+				c.mov(c.rax, c.qword[c.rdx + node.slot]);
+				c.L(write);
+				c.mov(c.dword[c.rsi + m_plan.srt_reads[slot].flat_offset * sizeof(uint32_t)], c.eax);
+			}
+			c.jmp(end, Near);
+			c.L(slow);
+			for (const auto slot: slots) flat(slot);
+			c.L(end);
+		};
+		const auto flat_list = [&](std::span<const uint32_t> slots) {
+			for (size_t begin = 0; begin < slots.size();) {
+				const auto first = run_node(slots[begin]);
+				size_t     count = 1;
+				if (first != UINT32_MAX) {
+					const auto& head = m_nodes[first];
+					int64_t     low = read_offset(first), high = low;
+					while (begin + count < slots.size()) {
+						const auto next = run_node(slots[begin + count]);
+						if (next == UINT32_MAX || m_nodes[next].inst->GetOpcode() != head.inst->GetOpcode() ||
+						    m_nodes[next].args != head.args) {
+							break;
+						}
+						const auto offset = read_offset(next);
+						if (std::max(high, offset) - std::min(low, offset) >= 4096) break;
+						low  = std::min(low, offset);
+						high = std::max(high, offset);
+						++count;
+					}
+					// A handle operand read by the run itself would be evaluated out of order.
+					for (const auto& arg: head.args) {
+						for (size_t i = begin; count >= 2u && i < begin + count; ++i) {
+							if (arg.kind == Kind::Node && arg.value == reads[slots[i]].value) count = 1;
+						}
+					}
+				}
+				if (count >= 2u) {
+					run(slots.subspan(begin, count));
+				} else {
+					flat(slots[begin]);
+				}
+				begin += count;
+			}
+		};
 		if (blocks.empty()) {
-			for (uint32_t slot = 0; slot < reads.size(); ++slot) flat(slot);
+			std::vector<uint32_t> slots(reads.size());
+			for (uint32_t slot = 0; slot < reads.size(); ++slot) slots[slot] = slot;
+			flat_list(slots);
 		}
 		for (uint32_t block = 0; block < blocks.size(); ++block) {
 			if (blocks[block].srt_reads.empty()) continue;
 			Xbyak::Label skip;
 			c.cmp(c.byte[c.rdx + m_reach + block], 0);
 			c.je(skip, Near);
-			for (const auto slot: blocks[block].srt_reads) flat(slot);
+			flat_list(blocks[block].srt_reads);
 			c.L(skip);
 		}
 		// A source or image no block lists is always active.
@@ -1512,16 +1670,25 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	const auto fast = WalkFastMode();
+	const auto runs = FlatRunsMode();
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	plan.srt_memo_loads = UINT32_MAX;
-	WalkerCompiler(plan, *plan.srt_code, fast != 0).Compile(values);
-	if (fast == 2u) {
+	WalkerCompiler(plan, *plan.srt_code, fast != 0, runs != 0).Compile(values);
+	if (fast == 2u || runs == 2u) {
 		// The same plan compiled the classic way: WalkSrt runs it after each walk and compares.
 		plan.srt_code_check = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-		WalkerCompiler(plan, *plan.srt_code_check, false).Compile(values);
+		WalkerCompiler(plan, *plan.srt_code_check, false, false).Compile(values);
 	} else {
 		plan.srt_code_check.reset();
 	}
+}
+
+uint32_t FlatRunsMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_SRT_FLAT_RUNS");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 1u;
+	}();
+	return mode;
 }
 
 uint32_t WalkFastMode() noexcept {
@@ -1602,7 +1769,7 @@ void LogReuseMismatch(const ResourcePlan& plan, const char* what, size_t index, 
 	}
 }
 
-// KYTY_SRT_WALK_FAST=2: runs the classic walker on the inputs of the walk that just ran and
+// KYTY_SRT_WALK_FAST=2 or KYTY_SRT_FLAT_RUNS=2: runs the classic walker on the inputs of the walk that just ran and
 // compares its result, scratch (values, states, descriptors, captures) and flat buffer.
 void CheckFastWalk(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
                    const uint64_t* end) {
