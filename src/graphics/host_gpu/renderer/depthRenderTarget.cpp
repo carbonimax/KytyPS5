@@ -16,14 +16,17 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/targetDescMemo.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -254,6 +257,14 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	return desc;
 }
 
+namespace {
+
+// MakeDepthTargetDesc(buffer, z, false) per depth register values (KYTY_TARGET_DESC_MEMO).
+using DepthTargetMemo = TargetDescMemo::Table<HW::DepthRenderTarget, TextureCache::ImageDesc, 16>;
+thread_local DepthTargetMemo t_depth_target_memo;
+
+} // namespace
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
@@ -309,7 +320,27 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
 		DepthFatal("unsupported depth-to-color copy state");
 	}
-	r.desc = MakeDepthTargetDesc(buffer, z);
+	const auto memo_mode = TargetDescMemo::Mode();
+	DepthTargetMemo::Entry* memo = nullptr;
+	if (memo_mode != 0) {
+		HW::DepthRenderTarget key;
+		std::memcpy(&key, &z, sizeof(key));
+		bool hit = false;
+		memo     = &t_depth_target_memo.Lookup(key, 0, &hit);
+		if (hit) {
+			if (memo_mode == 2 &&
+			    !TargetDescMemo::SameImageDesc(MakeDepthTargetDesc(buffer, z), memo->value)) {
+				EXIT("KYTY_TARGET_DESC_MEMO=2: kept depth target description differs: "
+				     "z=0x%010" PRIx64 "\n",
+				     z.z_read_base_addr);
+			}
+		} else {
+			DepthTargetMemo::Store(*memo, key, MakeDepthTargetDesc(buffer, z));
+		}
+		r.desc = memo->value;
+	} else {
+		r.desc = MakeDepthTargetDesc(buffer, z);
+	}
 	r.depth_clear_enable      = rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
@@ -347,7 +378,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	r.image_id = cache.FindImage(r.desc, false, memo != nullptr ? &memo->find[0] : nullptr);
 	BindRenderTarget(r.image_id);
 }
 
