@@ -27,10 +27,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -49,6 +52,275 @@ static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
 }
+
+// KYTY_EOP_AT_GPU=1 (default 0): RELEASE_MEM labels reach guest memory when the host GPU has
+// completed the work recorded before the packet, in stream order, instead of when the command
+// processor reads the packet. The label write joins the interrupt in one priority operation of the
+// command scheduler, whose single runner takes them in queue order once the master semaphore
+// reached the packet's tick: delivery order = release order, one write per release (no merge).
+// Until then the label is "pending": GPU-side readers keep today's view (label written at release)
+// through the pending table: command-processor reads (WAIT_REG_MEM, COND_EXEC, branch, predication)
+// and buffer-cache uploads of guest memory overlay the pending bytes, so the front never waits for
+// its own end of pipe and later recorded work still sees the label. Labels on GPU-modified pages
+// keep the immediate GPU-owned path (a guest sees them only through a readback, which waits for
+// this point of the command stream). Timestamp labels (data_sel 3) keep the reference clock read
+// with the packet, as with 0: only their delivery waits for completion.
+// =2 (verify): labels are written immediately as with 0; the pending table and the completion
+// operations run as with 1 and check the delivery order, that the label bytes reached memory, and
+// that overlays agree with memory. Counters: "PERF eop" lines (KYTY_PERF_STATS=1).
+namespace {
+
+int EopAtGpuMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_EOP_AT_GPU");
+		return value != nullptr ? static_cast<int>(std::strtol(value, nullptr, 10)) : 0;
+	}();
+	return mode;
+}
+
+// KYTY_EOP_AT_GPU_FLUSH=1 (with KYTY_EOP_AT_GPU=1, default 0): submit the command buffer after
+// each deferred label, so the guest does not wait for the end of the slice to see it.
+bool EopFlushEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EOP_AT_GPU_FLUSH");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+uint64_t EopNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+struct EopStats {
+	std::atomic<uint64_t> deferred {0};       // labels written at completion
+	std::atomic<uint64_t> gpu_owned {0};      // labels kept on the immediate GPU-owned path
+	std::atomic<uint64_t> gds {0};            // GDS labels (drained, then written)
+	std::atomic<uint64_t> interrupts {0};
+	std::atomic<uint64_t> fixups {0};         // completions that found the bytes GPU-owned
+	std::atomic<uint64_t> fallback {0};       // completions outside the backing, rewritten by the GPU thread
+	std::atomic<uint64_t> latency_ns {0};     // packet to label delivery
+	std::atomic<uint64_t> latency_max_ns {0};
+	std::atomic<uint64_t> front_reads {0};    // front reads that hit a pending label
+	std::atomic<uint64_t> front_passes {0};   // ... WAIT_REG_MEM that passed only because of it
+	std::atomic<uint64_t> upload_overlays {0}; // buffer uploads that covered a pending label
+	std::atomic<uint64_t> order_errors {0};   // delivery order differs from release order
+	std::atomic<uint64_t> value_errors {0};   // label bytes not in memory after delivery
+	std::atomic<uint64_t> overlay_diffs {0};  // verify: overlay and memory disagree
+	std::atomic<uint64_t> overwritten {0};    // verify: guest rewrote the label before completion
+	std::atomic<uint64_t> checked {0};        // completions checked
+};
+
+EopStats g_eop_stats;
+
+void NoteLatency(uint64_t released_ns) {
+	const auto latency = EopNowNs() - released_ns;
+	g_eop_stats.latency_ns.fetch_add(latency, std::memory_order_relaxed);
+	auto max = g_eop_stats.latency_max_ns.load(std::memory_order_relaxed);
+	while (latency > max && !g_eop_stats.latency_max_ns.compare_exchange_weak(max, latency, std::memory_order_relaxed)) {
+	}
+}
+
+// Released labels by address: the value of the latest one, how many are pending (released, not yet
+// written to guest memory) and the sequence of the latest release, so a GPU-thread fix-up never
+// replaces a newer label.
+class PendingLabels {
+public:
+	uint64_t Add(uint64_t address, uint32_t size, uint64_t value, bool pending) {
+		std::lock_guard lock(m_mutex);
+		if (m_entries.size() > 4096) {
+			std::erase_if(m_entries, [](const auto& item) { return item.second.pending == 0; });
+		}
+		auto& entry  = m_entries[address];
+		entry.value  = value;
+		entry.size   = size;
+		entry.latest = ++m_seq;
+		if (pending) {
+			entry.pending++;
+			m_pending.fetch_add(1, std::memory_order_release);
+		}
+		return entry.latest;
+	}
+
+	void Delivered(uint64_t address) {
+		std::lock_guard lock(m_mutex);
+		auto            it = m_entries.find(address);
+		if (it != m_entries.end() && it->second.pending != 0) {
+			it->second.pending--;
+			m_pending.fetch_sub(1, std::memory_order_release);
+		}
+	}
+
+	// No label was released at `address` after the one with sequence `seq`.
+	[[nodiscard]] bool IsLatest(uint64_t address, uint64_t seq) {
+		std::lock_guard lock(m_mutex);
+		auto            it = m_entries.find(address);
+		return it == m_entries.end() || it->second.latest == seq;
+	}
+
+	[[nodiscard]] bool AnyPending() const noexcept { return m_pending.load(std::memory_order_acquire) != 0; }
+
+	// A pending label overlaps [address, address + size).
+	[[nodiscard]] bool HasPending(uint64_t address, uint64_t size) {
+		if (!AnyPending()) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		bool            hit = false;
+		ForEachPending(address, size, [&hit](uint64_t, const Entry&) { hit = true; });
+		return hit;
+	}
+
+	// Overlays the pending label bytes on `bytes`, a copy of guest memory [address, address + size).
+	[[nodiscard]] bool Overlay(uint64_t address, uint64_t size, uint8_t* bytes) {
+		if (!AnyPending()) {
+			return false;
+		}
+		bool            hit = false;
+		std::lock_guard lock(m_mutex);
+		ForEachPending(address, size, [&](uint64_t base, const Entry& entry) {
+			const auto begin = std::max(base, address);
+			const auto end   = std::min(base + entry.size, address + size);
+			for (auto byte = begin; byte < end; byte++) {
+				bytes[byte - address] = static_cast<uint8_t>(entry.value >> (8u * (byte - base)));
+			}
+			hit = true;
+		});
+		return hit;
+	}
+
+private:
+	struct Entry {
+		uint64_t value   = 0;
+		uint64_t latest  = 0;
+		uint32_t size    = 0;
+		uint32_t pending = 0;
+	};
+
+	template <typename Func>
+	void ForEachPending(uint64_t address, uint64_t size, Func&& func) {
+		// Labels are at most 8 bytes: one that starts up to 7 bytes before the range can overlap it.
+		for (auto it = m_entries.lower_bound(address >= 7 ? address - 7 : 0);
+		     it != m_entries.end() && it->first < address + size; ++it) {
+			if (it->second.pending != 0 && it->first + it->second.size > address) {
+				func(it->first, it->second);
+			}
+		}
+	}
+
+	std::mutex                    m_mutex;
+	std::map<uint64_t, Entry>     m_entries;
+	std::atomic<uint32_t>         m_pending {0};
+	uint64_t                      m_seq = 0;
+};
+
+PendingLabels         g_pending_labels;
+std::atomic<uint64_t> g_eop_next_order {0}; // release order (GPU thread)
+uint64_t              g_eop_delivered_order = 0; // delivery order (priority runner only)
+
+void CheckOrder(uint64_t order) {
+	if (order != g_eop_delivered_order) {
+		g_eop_stats.order_errors.fetch_add(1, std::memory_order_relaxed);
+	}
+	g_eop_delivered_order = order + 1;
+}
+
+// Front read of a value that may be a pending label (WAIT_REG_MEM, COND_EXEC, branch, predication).
+template <typename T>
+T ReadFrontValue(const volatile T* address, bool* from_pending) {
+	T value       = *address;
+	*from_pending = false;
+	if (EopAtGpuMode() == 0 || !g_pending_labels.AnyPending()) {
+		return value;
+	}
+	uint8_t bytes[sizeof(T)];
+	std::memcpy(bytes, &value, sizeof(T));
+	if (g_pending_labels.Overlay(reinterpret_cast<uint64_t>(address), sizeof(T), bytes)) {
+		T pending_value {};
+		std::memcpy(&pending_value, bytes, sizeof(T));
+		*from_pending = true;
+		g_eop_stats.front_reads.fetch_add(1, std::memory_order_relaxed);
+		if (EopAtGpuMode() == 2) {
+			// The label is already in memory: the overlay must agree unless the guest rewrote it.
+			if (pending_value != value) {
+				g_eop_stats.overlay_diffs.fetch_add(1, std::memory_order_relaxed);
+			}
+			return value;
+		}
+		return pending_value;
+	}
+	return value;
+}
+
+} // namespace
+
+namespace EopAtGpu {
+
+bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept {
+	if (EopAtGpuMode() == 0 || !g_pending_labels.AnyPending()) {
+		return false;
+	}
+	if (EopAtGpuMode() == 2) {
+		if (size <= 64) {
+			uint8_t copy[64];
+			std::memcpy(copy, bytes, size);
+			if (g_pending_labels.Overlay(address, size, copy)) {
+				g_eop_stats.upload_overlays.fetch_add(1, std::memory_order_relaxed);
+				if (std::memcmp(copy, bytes, size) != 0) {
+					g_eop_stats.overlay_diffs.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+		} else if (g_pending_labels.HasPending(address, size)) {
+			g_eop_stats.upload_overlays.fetch_add(1, std::memory_order_relaxed);
+		}
+		return false;
+	}
+	if (g_pending_labels.Overlay(address, size, static_cast<uint8_t*>(bytes))) {
+		g_eop_stats.upload_overlays.fetch_add(1, std::memory_order_relaxed);
+		return true;
+	}
+	return false;
+}
+
+uint32_t ReadFront32(const volatile uint32_t* address) noexcept {
+	bool from_pending = false;
+	return ReadFrontValue<uint32_t>(address, &from_pending);
+}
+
+uint64_t ReadFront64(const volatile uint64_t* address) noexcept {
+	bool from_pending = false;
+	return ReadFrontValue<uint64_t>(address, &from_pending);
+}
+
+bool Enabled() noexcept {
+	return EopAtGpuMode() != 0;
+}
+
+void Report(double seconds) {
+	if (EopAtGpuMode() == 0 || seconds <= 0.0) {
+		return;
+	}
+	auto&      st       = g_eop_stats;
+	const auto take     = [](std::atomic<uint64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
+	const auto deferred = take(st.deferred);
+	const auto latency  = take(st.latency_ns);
+	const auto checked  = take(st.checked);
+	std::printf("PERF eop %.1fs mode=%d: deferred=%.0f/s gpu_owned=%.0f/s gds=%" PRIu64 " interrupts=%.0f/s"
+	            " latency=%.3fms(max %.2fms) fixups=%" PRIu64 " fallback=%" PRIu64 " front=%" PRIu64
+	            "(passes %" PRIu64 ") uploads=%" PRIu64 " check: checked=%" PRIu64 " order_err=%" PRIu64
+	            " value_err=%" PRIu64 " overlay_diff=%" PRIu64 " overwritten=%" PRIu64 "\n",
+	            seconds, EopAtGpuMode(), static_cast<double>(deferred) / seconds,
+	            static_cast<double>(take(st.gpu_owned)) / seconds, take(st.gds),
+	            static_cast<double>(take(st.interrupts)) / seconds,
+	            checked != 0 ? static_cast<double>(latency) / 1e6 / static_cast<double>(checked) : 0.0,
+	            static_cast<double>(take(st.latency_max_ns)) / 1e6, take(st.fixups), take(st.fallback),
+	            take(st.front_reads), take(st.front_passes), take(st.upload_overlays), checked,
+	            take(st.order_errors), take(st.value_errors), take(st.overlay_diffs), take(st.overwritten));
+}
+
+} // namespace EopAtGpu
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -329,8 +601,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	bool       from_pending = false;
+	const auto value        = ReadFrontValue<T>(addr, &from_pending);
+	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
+	} else if (from_pending && EopAtGpuMode() == 1 && !TestWaitRegMemValue(*addr, ref, mask, func)) {
+		g_eop_stats.front_passes.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -911,7 +1187,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+		{
+			bool from_pending = false;
+			value = ReadFrontValue<uint64_t>(reinterpret_cast<const volatile uint64_t*>(address), &from_pending);
+		}
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -1164,16 +1443,28 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
+	const int eop_mode = EopAtGpuMode();
+	if (eop_mode == 1) {
+		ReleaseMemAtGpu(data_sel, interrupt, address, data, interrupt_context_id);
+		return;
+	}
+
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
+	uint32_t label_size = 0;
 	switch (data_sel) {
 		case 0: break;
 		case 1: {
 			const auto value = static_cast<uint32_t>(data);
 			WriteEopLabel(address, &value, sizeof(value));
+			label_size = sizeof(value);
+			data       = value;
 			break;
 		}
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
-		case 2: WriteEopLabel(address, &data, sizeof(data)); break;
+		case 2:
+			WriteEopLabel(address, &data, sizeof(data));
+			label_size = sizeof(data);
+			break;
 		case 5: {
 			GetScheduler().Finish();
 			const auto gds = static_cast<uint32_t>(data);
@@ -1184,12 +1475,160 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
 	}
 
+	if (eop_mode == 2) {
+		// Verify: the label is already in memory. It is also entered in the pending table (so the
+		// overlays are exercised and compared with memory), and the completion checks the delivery
+		// order and whether the guest rewrote the label before the host GPU got there.
+		auto&      st            = g_eop_stats;
+		const auto address_value = reinterpret_cast<uint64_t>(address);
+		const auto order         = g_eop_next_order.fetch_add(1, std::memory_order_relaxed);
+		uint64_t   seq           = 0;
+		if (label_size != 0) {
+			uint64_t memory = 0;
+			if (Libs::LibKernel::Memory::TryReadBacking(address_value, &memory, label_size) &&
+			    std::memcmp(&memory, &data, label_size) != 0) {
+				st.value_errors.fetch_add(1, std::memory_order_relaxed);
+			}
+			seq = g_pending_labels.Add(address_value, label_size, data, true);
+		}
+		const auto released_ns = EopNowNs();
+		GetScheduler().DeferPriorityOperation([&renderer = m_renderer, event_id = m_interrupt_event_id,
+		                                       interrupt_context_id, interrupt, address_value, label_size,
+		                                       value = data, seq, order, released_ns] {
+			auto& st = g_eop_stats;
+			CheckOrder(order);
+			if (label_size != 0) {
+				NoteLatency(released_ns);
+				st.checked.fetch_add(1, std::memory_order_relaxed);
+				uint64_t memory = 0;
+				if (g_pending_labels.IsLatest(address_value, seq) &&
+				    Libs::LibKernel::Memory::TryReadBacking(address_value, &memory, label_size) &&
+				    std::memcmp(&memory, &value, label_size) != 0) {
+					st.overwritten.fetch_add(1, std::memory_order_relaxed);
+				}
+				g_pending_labels.Delivered(address_value);
+			}
+			if (interrupt) {
+				st.interrupts.fetch_add(1, std::memory_order_relaxed);
+				renderer.TriggerInterrupt(event_id, interrupt_context_id);
+			}
+		});
+		return;
+	}
+
 	// GuestGpu::Process's end-of-slice flush submits the work this interrupt waits on.
 	if (interrupt) {
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, event_id = m_interrupt_event_id, interrupt_context_id] {
 			    renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		    });
+	}
+}
+
+// KYTY_EOP_AT_GPU=1: see EopAtGpuMode. The completion operation captures the render context, not
+// this processor: priority operations can still run while the guest GPU shuts down.
+void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* address, uint64_t data,
+                                       uint32_t interrupt_context_id) {
+	auto&      st            = g_eop_stats;
+	const auto address_value = reinterpret_cast<uint64_t>(address);
+	uint32_t   label_size    = 0;
+	bool       ref_clock     = false;
+	switch (data_sel) {
+		case 0: break;
+		case 1:
+			label_size = sizeof(uint32_t);
+			data       = static_cast<uint32_t>(data);
+			break;
+		case 3: ref_clock = true; [[fallthrough]];
+		case 2: label_size = sizeof(uint64_t); break;
+		case 5: {
+			// The GDS bytes are read once all earlier work completed and every earlier label was
+			// delivered (nothing older stays pending), then written at once.
+			GetScheduler().Finish();
+			GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick() - 1);
+			const auto gds = static_cast<uint32_t>(data);
+			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
+			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
+			st.gds.fetch_add(1, std::memory_order_relaxed);
+			break;
+		}
+		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
+	}
+
+	bool     deferred = false;
+	uint64_t seq      = 0;
+	uint64_t value    = data;
+	if (label_size != 0) {
+		value = ref_clock ? Sync::ReadReferenceClock() : data;
+		// A GPU-modified destination keeps the immediate GPU-owned path: the guest reads it only
+		// through a readback, which waits for this point of the command stream. Not while an older
+		// label to these bytes is pending: that one would land after this one.
+		if (GpuOwnedEopLabelEnabled() && !g_pending_labels.HasPending(address_value, label_size) &&
+		    m_renderer.GetBufferCache().WriteGpuOwned(address_value, &value, label_size)) {
+			m_renderer.GetTextureCache().InvalidateMemory(address_value, label_size);
+			seq = g_pending_labels.Add(address_value, label_size, value, false);
+			st.gpu_owned.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			seq      = g_pending_labels.Add(address_value, label_size, value, true);
+			deferred = true;
+		}
+	}
+	if (!deferred && !interrupt) {
+		return;
+	}
+	const auto order       = g_eop_next_order.fetch_add(1, std::memory_order_relaxed);
+	const auto released_ns = EopNowNs();
+	GetScheduler().DeferPriorityOperation([&renderer = m_renderer, event_id = m_interrupt_event_id,
+	                                       interrupt_context_id, interrupt, deferred, address_value,
+	                                       label_size, value, seq, order, released_ns] {
+		auto& st = g_eop_stats;
+		CheckOrder(order);
+		if (deferred) {
+			// End-of-pipe timestamps keep the clock read with the packet (as with 0). Read now,
+			// every packet of a command buffer would get the buffer's end time and the guest's
+			// pass timings would collapse; games that size their work from them then add work.
+			const uint64_t label  = value;
+			const auto     result = renderer.WriteCompletedLabel(address_value, &label, label_size);
+			if (result == RenderContext::CompletedWrite::NotBacking &&
+			    !renderer.IsMapped(address_value, label_size)) {
+				// Untracked memory outside the backing: a plain store cannot need the GPU thread.
+				std::memcpy(reinterpret_cast<void*>(address_value), &label, label_size);
+			} else if (result != RenderContext::CompletedWrite::Done) {
+				// A readback of GPU-written bytes would overwrite the label (or it lies outside the
+				// backing): the GPU thread writes it again, in front of any later fault readback of
+				// the page, unless a newer label to these bytes was released meanwhile.
+				(result == RenderContext::CompletedWrite::GpuOwned ? st.fixups : st.fallback)
+				    .fetch_add(1, std::memory_order_relaxed);
+				renderer.TrySendGpuCommand([&renderer, address_value, label_size, label, seq] {
+					if (!g_pending_labels.IsLatest(address_value, seq)) {
+						return;
+					}
+					if (GpuOwnedEopLabelEnabled() &&
+					    renderer.GetBufferCache().WriteGpuOwned(address_value, &label, label_size)) {
+						renderer.GetTextureCache().InvalidateMemory(address_value, label_size);
+						return;
+					}
+					std::memcpy(reinterpret_cast<void*>(address_value), &label, label_size);
+				});
+			} else {
+				uint64_t memory = 0;
+				if (Libs::LibKernel::Memory::TryReadBacking(address_value, &memory, label_size) &&
+				    std::memcmp(&memory, &label, label_size) != 0) {
+					st.value_errors.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			g_pending_labels.Delivered(address_value);
+			st.deferred.fetch_add(1, std::memory_order_relaxed);
+			st.checked.fetch_add(1, std::memory_order_relaxed);
+			NoteLatency(released_ns);
+		}
+		if (interrupt) {
+			st.interrupts.fetch_add(1, std::memory_order_relaxed);
+			renderer.TriggerInterrupt(event_id, interrupt_context_id);
+		}
+	});
+	if (deferred && EopFlushEnabled()) {
+		GetScheduler().Flush();
 	}
 }
 

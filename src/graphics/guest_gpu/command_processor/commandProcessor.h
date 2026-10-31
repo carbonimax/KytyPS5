@@ -121,6 +121,8 @@ public:
 
 private:
 	void WriteEopLabel(void* dst, const void* data, uint64_t size);
+	void ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* address, uint64_t data,
+	                     uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();
