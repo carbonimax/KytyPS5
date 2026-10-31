@@ -214,11 +214,11 @@ void MaybeReport() noexcept {
 	if (const auto walk = ShaderRecompiler::IR::TakeWalkStats(); walk.walks != 0 || walk.reuse_checks != 0) {
 		std::printf("PERF srtwalk %.1fs: walk=%.0fms(%" PRIu64 ") backing_reads=%" PRIu64
 		            " fault_reads=%" PRIu64 " protected_calls=%" PRIu64 "(%.0fms,synced=%" PRIu64 ") evictions=%" PRIu64
-		            " reuse=%" PRIu64 "/%" PRIu64 "(%.0fms,diffs=%" PRIu64 ")\n",
+		            " reuse=%" PRIu64 "/%" PRIu64 "(%.0fms,diffs=%" PRIu64 ") fast_diffs=%" PRIu64 "/%" PRIu64 "\n",
 		            seconds, static_cast<double>(walk.ns) / 1e6, walk.walks, walk.backing_reads,
 		            walk.fault_reads, walk.protected_calls, static_cast<double>(walk.protected_ns) / 1e6,
 		            walk.protected_synced, walk.protected_evictions, walk.reuse_hits, walk.reuse_checks,
-		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
+		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs, walk.fast_diffs, walk.fast_checks);
 	}
 	CmdRecord::Report(seconds);
 	CpSplitProf::Report(seconds);

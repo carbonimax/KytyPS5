@@ -193,6 +193,8 @@ std::atomic<uint64_t> g_reuse_checks {0};
 std::atomic<uint64_t> g_reuse_hits {0};
 std::atomic<uint64_t> g_reuse_ns {0};
 std::atomic<uint64_t> g_reuse_diffs {0};
+std::atomic<uint64_t> g_fast_checks {0};
+std::atomic<uint64_t> g_fast_diffs {0};
 
 bool ProtectedLoadsEnabled() {
 	static const bool enabled = [] {
@@ -239,7 +241,38 @@ uint64_t KYTY_SYSV_ABI ProtectedLoad(uint64_t address) {
 // With KYTY_SRT_PROTECTED_LOADS (default 1), loads from pages that faulted on a tracker protection
 // before call ProtectedLoad instead of faulting again (a Windows exception costs microseconds).
 // Free here: rax, rcx, r9, r11; live: rdi, rsi, rdx, r8 and the address in r10.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
+// With a stub (KYTY_SRT_WALK_FAST), the call sequence is the code's one shared copy
+// (EmitProtectedLoadStub) instead of one per load.
+void EmitProtectedLoadCall(Xbyak::CodeGenerator& code) {
+	code.push(code.rbp);
+	code.mov(code.rbp, code.rsp);
+	code.and_(code.rsp, -16);
+	code.push(code.rdi);
+	code.push(code.rsi);
+	code.push(code.rdx);
+	code.push(code.r8);
+	code.push(code.r10);
+	code.sub(code.rsp, 8);
+	code.mov(code.rdi, code.r10);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&ProtectedLoad));
+	code.call(code.rax);
+	code.add(code.rsp, 8);
+	code.pop(code.r10);
+	code.pop(code.r8);
+	code.pop(code.rdx);
+	code.pop(code.rsi);
+	code.pop(code.rdi);
+	code.mov(code.rsp, code.rbp);
+	code.pop(code.rbp);
+}
+
+void EmitProtectedLoadStub(Xbyak::CodeGenerator& code, Xbyak::Label& stub) {
+	code.L(stub);
+	EmitProtectedLoadCall(code);
+	code.ret();
+}
+
+void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, const Xbyak::Label* stub = nullptr) {
 	code.lea(code.r10, code.ptr[address]);
 	if (ProtectedLoadsEnabled()) {
 		Xbyak::Label direct, done;
@@ -251,26 +284,11 @@ void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
 		code.mov(code.r11, reinterpret_cast<uint64_t>(g_protected_pages.data()));
 		code.cmp(code.qword[code.r11 + code.r9 * 8], code.rcx);
 		code.jne(direct, Xbyak::CodeGenerator::T_NEAR);
-		code.push(code.rbp);
-		code.mov(code.rbp, code.rsp);
-		code.and_(code.rsp, -16);
-		code.push(code.rdi);
-		code.push(code.rsi);
-		code.push(code.rdx);
-		code.push(code.r8);
-		code.push(code.r10);
-		code.sub(code.rsp, 8);
-		code.mov(code.rdi, code.r10);
-		code.mov(code.rax, reinterpret_cast<uint64_t>(&ProtectedLoad));
-		code.call(code.rax);
-		code.add(code.rsp, 8);
-		code.pop(code.r10);
-		code.pop(code.r8);
-		code.pop(code.rdx);
-		code.pop(code.rsi);
-		code.pop(code.rdi);
-		code.mov(code.rsp, code.rbp);
-		code.pop(code.rbp);
+		if (stub != nullptr) {
+			code.call(*stub);
+		} else {
+			EmitProtectedLoadCall(code);
+		}
 		code.bt(code.rax, 32);
 		code.jc(done, Xbyak::CodeGenerator::T_NEAR);
 		code.L(direct);
@@ -480,7 +498,10 @@ private:
 // rdx scratch, r8 capture cursor.
 class WalkerCompiler {
 public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+	// fast (KYTY_SRT_WALK_FAST): callers skip the call to a thunk whose value is already known, and
+	// loads share one protected-load call sequence. Same layout, loads and results either way.
+	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code, bool fast)
+	    : m_plan(plan), m_code(code), m_fast(fast) {}
 
 	void Compile(std::span<const Value> values);
 
@@ -550,6 +571,8 @@ private:
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	Xbyak::Label                                      m_ret;
+	Xbyak::Label                                      m_protected_stub;
+	const bool                                        m_fast;
 	uint32_t m_shader_base = 0, m_reach = 0, m_restart = 0, m_states = 0, m_states_end = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 };
@@ -849,9 +872,16 @@ void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown)
 		c.jmp(unknown, Near);
 	} else if (operand.kind == Kind::Node) {
 		auto& node = m_nodes[operand.value];
+		// State 2 = the value is known: the thunk would only return.
+		Xbyak::Label known;
+		if (m_fast) {
+			c.cmp(c.byte[c.rdx + node.state], 2);
+			c.je(known, Xbyak::CodeGenerator::T_SHORT);
+		}
 		c.call(node.label);
 		c.cmp(c.byte[c.rdx + node.state], 2);
 		c.jne(unknown, Near);
+		if (m_fast) c.L(known);
 	}
 }
 
@@ -1043,7 +1073,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.mov(c.rcx, c.rax);
 			c.shr(c.rcx, 48);
 			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
+			LoadGuest(c, c.rax, m_fast ? &m_protected_stub : nullptr);
 		} else {
 			Load(c.r11, args[1]);
 			c.shr(c.r11d, 16);
@@ -1073,7 +1103,7 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
+			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate), m_fast ? &m_protected_stub : nullptr);
 		}
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
@@ -1470,6 +1500,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
 		if (Thunk(index)) EmitNode(index);
 	}
+	if (m_fast && ProtectedLoadsEnabled()) EmitProtectedLoadStub(c, m_protected_stub);
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures * (WalkReuseMode() != 0 ? 2u : 1u), 0u);
 	m_plan.srt_user_data = m_user_data;
 	m_plan.srt_restart   = m_restart;
@@ -1480,9 +1511,25 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 } // namespace
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
+	const auto fast = WalkFastMode();
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	plan.srt_memo_loads = UINT32_MAX;
-	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+	WalkerCompiler(plan, *plan.srt_code, fast != 0).Compile(values);
+	if (fast == 2u) {
+		// The same plan compiled the classic way: WalkSrt runs it after each walk and compares.
+		plan.srt_code_check = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+		WalkerCompiler(plan, *plan.srt_code_check, false).Compile(values);
+	} else {
+		plan.srt_code_check.reset();
+	}
+}
+
+uint32_t WalkFastMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_SRT_WALK_FAST");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 2)) : 1u;
+	}();
+	return mode;
 }
 
 uint32_t WalkReuseMode() noexcept {
@@ -1555,6 +1602,36 @@ void LogReuseMismatch(const ResourcePlan& plan, const char* what, size_t index, 
 	}
 }
 
+// KYTY_SRT_WALK_FAST=2: runs the classic walker on the inputs of the walk that just ran and
+// compares its result, scratch (values, states, descriptors, captures) and flat buffer.
+void CheckFastWalk(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
+                   const uint64_t* end) {
+	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
+	const auto* base = plan.srt_scratch.data();
+	const std::vector<uint64_t> fast_scratch(base, end != nullptr ? end : base + plan.srt_scratch.size());
+	const std::vector<uint32_t> fast_flat = flat;
+	t_running_walker = plan.srt_code_check.get();
+	const auto* check = plan.srt_code_check->getCode<Walker>()(runtime.user_data.data(), flat.data(),
+	                                                             plan.srt_scratch.data(), runtime.shader_base);
+	t_running_walker = nullptr;
+	g_fast_checks.fetch_add(1, std::memory_order_relaxed);
+	bool same = check == end;
+	if (!same) LogReuseMismatch(plan, "fast end", 0, end != nullptr ? end - base : ~0ull, check != nullptr ? check - base : ~0ull);
+	for (size_t i = 0; same && i < fast_scratch.size(); ++i) {
+		if (fast_scratch[i] != plan.srt_scratch[i]) {
+			same = false;
+			LogReuseMismatch(plan, "fast scratch", i, fast_scratch[i], plan.srt_scratch[i]);
+		}
+	}
+	for (size_t i = 0; same && i < flat.size(); ++i) {
+		if (fast_flat[i] != flat[i]) {
+			same = false;
+			LogReuseMismatch(plan, "fast flat", i, fast_flat[i], flat[i]);
+		}
+	}
+	if (!same) g_fast_diffs.fetch_add(1, std::memory_order_relaxed);
+}
+
 } // namespace
 
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
@@ -1597,6 +1674,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	if (plan.srt_code_check != nullptr) CheckFastWalk(plan, runtime, flat, end);
 	if (timed) {
 		g_walks.fetch_add(1, std::memory_order_relaxed);
 		g_walk_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1723,7 +1801,9 @@ WalkStats TakeWalkStats() noexcept {
 	        .reuse_checks = g_reuse_checks.exchange(0, std::memory_order_relaxed),
 	        .reuse_hits   = g_reuse_hits.exchange(0, std::memory_order_relaxed),
 	        .reuse_ns     = g_reuse_ns.exchange(0, std::memory_order_relaxed),
-	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed)};
+	        .reuse_diffs  = g_reuse_diffs.exchange(0, std::memory_order_relaxed),
+	        .fast_checks  = g_fast_checks.exchange(0, std::memory_order_relaxed),
+	        .fast_diffs   = g_fast_diffs.exchange(0, std::memory_order_relaxed)};
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {
