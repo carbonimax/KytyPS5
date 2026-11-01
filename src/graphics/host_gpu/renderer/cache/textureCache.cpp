@@ -1293,103 +1293,51 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
-ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+uint32_t TextureCache::FindImageMemoMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_FIND_IMAGE_MEMO");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return mode;
+}
+
+// KYTY_FIND_IMAGE_MEMO. A search is kept only when its result came straight from the candidate
+// scan (same backing, or the stencil plane of a depth image), no candidate could block-alias the
+// description, and nothing was inserted, freed or merged. Its outcome then depends only on the
+// description (identical, by the caller's contract), the candidate list and, per candidate,
+// fields that change only together with m_image_index_epoch (registration, range, stencil
+// association, which also rewrites the record's info). While the epoch is unchanged the same
+// search gives the same image, so a hit skips the description checks and the scan. The per-bind
+// rest (view offset, access tick, LRU touch, metadata clears, video-out check) still runs.
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMemo* memo) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
-	ValidateImageDesc(desc);
-	EXIT_IF(desc.info.data.Empty());
+	const auto memo_mode           = memo != nullptr ? FindImageMemoMode() : 0u;
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		// Stays valid below: only FindImage (not reentrant, m_lock) rewrites cached lists.
-		const auto& candidates =
-		    FindImageCandidates(desc.info.data.address, desc.info.data.size);
-		bool block_alias = false;
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			// Stencil descriptors name the associated plane; its depth owner supplies
-			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
-				result = id;
-				break;
-			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			} else if (image.SafeToDownload() &&
-			           BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
-			}
+		bool             memo_hit = false;
+		if (memo_mode != 0 && memo->id && memo->epoch == m_image_index_epoch) {
+			const auto* kept = m_slot_images.try_get(memo->id);
+			memo_hit         = kept != nullptr && kept->registered;
 		}
-
-		if (!result) {
-			for (const auto candidate: candidates) {
-				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result = overlap.image;
-				}
+		if (memo_hit && memo_mode == 1) {
+			result = memo->id;
+		} else {
+			const auto kept_id = memo_hit ? memo->id : ImageId {};
+			result = FindImageLocked(command, desc, exact_format, memo_mode != 0 ? memo : nullptr);
+			if (memo_hit && (kept_id != result || memo->id != result)) {
+				EXIT("KYTY_FIND_IMAGE_MEMO=2: kept image %u, search gives %u (keepable %d) "
+				     "addr=0x%010" PRIx64 " size=0x%" PRIx64 "\n",
+				     static_cast<uint32_t>(kept_id.index), static_cast<uint32_t>(result.index),
+				     memo->id ? 1 : 0, desc.info.data.address, desc.info.data.size);
 			}
-			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
-			// and only one extent at an address holds data, so heap lookups create no second one.
-			if (!result && desc.heap &&
-			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
-				    const auto* image = m_slot_images.try_get(id);
-				    return image != nullptr && image->registered &&
-					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
-					       image->info.data.address == desc.info.data.address &&
-					       image->info.type == desc.info.type &&
-					       image->info.extent != desc.info.extent;
-			    })) {
+			if (!result) {
 				return {};
-			}
-		} else if (block_alias) {
-			for (const auto candidate: candidates) {
-				const auto& owner = m_slot_images[candidate];
-				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
-				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
-					BcAlias::Resolve(*this, candidate, result);
-				}
-			}
-		}
-
-		if (result && !m_slot_images[result].depth_id) {
-			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
-				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
-				result = {};
-			}
-		}
-		if (!result) {
-			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
-			}
-			if (MsaaZeroInit() && inserted.info.samples > 1 && !inserted.info.IsDepth() &&
-			    inserted.backing.image != nullptr && inserted.backing.layers != 0) {
-				// Defines the native image only; guest bytes are untouched. ClearImage commits a
-				// GPU write, which drops BufferModified (never uploaded for multisampled images).
-				vk::ClearValue zero {};
-				zero.color = vk::ClearColorValue {};
-				ClearImage(command, result, inserted.backing.format,
-				           {vk::ImageAspectFlagBits::eColor, 0, inserted.info.resources.levels, 0,
-				            inserted.backing.layers},
-				           zero);
 			}
 		}
 		auto& image = m_slot_images[result];
@@ -1419,6 +1367,118 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			EXIT("TextureCache: compressed video-out read requires clean native GPU "
 			     "contents\n");
 		}
+	}
+	return result;
+}
+
+// The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for
+// another extent. memo (if any) is filled when the result may be kept, cleared otherwise.
+ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
+                                      FindImageMemo* memo) {
+	ValidateImageDesc(desc);
+	EXIT_IF(desc.info.data.Empty());
+
+	ImageId result {};
+	bool    keepable = true;
+	{
+		// Stays valid below: only FindImage (not reentrant, m_lock) rewrites cached lists.
+		const auto& candidates =
+		    FindImageCandidates(desc.info.data.address, desc.info.data.size);
+		bool block_alias = false;
+
+		for (const auto id: candidates) {
+			const auto& image = m_slot_images[id];
+			// Stencil descriptors name the associated plane; its depth owner supplies
+			// the native image and the canonical guest tiling.
+			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+			    image.depth_id && image.info.data == desc.info.data &&
+			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+			    image.info.resources.levels >= desc.info.resources.levels &&
+			    image.info.resources.layers >= desc.info.resources.layers &&
+			    desc.info.bytes_per_block == 1 &&
+			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+				result = id;
+				break;
+			}
+			if (SameBacking(image.info, desc.info, exact_format)) {
+				result = id;
+			} else if (BcAlias::Matches(desc.info, image.info)) {
+				// SafeToDownload changes without an epoch bump: a possible alias is not kept.
+				keepable = false;
+				if (image.SafeToDownload()) {
+					block_alias = true;
+				}
+			}
+		}
+
+		if (!result) {
+			keepable = false;
+			for (const auto candidate: candidates) {
+				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				if (overlap.image) {
+					result = overlap.image;
+				}
+			}
+			// PS5: image heaps hold a descriptor per dynamic-resolution extent of a render target,
+			// and only one extent at an address holds data, so heap lookups create no second one.
+			if (!result && desc.heap &&
+			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+				    const auto* image = m_slot_images.try_get(id);
+				    return image != nullptr && image->registered &&
+					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+					       image->info.data.address == desc.info.data.address &&
+					       image->info.type == desc.info.type &&
+					       image->info.extent != desc.info.extent;
+			    })) {
+				if (memo != nullptr) {
+					*memo = {};
+				}
+				return {};
+			}
+		} else if (block_alias) {
+			for (const auto candidate: candidates) {
+				const auto& owner = m_slot_images[candidate];
+				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
+				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
+					BcAlias::Resolve(*this, candidate, result);
+				}
+			}
+		}
+
+		if (result && !m_slot_images[result].depth_id) {
+			auto& resolved = m_slot_images[result];
+			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+				result = {};
+			} else if (resolved.info.resources < desc.info.resources) {
+				FreeImage(result);
+				result = {};
+			}
+		}
+		if (!result) {
+			keepable       = false;
+			result         = InsertImage(desc.info);
+			auto& inserted = m_slot_images[result];
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+			                                    inserted.info.data.size)) {
+				inserted.MarkBufferModified();
+			}
+			if (MsaaZeroInit() && inserted.info.samples > 1 && !inserted.info.IsDepth() &&
+			    inserted.backing.image != nullptr && inserted.backing.layers != 0) {
+				// Defines the native image only; guest bytes are untouched. ClearImage commits a
+				// GPU write, which drops BufferModified (never uploaded for multisampled images).
+				vk::ClearValue zero {};
+				zero.color = vk::ClearColorValue {};
+				ClearImage(command, result, inserted.backing.format,
+				           {vk::ImageAspectFlagBits::eColor, 0, inserted.info.resources.levels, 0,
+				            inserted.backing.layers},
+				           zero);
+			}
+		}
+	}
+	if (memo != nullptr) {
+		*memo = keepable ? FindImageMemo {result, m_image_index_epoch} : FindImageMemo {};
 	}
 	return result;
 }

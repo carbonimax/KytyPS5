@@ -514,6 +514,8 @@ struct TextureDescMemoEntry {
 	ShaderRecompiler::IR::DescriptorValue value;
 	ShaderRecompiler::IR::ImageResource resource;
 	ResolvedTextureDesc                 resolved;
+	// The image FindImage gave for resolved.desc (KYTY_FIND_IMAGE_MEMO); reset with the entry.
+	TextureCache::FindImageMemo find;
 };
 
 // Direct-mapped, one per host thread that resolves textures (the GPU thread, and the
@@ -597,10 +599,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			}
 		}
 	}
-	ResolvedTextureDesc        resolved_storage;
-	const ResolvedTextureDesc* resolved = &resolved_storage;
+	ResolvedTextureDesc          resolved_storage;
+	const ResolvedTextureDesc*   resolved  = &resolved_storage;
+	TextureCache::FindImageMemo* find_memo = nullptr;
 	if (memo != nullptr) {
-		resolved = &memo->resolved;
+		resolved  = &memo->resolved;
+		find_memo = &memo->find;
 	} else {
 		if (!ResolveTextureDesc(m_context, resource, descriptor, resolved_storage)) {
 			return {.layout = vk::ImageLayout::eGeneral};
@@ -611,6 +615,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			entry.value    = value;
 			entry.resource = resource;
 			entry.resolved = resolved_storage;
+			entry.find     = {};
+			find_memo      = &entry.find;
 		}
 	}
 	const auto pixel_format = resolved->pixel_format;
@@ -619,7 +625,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto id = [&] {
 		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
-		return texture_cache.FindImage(desc, resolved->shader_conversion);
+		return texture_cache.FindImage(desc, resolved->shader_conversion, find_memo);
 	}();
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
