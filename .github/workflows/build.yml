@@ -226,8 +226,8 @@ jobs:
           # KYTY_MESH_EXPERIMENTAL. Set the repository variable MOLTENVK_SOURCE to "official" to bundle
           # the KhronosGroup release instead.
           MOLTENVK_SOURCE: ${{ vars.MOLTENVK_SOURCE || 'fork' }}
-          MOLTENVK_FORK_TAG: v1.4.2-kyty.1
-          MOLTENVK_FORK_SHA256: 1d9d44257a7d190b59f43e4f79315366ff3e42beb0b932a1529c7c82e3266c29
+          MOLTENVK_FORK_TAG: v1.4.2-kyty.2
+          MOLTENVK_FORK_SHA256: 4aae54bddf600aa3253870b924c706817f7a4651c00657d3433bca3f7371981d
           MOLTENVK_OFFICIAL_VERSION: v1.4.2
           MOLTENVK_OFFICIAL_SHA256: f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e
         run: |
