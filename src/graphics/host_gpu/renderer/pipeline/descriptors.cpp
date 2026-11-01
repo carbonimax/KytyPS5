@@ -37,8 +37,10 @@
 #include <atomic>
 #include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -480,6 +482,83 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+namespace {
+
+// What ResolveTexture derives from a T# and the shader's image resource alone, before the
+// texture cache lookup: the image and view descriptions and the formats the checks after the
+// lookup compare.
+struct ResolvedTextureDesc {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+};
+
+// KYTY_TEXTURE_DESC_MEMO (default 1; 0 = off; 2 = verify): ResolveTexture keeps the
+// description it derived for a (resource, T#) pair and reuses it the next time any draw binds
+// the same T# through an equal resource, skipping the descriptor decode, the tiled mip layout
+// (ImageInfo::UpdateSize) and the view setup. The description is a pure function of those
+// inputs; the texture cache lookup and every check against the image found still run per
+// bind. Image heap resources (which also depend on the guest mapping) are not kept. 2 = derive
+// anyway and exit on any difference with the kept description.
+uint32_t TextureDescMemoMode() noexcept {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_DESC_MEMO");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return mode;
+}
+
+struct TextureDescMemoEntry {
+	bool                                valid = false;
+	ShaderRecompiler::IR::DescriptorValue value;
+	ShaderRecompiler::IR::ImageResource resource;
+	ResolvedTextureDesc                 resolved;
+};
+
+// Direct-mapped, one per host thread that resolves textures (the GPU thread, and the
+// KYTY_CP_PIPELINE back thread): no lock, no shared state.
+constexpr size_t TextureDescMemoSlots = 4096;
+thread_local std::unique_ptr<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>
+    t_texture_desc_memo;
+
+size_t TextureDescMemoSlot(const ShaderRecompiler::IR::ImageResource& resource,
+                           const ShaderRecompiler::IR::DescriptorValue& value) noexcept {
+	uint64_t hash = 0x9e3779b97f4a7c15ull ^ value.dword_count;
+	for (const auto dword: value.dwords) {
+		hash = (hash ^ dword) * 0x100000001b3ull;
+		hash ^= hash >> 29u;
+	}
+	hash = (hash ^ reinterpret_cast<uintptr_t>(&resource)) * 0x9e3779b97f4a7c15ull;
+	return static_cast<size_t>(hash >> 40u) & (TextureDescMemoSlots - 1u);
+}
+
+bool SameResolvedTextureDesc(const ResolvedTextureDesc& a, const ResolvedTextureDesc& b) {
+	const auto& x = a.desc.info;
+	const auto& y = b.desc.info;
+	return a.pixel_format == b.pixel_format && a.view_format == b.view_format &&
+	       a.shader_conversion == b.shader_conversion && a.desc.type == b.desc.type &&
+	       a.desc.heap == b.desc.heap && a.desc.view_info == b.desc.view_info &&
+	       x.data == y.data && x.stencil == y.stencil && x.metadata.range == y.metadata.range &&
+	       x.metadata.kind == y.metadata.kind && x.metadata.dcc_alpha_msb == y.metadata.dcc_alpha_msb &&
+	       x.pixel_format == y.pixel_format && x.guest_format == y.guest_format &&
+	       x.type == y.type && x.extent == y.extent && x.resources == y.resources &&
+	       x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.mip_layout == y.mip_layout &&
+	       x.tiled_slice_stride == y.tiled_slice_stride &&
+	       x.linear_slice_stride == y.linear_slice_stride &&
+	       x.first_tail_level == y.first_tail_level &&
+	       std::memcmp(&x.tiling, &y.tiling, sizeof(x.tiling)) == 0;
+}
+
+} // namespace
+
+// The part of ResolveTexture before the texture cache lookup: no texture cache, no guest memory
+// except, for image heap resources, whether the image is mapped (false: bind nothing).
+static bool ResolveTextureDesc(const RenderContext& context,
+                               const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, ResolvedTextureDesc& out);
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -496,6 +575,81 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
 
+	const auto          memo_mode = resource.heap ? 0u : TextureDescMemoMode();
+	TextureDescMemoEntry* memo     = nullptr;
+	if (memo_mode != 0) {
+		if (!t_texture_desc_memo) {
+			t_texture_desc_memo =
+			    std::make_unique<std::array<TextureDescMemoEntry, TextureDescMemoSlots>>();
+		}
+		memo = &(*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+		if (!(memo->valid && memo->value == value && memo->resource == resource)) {
+			memo = nullptr;
+		} else if (memo_mode == 2) {
+			ResolvedTextureDesc check;
+			if (!ResolveTextureDesc(m_context, resource, descriptor, check) ||
+			    !SameResolvedTextureDesc(check, memo->resolved)) {
+				EXIT("KYTY_TEXTURE_DESC_MEMO=2: kept texture description differs: "
+				     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+				     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+				     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+				     descriptor.fields[6], descriptor.fields[7]);
+			}
+		}
+	}
+	ResolvedTextureDesc        resolved_storage;
+	const ResolvedTextureDesc* resolved = &resolved_storage;
+	if (memo != nullptr) {
+		resolved = &memo->resolved;
+	} else {
+		if (!ResolveTextureDesc(m_context, resource, descriptor, resolved_storage)) {
+			return {.layout = vk::ImageLayout::eGeneral};
+		}
+		if (memo_mode != 0) {
+			auto& entry    = (*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+			entry.valid    = true;
+			entry.value    = value;
+			entry.resource = resource;
+			entry.resolved = resolved_storage;
+		}
+	}
+	const auto pixel_format = resolved->pixel_format;
+	const auto view_format  = resolved->view_format;
+	auto       desc         = resolved->desc;
+
+	auto id = [&] {
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
+		return texture_cache.FindImage(desc, resolved->shader_conversion);
+	}();
+	if (!id) {
+		// Another extent at the address holds it; the heap retries once an image is created.
+		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
+	}
+	auto*      image               = &texture_cache.GetImage(id);
+	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (stencil_association) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		                            desc.info.data.size);
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		                             descriptor.DstSelXYZW());
+	}
+	TextureBinding binding {id, nullptr, std::move(desc)};
+	return binding;
+}
+
+static bool ResolveTextureDesc(const RenderContext& context,
+                               const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, ResolvedTextureDesc& out) {
+	const bool storage         = resource.written;
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -573,7 +727,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
-	TextureCache::ImageDesc desc {};
+	auto& desc = out.desc;
+	desc       = {};
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
@@ -603,8 +758,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
 	                     (address & (static_cast<uint64_t>(alignment) - 1u)) != 0);
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
-	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
+	if (resource.heap && !context.IsMapped(address, desc.info.data.size)) {
+		return false;
 	}
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
@@ -622,34 +777,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base + resource.view_min_level;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
-
-	auto id = [&] {
-		PerfStats::ScopedTimer find_timer(PerfStats::Counter::BindFindImageNs, PerfStats::SrtProfEnabled());
-		return texture_cache.FindImage(desc, shader_conversion);
-	}();
-	if (!id) {
-		// Another extent at the address holds it; the heap retries once an image is created.
-		return {.desc = std::move(desc), .layout = vk::ImageLayout::eGeneral};
-	}
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-	} else if (image->info.IsDepth()) {
-		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
-		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                            desc.info.data.size);
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
-	}
-	TextureBinding binding {id, nullptr, std::move(desc)};
-	return binding;
+	out.pixel_format      = pixel_format;
+	out.view_format       = view_format;
+	out.shader_conversion = shader_conversion;
+	return true;
 }
 
 static vk::Sampler NativeSampler(RenderContext& context, const ShaderRecompiler::IR::CompiledShaderInfo& program, uint32_t index, const ShaderRecompiler::IR::DescriptorValue& value) {
