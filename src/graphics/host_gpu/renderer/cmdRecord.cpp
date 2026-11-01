@@ -1953,7 +1953,7 @@ void Report(double seconds) {
 		            v.ns * scale, static_cast<double>(v.n) * ratio / seconds, v.ns / 1e3 / static_cast<double>(v.n),
 		            static_cast<double>(v.work) * ratio / seconds,
 		            v.work > 0 ? v.ns / static_cast<double>(v.work) : 0.0, g_cat_names[v.cat],
-		            GpuTagName(static_cast<GpuTag>(v.tag)), label != g_labels.end() ? label->second.c_str() : "?");
+		            GpuTagName(static_cast<GpuTag>(v.tag)), pipe, label != g_labels.end() ? label->second.c_str() : "?");
 	}
 }
 
