@@ -8,6 +8,9 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
 #include <chrono>
@@ -15,14 +18,17 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
 struct AliasedColorTargets;
 struct GraphicContext;
 class CommandBuffer;
+class ShaderStore;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
@@ -34,14 +40,13 @@ struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
+	// 0 without tessellation, 3 for a rectangle list, else the input control points.
+	uint8_t                    patch_control_points     = 0;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
@@ -61,7 +66,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 117);
+static_assert(sizeof(PipelineStaticParameters) == 115);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -98,7 +103,29 @@ struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
 
-	explicit operator bool() const { return id != 0 && module != nullptr; }
+	// A module loaded from the shader store has no handle module until a pipeline needs it.
+	explicit operator bool() const { return id != 0; }
+};
+
+// A compiled program variant. The handle id is stable across runs: it hashes the program key,
+// push data start, specialization and function code, which with the host and the build decide
+// the SPIR-V. A pipeline is built from its key and its stages' modules alone.
+struct ShaderModule {
+	ShaderProgram                                handle;
+	ShaderRecompiler::IR::CompiledShaderInfo     program;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	std::vector<uint32_t>                        function_code;
+	// VS or LS: the host format of each vertex input attribute.
+	std::vector<vk::Format>                      vertex_formats;
+	// Rectangle-list PS: the parameters it reads.
+	std::vector<RectListParameter>               rect_parameters;
+	// Loaded from the shader store: 1 + the index of its SPIR-V there (ShaderStore::ReadSpirv),
+	// from which the handle module is created when a pipeline needs it; 0 otherwise.
+	uint32_t                                     store_spirv = 0;
+	// Loaded from the shader store and not used yet in this launch.
+	bool                                         store_use_pending = false;
+	// Loaded with KYTY_SHADER_STORE=2: its first use retranslates it to check the store.
+	bool                                         store_verify_pending = false;
 };
 
 // A draw's topology, shader stages (from PipelineCache::GetGraphicsPrograms) and targets.
@@ -135,6 +162,8 @@ public:
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Prewarmed from the shader store and not used yet in this launch: its record id.
+		uint64_t                store_id              = 0;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -184,6 +213,13 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	// The shader store (KYTY_SHADER_STORE, --shader-cache), loaded by m_warm_up. Every other member
+	// function waits for the warm-up first.
+	std::unique_ptr<ShaderStore>  m_store;
+	std::thread                   m_warm_up;
+	// Loaded modules whose handle module a new pipeline needed (the thread creating pipelines: the
+	// GPU thread, or the KYTY_CP_PIPELINE back thread while the GPU thread only looks up programs).
+	uint64_t                      m_stored_modules_created = 0;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -194,6 +230,16 @@ private:
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	// Loads the shader store: its modules, then its pipelines, created on several threads.
+	void WarmUp(const std::filesystem::path& path);
+	void WaitWarmUp() {
+		if (m_warm_up.joinable()) [[unlikely]] {
+			JoinWarmUp();
+		}
+	}
+	void JoinWarmUp();
+	// Creates the handle module of a module loaded from the shader store, if it has none.
+	void LoadStoredModule(const ShaderModule* module);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -204,15 +250,20 @@ struct PipelineCacheFeedback {
 	bool hit   = false;
 };
 [[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
+// Pipelines created by this thread are left out of the performance counters (shader store warm-up).
+void SetPipelineCreationQuiet(bool quiet) noexcept;
+// `vertex_stages`: VS, mesh or LS/HS/TES; `pixel` is null without a pixel stage.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&   rendering,
-                            const PipelineVertexInputState& vertex_input,
-                            const DrawRenderState&          state,
-                            const PipelineStaticParameters& static_params,
-                            vk::PipelineCache               driver_cache);
+                            const PipelineRenderingState&        rendering,
+                            const PipelineVertexInputState&      vertex_input,
+                            const PipelineStaticParameters&      static_params,
+                            std::span<const ShaderModule* const> vertex_stages,
+                            const ShaderModule* pixel, vk::PipelineCache driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            const ShaderModule& compute, vk::PipelineCache driver_cache);
+// The host format of each vertex input attribute of a VS or LS program.
+std::vector<vk::Format> VertexInputFormats(const ShaderVertexInputInfo&                    input_info,
+                                           const ShaderRecompiler::IR::CompiledShaderInfo& program);
 
 } // namespace Libs::Graphics
 

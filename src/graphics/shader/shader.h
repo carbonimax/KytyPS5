@@ -50,11 +50,14 @@ struct ShaderHostFeatures {
 };
 
 struct ShaderProgram;
+struct ShaderModule;
 
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 	const ShaderProgram*                            handle    = nullptr;
+	// Owns program and handle.
+	const ShaderModule*                             module    = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
 		return program != nullptr && resources != nullptr;

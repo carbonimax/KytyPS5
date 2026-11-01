@@ -57,6 +57,11 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Shader cache record of a plan; loading it into a default-constructed plan rebuilds the walker
+// and scratch state like extraction. A failed load leaves a plan that must not be used.
+std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
+bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
+
 // KYTY_SRT_PROF measurement: while enabled on the calling thread, MaterializeResources adds the time
 // of its walk, its descriptor evaluation and its specialization build.
 struct MaterializeTimes {

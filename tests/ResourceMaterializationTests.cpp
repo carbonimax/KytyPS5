@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
@@ -20,6 +21,22 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "ResourceMaterializationTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+// Every extracted plan below is the one a restarted game loads from the shader cache: exactly
+// its bytes load, and the loaded plan saves back to them.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
+Extract(const Libs::Graphics::ShaderRecompiler::IR::Program &program) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto bytes = SaveResourcePlan(ExtractResourcePlan(program));
+  auto extended = bytes;
+  extended.push_back(0u);
+  ResourcePlan loaded, truncated, padded;
+  Check(LoadResourcePlan(bytes, loaded) && SaveResourcePlan(loaded) == bytes &&
+            !LoadResourcePlan(std::span(bytes).first(bytes.size() - 1u), truncated) &&
+            !LoadResourcePlan(extended, padded),
+        "resource plan did not round-trip through its exact cache bytes");
+  return loaded;
 }
 
 bool RejectSpecializationRead(void *userdata, uint64_t, std::span<uint32_t>) {
@@ -97,7 +114,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UnbasedFlatPlan() {
   program.resource_tracking_complete = true;
   AddValueBlock(program);
   program.info.uses_dma = true;
-  return ExtractResourcePlan(program);
+  return Extract(program);
 }
 
 Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
@@ -118,7 +135,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   source.dword_count = 4;
   program.descriptor_sources.push_back(source);
   program.info.buffers.push_back({.source = 0});
-  return ExtractResourcePlan(program);
+  return Extract(program);
 }
 
 Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
@@ -176,7 +193,7 @@ Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
 void TestWalkerLoadsBypassSpecializationReader() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
-  auto plan = ExtractResourcePlan(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  auto plan = Extract(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
   uint32_t specialization_reads = 0;
   const SrtRuntime runtime{.userdata = &specialization_reads,
                            .read_specialization_memory =
@@ -228,7 +245,7 @@ void TestNativeNestedSrtRefresh() {
   leaf->Arg(0).Instruction()->SetArg(1, pointer_high);
   leaf->SetArg(1, Value(7u));
   read(leaf->Arg(0), 11u);
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   Check(plan.srt_code != nullptr, "nested user-data tree did not compile an x86 walker");
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
@@ -273,7 +290,7 @@ void TestNativeNestedSrtRefresh() {
   program.srt_reads.resize(1);
   for (const int32_t offset : {-1, 7}) {
     program.memory_info[0].offset = static_cast<uint32_t>(offset);
-    auto bounded = ExtractResourcePlan(program);
+    auto bounded = Extract(program);
     auto base = pointer_words(second.data() + 1);
     Check(bounded.srt_code != nullptr &&
               MaterializeResources(bounded, {.user_data = base}, snapshot, specialization) &&
@@ -363,7 +380,7 @@ void TestSrtAliasesShareReads() {
   DescriptorSource indirect;
   indirect.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{}).sources = {0, 1};
   program.descriptor_sources.push_back(indirect);
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   for (const auto &inst : plan.value_storage) {
     Check(inst.GetOpcode() != ValueOpcode::ReadConst &&
               inst.GetOpcode() != ValueOpcode::GetSrtResource,
@@ -530,7 +547,7 @@ void TestUniformVectorDescriptorRead() {
   ResourceSpecialization specialization;
   for (const bool written : {false, true}) {
     program.info.buffers[0].written = written;
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     Check(plan.control_flow.empty() && plan.capture_specialization_reads,
           "vector descriptor read depended on incidental control-flow capture");
     reads = {};
@@ -552,7 +569,7 @@ void TestUniformVectorDescriptorRead() {
   auto &guarded_lane = block.AppendNewInst(ValueOpcode::ReadFirstLane, {Value(&guarded), Value(&active)});
   program.descriptor_sources.push_back({.dwords = {Value(&guarded_lane)}, .dword_count = 1});
   {
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     uint32_t value = 0;
     reads = {};
     Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], value) &&
@@ -565,7 +582,7 @@ void TestUniformVectorDescriptorRead() {
   reads.count = 0;
   uint32_t result = 99;
   {
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], result) &&
               result == 0 && reads.count == 0,
           "literal false EXEC read vector memory");
@@ -574,7 +591,7 @@ void TestUniformVectorDescriptorRead() {
   handle.SetArg(3, Value(0x204u));
   program.descriptor_sources.back().dwords[0] = Value(&count);
   {
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     Check(EvaluateSrtValue(plan, runtime, plan.descriptor_sources.back().dwords[0], result) &&
               result == 0 && reads.count == 0,
           "invalid vector buffer format read memory");
@@ -663,7 +680,7 @@ void TestWrittenDescriptorPredicateReads(bool memory_condition) {
   store_block.AppendNewInst(ValueOpcode::StoreBufferU32,
       {Value(&output), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)})
       .SetFlags(MemoryFlags{.index = 1});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   Check(plan.capture_specialization_reads == memory_condition && !plan.control_flow.empty(),
         "conditional writable descriptor used the wrong memory dependency policy");
   struct Reads { uint32_t count = 0; bool readable = false; } reads;
@@ -733,7 +750,7 @@ void TestSharedControlPredicates() {
       program.blocks[i]->terminator.true_block = program.blocks[i == 0 ? 1 : 3];
       program.blocks[i]->terminator.false_block = program.blocks[2];
     }
-    auto plan = ExtractResourcePlan(program);
+    auto plan = Extract(program);
     Check(plan.value_storage.size() <= 2u * depth + 12u &&
               plan.control_flow.size() == 4 &&
               plan.control_flow[0].condition == plan.control_flow[1].condition &&
@@ -805,7 +822,7 @@ void TestNestedExecPredicatesReuseReads() {
   use.AppendNewInst(ValueOpcode::LoadBufferU32,
       {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
       .SetFlags(MemoryFlags{.index = 1});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   struct Reads { uint32_t value = 0; bool readable = true; uint32_t count = 0; } reads;
   FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
         auto &reads = *static_cast<Reads *>(data);
@@ -868,7 +885,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
       .resource_class = ImageResourceClass::Sampled,
       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   struct Reads {
     std::array<uint32_t, 3> words{0x100u, 0x200u, 0x200u};
     std::array<uint32_t, 3> counts{};
@@ -1011,7 +1028,7 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
       {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]});
   emit(use, ValueOpcode::LoadBufferU32, {buffer, Value(0u), Value(0u), Value(0u), Value(true)})
       .Instruction()->SetFlags(MemoryFlags{.index = buffer_index});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   struct Reads { uint32_t count = 0; bool readable = true; uint32_t descriptors = 0; } reads;
   FakeGuestMemory fake(+[](void *data, uint64_t address, std::span<uint32_t> words) {
         constexpr std::array<uint32_t, 4> descriptor{0x8000u, 1u << 16u, 16u,
@@ -1093,7 +1110,7 @@ void TestCyclicControlPredicatesRemainUnknown() {
   branch(entry, u, left, right);
   branch(left, a, right, exit);
   branch(right, b, left, exit);
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   uint32_t value = 99;
   Check(!EvaluateSrtValue(plan, {}, plan.control_flow[1].condition, value) &&
             !EvaluateSrtValue(plan, {}, plan.control_flow[2].condition, value),
@@ -1146,7 +1163,7 @@ void TestBackEdgeReachesPhiPredecessor() {
   program.srt_reads.push_back({Value(&load(exit, 0u)), 0});
   exit.AppendNewInst(ValueOpcode::ReadConst,
                      {Value(&exit.AppendNewInst(ValueOpcode::GetSrtResource)), Value(0u)});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   Check(plan.control_flow.size() == 4 && plan.control_phi_predecessors.size() == 1,
         "back-edge plan lost its control flow or Phi");
   plan.capture_specialization_reads = true;
@@ -1233,7 +1250,7 @@ void TestEmptyScalarBufferSpecialization() {
     return fixture;
   };
   auto fixture = make_fixture();
-  auto plan = ExtractResourcePlan(fixture.program);
+  auto plan = Extract(fixture.program);
   std::array<uint32_t, 4> descriptor{0x1000u, 8u << 16u, 0u, 3u << 28u};
   uint32_t reads = 0u;
   const SrtRuntime runtime{.user_data = descriptor, .userdata = &reads,
@@ -1290,7 +1307,7 @@ void TestEmptyScalarBufferSpecialization() {
 void TestMixedSamplerVariantsShareRuntimeDescriptor() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto program = MixedSamplerProgram();
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
   const SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -1673,7 +1690,7 @@ void TestSignedStorageSpecialization() {
   program.descriptor_sources.push_back(source);
   program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Storage,
       .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D, .written = true});
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   std::array<uint32_t, 1> data{};
   const SrtRuntime runtime{.user_data = data};
   ResourceSnapshot snapshot;
@@ -1849,7 +1866,7 @@ void TestIndirectImageSamplerClasses(bool mixed, bool min_lod_exact) {
   program.descriptor_sources.push_back(root);
   program.info.samplers.resize(1);
   program.info.sampled_pairs.resize(1);
-  auto plan = ExtractResourcePlan(program);
+  auto plan = Extract(program);
   std::array<uint32_t, 1> user_data{0x11111111u};
   uint32_t reads = 0;
   const SrtRuntime runtime{.user_data = user_data, .userdata = &reads,
@@ -1891,6 +1908,47 @@ void TestIndirectImageSamplerClasses(bool mixed, bool min_lod_exact) {
   }
 }
 
+void TestShaderCacheRecords() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Equivalent selector domains share one key group, which a load rebuilds.
+  Program selectors;
+  AddValueBlock(selectors);
+  for (const uint32_t stride : {4u, 8u, 4u}) {
+    DescriptorSource source;
+    source.indirect_descriptor = DescriptorSource::IndirectDescriptor{
+        .selector = DescriptorSource::IndirectDescriptor::SelectorRead{.stride = stride}};
+    selectors.descriptor_sources.push_back(source);
+  }
+  selectors.descriptor_sources.emplace_back();
+  const auto plan = Extract(selectors);
+  Check(plan.selector_groups == std::vector<uint32_t>{0u, 1u, 0u, UINT32_MAX} &&
+            plan.selector_keys.size() == 2u,
+        "loaded plan lost its selector key groups");
+
+  const std::array values{Value(), Value(ScalarReg(3)), Value(VectorReg(5)), Value(true),
+                          Value(uint8_t{7}), Value(uint16_t{9}), Value(11u), Value(uint64_t{1} << 40u),
+                          Value::F16(0x3c00u), Value::F32(-2.5f)};
+  Writer writer;
+  Io(writer, values);
+  Reader reader{writer.bytes};
+  std::array<Value, values.size()> loaded;
+  Io(reader, loaded);
+  Check(reader.ok && reader.bytes.empty() && loaded == values,
+        "immediate values changed through the shader cache");
+  // Damaged records: a missing instruction, a type that is no value type, an oversized count and
+  // an unknown opcode.
+  for (const uint8_t type : {1u, 3u}) {
+    const std::array<uint8_t, 12> bytes{type};
+    Reader damaged{bytes};
+    Value value;
+    Io(damaged, value);
+    Check(!damaged.ok, "damaged value was accepted");
+  }
+  ResourcePlan oversized, unknown;
+  Check(!LoadResourcePlan(std::array<uint8_t, 4>{0xffu, 0xffu, 0xffu, 0xffu}, oversized) &&
+            !LoadResourcePlan(std::array<uint8_t, 14>{1u, 0u, 0u, 0u, 0xffu, 0xffu}, unknown),
+        "damaged resource plan was accepted");
+}
 
 } // namespace
 
@@ -1939,6 +1997,7 @@ int main() {
   for (const bool mixed : {false, true}) {
     for (const bool exact : {false, true}) TestIndirectImageSamplerClasses(mixed, exact);
   }
+  TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }
