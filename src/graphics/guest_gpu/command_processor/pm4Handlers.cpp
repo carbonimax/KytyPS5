@@ -1242,6 +1242,7 @@ KYTY_HW_UC_PARSER(HwUcSetGdsOaRegisters) {
 
 KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800);
 	return KYTY_PM4_LEN(cmd_id) - 1;
@@ -1311,6 +1312,7 @@ KYTY_CP_OP_PARSER(CpOpDispatchReset) {
 
 KYTY_CP_OP_PARSER(CpOpPfpSyncMe) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0004200);
 
@@ -1362,6 +1364,7 @@ KYTY_CP_OP_PARSER(CpOpSetPredication) {
 
 KYTY_CP_OP_PARSER(CpOpCondExec) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_COND_EXEC);
 
@@ -1459,6 +1462,7 @@ static uint8_t CopyDataSrcToDma(uint32_t src) {
 
 KYTY_CP_OP_PARSER(CpOpCopyData) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(6, Pm4::IT_COPY_DATA, 0u));
 
@@ -1499,6 +1503,7 @@ KYTY_CP_OP_PARSER(CpOpCopyData) {
 
 KYTY_CP_OP_PARSER(CpOpDmaData) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(7, Pm4::IT_DMA_DATA, 0u));
 
@@ -1677,6 +1682,7 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
@@ -1697,6 +1703,7 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 
 KYTY_CP_OP_PARSER(CpOpFlip) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);
 
@@ -2046,6 +2053,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 
@@ -2061,6 +2069,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 
 KYTY_CP_OP_PARSER(CpOpMemSemaphore) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	const auto control = buffer[2];
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0023900 || (control & ~0xe0110000u) != 0 ||
@@ -2217,6 +2226,7 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
 
@@ -2280,18 +2290,21 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem32) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	return CpOpWaitRegMemSized<uint32_t>(cp, cmd_id, buffer);
 }
 
 KYTY_CP_OP_PARSER(CpOpWaitRegMem64) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	return CpOpWaitRegMemSized<uint64_t>(cp, cmd_id, buffer);
 }
 
 KYTY_CP_OP_PARSER(CpOpWriteData) {
 	KYTY_PROFILER_FUNCTION();
+	NoteGuestSync();
 
 	auto op = (cmd_id >> 8u) & 0xffu;
 
