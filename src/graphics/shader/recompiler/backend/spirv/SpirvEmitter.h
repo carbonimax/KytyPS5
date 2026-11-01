@@ -33,6 +33,8 @@ EmitStats& ThreadEmitStats() noexcept;
 // range but inside its robustness alignment are no longer zero: rendering parity is not
 // guaranteed; this only bounds the GPU time of the checks.
 bool ProfSkipStorageBounds() noexcept;
+// Profiling: KYTY_PROF_STORAGE_BOUNDS=2 loads a clamped element and selects zero past the end.
+bool ProfSelectStorageBounds() noexcept;
 
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,

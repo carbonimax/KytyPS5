@@ -226,6 +226,19 @@ bool ProfSkipStorageBounds() noexcept {
 	return skip;
 }
 
+bool ProfSelectStorageBounds() noexcept {
+	static const bool select = [] {
+		const char* value = std::getenv("KYTY_PROF_STORAGE_BOUNDS");
+		const bool  on    = value != nullptr && value[0] == '2';
+		if (on) {
+			std::printf("PERF gput: KYTY_PROF_STORAGE_BOUNDS=2, storage buffer loads clamped and selected (no branch)
+");
+		}
+		return on;
+	}();
+	return select;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info, ShaderHostFeatures host_features) {

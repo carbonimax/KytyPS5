@@ -10,6 +10,17 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
+// Profiling (KYTY_PROF_STORAGE_BOUNDS=2): branch-free storage loads.
+bool IsStorageKind(const MemoryResourceAccess& access) {
+	return access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer;
+}
+
+// min(index, length - 1); with length 0 the index stays as is and the device bounds the read.
+uint32_t ClampedElement(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+	const auto last = Binary(state, spv::OpISub, TypeU32(state), access.length, ConstantU32(state, 1));
+	return EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, index, last);
+}
+
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
 }
@@ -381,6 +392,11 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
+	if (ProfSelectStorageBounds() && IsStorageKind(resource)) {
+		const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+		const auto value     = LoadWordInBounds(ctx, resource, ClampedElement(ctx.state, resource, index));
+		return Select(ctx.state, TypeU32(ctx.state), in_bounds, value, ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index); });
@@ -401,6 +417,12 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	if (ProfSelectStorageBounds() && IsStorageKind(resource)) {
+		const auto in_bounds = EmitMemoryElementInBounds(ctx.state, resource, index);
+		const auto value     = LoadSubwordInBounds(ctx, resource, address,
+		                                           ClampedElement(ctx.state, resource, index), bits, sign_extend);
+		return Select(ctx.state, TypeU32(ctx.state), in_bounds, value, ConstantU32(ctx.state, 0));
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitStorageElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
@@ -1640,6 +1662,13 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
 		element = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(state, element,
 		                                                  ConstantU32(state, last_element));
+	}
+	if (ProfSelectStorageBounds()) {
+		const auto in_bounds = EmitMemoryElementInBounds(state, access, element);
+		const auto value     = EmitNative<spv::OpLoad, IR::Type::U32>(
+		    state, EmitMemoryElementPointer(state, access, ClampedElement(state, access, element)));
+		ctx.Define(inst, Select(state, TypeU32(state), in_bounds, value, ConstantU32(state, 0)));
+		return;
 	}
 	const auto condition = EmitStorageElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
