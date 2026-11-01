@@ -1130,12 +1130,24 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				keys |= 1u << key;
 			}
 		}
-		// No selected key to clear, or none left since the last check.
+		// No selected key to clear, or none left since the last check. A target rebound while no
+		// checked metadata was forgotten (mipmapped DCC targets bind each mip every frame) reuses
+		// its last result instead of looking up every slice and key again.
+		const Image::ColorClearCheck check {viewed.address, slice_size, mip.size, count, keys,
+		                                    m_buffer_cache.ColorMetadataEpoch()};
+		{
+			std::scoped_lock lock {m_lock};
+			if (m_slot_images[id].color_clear_check == check) {
+				return;
+			}
+		}
 		bool checked = true;
 		for (uint32_t slice = 0; slice < count && checked; slice++) {
 			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
 		}
 		if (checked) {
+			std::scoped_lock lock {m_lock};
+			m_slot_images[id].color_clear_check = check;
 			return;
 		}
 		{
@@ -1362,9 +1374,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		// The descriptor's base level and layer are relative to its own data. When it resolves
 		// into a larger image that starts before that data, offset them by where the data starts
 		// in the final image (a position taken from an earlier candidate may no longer apply).
-		// A smaller mip can also start at the image's own address (mips stored smallest first).
+		// A smaller mip can also start at the image's own address (mips stored smallest first);
+		// only a one-mip descriptor of a mip chain can be one (SliceOf needs both).
 		if (desc.info.data.address != image.info.data.address ||
-		    desc.info.extent != image.info.extent) {
+		    (desc.info.resources.levels == 1 && image.info.resources.levels > 1 &&
+		     desc.info.extent != image.info.extent)) {
 			const int32_t mip   = desc.info.MipOf(image.info);
 			const int32_t layer = mip >= 0 ? desc.info.SliceOf(image.info, mip) : -1;
 			if (layer >= 0) {
