@@ -75,6 +75,7 @@ static void PrintUsage() {
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
+	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
 	::printf("  --vulkan-validation                  Enable Vulkan validation.\n");
@@ -206,6 +207,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
+    {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
     {"--emulate-psn", &ConfigOptions::psn_emulation_enabled},
     {"--vulkan-validation", &ConfigOptions::vulkan_validation_enabled},

@@ -64,6 +64,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(profiler_enabled);
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
+	KYTY_CFG_SET(guest_tsc_enabled);
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -130,6 +131,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(printf_output_file);
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
+	KYTY_CFG_GET(guest_tsc_enabled);
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 	red_zone_protection_enabled =

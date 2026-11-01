@@ -297,6 +297,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
+	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif
