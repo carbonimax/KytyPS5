@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cinttypes>
 #include <cstring>
@@ -1059,6 +1060,14 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	if (upload && CmdRecord::GpuTimingOn()) {
+		char key[160];
+		std::snprintf(key, sizeof(key), "tc upload %ux%u levels=%u guest_fmt=%u tile=%u buffer_modified=%d cpu_dirty=%d",
+		              image.info.extent.width, image.info.extent.height, image.info.resources.levels,
+		              static_cast<uint32_t>(image.info.guest_format), static_cast<uint32_t>(image.info.tile_mode),
+		              image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0);
+		CmdRecord::NoteEvent(key, image.info.data.size);
+	}
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
@@ -2109,6 +2118,15 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	if (CmdRecord::GpuTimingOn()) {
+		char key[128];
+		std::snprintf(key, sizeof(key), "tc gc used=%.1fG trigger=%.1fG pressure=%.1fG critical=%.1fG",
+		              static_cast<double>(m_total_used_memory) / (1u << 30),
+		              static_cast<double>(m_trigger_gc_memory) / (1u << 30),
+		              static_cast<double>(m_pressure_gc_memory) / (1u << 30),
+		              static_cast<double>(m_critical_gc_memory) / (1u << 30));
+		CmdRecord::NoteEvent(key, 0);
+	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
@@ -2147,6 +2165,15 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}
+			}
+			if (CmdRecord::GpuTimingOn()) {
+				const auto& info = owner->info;
+				char        key[160];
+				std::snprintf(key, sizeof(key), "tc evict %ux%u levels=%u guest_fmt=%u tile=%u gpu_modified=%d %s",
+				              info.extent.width, info.extent.height, info.resources.levels,
+				              static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+				              owner->IsGpuModified() ? 1 : 0, aggressive ? "aggressive" : pressured ? "pressured" : "age");
+				CmdRecord::NoteEvent(key, info.data.size);
 			}
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
