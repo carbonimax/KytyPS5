@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -352,6 +353,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DepthCopy);
 	const auto& hw       = buffer.GetRegisters();
 	const auto& z        = hw.GetDepthRenderTarget();
 	const auto& override = hw.GetDepthRenderOverride();

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
 #include "gpu_blit_shaders/gpu_blit_color_to_ms_depth_spv.h"
@@ -121,6 +122,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 }
 
 void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Blit);
 	const auto& source_info      = source.info;
 	const auto& destination_info = destination.info;
 	EXIT_IF(DepthAspectTransferFormat(source_info.pixel_format) != vk::Format::eUndefined ||

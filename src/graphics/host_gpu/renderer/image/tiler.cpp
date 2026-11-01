@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -248,6 +249,7 @@ vk::Pipeline TileManager::CreatePipeline(std::span<const uint32_t>     code,
 void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
                          vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
                          const Tiling& tiling, bool clear_target) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Detile);
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -421,6 +423,7 @@ uint32_t TileManager::ConversionRows(uint64_t offset, uint64_t row_stride, uint6
 
 void TileManager::ConvertD16(Result source, Result target, D16Direction direction, bool d32,
                              const D16Layout& layout) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Detile);
 	vk::Pipeline*             pipeline_pointer = nullptr;
 	std::span<const uint32_t> code;
 	if (direction == D16Direction::Promote) {
@@ -557,6 +560,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 void TileManager::TransformColor(Result input, Result output, ColorTransform transform,
                                  bool to_host) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Detile);
 	uint32_t element_bytes = 0;
 	switch (transform) {
 		case ColorTransform::SwapBgra16: element_bytes = 8; break;
@@ -630,6 +634,7 @@ TileManager::Result TileManager::TransformColor(Result input, ColorTransform tra
 
 vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
                                         bool expand) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Detile);
 	struct Check {
 		uint32_t metadata_base;
 		uint32_t words;

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1074,6 +1075,7 @@ void TextureCache::InitializeImage(ImageId id) {
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::TexClear);
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
@@ -1716,6 +1718,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
                               const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::TexClear);
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
@@ -1982,9 +1985,12 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
-	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
-	                                               1, &barrier, 0, nullptr);
+	{
+		CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufDownload);
+		m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+		                                               1, &barrier, 0, nullptr);
+	}
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);

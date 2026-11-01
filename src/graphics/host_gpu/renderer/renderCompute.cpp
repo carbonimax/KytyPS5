@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -397,7 +398,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		{
+			CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -473,7 +477,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			for (uint32_t y = 0; y < thread_group_y; ++y) {
 				for (uint32_t x = 0; x < thread_group_x; ++x) {
 					if ((x | y | z) != 0u) {
-						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						{
+							CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+							ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						}
 					}
 					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
 				}
@@ -485,7 +492,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	{
+		CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 
@@ -555,20 +565,29 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		{
+			CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	{
+		CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+		                          1, &barrier, 0, nullptr, 0, nullptr);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	{
+		CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 

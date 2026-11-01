@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -75,6 +76,7 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Fault);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();

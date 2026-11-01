@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -1254,6 +1255,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 
 bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
                                        const DrawEmitInfo& emit, DrawRenderState& state) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::RtCopy);
 	if (!buffer.GetRegisters().GetRenderControl().copy_depth_to_color) {
 		return false;
 	}
@@ -1532,7 +1534,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 		if (pass != 0) {
 			m_context.GetCommandScheduler().EndRendering();
-			ColorAttachmentPassBarrier(vk_buffer);
+			{
+				CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DrawSync);
+				ColorAttachmentPassBarrier(vk_buffer);
+			}
 		}
 		if (shader_write_stages && !chained) {
 			// As for dispatches, buffer writes wait for earlier accesses to the memory. Each
@@ -1542,7 +1547,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			// first one, so the barrier that opens a chain covers every graphics stage.
 			const auto hazard_stages = chain_writes ? vk::PipelineStageFlags {vk::PipelineStageFlagBits::eAllGraphics}
 			                                        : shader_write_stages;
-			ShaderWriteHazardBarrier(vk_buffer, hazard_stages);
+			{
+				CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DrawSync);
+				ShaderWriteHazardBarrier(vk_buffer, hazard_stages);
+			}
 		}
 		LogDrawPhase(draw.Name(), "BeginRendering");
 		if (!draw.IsIndexed()) {
@@ -1579,7 +1587,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.DeferDrawWrites(shader_write_stages, sync_epoch);
 	} else if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		{
+			CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DrawSync);
+			ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

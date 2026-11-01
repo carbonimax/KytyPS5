@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include <spirv/unified1/spirv.hpp>
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 
@@ -135,6 +138,65 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// KYTY_GPU_TIMING (local measurement build): one "PERF gput prog" line per compiled program with
+// its id (the pipeline labels name it), SPIR-V size, a histogram of the instructions that matter for
+// GPU cost and the emitter's added bounds checks.
+void NoteProgramStats(const char* stage_name, uint64_t shader_hash, uint64_t id, const std::vector<uint32_t>& spirv,
+                      const ShaderRecompiler::Spirv::EmitStats& emit, const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	uint32_t total = 0, branches = 0, merges = 0, loops = 0, phis = 0, loads = 0, stores = 0, chains = 0,
+	         atomics = 0, samples = 0, fetches = 0, image_rw = 0, group = 0, calls = 0, ext = 0, compares = 0,
+	         converts = 0, bitfield = 0, selects = 0, barriers = 0, kills = 0, functions = 0;
+	for (size_t at = 5; at < spirv.size();) {
+		const uint32_t words = spirv[at] >> 16u;
+		const uint32_t op    = spirv[at] & 0xffffu;
+		if (words == 0) {
+			break;
+		}
+		at += words;
+		if (op == spv::OpFunction) {
+			functions++;
+		}
+		if (functions == 0) {
+			continue; // declarations, types, constants, decorations
+		}
+		total++;
+		if (op == spv::OpBranchConditional || op == spv::OpSwitch) branches++;
+		else if (op == spv::OpSelectionMerge) merges++;
+		else if (op == spv::OpLoopMerge) loops++;
+		else if (op == spv::OpPhi) phis++;
+		else if (op == spv::OpLoad) loads++;
+		else if (op == spv::OpStore) stores++;
+		else if (op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain) chains++;
+		else if ((op >= spv::OpAtomicLoad && op <= spv::OpAtomicXor) || op == spv::OpAtomicFMinEXT ||
+		         op == spv::OpAtomicFMaxEXT || op == spv::OpAtomicFAddEXT) atomics++;
+		else if (op >= spv::OpImageSampleImplicitLod && op <= spv::OpImageSampleProjDrefExplicitLod) samples++;
+		else if (op == spv::OpImageFetch || op == spv::OpImageGather || op == spv::OpImageDrefGather) fetches++;
+		else if (op == spv::OpImageRead || op == spv::OpImageWrite || op == spv::OpImageTexelPointer) image_rw++;
+		else if (op >= spv::OpGroupNonUniformElect && op <= spv::OpGroupNonUniformQuadSwap) group++;
+		else if (op == spv::OpFunctionCall) calls++;
+		else if (op == spv::OpExtInst) ext++;
+		else if (op >= spv::OpIEqual && op <= spv::OpFUnordGreaterThanEqual) compares++;
+		else if (op >= spv::OpConvertFToU && op <= spv::OpBitcast) converts++;
+		else if (op >= spv::OpBitFieldInsert && op <= spv::OpBitReverse) bitfield++;
+		else if (op == spv::OpSelect) selects++;
+		else if (op == spv::OpControlBarrier || op == spv::OpMemoryBarrier) barriers++;
+		else if (op == spv::OpKill || op == spv::OpTerminateInvocation || op == spv::OpDemoteToHelperInvocation) kills++;
+	}
+	const auto& info = program.info;
+	std::printf("PERF gput prog id=%016" PRIx64 " %s hash=%016" PRIx64 " words=%zu wave=%u insts=%u funcs=%u"
+	            " branches=%u merges=%u loops=%u phis=%u loads=%u stores=%u chains=%u atomics=%u samples=%u fetches=%u"
+	            " image_rw=%u group=%u calls=%u ext=%u compares=%u converts=%u bitfield=%u selects=%u barriers=%u"
+	            " kills=%u bounds_storage=%u bounds_skipped=%u bounds_other=%u images=%zu buffers=%zu bvh=%d lds=%d"
+	            " scratch=%u dma=%d helper=%d derivs=%d ballot=%d shuffle=%d heap=%d addr_writes=%d\n",
+	            id, stage_name, shader_hash, spirv.size(), program.wave_size, total, functions, branches, merges, loops,
+	            phis, loads, stores, chains, atomics, samples, fetches, image_rw, group, calls, ext, compares, converts,
+	            bitfield, selects, barriers, kills, emit.storage_bounds, emit.storage_bounds_skipped, emit.other_bounds,
+	            info.images.size(), info.buffers.size(), info.bvh ? 1 : 0, info.uses_lds ? 1 : 0,
+	            program.scratch_dwords, info.uses_dma ? 1 : 0, info.helper_invocation ? 1 : 0,
+	            info.compute_derivatives ? 1 : 0, info.subgroup_ballot ? 1 : 0, info.subgroup_shuffle ? 1 : 0,
+	            info.uses_image_heap ? 1 : 0, program.has_address_writes ? 1 : 0);
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -463,6 +525,7 @@ struct PipelineCache::ProgramCache {
 		const auto emit_begin = diag_log ? PerfStats::SteadyUs() : 0;
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		const auto emit_stats = ShaderRecompiler::Spirv::ThreadEmitStats();
 		if (diag_log) diag_emit_us = PerfStats::SteadyUs() - emit_begin;
 		if (options.stage == ShaderType::Pixel) {
 			// Pixel waves run in 64-lane amdvlk subgroups with no required size: record the guest
@@ -500,6 +563,10 @@ struct PipelineCache::ProgramCache {
 		};
 		permutation.handle.id = ModuleId(key, permutation.program.bindings.push_data_start_dword,
 		                                 permutation.specialization, function_code);
+		if (CmdRecord::GpuTimingOn()) {
+			NoteProgramStats(stage_name, options.shader_hash, permutation.handle.id, result.spirv, emit_stats,
+			                 permutation.program);
+		}
 		// The inputs of these come from the stage's static key.
 		if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 		    options.input_info.vertex != nullptr) {
@@ -1975,6 +2042,21 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                       ps_active ? ps_input_info.stage.module : nullptr, m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	if (CmdRecord::GpuTimingOn()) {
+		char        label[256];
+		std::string formats;
+		for (uint32_t i = 0; i < rendering.color_count; i++) {
+			formats += (i != 0 ? "," : "") + std::to_string(static_cast<int>(rendering.color_formats[i]));
+		}
+		std::snprintf(label, sizeof(label),
+		              "vs=%016" PRIx64 "/%" PRIx64 "/%" PRIx64 " ps=%016" PRIx64
+		              " colors=%u f=%s depth=%d samples=%u sshade=%d topo=%d",
+		              key.vertex_shader_ids[0], key.vertex_shader_ids[1], key.vertex_shader_ids[2], ps_id,
+		              rendering.color_count, formats.c_str(), static_cast<int>(rendering.depth_format),
+		              static_params.samples, static_params.sample_shading_enable ? 1 : 0,
+		              static_cast<int>(static_params.topology));
+		CmdRecord::NotePipelineLabel(pipeline.pipeline, label);
+	}
 	if (PerfStats::CompileLogEnabled()) {
 		// P time driver_hit(1/0, -1 unknown) us vs_id ps_id
 		const auto feedback = LastPipelineCacheFeedback();
@@ -2023,6 +2105,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::CsPipelineNs,
 		                                  PerfStats::Counter::CsPipelineCount);
 		CreatePipelineInternal(m_graphics, pipeline, *input_info.stage.module, m_driver_cache);
+	}
+	if (CmdRecord::GpuTimingOn()) {
+		char label[64];
+		std::snprintf(label, sizeof(label), "cs=%016" PRIx64, compute_program.id);
+		CmdRecord::NotePipelineLabel(pipeline.pipeline, label);
 	}
 	if (PerfStats::CompileLogEnabled()) {
 		const auto feedback = LastPipelineCacheFeedback();

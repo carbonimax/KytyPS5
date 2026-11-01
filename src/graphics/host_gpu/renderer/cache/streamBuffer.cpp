@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -165,6 +166,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
                       uint64_t destination_offset, uint64_t size, vk::AccessFlags source_before,
                       vk::AccessFlags destination_before, vk::AccessFlags source_after,
                       vk::AccessFlags destination_after) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Stream);
 	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
 	    destination_offset > Size() || size > Size() - destination_offset) {
 		EXIT("Buffer: invalid copy range\n");
@@ -201,6 +203,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 }
 
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::Stream);
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}

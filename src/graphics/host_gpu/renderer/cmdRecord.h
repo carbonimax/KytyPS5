@@ -52,6 +52,59 @@ void Call(void (*fn)(void* data), const void* data, size_t bytes);
 // Crash reports: ring positions and recorder state (any thread, lock-free reads).
 void Describe() noexcept;
 
+// KYTY_GPU_TIMING=1 (local measurement build, default off; modes 1 and 2): GPU timestamps on the
+// main command buffers, reported as "PERF gput" lines (see cmdRecord.cpp, GpuTiming).
+// - every main buffer: one timestamp at its begin and one at its end (busy time, idle gaps);
+// - 1 of KYTY_GPU_TIMING_EVERY (4) buffers: one timestamp after each draw, dispatch, barrier,
+//   copy, clear and pass edge, charged to the command, its pipeline, its pass and its tag.
+// The tag names the emulator subsystem that recorded the command (0 = the guest's own draws and
+// dispatches, and everything recorded outside a GpuTagScope).
+enum class GpuTag : uint16_t {
+	Guest = 0,
+	BufUpload,     // buffer cache: CPU data into GPU buffers
+	BufDownload,   // buffer cache: GPU buffers to host memory (readbacks)
+	BufCopy,       // buffer cache: buffer-to-buffer moves (merge, stream rings)
+	Stream,        // stream buffer copies and fills
+	ImgUpload,     // texture cache: CPU data into images
+	ImgReadback,   // texture cache: images to buffers (readbacks)
+	ImgCopy,       // texture cache: image-to-image copies (aliases, format reinterpretation)
+	ImgResolve,    // MSAA resolves
+	DepthCopy,     // depth render target copies
+	RtCopy,        // render target copies made by the draw path (feedback loops)
+	Detile,        // tiler compute passes (tile, detile) and their fills
+	Fault,         // fault manager compute
+	TexClear,      // texture cache clears
+	Blit,          // blit helper draws
+	Present,       // presentation (swapchain)
+	ImgTransit,    // image layout transitions outside the scopes above (bindings, render targets)
+	DrawSync,      // barriers of the draw path (buffer-writing draws, render target transitions)
+	DispatchSync,  // barriers of the dispatch path
+	Count
+};
+[[nodiscard]] const char* GpuTagName(GpuTag tag) noexcept;
+inline thread_local uint16_t t_gpu_tag = 0;
+// Tags the commands recorded in its lifetime (the innermost scope wins; a weak scope only tags
+// commands no other scope tags).
+class GpuTagScope {
+public:
+	explicit GpuTagScope(GpuTag tag, bool weak = false) noexcept: m_previous(t_gpu_tag) {
+		if (!weak || t_gpu_tag == 0) {
+			t_gpu_tag = static_cast<uint16_t>(tag);
+		}
+	}
+	~GpuTagScope() { t_gpu_tag = m_previous; }
+	GpuTagScope(const GpuTagScope&)            = delete;
+	GpuTagScope& operator=(const GpuTagScope&) = delete;
+
+private:
+	uint16_t m_previous;
+};
+[[nodiscard]] bool GpuTimingOn() noexcept;
+// Device timestamp period, after Install.
+void SetTimestampPeriod(float period_ns) noexcept;
+// A label per pipeline handle (shader ids, targets), used in the per-pipeline report.
+void NotePipelineLabel(vk::Pipeline pipeline, const char* label);
+
 } // namespace Libs::Graphics::CmdRecord
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CMDRECORD_H_

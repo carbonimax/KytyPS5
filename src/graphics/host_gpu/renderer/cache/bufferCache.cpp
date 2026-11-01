@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -233,6 +234,7 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufUpload);
 	auto* bytes = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
@@ -545,6 +547,7 @@ std::shared_ptr<BufferCache::ReadbackCompletion> BufferCache::DownloadForFault(B
                                                                               uint64_t vaddr,
                                                                               uint64_t size,
                                                                               bool     side_ok) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufDownload);
 	if (side_ok && m_readback_queue != nullptr) {
 		std::vector<vk::BufferCopy> copies;
 		uint64_t                    total_size = 0;
@@ -680,6 +683,7 @@ void BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 
 void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                   uint64_t total_size, Common::UniqueFunction<void>& publish_out) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufDownload);
 	const auto buffer_address = buffer.CpuAddress();
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -1202,6 +1206,7 @@ void BufferCache::EndUploadBatch() {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufUpload);
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;

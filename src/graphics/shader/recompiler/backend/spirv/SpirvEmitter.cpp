@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -208,10 +209,28 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 
 } // namespace
 
+EmitStats& ThreadEmitStats() noexcept {
+	thread_local EmitStats stats;
+	return stats;
+}
+
+bool ProfSkipStorageBounds() noexcept {
+	static const bool skip = [] {
+		const char* value = std::getenv("KYTY_PROF_STORAGE_BOUNDS");
+		const bool  on    = value != nullptr && value[0] == '0';
+		if (on) {
+			std::printf("PERF gput: KYTY_PROF_STORAGE_BOUNDS=0, storage buffer bounds checks left to the device\n");
+		}
+		return on;
+	}();
+	return skip;
+}
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,
                                   bool emit_debug_info, ShaderHostFeatures host_features) {
 	using namespace Emitter;
+	ThreadEmitStats() = {};
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
 	    program.stage != ShaderType::Pixel && program.stage != ShaderType::Mesh &&

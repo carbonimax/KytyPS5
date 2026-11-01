@@ -339,9 +339,25 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index) {
+	auto& stats = ThreadEmitStats();
+	if (access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer) {
+		stats.storage_bounds++;
+	} else {
+		stats.other_bounds++;
+	}
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
 	return in_bounds;
+}
+
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index) {
+	if (ProfSkipStorageBounds() &&
+	    (access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer)) {
+		ThreadEmitStats().storage_bounds_skipped++;
+		return ConstantBool(state, true);
+	}
+	return EmitMemoryElementInBounds(state, access, index);
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,

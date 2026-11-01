@@ -477,6 +477,10 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// EmitMemoryElementInBounds, or true for storage buffers with KYTY_PROF_STORAGE_BOUNDS=0 (measurement
+// only); only loads and plain stores may use it.
+uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
+                                    uint32_t index);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

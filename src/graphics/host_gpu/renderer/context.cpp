@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -38,6 +39,7 @@ vk::CommandBuffer CommandBuffer::HandleForUpload() const {
 }
 
 void CommandBuffer::FlushUploadPost() const {
+	CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::BufUpload);
 	m_upload_post_pending = false;
 	// All copies of the batch complete and become visible before any later command.
 	vk::MemoryBarrier2 after {};
@@ -148,7 +150,10 @@ void CommandBuffer::EndRendering() const {
 	if (m_draw_write_stages) {
 		const auto stages   = m_draw_write_stages;
 		m_draw_write_stages = {};
-		ShaderWriteBarrier(Handle(), stages);
+		{
+			CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DrawSync);
+			ShaderWriteBarrier(Handle(), stages);
+		}
 	}
 }
 

@@ -12,12 +12,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <new>
 #include <string>
 #include <thread>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -67,6 +69,7 @@ enum FuncIndex : uint32_t {
 	F_Device, // device-level calls that drain first (pools, destruction)
 	F_Count
 };
+static_assert(F_Count < 65536);
 
 const char* const g_func_names[F_Count] = {
 #define KYTY_VK_CMD(name) #name,
@@ -116,7 +119,8 @@ constexpr uint64_t MaxCommandBytes = RingBytes / 8;
 struct alignas(16) Header {
 	void (*run)(Header*) = nullptr; // nullptr: padding up to the end of the ring
 	uint32_t size = 0;              // bytes, header included, multiple of 16
-	uint32_t func = 0;
+	uint16_t func = 0;
+	uint16_t tag  = 0;              // KYTY_GPU_TIMING: GpuTag of the producer when published
 };
 static_assert(sizeof(Header) == 16);
 
@@ -150,6 +154,9 @@ std::atomic<uint64_t>        g_rec_commands {0};
 std::atomic<uint64_t>        g_rec_sleeps {0};
 std::atomic<uint64_t>        g_foreign_total {0};
 
+// KYTY_GPU_TIMING: replay observer (recorder thread, or the GPU thread in mode 2), set at Install.
+void (*g_replay_observer)(Header* header, bool before) = nullptr;
+
 constexpr uint64_t AlignUp(uint64_t value, uint64_t align) noexcept {
 	return (value + align - 1) & ~(align - 1);
 }
@@ -168,7 +175,13 @@ uint64_t Replay(uint64_t from, uint64_t to) {
 		commands++;
 		auto* header = reinterpret_cast<Header*>(g_ring + (from % RingBytes));
 		if (header->run != nullptr) {
-			header->run(header);
+			if (g_replay_observer != nullptr) [[unlikely]] {
+				g_replay_observer(header, true);
+				header->run(header);
+				g_replay_observer(header, false);
+			} else {
+				header->run(header);
+			}
 		}
 		from += header->size;
 	}
@@ -299,6 +312,7 @@ uint8_t* Allocate(uint64_t bytes) noexcept {
 }
 
 void Publish(Header* header, uint32_t func) noexcept {
+	header->tag = t_gpu_tag;
 	g_ps.deferred[func]++;
 	g_ps.bytes += header->size;
 	g_head += header->size;
@@ -356,7 +370,7 @@ C* NewCommand(uint64_t extra, uint32_t func, Block*& block, Block& storage) noex
 	auto*          cmd   = new (base) C {};
 	cmd->h.run           = &C::Run;
 	cmd->h.size          = static_cast<uint32_t>(total);
-	cmd->h.func          = func;
+	cmd->h.func          = static_cast<uint16_t>(func);
 	storage              = Block(base, head);
 	block                = &storage;
 	return cmd;
@@ -426,7 +440,7 @@ struct Hook<R(VKAPI_PTR*)(VkCommandBuffer, A...)> {
 		auto* cmd  = new (base) C {};
 		cmd->h.run  = &C::Run;
 		cmd->h.size = static_cast<uint32_t>(AlignUp(sizeof(C), 16));
-		cmd->h.func = Func;
+		cmd->h.func = static_cast<uint16_t>(Func);
 		cmd->buffer = buffer;
 		cmd->args   = std::tuple<A...>(args...);
 		Publish(&cmd->h, Func);
@@ -1331,6 +1345,620 @@ void InstallCaptures(D& d) {
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// KYTY_GPU_TIMING=1 (local measurement build, default off; modes 1 and 2).
+// - Every main command buffer gets a TOP_OF_PIPE timestamp after vkBeginCommandBuffer and a
+//   BOTTOM_OF_PIPE one before vkEndCommandBuffer: busy time (union of buffer spans) and idle gaps
+//   between consecutive buffers on the queue ("PERF gput edges").
+// - In 1 of every KYTY_GPU_TIMING_EVERY (4) main buffers, the replay also writes a BOTTOM_OF_PIPE
+//   timestamp after each draw, dispatch, barrier, copy, blit, resolve, fill, clear and pass edge.
+//   The delta between two consecutive timestamps is charged to the command just replayed: its
+//   category, its emulator tag (GpuTagScope), its pipeline, its render pass and, for barriers, its
+//   stage masks. This partitions the buffer's GPU execution time.
+// - Barrier counts (per tag and stage masks, full-pipeline ones, image layout transitions) are
+//   taken on every main buffer.
+// Results are read without waiting, at later buffer begins. The recorded commands and their order
+// are unchanged; only query resets and timestamp writes are added.
+namespace GpuTiming {
+
+constexpr uint32_t Cap      = 16384;
+constexpr uint32_t Slots    = 8;
+constexpr uint32_t EdgeRing = 4096;
+constexpr uint32_t Tags     = static_cast<uint32_t>(GpuTag::Count);
+
+enum Cat : uint8_t {
+	C_None,
+	C_Draw,
+	C_DrawMesh,
+	C_DrawIndirect,
+	C_Dispatch,
+	C_DispatchIndirect,
+	C_Barrier,
+	C_Copy,
+	C_Blit,
+	C_Resolve,
+	C_Fill,
+	C_Clear,
+	C_ClearAtt,
+	C_Pass,
+	C_Count
+};
+const char* const g_cat_names[C_Count] = {"none",    "draw",  "draw_mesh", "draw_indirect", "dispatch",
+                                          "dispatch_indirect", "barrier", "copy", "blit", "resolve",
+                                          "fill",    "clear", "clear_att", "pass_edge"};
+
+struct Entry {
+	uint16_t func;
+	uint16_t tag;
+	uint32_t pass;
+	uint64_t pipe;  // pipeline handle (draws, dispatches); (src << 32) | dst stages (barriers)
+	uint64_t work;  // vertex or group invocations (0 if indirect)
+};
+
+struct Slot {
+	VkQueryPool           pool    = VK_NULL_HANDLE;
+	uint32_t              count   = 0;
+	bool                  pending = false;
+	uint64_t              last    = 0; // latest timestamp of the previous use (stale results are older)
+	std::vector<Entry>    entries;
+	std::vector<uint64_t> ts;
+};
+
+struct PipeAcc {
+	double   ns   = 0;
+	uint64_t n    = 0;
+	uint64_t work = 0;
+	uint16_t tag  = 0;
+	uint8_t  cat  = 0;
+};
+struct BarrierKey {
+	uint16_t tag;
+	uint32_t src, dst;
+	bool     operator<(const BarrierKey& o) const noexcept {
+        return std::tie(tag, src, dst) < std::tie(o.tag, o.src, o.dst);
+	}
+};
+struct BarrierAcc {
+	double   ns     = 0; // sampled buffers
+	uint64_t timed  = 0; // sampled buffers
+	uint64_t n      = 0; // all buffers
+	uint64_t images = 0; // image layout transitions, all buffers
+};
+
+struct Acc {
+	std::array<std::array<double, Tags>, C_Count>   cat_ns {};
+	std::array<std::array<uint64_t, Tags>, C_Count> cat_n {};
+	std::unordered_map<uint64_t, PipeAcc>           pipe;
+	std::unordered_map<uint32_t, std::pair<double, uint64_t>> pass; // draws per pass key
+	std::map<BarrierKey, BarrierAcc>                barriers;
+	uint64_t barriers_all = 0, barriers_full = 0, barriers_src_all = 0, image_transitions = 0;
+	double   total_ns = 0;
+	uint64_t sampled  = 0;
+	uint64_t buffers  = 0;
+	uint64_t busy     = 0; // sampled buffer skipped: every slot still pending
+	// Edges (all buffers).
+	uint64_t edge_buffers = 0, edge_lost = 0;
+	double   edge_busy_ns = 0, edge_raw_ns = 0, edge_span_ns = 0;
+	std::array<double, 7>   gap_ns {};
+	std::array<uint64_t, 7> gap_n {};
+};
+// Gap buckets: <20 us, <100 us, <1 ms, <5 ms, <20 ms, <100 ms, >=100 ms.
+constexpr double g_gap_limits_ns[6] = {20e3, 100e3, 1e6, 5e6, 20e6, 100e6};
+
+bool                     g_on        = false;
+uint32_t                 g_every     = 4;
+double                   g_period_ns = 1.0;
+VkDevice                 g_device    = VK_NULL_HANDLE;
+std::array<Cat, F_Count> g_cat {};
+Slot                     g_slots[Slots];
+int                      g_cur        = -1;
+VkCommandBuffer          g_cur_buffer = VK_NULL_HANDLE;
+uint64_t                 g_gfx_pipe = 0, g_cs_pipe = 0;
+uint32_t                 g_cur_pass = 0;
+std::mutex               g_mutex; // g_acc and g_pass_names (replay thread vs report)
+Acc                      g_acc;
+std::vector<std::string> g_pass_names {"none"};
+std::unordered_map<std::string, uint32_t> g_pass_ids; // replay thread only
+std::mutex                                g_label_mutex;
+std::unordered_map<uint64_t, std::string> g_labels;
+
+// Edges.
+VkQueryPool g_edge_pool = VK_NULL_HANDLE;
+uint64_t    g_edge_next = 0;   // buffers begun
+uint64_t    g_edge_done = 0;   // buffers read (or lost)
+bool        g_edge_open = false;
+uint64_t    g_edge_last_begin = 0, g_edge_last_end = 0, g_edge_first = 0;
+
+void Init(VkDevice device) {
+	const char* value = std::getenv("KYTY_GPU_TIMING");
+	g_on              = value != nullptr && std::atoi(value) != 0;
+	if (!g_on) {
+		return;
+	}
+	if (const char* every = std::getenv("KYTY_GPU_TIMING_EVERY"); every != nullptr && std::atoi(every) > 0) {
+		g_every = static_cast<uint32_t>(std::atoi(every));
+	}
+	g_device = device;
+	for (uint32_t i = 0; i < F_Count; i++) {
+		const std::string name = g_func_names[i];
+		const auto        has  = [&](const char* prefix) { return name.rfind(prefix, 0) == 0; };
+		const bool indirect = name.find("Indirect") != std::string::npos;
+		g_cat[i] = has("vkCmdDrawMeshTasks")                                 ? C_DrawMesh
+		           : has("vkCmdDraw") && indirect                            ? C_DrawIndirect
+		           : has("vkCmdDraw")                                        ? C_Draw
+		           : has("vkCmdDispatch") && indirect                        ? C_DispatchIndirect
+		           : has("vkCmdDispatch")                                    ? C_Dispatch
+		           : has("vkCmdPipelineBarrier")                             ? C_Barrier
+		           : has("vkCmdCopyQueryPoolResults")                        ? C_Copy
+		           : has("vkCmdCopy")                                        ? C_Copy
+		           : has("vkCmdBlit")                                        ? C_Blit
+		           : has("vkCmdResolve")                                     ? C_Resolve
+		           : has("vkCmdFillBuffer") || has("vkCmdUpdateBuffer")      ? C_Fill
+		           : has("vkCmdClearAttachments")                            ? C_ClearAtt
+		           : has("vkCmdClear")                                       ? C_Clear
+		           : has("vkCmdBeginRendering") || has("vkCmdEndRendering")  ? C_Pass
+		                                                                     : C_None;
+	}
+	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	for (auto& slot: g_slots) {
+		VkQueryPoolCreateInfo info {};
+		info.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+		info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+		info.queryCount = Cap;
+		EXIT_NOT_IMPLEMENTED(d.vkCreateQueryPool(device, &info, nullptr, &slot.pool) != VK_SUCCESS);
+		slot.entries.resize(Cap);
+		slot.ts.resize(Cap);
+	}
+	VkQueryPoolCreateInfo info {};
+	info.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+	info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+	info.queryCount = EdgeRing * 2;
+	EXIT_NOT_IMPLEMENTED(d.vkCreateQueryPool(device, &info, nullptr, &g_edge_pool) != VK_SUCCESS);
+}
+
+void PollEdges() {
+	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	// The open buffer (begun, not ended) is never read.
+	const uint64_t limit = g_edge_next - (g_edge_open ? 1 : 0);
+	while (g_edge_done < limit) {
+		const auto index = static_cast<uint32_t>(g_edge_done % EdgeRing);
+		uint64_t   ts[2] {};
+		const auto result = d.vkGetQueryPoolResults(g_device, g_edge_pool, index * 2, 2, sizeof(ts), ts,
+		                                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+		// Before the GPU runs the buffer's reset, the values of the ring's previous use are still
+		// there: older than the last accepted begin.
+		const bool fresh = result == VK_SUCCESS && ts[0] >= g_edge_last_begin && ts[1] >= ts[0];
+		if (!fresh) {
+			if (limit - g_edge_done > EdgeRing / 2) {
+				// Never executed (or unreadable): drop it so the ring keeps moving.
+				std::lock_guard lock(g_mutex);
+				g_acc.edge_lost++;
+				g_edge_done++;
+				continue;
+			}
+			return;
+		}
+		std::lock_guard lock(g_mutex);
+		auto&      a     = g_acc;
+		const auto begin = ts[0], end = ts[1];
+		if (g_edge_first == 0) {
+			g_edge_first    = begin;
+			g_edge_last_end = begin;
+		}
+		a.edge_buffers++;
+		a.edge_raw_ns += static_cast<double>(end - begin) * g_period_ns;
+		if (begin > g_edge_last_end) {
+			const double gap = static_cast<double>(begin - g_edge_last_end) * g_period_ns;
+			uint32_t     b   = 0;
+			while (b < 6 && gap >= g_gap_limits_ns[b]) b++;
+			a.gap_ns[b] += gap;
+			a.gap_n[b]++;
+		}
+		const auto from = std::max(begin, g_edge_last_end);
+		if (end > from) {
+			a.edge_busy_ns += static_cast<double>(end - from) * g_period_ns;
+		}
+		if (end > g_edge_last_end) {
+			a.edge_span_ns += static_cast<double>(end - std::max(g_edge_last_end, g_edge_first)) * g_period_ns;
+			g_edge_last_end = end;
+		}
+		g_edge_last_begin = begin;
+		g_edge_done++;
+	}
+}
+
+void Poll() {
+	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
+	PollEdges();
+	for (auto& slot: g_slots) {
+		if (!slot.pending) {
+			continue;
+		}
+		const auto result = d.vkGetQueryPoolResults(g_device, slot.pool, 0, slot.count,
+		                                            slot.count * sizeof(uint64_t), slot.ts.data(),
+		                                            sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+		// Before the GPU runs the buffer's query reset, the previous use's values are still available.
+		if (result != VK_SUCCESS || slot.ts[0] <= slot.last) {
+			continue;
+		}
+		slot.pending = false;
+		slot.last    = *std::max_element(slot.ts.begin(), slot.ts.begin() + slot.count);
+		std::lock_guard lock(g_mutex);
+		auto&           a = g_acc;
+		for (uint32_t i = 1; i < slot.count; i++) {
+			if (slot.ts[i] < slot.ts[i - 1]) {
+				continue;
+			}
+			const double ns  = static_cast<double>(slot.ts[i] - slot.ts[i - 1]) * g_period_ns;
+			const auto&  e   = slot.entries[i];
+			const auto   cat = g_cat[e.func];
+			const auto   tag = std::min<uint32_t>(e.tag, Tags - 1);
+			a.cat_ns[cat][tag] += ns;
+			a.cat_n[cat][tag]++;
+			if (cat == C_Barrier) {
+				auto& b = a.barriers[{static_cast<uint16_t>(tag), static_cast<uint32_t>(e.pipe >> 32u),
+				                      static_cast<uint32_t>(e.pipe)}];
+				b.ns += ns;
+				b.timed++;
+			} else if (e.pipe != 0) {
+				auto& p = a.pipe[e.pipe];
+				p.ns += ns;
+				p.n++;
+				p.work += e.work;
+				p.tag = e.tag;
+				p.cat = cat;
+			}
+			if (cat == C_Draw || cat == C_DrawMesh || cat == C_DrawIndirect) {
+				auto& p = a.pass[e.pass];
+				p.first += ns;
+				p.second++;
+			}
+		}
+		if (slot.count > 1 && slot.ts[slot.count - 1] >= slot.ts[0]) {
+			a.total_ns += static_cast<double>(slot.ts[slot.count - 1] - slot.ts[0]) * g_period_ns;
+		}
+		a.sampled++;
+	}
+}
+
+void Stamp(Slot& slot, uint32_t func, uint16_t tag, uint64_t pipe, uint64_t work) {
+	if (slot.count >= Cap) {
+		return;
+	}
+	g_orig_vkCmdWriteTimestamp(g_cur_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.pool, slot.count);
+	slot.entries[slot.count] = {static_cast<uint16_t>(func), tag, g_cur_pass, pipe, work};
+	slot.count++;
+}
+
+// Stage masks of a barrier (lower 32 bits of the 64-bit masks of barrier2) and its image layout
+// transitions.
+void BarrierMasks(Header* header, uint32_t& src, uint32_t& dst, uint32_t& images) {
+	src = dst = images = 0;
+	if (header->func == F_vkCmdPipelineBarrier) {
+		using C = PipelineBarrierCmd<&g_orig_vkCmdPipelineBarrier, F_vkCmdPipelineBarrier>;
+		auto* c = reinterpret_cast<C*>(header);
+		src     = c->src;
+		dst     = c->dst;
+		for (uint32_t k = 0; k < c->ni; k++) images += c->i[k].oldLayout != c->i[k].newLayout ? 1u : 0u;
+		return;
+	}
+	using C = PipelineBarrier2Cmd<&g_orig_vkCmdPipelineBarrier2, F_vkCmdPipelineBarrier2>;
+	const auto& info = reinterpret_cast<C*>(header)->info;
+	for (uint32_t k = 0; k < info.memoryBarrierCount; k++) {
+		src |= static_cast<uint32_t>(info.pMemoryBarriers[k].srcStageMask);
+		dst |= static_cast<uint32_t>(info.pMemoryBarriers[k].dstStageMask);
+	}
+	for (uint32_t k = 0; k < info.bufferMemoryBarrierCount; k++) {
+		src |= static_cast<uint32_t>(info.pBufferMemoryBarriers[k].srcStageMask);
+		dst |= static_cast<uint32_t>(info.pBufferMemoryBarriers[k].dstStageMask);
+	}
+	for (uint32_t k = 0; k < info.imageMemoryBarrierCount; k++) {
+		const auto& b = info.pImageMemoryBarriers[k];
+		src |= static_cast<uint32_t>(b.srcStageMask);
+		dst |= static_cast<uint32_t>(b.dstStageMask);
+		images += b.oldLayout != b.newLayout ? 1u : 0u;
+	}
+}
+
+uint32_t PassId(Header* header) {
+	using C = BeginRenderingCmd<&g_orig_vkCmdBeginRendering, F_vkCmdBeginRendering>;
+	const auto& info    = reinterpret_cast<C*>(header)->info;
+	bool        resolve = false;
+	uint32_t    clears  = 0;
+	for (uint32_t k = 0; k < info.colorAttachmentCount; k++) {
+		resolve |= info.pColorAttachments[k].resolveMode != VK_RESOLVE_MODE_NONE;
+		clears += info.pColorAttachments[k].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u : 0u;
+	}
+	const bool depth = info.pDepthAttachment != nullptr && info.pDepthAttachment->imageView != VK_NULL_HANDLE;
+	char       key[96];
+	std::snprintf(key, sizeof(key), "%ux%u c%u%s%s%s", info.renderArea.extent.width, info.renderArea.extent.height,
+	              info.colorAttachmentCount, depth ? " d" : "", resolve ? " resolve" : "",
+	              clears != 0 ? " clear" : "");
+	const auto [it, inserted] = g_pass_ids.try_emplace(key, static_cast<uint32_t>(g_pass_ids.size() + 1));
+	if (inserted) {
+		std::lock_guard lock(g_mutex);
+		g_pass_names.emplace_back(key);
+	}
+	return it->second;
+}
+
+void Observe(Header* header, bool before) {
+	const uint32_t func = header->func;
+	if (func == F_vkBeginCommandBuffer) {
+		if (before) {
+			return;
+		}
+		static uint64_t buffers = 0;
+		buffers++;
+		{
+			std::lock_guard lock(g_mutex);
+			g_acc.buffers++;
+		}
+		Poll();
+		g_cur        = -1;
+		g_cur_pass   = 0;
+		g_cur_buffer = reinterpret_cast<BeginBufferCmd*>(header)->buffer;
+		// Edge stamps (every buffer).
+		const auto edge = static_cast<uint32_t>(g_edge_next % EdgeRing);
+		g_orig_vkCmdResetQueryPool(g_cur_buffer, g_edge_pool, edge * 2, 2);
+		g_orig_vkCmdWriteTimestamp(g_cur_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_edge_pool, edge * 2);
+		g_edge_next++;
+		g_edge_open = true;
+		if (buffers % g_every != 0) {
+			return;
+		}
+		for (int i = 0; i < static_cast<int>(Slots); i++) {
+			if (!g_slots[i].pending) {
+				g_cur = i;
+				break;
+			}
+		}
+		if (g_cur < 0) {
+			std::lock_guard lock(g_mutex);
+			g_acc.busy++;
+			return;
+		}
+		auto& slot = g_slots[g_cur];
+		slot.count = 0;
+		g_orig_vkCmdResetQueryPool(g_cur_buffer, slot.pool, 0, Cap);
+		Stamp(slot, F_vkBeginCommandBuffer, 0, 0, 0);
+		return;
+	}
+	if (func == F_vkEndCommandBuffer) {
+		if (before) {
+			if (g_cur >= 0) {
+				auto& slot   = g_slots[g_cur];
+				slot.pending = slot.count > 1;
+				g_cur        = -1;
+			}
+			if (g_edge_open) {
+				const auto edge = static_cast<uint32_t>((g_edge_next - 1) % EdgeRing);
+				g_orig_vkCmdWriteTimestamp(g_cur_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_edge_pool,
+				                           edge * 2 + 1);
+				g_edge_open = false;
+			}
+		}
+		return;
+	}
+	if (before) {
+		return;
+	}
+	if (func == F_vkCmdBindPipeline) {
+		using C          = Hook<PFN_vkCmdBindPipeline>::ByValue<&g_orig_vkCmdBindPipeline, F_vkCmdBindPipeline>;
+		auto*      cmd   = reinterpret_cast<C*>(header);
+		const auto point = std::get<0>(cmd->args);
+		const auto pipe  = reinterpret_cast<uint64_t>(std::get<1>(cmd->args));
+		(point == VK_PIPELINE_BIND_POINT_COMPUTE ? g_cs_pipe : g_gfx_pipe) = pipe;
+		return;
+	}
+	if (func >= F_Count || g_cat[func] == C_None) {
+		return;
+	}
+	const auto cat = g_cat[func];
+	if (cat == C_Pass && (func == F_vkCmdBeginRendering || func == F_vkCmdBeginRenderingKHR)) {
+		g_cur_pass = PassId(header);
+	}
+	uint64_t pipe = 0;
+	if (cat == C_Barrier) {
+		uint32_t src = 0, dst = 0, images = 0;
+		BarrierMasks(header, src, dst, images);
+		pipe = (static_cast<uint64_t>(src) << 32u) | dst;
+		const auto      tag = static_cast<uint16_t>(std::min<uint32_t>(header->tag, Tags - 1));
+		std::lock_guard lock(g_mutex);
+		auto&           b = g_acc.barriers[{tag, src, dst}];
+		b.n++;
+		b.images += images;
+		g_acc.barriers_all++;
+		g_acc.image_transitions += images;
+		constexpr uint32_t all = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		g_acc.barriers_src_all += (src & all) != 0 ? 1u : 0u;
+		g_acc.barriers_full += (src & all) != 0 && (dst & all) != 0 ? 1u : 0u;
+	}
+	if (g_cur < 0) {
+		if (cat == C_Pass && func != F_vkCmdBeginRendering && func != F_vkCmdBeginRenderingKHR) {
+			g_cur_pass = 0;
+		}
+		return;
+	}
+	auto&    slot = g_slots[g_cur];
+	uint64_t work = 0;
+	if (func == F_vkCmdDrawIndexed) {
+		using C   = Hook<PFN_vkCmdDrawIndexed>::ByValue<&g_orig_vkCmdDrawIndexed, F_vkCmdDrawIndexed>;
+		auto* cmd = reinterpret_cast<C*>(header);
+		work      = uint64_t {std::get<0>(cmd->args)} * std::get<1>(cmd->args);
+	} else if (func == F_vkCmdDraw) {
+		using C   = Hook<PFN_vkCmdDraw>::ByValue<&g_orig_vkCmdDraw, F_vkCmdDraw>;
+		auto* cmd = reinterpret_cast<C*>(header);
+		work      = uint64_t {std::get<0>(cmd->args)} * std::get<1>(cmd->args);
+	} else if (func == F_vkCmdDrawMeshTasksEXT) {
+		using C   = Hook<PFN_vkCmdDrawMeshTasksEXT>::ByValue<&g_orig_vkCmdDrawMeshTasksEXT, F_vkCmdDrawMeshTasksEXT>;
+		auto* cmd = reinterpret_cast<C*>(header);
+		work      = uint64_t {std::get<0>(cmd->args)} * std::get<1>(cmd->args) * std::get<2>(cmd->args);
+	} else if (func == F_vkCmdDispatch) {
+		using C   = Hook<PFN_vkCmdDispatch>::ByValue<&g_orig_vkCmdDispatch, F_vkCmdDispatch>;
+		auto* cmd = reinterpret_cast<C*>(header);
+		work      = uint64_t {std::get<0>(cmd->args)} * std::get<1>(cmd->args) * std::get<2>(cmd->args);
+	}
+	if (cat != C_Barrier) {
+		const bool gfx = cat == C_Draw || cat == C_DrawMesh || cat == C_DrawIndirect;
+		const bool cs  = cat == C_Dispatch || cat == C_DispatchIndirect;
+		pipe           = gfx ? g_gfx_pipe : cs ? g_cs_pipe : 0;
+	}
+	Stamp(slot, func, header->tag, pipe, work);
+	if (cat == C_Pass && func != F_vkCmdBeginRendering && func != F_vkCmdBeginRenderingKHR) {
+		g_cur_pass = 0;
+	}
+}
+
+std::string StageNames(uint32_t mask) {
+	static const std::pair<uint32_t, const char*> names[] = {
+	    {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, "top"},
+	    {VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, "indirect"},
+	    {VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, "vin"},
+	    {VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, "vs"},
+	    {VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT, "hs"},
+	    {VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT, "ds"},
+	    {VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT, "gs"},
+	    {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, "fs"},
+	    {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, "early"},
+	    {VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, "late"},
+	    {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, "color"},
+	    {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "cs"},
+	    {VK_PIPELINE_STAGE_TRANSFER_BIT, "xfer"},
+	    {VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, "bottom"},
+	    {VK_PIPELINE_STAGE_HOST_BIT, "host"},
+	    {VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, "ALLGFX"},
+	    {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, "ALL"},
+	    {VK_PIPELINE_STAGE_TASK_SHADER_BIT_EXT, "task"},
+	    {VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT, "mesh"},
+	    {VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT, "cond"},
+	};
+	std::string out;
+	for (const auto& [bit, name]: names) {
+		if ((mask & bit) != 0) {
+			if (!out.empty()) out += '+';
+			out += name;
+			mask &= ~bit;
+		}
+	}
+	if (mask != 0) {
+		char buf[16];
+		std::snprintf(buf, sizeof(buf), "%s0x%x", out.empty() ? "" : "+", mask);
+		out += buf;
+	}
+	return out.empty() ? "none" : out;
+}
+
+void Report(double seconds) {
+	if (!g_on) {
+		return;
+	}
+	Acc                      acc;
+	std::vector<std::string> pass_names;
+	{
+		std::lock_guard lock(g_mutex);
+		acc   = std::move(g_acc);
+		g_acc = {};
+		pass_names = g_pass_names;
+	}
+	const auto per_s = [seconds](double ns) { return ns / seconds / 1e6; };
+	std::printf("PERF gput edges %.1fs: buffers=%" PRIu64 " lost=%" PRIu64 " busy=%.1fms/s raw=%.1fms/s span=%.1fms/s"
+	            " gaps=%.1fms/s(%" PRIu64 ") <20us=%.2f(%" PRIu64 ") <100us=%.2f(%" PRIu64 ") <1ms=%.2f(%" PRIu64
+	            ") <5ms=%.2f(%" PRIu64 ") <20ms=%.2f(%" PRIu64 ") <100ms=%.2f(%" PRIu64 ") >=100ms=%.2f(%" PRIu64 ")\n",
+	            seconds, acc.edge_buffers, acc.edge_lost, per_s(acc.edge_busy_ns), per_s(acc.edge_raw_ns),
+	            per_s(acc.edge_span_ns),
+	            per_s(acc.gap_ns[0] + acc.gap_ns[1] + acc.gap_ns[2] + acc.gap_ns[3] + acc.gap_ns[4] + acc.gap_ns[5] +
+	                  acc.gap_ns[6]),
+	            acc.gap_n[0] + acc.gap_n[1] + acc.gap_n[2] + acc.gap_n[3] + acc.gap_n[4] + acc.gap_n[5] + acc.gap_n[6],
+	            per_s(acc.gap_ns[0]), acc.gap_n[0], per_s(acc.gap_ns[1]), acc.gap_n[1], per_s(acc.gap_ns[2]),
+	            acc.gap_n[2], per_s(acc.gap_ns[3]), acc.gap_n[3], per_s(acc.gap_ns[4]), acc.gap_n[4],
+	            per_s(acc.gap_ns[5]), acc.gap_n[5], per_s(acc.gap_ns[6]), acc.gap_n[6]);
+	// Barrier counts (all buffers, per second).
+	std::printf("PERF gput barriers %.1fs: n=%.0f/s full=%.0f/s src_all=%.0f/s image_transitions=%.0f/s\n", seconds,
+	            static_cast<double>(acc.barriers_all) / seconds, static_cast<double>(acc.barriers_full) / seconds,
+	            static_cast<double>(acc.barriers_src_all) / seconds,
+	            static_cast<double>(acc.image_transitions) / seconds);
+	if (acc.sampled == 0) {
+		std::printf("PERF gput %.1fs: buffers=%" PRIu64 " sampled=0 busy=%" PRIu64 "\n", seconds, acc.buffers,
+		            acc.busy);
+		return;
+	}
+	// Per second of wall time, scaled from the sampled buffers to all captured buffers.
+	const double ratio = static_cast<double>(acc.buffers) / static_cast<double>(acc.sampled);
+	const double scale = ratio / seconds / 1e6;
+	std::string  line;
+	char         buf[320];
+	for (uint32_t c = 1; c < C_Count; c++) {
+		double   ns = 0;
+		uint64_t n  = 0;
+		for (uint32_t t = 0; t < Tags; t++) {
+			ns += acc.cat_ns[c][t];
+			n += acc.cat_n[c][t];
+		}
+		if (n == 0) continue;
+		std::snprintf(buf, sizeof(buf), " %s=%.2fms(%.0f)", g_cat_names[c], ns * scale,
+		              static_cast<double>(n) * ratio / seconds);
+		line += buf;
+	}
+	std::printf("PERF gput %.1fs: buffers=%" PRIu64 " sampled=%" PRIu64 " busy=%" PRIu64 " gpu=%.1fms/s%s\n",
+	            seconds, acc.buffers, acc.sampled, acc.busy, acc.total_ns * scale, line.c_str());
+	line.clear();
+	for (uint32_t c = 1; c < C_Count; c++) {
+		for (uint32_t t = 0; t < Tags; t++) {
+			if (acc.cat_n[c][t] == 0) continue;
+			std::snprintf(buf, sizeof(buf), " %s/%s=%.2fms(%.0f)", g_cat_names[c], GpuTagName(static_cast<GpuTag>(t)),
+			              acc.cat_ns[c][t] * scale, static_cast<double>(acc.cat_n[c][t]) * ratio / seconds);
+			line += buf;
+		}
+	}
+	std::printf("PERF gput tags (per s):%s\n", line.c_str());
+	// Barriers by tag and stage masks: count (all buffers) and time (sampled, scaled).
+	{
+		std::vector<std::pair<double, BarrierKey>> v;
+		for (const auto& [k, b]: acc.barriers) v.emplace_back(b.ns * scale + 1e-9 * static_cast<double>(b.n), k);
+		std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		for (size_t i = 0; i < v.size() && i < 16; i++) {
+			const auto& k = v[i].second;
+			const auto& b = acc.barriers[k];
+			std::printf("PERF gput barrier %2zu: %.2fms/s n=%.0f/s timed=%.0f/s avg=%.1fus images=%.0f/s %s %s -> %s\n", i,
+			            b.ns * scale, static_cast<double>(b.n) / seconds,
+			            static_cast<double>(b.timed) * ratio / seconds,
+			            b.timed != 0 ? b.ns / 1e3 / static_cast<double>(b.timed) : 0.0,
+			            static_cast<double>(b.images) / seconds, GpuTagName(static_cast<GpuTag>(k.tag)),
+			            StageNames(k.src).c_str(), StageNames(k.dst).c_str());
+		}
+	}
+	// Draw time per render pass key.
+	{
+		std::vector<std::pair<double, uint32_t>> v;
+		for (const auto& [id, p]: acc.pass) v.emplace_back(p.first, id);
+		std::sort(v.begin(), v.end(), std::greater<>());
+		for (size_t i = 0; i < v.size() && i < 16; i++) {
+			const auto& p = acc.pass[v[i].second];
+			std::printf("PERF gput pass %2zu: %.2fms/s draws=%.0f/s avg=%.1fus %s\n", i, p.first * scale,
+			            static_cast<double>(p.second) * ratio / seconds,
+			            p.first / 1e3 / static_cast<double>(p.second),
+			            v[i].second < pass_names.size() ? pass_names[v[i].second].c_str() : "?");
+		}
+	}
+	std::vector<std::pair<double, uint64_t>> pipes;
+	for (const auto& [pipe, v]: acc.pipe) pipes.emplace_back(v.ns, pipe);
+	std::sort(pipes.begin(), pipes.end(), std::greater<>());
+	std::lock_guard lock(g_label_mutex);
+	for (size_t i = 0; i < pipes.size() && i < 40; i++) {
+		const auto  pipe  = pipes[i].second;
+		const auto& v     = acc.pipe[pipe];
+		const auto  label = g_labels.find(pipe);
+		std::printf("PERF gput pipe %2zu: %.2fms/s n=%.0f/s avg=%.1fus work=%.0f/s ns_per_work=%.2f %s tag=%s %s\n", i,
+		            v.ns * scale, static_cast<double>(v.n) * ratio / seconds, v.ns / 1e3 / static_cast<double>(v.n),
+		            static_cast<double>(v.work) * ratio / seconds,
+		            v.work > 0 ? v.ns / static_cast<double>(v.work) : 0.0, g_cat_names[v.cat],
+		            GpuTagName(static_cast<GpuTag>(v.tag)), label != g_labels.end() ? label->second.c_str() : "?");
+	}
+}
+
+} // namespace GpuTiming
+
 } // namespace
 
 int Mode() noexcept {
@@ -1352,6 +1980,12 @@ void Install(vk::Device device) {
 		g_submit           = submit == nullptr || std::strtol(submit, nullptr, 10) != 0;
 		g_ring = static_cast<uint8_t*>(::operator new(RingBytes, std::align_val_t {64}));
 		InstallCaptures(d);
+	}
+	if (Mode() == 1 || Mode() == 2) {
+		GpuTiming::Init(static_cast<VkDevice>(device));
+		if (GpuTiming::g_on) {
+			g_replay_observer = &GpuTiming::Observe;
+		}
 	}
 	if (Mode() == 1) {
 		std::thread(RecorderThread).detach();
@@ -1401,10 +2035,41 @@ void Call(void (*fn)(void* data), const void* data, size_t bytes) {
 	Publish(&c->h, F_Device);
 }
 
+const char* GpuTagName(GpuTag tag) noexcept {
+	static const char* const names[] = {"guest",     "buf_upload", "buf_download", "buf_copy",  "stream",
+	                                    "img_upload", "img_readback", "img_copy",   "img_resolve", "depth_copy",
+	                                    "rt_copy",   "detile",     "fault",        "tex_clear", "blit",
+	                                    "present",   "img_transit", "draw_sync",  "dispatch_sync"};
+	static_assert(std::size(names) == static_cast<size_t>(GpuTag::Count));
+	const auto index = static_cast<size_t>(tag);
+	return index < std::size(names) ? names[index] : "?";
+}
+
+bool GpuTimingOn() noexcept {
+	return GpuTiming::g_on;
+}
+
+void SetTimestampPeriod(float period_ns) noexcept {
+	GpuTiming::g_period_ns = period_ns;
+	if (GpuTiming::g_on) {
+		std::printf("PERF gput: on, 1 of %u main buffers, period %.3f ns
+", GpuTiming::g_every, period_ns);
+	}
+}
+
+void NotePipelineLabel(vk::Pipeline pipeline, const char* label) {
+	if (!GpuTiming::g_on) {
+		return;
+	}
+	std::lock_guard lock(GpuTiming::g_label_mutex);
+	GpuTiming::g_labels[reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline))] = label;
+}
+
 void Report(double seconds) {
 	if (g_mode <= 0) {
 		return;
 	}
+	GpuTiming::Report(seconds);
 	static uint64_t last_tsc = Ticks();
 	static auto     last_ns  = std::chrono::steady_clock::now();
 	const auto      now_tsc  = Ticks();
