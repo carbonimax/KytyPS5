@@ -2052,8 +2052,7 @@ bool GpuTimingOn() noexcept {
 void SetTimestampPeriod(float period_ns) noexcept {
 	GpuTiming::g_period_ns = period_ns;
 	if (GpuTiming::g_on) {
-		std::printf("PERF gput: on, 1 of %u main buffers, period %.3f ns
-", GpuTiming::g_every, period_ns);
+		std::printf("PERF gput: on, 1 of %u main buffers, period %.3f ns\n", GpuTiming::g_every, period_ns);
 	}
 }
 
