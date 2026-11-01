@@ -9,7 +9,8 @@
 #include <array>
 #include <cstdint>
 
-// KYTY_CP_PIPELINE (default 0): pipelined command processor, slice 2.1 (direct graphics draws).
+// KYTY_CP_PIPELINE (default 1; 0 = off): pipelined command processor, slice 2.1 (direct graphics
+// draws).
 // The GPU thread (front) decodes PM4, keeps the registers and looks up the draw's programs (SRT
 // walks); it then copies everything the rest of the draw reads into a DrawRecord: the registers, the
 // draw arguments, the looked-up state and a copy of each stage's resource snapshot (the program
@@ -28,8 +29,9 @@
 // (the front drains before it records anything itself).
 // The back thread is host-only: it never runs guest code nor touches guest TLS. Hand-over uses
 // explicit acquire/release atomics (no reliance on x86 ordering).
-// Modes: 1 = back thread; 2 = records executed inline on the GPU thread (checks that a record holds
-// everything its draw reads, no concurrency).
+// Modes: 0 = off (every draw runs on the GPU thread); 1 = back thread (default when the variable is
+// unset); 2 = records executed inline on the GPU thread (checks that a record holds everything its
+// draw reads, no concurrency). Any other value is off.
 namespace Libs::Graphics::CpPipeline {
 
 struct DrawRecord {

@@ -156,7 +156,7 @@ void BackThread() {
 int Mode() noexcept {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_CP_PIPELINE");
-		const int   m     = value != nullptr ? std::atoi(value) : 0;
+		const int   m     = value != nullptr ? std::atoi(value) : 1;
 		return m == 1 || m == 2 ? m : 0;
 	}();
 	return mode;
