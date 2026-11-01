@@ -57,6 +57,14 @@ public:
 	// GPU (not async-signal-safe).
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// KYTY_EOP_AT_GPU: an end-of-pipe label delivered at host-GPU completion, on any thread but the
+	// GPU thread's caches are never waited for. Written through the backing, then the trackers see
+	// it as a guest write. NotBacking: nothing written. GpuOwned: written to the backing only, a
+	// readback of GPU bytes would overwrite it (the caller writes it again from the GPU thread).
+	enum class CompletedWrite { Done, NotBacking, GpuOwned };
+	[[nodiscard]] CompletedWrite WriteCompletedLabel(uint64_t vaddr, const void* data, uint64_t size);
+	// KYTY_EOP_AT_GPU: queues `command` on the GPU thread unless the guest GPU is stopping.
+	void TrySendGpuCommand(Common::UniqueFunction<void>&& command);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void RestorePageProtection(uint64_t vaddr, uint64_t size) noexcept {
 		m_page_manager.RestoreProtection(vaddr, size);

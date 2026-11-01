@@ -105,6 +105,20 @@ private:
 
 	friend class CommandProcessor;
 };
+
+// KYTY_EOP_AT_GPU (graphicsRun.cpp): RELEASE_MEM labels released by the command processor that
+// reach guest memory only at host-GPU completion ("pending" until then).
+namespace EopAtGpu {
+// KYTY_EOP_AT_GPU is 1 or 2.
+[[nodiscard]] bool Enabled() noexcept;
+// GPU thread: `bytes` holds a copy of guest memory [address, address + size) about to be used by
+// GPU work recorded now; overlays the pending label bytes (as if written at release). Returns true
+// when it changed something.
+bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept;
+// Command-processor reads of a value that may be a pending label.
+[[nodiscard]] uint32_t ReadFront32(const volatile uint32_t* address) noexcept;
+[[nodiscard]] uint64_t ReadFront64(const volatile uint64_t* address) noexcept;
+} // namespace EopAtGpu
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

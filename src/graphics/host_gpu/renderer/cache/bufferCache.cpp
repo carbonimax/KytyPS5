@@ -1030,6 +1030,19 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	return true;
 }
 
+bool BufferCache::InvalidateCompletedWrite(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	bool gpu_owned = false;
+	m_memory_tracker.InvalidateRegion(vaddr, size, [&gpu_owned] { gpu_owned = true; });
+	if (gpu_owned) {
+		return false;
+	}
+	QueueBdaSync(vaddr, size);
+	return true;
+}
+
 void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BACKING_READ_WINDOW");
@@ -1317,6 +1330,7 @@ void BufferCache::FlushDeferredUploads() {
 		if (!LibKernel::Memory::CopySparseMemory(copy.address, copy.destination, copy.size)) {
 			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 		}
+		(void)EopAtGpu::OverlayPending(copy.address, copy.destination, copy.size);
 	}
 	m_deferred_copies.clear();
 }
@@ -1357,6 +1371,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 			if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset, copy.size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
+			(void)EopAtGpu::OverlayPending(address, mapped + copy.srcOffset, copy.size);
 			copy.srcOffset += base_offset;
 		}
 	});
@@ -1381,6 +1396,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
+			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}

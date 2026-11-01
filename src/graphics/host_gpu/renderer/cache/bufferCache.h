@@ -75,6 +75,10 @@ public:
 	// at this point of the command stream. Returns false when the regular CPU write must be used
 	// (KYTY_GPU_OWNED_WRITE_DATA=0 always does).
 	[[nodiscard]] bool     WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size);
+	// Any thread (KYTY_EOP_AT_GPU label delivery): the bytes were just written through the backing.
+	// Marks them CPU-modified, as a guest write fault would, and returns true; returns false and
+	// changes nothing when a byte is GPU-modified (a readback would overwrite them).
+	[[nodiscard]] bool     InvalidateCompletedWrite(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

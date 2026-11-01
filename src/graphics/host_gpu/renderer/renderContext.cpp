@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -36,6 +37,11 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// KYTY_EOP_AT_GPU: label deliveries may still queue fix-ups on the guest GPU (refused once
+		// it stops); they finish before it is destroyed. The GPU thread submitted everything.
+		if (EopAtGpu::Enabled() && m_command_scheduler.Active()) {
+			m_command_scheduler.DrainPriorityOperations();
+		}
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
@@ -86,6 +92,30 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
+}
+
+RenderContext::CompletedWrite RenderContext::WriteCompletedLabel(uint64_t vaddr, const void* data,
+                                                                uint64_t size) {
+	// The store comes first: a cache upload racing with it either copies the new bytes or is
+	// redone, because the invalidation below marks them CPU-modified after the store.
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return CompletedWrite::NotBacking;
+	}
+	if (!IsMapped(vaddr, size)) {
+		return CompletedWrite::Done;
+	}
+	if (!m_buffer_cache.InvalidateCompletedWrite(vaddr, size)) {
+		return CompletedWrite::GpuOwned;
+	}
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
+	return CompletedWrite::Done;
+}
+
+void RenderContext::TrySendGpuCommand(Common::UniqueFunction<void>&& command) {
+	if (m_gpu != nullptr && !m_gpu->IsStopping()) {
+		m_gpu->SendCommand(std::move(command));
+	}
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
