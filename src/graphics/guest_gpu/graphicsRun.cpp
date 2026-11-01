@@ -123,41 +123,41 @@ void NoteLatency(uint64_t released_ns) {
 	}
 }
 
-// Released labels by address: the value of the latest one, how many are pending (released, not yet
-// written to guest memory) and the sequence of the latest release, so a GPU-thread fix-up never
-// replaces a newer label.
+// Keep each release until delivery/repair; only bytes not replaced by newer releases apply.
+// Retain completed coverage newer than the oldest pending release/repair that can need it.
 class PendingLabels {
 public:
 	uint64_t Add(uint64_t address, uint32_t size, uint64_t value, bool pending) {
 		std::lock_guard lock(m_mutex);
 		if (m_entries.size() > 4096) {
-			std::erase_if(m_entries, [](const auto& item) { return item.second.pending == 0; });
+			uint64_t oldest_pending = m_seq + 1;
+			for (const auto& [base, entry] : m_entries) {
+				if (entry.pending != 0) {
+					oldest_pending = std::min(oldest_pending, entry.latest);
+				}
+			}
+			std::erase_if(m_entries, [oldest_pending](const auto& item) {
+				return item.second.pending == 0 && item.second.latest < oldest_pending;
+			});
 		}
-		auto& entry  = m_entries[address];
-		entry.value  = value;
-		entry.size   = size;
-		entry.latest = ++m_seq;
+		const auto seq = ++m_seq;
+		m_entries.emplace(address, Entry {value, seq, size, pending ? 1u : 0u});
 		if (pending) {
-			entry.pending++;
 			m_pending.fetch_add(1, std::memory_order_release);
 		}
-		return entry.latest;
+		return seq;
 	}
 
-	void Delivered(uint64_t address) {
+	void Delivered(uint64_t address, uint64_t seq) {
 		std::lock_guard lock(m_mutex);
-		auto            it = m_entries.find(address);
-		if (it != m_entries.end() && it->second.pending != 0) {
-			it->second.pending--;
-			m_pending.fetch_sub(1, std::memory_order_release);
+		const auto [begin, end] = m_entries.equal_range(address);
+		for (auto it = begin; it != end; ++it) {
+			if (it->second.latest == seq && it->second.pending != 0) {
+				it->second.pending = 0;
+				m_pending.fetch_sub(1, std::memory_order_release);
+				break;
+			}
 		}
-	}
-
-	// No label was released at `address` after the one with sequence `seq`.
-	[[nodiscard]] bool IsLatest(uint64_t address, uint64_t seq) {
-		std::lock_guard lock(m_mutex);
-		auto            it = m_entries.find(address);
-		return it == m_entries.end() || it->second.latest == seq;
 	}
 
 	[[nodiscard]] bool AnyPending() const noexcept { return m_pending.load(std::memory_order_acquire) != 0; }
@@ -181,17 +181,43 @@ public:
 		bool            hit = false;
 		std::lock_guard lock(m_mutex);
 		ForEachPending(address, size, [&](uint64_t base, const Entry& entry) {
+			const auto mask  = UnreplacedMask(base, entry.size, entry.latest);
 			const auto begin = std::max(base, address);
 			const auto end   = std::min(base + entry.size, address + size);
 			for (auto byte = begin; byte < end; byte++) {
-				bytes[byte - address] = static_cast<uint8_t>(entry.value >> (8u * (byte - base)));
+				if ((mask & (1u << (byte - base))) != 0) {
+					bytes[byte - address] = static_cast<uint8_t>(entry.value >> (8u * (byte - base)));
+					hit = true;
+				}
 			}
-			hit = true;
 		});
 		return hit;
 	}
 
+	// GPU thread: Add and repair writes are serialized here. Keep this release pending
+	// until its repair writes finish, then retire it with Delivered(address, seq).
+	[[nodiscard]] uint8_t RepairMask(uint64_t address, uint32_t size, uint64_t seq) {
+		std::lock_guard lock(m_mutex);
+		return UnreplacedMask(address, size, seq);
+	}
+
 private:
+	[[nodiscard]] uint8_t UnreplacedMask(uint64_t address, uint32_t size, uint64_t seq) {
+		uint8_t mask = static_cast<uint8_t>((1u << size) - 1u);
+		for (auto it = m_entries.lower_bound(address >= 7 ? address - 7 : 0);
+		     it != m_entries.end() && it->first < address + size; ++it) {
+			if (it->second.latest <= seq) {
+				continue;
+			}
+			const auto begin = std::max(address, it->first);
+			const auto end   = std::min(address + size, it->first + it->second.size);
+			for (auto byte = begin; byte < end; byte++) {
+				mask &= static_cast<uint8_t>(~(1u << (byte - address)));
+			}
+		}
+		return mask;
+	}
+
 	struct Entry {
 		uint64_t value   = 0;
 		uint64_t latest  = 0;
@@ -211,7 +237,7 @@ private:
 	}
 
 	std::mutex                    m_mutex;
-	std::map<uint64_t, Entry>     m_entries;
+	std::multimap<uint64_t, Entry> m_entries;
 	std::atomic<uint32_t>         m_pending {0};
 	uint64_t                      m_seq = 0;
 };
@@ -1501,12 +1527,16 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 				NoteLatency(released_ns);
 				st.checked.fetch_add(1, std::memory_order_relaxed);
 				uint64_t memory = 0;
-				if (g_pending_labels.IsLatest(address_value, seq) &&
-				    Libs::LibKernel::Memory::TryReadBacking(address_value, &memory, label_size) &&
-				    std::memcmp(&memory, &value, label_size) != 0) {
-					st.overwritten.fetch_add(1, std::memory_order_relaxed);
+				const auto mask = g_pending_labels.RepairMask(address_value, label_size, seq);
+				if (Libs::LibKernel::Memory::TryReadBacking(address_value, &memory, label_size)) {
+					for (uint32_t byte = 0; byte < label_size; byte++) {
+						if ((mask & (1u << byte)) != 0 && ((memory ^ value) & (uint64_t {0xff} << (8u * byte))) != 0) {
+							st.overwritten.fetch_add(1, std::memory_order_relaxed);
+							break;
+						}
+					}
 				}
-				g_pending_labels.Delivered(address_value);
+				g_pending_labels.Delivered(address_value, seq);
 			}
 			if (interrupt) {
 				st.interrupts.fetch_add(1, std::memory_order_relaxed);
@@ -1546,6 +1576,10 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 			// delivered (nothing older stays pending), then written at once.
 			GetScheduler().Finish();
 			GetScheduler().WaitPriorityOperations(GetScheduler().CurrentTick() - 1);
+			// Timeline completion can leave older label repairs queued on the GPU thread.
+			if (g_gpu_state != nullptr) {
+				g_gpu_state->ProcessCommands();
+			}
 			const auto gds = static_cast<uint32_t>(data);
 			Sync::ReadGds(*m_renderer.GetBufferCache().GetGdsBuffer(),
 			              static_cast<uint32_t*>(address), gds & 0xffffu, gds >> 16u);
@@ -1589,6 +1623,7 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 			// pass timings would collapse; games that size their work from them then add work.
 			const uint64_t label  = value;
 			const auto     result = renderer.WriteCompletedLabel(address_value, &label, label_size);
+			bool repair_required = false;
 			if (result == RenderContext::CompletedWrite::NotBacking &&
 			    !renderer.IsMapped(address_value, label_size)) {
 				// Untracked memory outside the backing: a plain store cannot need the GPU thread.
@@ -1599,16 +1634,30 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 				// the page, unless a newer label to these bytes was released meanwhile.
 				(result == RenderContext::CompletedWrite::GpuOwned ? st.fixups : st.fallback)
 				    .fetch_add(1, std::memory_order_relaxed);
+				repair_required = true;
 				renderer.TrySendGpuCommand([&renderer, address_value, label_size, label, seq] {
-					if (!g_pending_labels.IsLatest(address_value, seq)) {
-						return;
+					const auto mask = g_pending_labels.RepairMask(address_value, label_size, seq);
+					for (uint32_t begin = 0; begin < label_size;) {
+						if ((mask & (1u << begin)) == 0) {
+							begin++;
+							continue;
+						}
+						uint32_t end = begin + 1;
+						while (end < label_size && (mask & (1u << end)) != 0) {
+							end++;
+						}
+						const auto target = address_value + begin;
+						const auto size   = end - begin;
+						const auto* bytes = reinterpret_cast<const uint8_t*>(&label) + begin;
+						if (GpuOwnedEopLabelEnabled() &&
+						    renderer.GetBufferCache().WriteGpuOwned(target, bytes, size)) {
+							renderer.GetTextureCache().InvalidateMemory(target, size);
+						} else {
+							std::memcpy(reinterpret_cast<void*>(target), bytes, size);
+						}
+						begin = end;
 					}
-					if (GpuOwnedEopLabelEnabled() &&
-					    renderer.GetBufferCache().WriteGpuOwned(address_value, &label, label_size)) {
-						renderer.GetTextureCache().InvalidateMemory(address_value, label_size);
-						return;
-					}
-					std::memcpy(reinterpret_cast<void*>(address_value), &label, label_size);
+					g_pending_labels.Delivered(address_value, seq);
 				});
 			} else {
 				uint64_t memory = 0;
@@ -1617,7 +1666,9 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 					st.value_errors.fetch_add(1, std::memory_order_relaxed);
 				}
 			}
-			g_pending_labels.Delivered(address_value);
+			if (!repair_required) {
+				g_pending_labels.Delivered(address_value, seq);
+			}
 			st.deferred.fetch_add(1, std::memory_order_relaxed);
 			st.checked.fetch_add(1, std::memory_order_relaxed);
 			NoteLatency(released_ns);
