@@ -1949,7 +1949,7 @@ void Report(double seconds) {
 		const auto  pipe  = pipes[i].second;
 		const auto& v     = acc.pipe[pipe];
 		const auto  label = g_labels.find(pipe);
-		std::printf("PERF gput pipe %2zu: %.2fms/s n=%.0f/s avg=%.1fus work=%.0f/s ns_per_work=%.2f %s tag=%s %s\n", i,
+		std::printf("PERF gput pipe %2zu: %.2fms/s n=%.0f/s avg=%.1fus work=%.0f/s ns_per_work=%.2f %s tag=%s h=%" PRIx64 " %s\n", i,
 		            v.ns * scale, static_cast<double>(v.n) * ratio / seconds, v.ns / 1e3 / static_cast<double>(v.n),
 		            static_cast<double>(v.work) * ratio / seconds,
 		            v.work > 0 ? v.ns / static_cast<double>(v.work) : 0.0, g_cat_names[v.cat],
