@@ -419,7 +419,10 @@ ShaderStoreContents ParseStore(std::span<const uint8_t> bytes, std::span<const u
 		}
 		live_modules.insert(contents.modules[i].module.handle.id);
 		module_spirv[kept_modules]       = module_spirv[i];
-		contents.modules[kept_modules++] = std::move(contents.modules[i]);
+		if (kept_modules != i) {
+			contents.modules[kept_modules] = std::move(contents.modules[i]);
+		}
+		kept_modules++;
 	}
 	contents.modules.resize(kept_modules);
 	module_spirv.resize(kept_modules);
