@@ -1217,12 +1217,13 @@ void FlipQueue::SignalDoneLocked() {
 	}
 }
 
-// A display buffer is safe for rendering once it is neither displayed nor waiting to be.
+// A display buffer is safe for rendering once no flip of it is queued or presenting. The
+// buffer on screen is safe: Present() has already consumed it, and waiting for the next flip
+// would cost a frame of overlap or stall a title that redraws the buffer it shows.
 bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-	const bool safe = cfg.flip_status.currentBuffer != index &&
-	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	const bool safe = std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
 	return safe;

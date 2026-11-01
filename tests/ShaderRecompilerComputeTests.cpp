@@ -54273,7 +54273,7 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
 }
 
 // waitUntilSafeForRendering stalls only its own command processor, and a display buffer
-// stays busy while its flip is pending or while it is on screen.
+// stays busy while its flip is pending (not while it is on screen: upstream 1be1c6c4).
 void CheckWaitUntilSafeForRendering() {
   constexpr const char *name = "WaitUntilSafeForRendering";
   Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
@@ -54292,7 +54292,6 @@ void CheckWaitUntilSafeForRendering() {
   constexpr int bus_main = 0;
   constexpr int flip_mode_vsync = 1;
   // Special buffer indices flip without a registered surface.
-  constexpr int index_blank = -1;
   constexpr int index_black = -2;
   const int handle = VideoOut::VideoOutOpen(user_system, bus_main, 0, nullptr);
   Require(name, "open", handle > 0, "video-out open failed");
@@ -54343,15 +54342,9 @@ void CheckWaitUntilSafeForRendering() {
   gate.store(1);
   Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
           "the BLACK flip was not presented");
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  Require(name, "displayed", rendered.load() == 0,
-          "rendering started while its display buffer was on screen");
-
-  Require(name, "flip blank",
-          VideoOut::VideoOutSubmitFlip(handle, index_blank, flip_mode_vsync, 0) == 0,
-          "CPU flip failed");
+  // The buffer stays on screen (no later flip), yet it is safe once its flip is presented.
   Require(name, "resume", wait_until([&] { return rendered.load() == 1; }),
-          "rendering did not resume once its display buffer left the screen");
+          "rendering did not resume once its display buffer's flip was presented");
 
   gpu.WaitForIdle();
   Require(name, "close", VideoOut::VideoOutClose(handle) == 0, "video-out close failed");
