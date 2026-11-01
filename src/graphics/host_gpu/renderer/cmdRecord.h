@@ -104,6 +104,10 @@ private:
 void SetTimestampPeriod(float period_ns) noexcept;
 // A label per pipeline handle (shader ids, targets), used in the per-pipeline report.
 void NotePipelineLabel(vk::Pipeline pipeline, const char* label);
+// The main buffer just ended is being submitted (recorder thread, before vkQueueSubmit): whether the
+// queue had already finished the previous submission (a gap before it is starvation) or not (a gap
+// is per-submission overhead).
+void NoteSubmitState(bool previous_done) noexcept;
 
 } // namespace Libs::Graphics::CmdRecord
 

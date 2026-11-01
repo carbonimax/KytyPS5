@@ -66,6 +66,19 @@ struct DeferredSubmit {
 		submit_info.signalSemaphoreCount = d.submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = d.submit.signal_semaphores.data();
 		vk::Result result;
+		if (CmdRecord::GpuTimingOn()) {
+			// KYTY_GPU_TIMING: was the previous submission already done (the queue idle)?
+			for (uint32_t i = 0; i < d.submit.num_signal_semaphores; i++) {
+				if (d.submit.signal_ticks[i] == d.tick) {
+					uint64_t value = 0;
+					VULKAN_HPP_DEFAULT_DISPATCHER.vkGetSemaphoreCounterValue(
+					    static_cast<VkDevice>(d.graphics->device),
+					    static_cast<VkSemaphore>(d.submit.signal_semaphores[i]), &value);
+					CmdRecord::NoteSubmitState(value + 1 >= d.tick);
+					break;
+				}
+			}
+		}
 		{
 			Common::LockGuard lock(d.graphics->queue_mutex);
 			result = d.graphics->queue.submit(1, &submit_info, nullptr);

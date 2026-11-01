@@ -1441,6 +1441,10 @@ struct Acc {
 	double   edge_busy_ns = 0, edge_raw_ns = 0, edge_span_ns = 0;
 	std::array<double, 7>   gap_ns {};
 	std::array<uint64_t, 7> gap_n {};
+	// Gaps before buffers submitted while the queue was idle / still busy / not known.
+	std::array<double, 3>   gap_kind_ns {};
+	std::array<uint64_t, 3> gap_kind_n {};
+	std::array<uint64_t, 3> buffers_kind {};
 };
 // Gap buckets: <20 us, <100 us, <1 ms, <5 ms, <20 ms, <100 ms, >=100 ms.
 constexpr double g_gap_limits_ns[6] = {20e3, 100e3, 1e6, 5e6, 20e6, 100e6};
@@ -1467,6 +1471,7 @@ VkQueryPool g_edge_pool = VK_NULL_HANDLE;
 uint64_t    g_edge_next = 0;   // buffers begun
 uint64_t    g_edge_done = 0;   // buffers read (or lost)
 bool        g_edge_open = false;
+std::array<uint8_t, EdgeRing> g_edge_kind {}; // 0 unknown, 1 queue idle at submit, 2 queue busy at submit
 uint64_t    g_edge_last_begin = 0, g_edge_last_end = 0, g_edge_first = 0;
 
 void Init(VkDevice device) {
@@ -1547,8 +1552,14 @@ void PollEdges() {
 		}
 		a.edge_buffers++;
 		a.edge_raw_ns += static_cast<double>(end - begin) * g_period_ns;
+		const uint32_t kind = g_edge_kind[index] == 1 ? 0u : g_edge_kind[index] == 2 ? 1u : 2u;
+		a.buffers_kind[kind]++;
 		if (begin > g_edge_last_end) {
 			const double gap = static_cast<double>(begin - g_edge_last_end) * g_period_ns;
+			if (gap < 100e6) {
+				a.gap_kind_ns[kind] += gap;
+				a.gap_kind_n[kind]++;
+			}
 			uint32_t     b   = 0;
 			while (b < 6 && gap >= g_gap_limits_ns[b]) b++;
 			a.gap_ns[b] += gap;
@@ -1702,6 +1713,7 @@ void Observe(Header* header, bool before) {
 		const auto edge = static_cast<uint32_t>(g_edge_next % EdgeRing);
 		g_orig_vkCmdResetQueryPool(g_cur_buffer, g_edge_pool, edge * 2, 2);
 		g_orig_vkCmdWriteTimestamp(g_cur_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_edge_pool, edge * 2);
+		g_edge_kind[edge] = 0;
 		g_edge_next++;
 		g_edge_open = true;
 		if (buffers % g_every != 0) {
@@ -1873,6 +1885,10 @@ void Report(double seconds) {
 	            per_s(acc.gap_ns[0]), acc.gap_n[0], per_s(acc.gap_ns[1]), acc.gap_n[1], per_s(acc.gap_ns[2]),
 	            acc.gap_n[2], per_s(acc.gap_ns[3]), acc.gap_n[3], per_s(acc.gap_ns[4]), acc.gap_n[4],
 	            per_s(acc.gap_ns[5]), acc.gap_n[5], per_s(acc.gap_ns[6]), acc.gap_n[6]);
+	std::printf("PERF gput gapkind %.1fs: starved=%.2fms/s(%" PRIu64 " of %" PRIu64 ") queued=%.2fms/s(%" PRIu64
+	            " of %" PRIu64 ") unknown=%.2fms/s(%" PRIu64 " of %" PRIu64 ")\n",
+	            seconds, per_s(acc.gap_kind_ns[0]), acc.gap_kind_n[0], acc.buffers_kind[0], per_s(acc.gap_kind_ns[1]),
+	            acc.gap_kind_n[1], acc.buffers_kind[1], per_s(acc.gap_kind_ns[2]), acc.gap_kind_n[2], acc.buffers_kind[2]);
 	// Barrier counts (all buffers, per second).
 	std::printf("PERF gput barriers %.1fs: n=%.0f/s full=%.0f/s src_all=%.0f/s image_transitions=%.0f/s\n", seconds,
 	            static_cast<double>(acc.barriers_all) / seconds, static_cast<double>(acc.barriers_full) / seconds,
@@ -2047,6 +2063,12 @@ const char* GpuTagName(GpuTag tag) noexcept {
 
 bool GpuTimingOn() noexcept {
 	return GpuTiming::g_on;
+}
+
+void NoteSubmitState(bool previous_done) noexcept {
+	if (GpuTiming::g_on && !GpuTiming::g_edge_open && GpuTiming::g_edge_next != 0) {
+		GpuTiming::g_edge_kind[(GpuTiming::g_edge_next - 1) % GpuTiming::EdgeRing] = previous_done ? 1 : 2;
+	}
 }
 
 void SetTimestampPeriod(float period_ns) noexcept {
