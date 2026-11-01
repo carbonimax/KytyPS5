@@ -1362,7 +1362,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		// The descriptor's base level and layer are relative to its own data. When it resolves
 		// into a larger image that starts before that data, offset them by where the data starts
 		// in the final image (a position taken from an earlier candidate may no longer apply).
-		if (desc.info.data.address != image.info.data.address) {
+		// A smaller mip can also start at the image's own address (mips stored smallest first).
+		if (desc.info.data.address != image.info.data.address ||
+		    desc.info.extent != image.info.extent) {
 			const int32_t mip   = desc.info.MipOf(image.info);
 			const int32_t layer = mip >= 0 ? desc.info.SliceOf(image.info, mip) : -1;
 			if (layer >= 0) {
