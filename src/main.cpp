@@ -4,6 +4,7 @@
 #include "common/debug.h"
 #include "common/file.h"
 #include "common/stringUtils.h"
+#include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
@@ -435,6 +436,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
+	}
+
+	if (options.config.guest_tsc_enabled && !Common::GuestTscHostSupported()) {
+		::printf("--guest-tsc ignored: needs a native x86-64 host with BMI2 (not Rosetta or ARM)\n");
+		options.config.guest_tsc_enabled = false;
 	}
 
 	return show_help || (!options.app0_dir.empty() && !options.elf.empty());

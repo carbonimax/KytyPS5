@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/systemInfo.h"
 
 #include <algorithm>
 #include <memory>
@@ -118,7 +119,8 @@ bool AmdCpuEnabled() {
 }
 
 bool GuestTscEnabled() {
-	return g_config->guest_tsc_enabled;
+	// The RDTSC rewrite is native x86-64 code (BMI2): never under Rosetta or on ARM hosts.
+	return g_config->guest_tsc_enabled && Common::GuestTscHostSupported();
 }
 
 uint32_t GetVblankFrequency() {

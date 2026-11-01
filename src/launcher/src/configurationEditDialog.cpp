@@ -328,6 +328,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
+	// The emulator ignores --guest-tsc under Rosetta.
+	m_ui->checkBox_guest_tsc->setVisible(false);
 #endif
 #if defined(_WIN32)
 	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
