@@ -104,6 +104,8 @@ private:
 void SetTimestampPeriod(float period_ns) noexcept;
 // A label per pipeline handle (shader ids, targets), used in the per-pipeline report.
 void NotePipelineLabel(vk::Pipeline pipeline, const char* label);
+// Counts an emulator event (key, bytes) for the per-report event table (GPU timing on only).
+void NoteEvent(const char* key, uint64_t bytes);
 // The main buffer just ended is being submitted (recorder thread, before vkQueueSubmit): whether the
 // queue had already finished the previous submission (a gap before it is starvation) or not (a gap
 // is per-submission overhead).

@@ -27,6 +27,24 @@
 #include <cstring>
 #include <limits>
 
+#include <cstdio>
+
+namespace {
+// GPU timing: one event per tiler call (direction, extent, formats, tile mode).
+void NoteTilerEvent(const char* what, const Libs::Graphics::ImageInfo& info, uint64_t bytes) {
+	if (!Libs::Graphics::CmdRecord::GpuTimingOn()) {
+		return;
+	}
+	char key[160];
+	std::snprintf(key, sizeof(key), "tiler %s %ux%ux%u layers=%u levels=%u guest_fmt=%u vk_fmt=%u tile=%u samples=%u bytes=%llu", what,
+	              info.extent.width, info.extent.height, info.extent.depth, info.resources.layers,
+	              info.resources.levels, static_cast<uint32_t>(info.guest_format),
+	              static_cast<uint32_t>(info.pixel_format), static_cast<uint32_t>(info.tile_mode), info.samples,
+	              static_cast<unsigned long long>(bytes));
+	Libs::Graphics::CmdRecord::NoteEvent(key, bytes);
+}
+} // namespace
+
 namespace Libs::Graphics {
 
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -224,6 +242,14 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
 	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
 	m_pipelines[slot] = CreatePipeline(shaders[family_index], &specialization);
+	if (CmdRecord::GpuTimingOn()) {
+		static constexpr const char* names[FamilyCount] {"std256", "std4", "std4_3d", "std64", "std64_3d",
+		                                                 "prt", "prt_3d", "rt", "depth"};
+		char label[64];
+		std::snprintf(label, sizeof(label), "tiler %s %s bpe=%u", direction_index ? "tile" : "detile",
+		              names[family_index], 1u << element_index);
+		CmdRecord::NotePipelineLabel(m_pipelines[slot], label);
+	}
 	return m_pipelines[slot];
 }
 
@@ -344,6 +370,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
 	const auto     linear_capacity = info.LinearSize();
 	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
+	NoteTilerEvent("detile", info, info.data.size);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size, tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
@@ -359,6 +386,7 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
 	const auto     tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
+	NoteTilerEvent("tile", info, tiled_capacity);
 	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
 	       false);
 }
@@ -375,6 +403,7 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	// Reserve stream parameters before recording the image download.
 	const auto tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
+	NoteTilerEvent("tile_image", image.info, tiled_capacity);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling, false);
@@ -439,7 +468,10 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 		const vk::SpecializationMapEntry entry {0, 0, sizeof(value)};
 		const vk::SpecializationInfo     specialization {1, &entry, sizeof(value), &value};
 		pipeline = CreatePipeline(code, &specialization);
+		CmdRecord::NotePipelineLabel(pipeline, direction == D16Direction::Promote ? "tiler d16 promote" : "tiler d16 demote");
 	}
+	Libs::Graphics::CmdRecord::NoteEvent(direction == D16Direction::Promote ? "tiler d16 promote" : "tiler d16 demote",
+	                                     static_cast<uint64_t>(layout.width) * layout.height * layout.layers * 2);
 
 	const uint64_t source_element =
 	    direction == D16Direction::Promote ? sizeof(uint16_t) : sizeof(uint32_t);
@@ -573,7 +605,9 @@ void TileManager::TransformColor(Result input, Result output, ColorTransform tra
 	const auto pixels = static_cast<uint32_t>(input.size / element_bytes);
 	if (m_color_transform == nullptr) {
 		m_color_transform = CreatePipeline(GPU_TILER_COLOR_TRANSFORM_SPV, nullptr);
+		CmdRecord::NotePipelineLabel(m_color_transform, "tiler color transform");
 	}
+	CmdRecord::NoteEvent(to_host ? "tiler color transform to_host" : "tiler color transform to_guest", input.size);
 	const auto input_binding  = BindStorage(input, input.size);
 	const auto output_binding = BindStorage(output, input.size);
 
@@ -648,6 +682,7 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	        metadata.size / 4 > UINT32_MAX);
 	if (m_color_clear == nullptr) {
 		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
+		CmdRecord::NotePipelineLabel(m_color_clear, "tiler color clear check");
 		m_clear_predicates = std::make_unique<Buffer>(
 		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eStorageBuffer |

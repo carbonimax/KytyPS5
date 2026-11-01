@@ -1465,6 +1465,8 @@ std::vector<std::string> g_pass_names {"none"};
 std::unordered_map<std::string, uint32_t> g_pass_ids; // replay thread only
 std::mutex                                g_label_mutex;
 std::unordered_map<uint64_t, std::string> g_labels;
+std::mutex                                g_event_mutex;
+std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> g_events; // key -> (n, bytes)
 
 // Edges.
 VkQueryPool g_edge_pool = VK_NULL_HANDLE;
@@ -1971,6 +1973,19 @@ void Report(double seconds) {
 		            v.work > 0 ? v.ns / static_cast<double>(v.work) : 0.0, g_cat_names[v.cat],
 		            GpuTagName(static_cast<GpuTag>(v.tag)), pipe, label != g_labels.end() ? label->second.c_str() : "?");
 	}
+	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> events;
+	{
+		std::lock_guard elock(g_event_mutex);
+		events.swap(g_events);
+	}
+	std::vector<std::pair<uint64_t, const std::string*>> ev;
+	for (const auto& [key, v]: events) ev.emplace_back(v.second, &key);
+	std::sort(ev.begin(), ev.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+	for (size_t i = 0; i < ev.size() && i < 24; i++) {
+		const auto& v = events[*ev[i].second];
+		std::printf("PERF gput event %2zu: n=%.1f/s mb=%.2f/s %s\n", i, static_cast<double>(v.first) / seconds,
+		            static_cast<double>(v.second) / 1e6 / seconds, ev[i].second->c_str());
+	}
 }
 
 } // namespace GpuTiming
@@ -2084,6 +2099,16 @@ void NotePipelineLabel(vk::Pipeline pipeline, const char* label) {
 	}
 	std::lock_guard lock(GpuTiming::g_label_mutex);
 	GpuTiming::g_labels[reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline))] = label;
+}
+
+void NoteEvent(const char* key, uint64_t bytes) {
+	if (!GpuTiming::g_on) {
+		return;
+	}
+	std::lock_guard lock(GpuTiming::g_event_mutex);
+	auto&           v = GpuTiming::g_events[key];
+	v.first++;
+	v.second += bytes;
 }
 
 void Report(double seconds) {
