@@ -148,6 +148,7 @@ void NoteProgramStats(const char* stage_name, uint64_t shader_hash, uint64_t id,
 	uint32_t total = 0, branches = 0, merges = 0, loops = 0, phis = 0, loads = 0, stores = 0, chains = 0,
 	         atomics = 0, samples = 0, fetches = 0, image_rw = 0, group = 0, calls = 0, ext = 0, compares = 0,
 	         converts = 0, bitfield = 0, selects = 0, barriers = 0, kills = 0, functions = 0;
+	std::unordered_map<uint32_t, uint32_t> histogram;
 	for (size_t at = 5; at < spirv.size();) {
 		const uint32_t words = spirv[at] >> 16u;
 		const uint32_t op    = spirv[at] & 0xffffu;
@@ -162,6 +163,7 @@ void NoteProgramStats(const char* stage_name, uint64_t shader_hash, uint64_t id,
 			continue; // declarations, types, constants, decorations
 		}
 		total++;
+		histogram[op]++;
 		if (op == spv::OpBranchConditional || op == spv::OpSwitch) branches++;
 		else if (op == spv::OpSelectionMerge) merges++;
 		else if (op == spv::OpLoopMerge) loops++;
@@ -197,6 +199,15 @@ void NoteProgramStats(const char* stage_name, uint64_t shader_hash, uint64_t id,
 	            program.scratch_dwords, info.uses_dma ? 1 : 0, info.helper_invocation ? 1 : 0,
 	            info.compute_derivatives ? 1 : 0, info.subgroup_ballot ? 1 : 0, info.subgroup_shuffle ? 1 : 0,
 	            info.uses_image_heap ? 1 : 0, program.has_address_writes ? 1 : 0);
+	// The 24 most frequent opcodes of the function bodies (numbers, see spirv.hpp).
+	std::vector<std::pair<uint32_t, uint32_t>> ops;
+	for (const auto& [op, count]: histogram) ops.emplace_back(count, op);
+	std::sort(ops.begin(), ops.end(), std::greater<>());
+	std::string line;
+	for (size_t i = 0; i < ops.size() && i < 24; i++) {
+		line += ' ' + std::to_string(ops[i].second) + ':' + std::to_string(ops[i].first);
+	}
+	std::printf("PERF gput progops id=%016" PRIx64 "%s\n", id, line.c_str());
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
