@@ -764,7 +764,9 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
-void  ValidateProgram(const Program& program);
+// Checks the IR's structure and, with require_ssa, that no register-state pseudo is left
+// (only tests validate the IR before the SSA rewrite).
+void  ValidateProgram(const Program& program, bool require_ssa = true);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
