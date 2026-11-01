@@ -49,7 +49,7 @@ enum class Counter : uint32_t {
 	BindImagesNs,      // RebindImages: image views
 	BindBuffersNs,     // RebindBuffers: storage buffer views, uploads
 	BindCommitNs,      // CommitBindings, whole
-	BindCheckNs,       // of which scalar-read overlap checks + image heap commit
+	BindCheckNs,       // of which stage checks + image heap commit
 	BindTransitNs,     // of which image layout transitions
 	BindPushNs,        // of which push descriptors / set update + bind (record hook or driver)
 	BindCommitCount,   // CommitBindings calls

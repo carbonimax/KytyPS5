@@ -2727,6 +2727,10 @@ public:
                 vertex.shader_data_buffer.offset == 0,
             "repeated shader binding preparation allocated or retained stale state");
 
+    // Scalar resource reads are captured before the draw, so a stage that writes through
+    // computed addresses commits alongside them.
+    vertex_program.has_address_writes = true;
+    pixel_snapshot.specialization_reads = {{0x1000u, 4u}};
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
     Require(name, "shared push data",
