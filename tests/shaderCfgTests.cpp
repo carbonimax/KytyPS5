@@ -2290,6 +2290,17 @@ void TestDisabledDebugBranches() {
   }
 }
 
+void TestOrderedPsDoneEndsProgram() {
+  using namespace ShaderRecompiler;
+  // Captured POPS pixel shaders of a title end in s_endpgm_ordered_ps_done, padded to 16 bytes.
+  const std::array shader = {EncodeSopp(0x1e), 0u, 0u, 0u};
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  Check(decoded.instructions.size() == 1u &&
+            decoded.instructions.front().opcode == Decoder::Opcode::S_ENDPGM,
+        "s_endpgm_ordered_ps_done did not end the program");
+}
+
 void TestNewShaderRecompilerRdna2ScalarOpcodes() {
   const uint32_t shader[] = {
       EncodeSMovB32(2, 135),         // s2 = 7
@@ -2476,6 +2487,50 @@ void TestNewShaderRecompilerVop3LaneReadDestinationEncoding() {
   Check((result.decoded_dump.find("V_READLANE_B32 s26, v5, 2") != std::string::npos),
         "VOP3 V_READLANE_B32 destination was not decoded from VDST");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestVop3FloatConversionDecode() {
+  namespace Decoder = ShaderRecompiler::Decoder;
+  const std::pair<uint32_t, Decoder::Opcode> conversions[] = {
+      {0x18b, Decoder::Opcode::V_CVT_F32_F16},
+      {0x191, Decoder::Opcode::V_CVT_F32_UBYTE0},
+      {0x192, Decoder::Opcode::V_CVT_F32_UBYTE1},
+      {0x193, Decoder::Opcode::V_CVT_F32_UBYTE2},
+      {0x194, Decoder::Opcode::V_CVT_F32_UBYTE3},
+  };
+  for (const auto &[encoding, opcode] : conversions) {
+    for (const uint32_t source : {261u, 12u, 128u, 255u}) {
+      const uint32_t code[] = {
+          EncodeVop3Word0(encoding, 20, 0, 1, true),
+          EncodeVop3Word1(source, 0, 0) | (2u << 27u) | (1u << 29u),
+          0xa5a53e00u,
+      };
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == opcode && inst.family == Decoder::Family::VOP3 &&
+                inst.src_count == 1 && inst.word_count == (source == 255u ? 3u : 2u),
+            "VOP3 conversion lost its opcode, unary source, or literal length");
+      Check(inst.dst.kind == Decoder::OperandKind::Vgpr && inst.dst.reg == 20 &&
+                inst.dst.sdwa_sel == 6 && inst.dst.clamp && inst.dst.omod == 2,
+            "VOP3 conversion lost its full-width destination or output modifiers");
+      const bool half = opcode == Decoder::Opcode::V_CVT_F32_F16;
+      Check(inst.src0.absolute == half && inst.src0.negate == half,
+            "VOP3 conversion must apply half-float modifiers and ignore byte modifiers");
+      Decoder::Operand expected_source;
+      Decoder::DecodeScalarSource(source, 0, expected_source);
+      Check(inst.src0.kind == expected_source.kind && inst.src0.reg == expected_source.reg &&
+                (source != 255u || inst.src0.value == code[2]),
+            "VOP3 conversion changed its source register or literal value");
+    }
+    for (const uint32_t op_sel : {1u, 2u, 4u, 8u}) {
+      const uint32_t code[] = {EncodeVop3Word0(encoding, 20, op_sel),
+                               EncodeVop3Word1(261, 0, 0)};
+      Decoder::Instruction inst;
+      Decoder::DecodeInstruction(code, 0, inst);
+      Check(inst.opcode == Decoder::Opcode::UNSUPPORTED,
+            "VOP3 conversion accepted unsupported OP_SEL bits");
+    }
+  }
 }
 
 void TestNewShaderRecompilerMoreAluFamilies() {
@@ -10647,6 +10702,43 @@ void TestNewShaderRecompilerNativeU64Translation() {
         "captured VOP3 V_LSHLREV_B64 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 
+  const uint32_t ashrrev_i64_shader[] = {
+      0xd7010001u, 0x0000d50cu,
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded_ashrrev_i64;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_i64_shader, 0u,
+                                               decoded_ashrrev_i64);
+  Check(decoded_ashrrev_i64.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_i64.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.dst.reg == 1u &&
+            decoded_ashrrev_i64.src_count == 2u &&
+            decoded_ashrrev_i64.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_i64.src0.reg == 12u &&
+            decoded_ashrrev_i64.src1.kind == Decoder::OperandKind::VccLo,
+        "decoder rejected VOP3 V_ASHRREV_I64 fields");
+  result = RecompileForTest(ashrrev_i64_shader, options);
+  Check((result.decoded_dump.find("V_ASHRREV_I64 v1, v12, vcc_lo") != std::string::npos),
+        "VOP3 V_ASHRREV_I64 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t ashrrev_captured[] = {0xd7010007u, 0x00020498u, EncodeSopp(0x01)};
+  Decoder::Instruction decoded_ashrrev_captured;
+  ShaderRecompiler::Decoder::DecodeInstruction(ashrrev_captured, 0u,
+                                               decoded_ashrrev_captured);
+  Check(decoded_ashrrev_captured.opcode == Decoder::Opcode::V_ASHRREV_I64 &&
+            decoded_ashrrev_captured.family == Decoder::Family::VOP3 &&
+            decoded_ashrrev_captured.src_count == 2u &&
+            decoded_ashrrev_captured.dst.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_captured.dst.reg == 7u &&
+            decoded_ashrrev_captured.src0.kind == Decoder::OperandKind::IntegerInlineConstant &&
+            decoded_ashrrev_captured.src0.value == 24u &&
+            decoded_ashrrev_captured.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded_ashrrev_captured.src1.reg == 2u,
+        "captured VOP3 V_ASHRREV_I64 opcode 0x301 was not decoded");
+  result = RecompileForTest(ashrrev_captured, options);
+  CheckSpirvBinaryValidates(result.spirv);
+
   const uint32_t cmpx_i64_shader[] = {
       0xd4b5007eu, 0x00020e80u, // v_cmpx_ne_i64 exec, 0, v[7:8]
       EncodeSopp(0x01),
@@ -11207,6 +11299,14 @@ void TestMemoryFedScalarLeafCall() {
   const auto skipped = PrepareShaderSource(gpu_callable, options);
   Check(skipped.unsupported_call_pc == 12u && skipped.calls.empty(),
         "GPU-buffer callable did not report its unsupported call site");
+  // The table index s20 is loop-carried, so two definitions reach the call.
+  const uint32_t loop_callable[] = {EncodeSmem0(0x08, 20, 0), 0xfa000000u,
+      EncodeSmem0(0x09, 14, 0), 20u << 25u, EncodeSop1(0x21, 14, 14),
+      EncodeSmem0(0x08, 20, 0), 20u << 25u, EncodeSopc(0x07, 20, 128),
+      EncodeSopp(0x05, 0xfff9u), EncodeSopp(0x01)};
+  const auto loop_skipped = PrepareShaderSource(loop_callable, options);
+  Check(loop_skipped.unsupported_call_pc == 16u && loop_skipped.calls.empty(),
+        "loop-selected GPU-buffer callable did not report its unsupported call site");
   auto source = PrepareShaderSource(shader, options);
   Check(source.calls.size() == 1 && source.decoded.has_swap_pc &&
             source.decoded.instructions[source.calls.front().instruction].branch_target == UINT32_MAX,
@@ -11511,6 +11611,29 @@ void TestNewShaderRecompilerSetpcBranch() {
   Check((result.ir_dump.find("successors=[") != std::string::npos),
         "S_SETPC_B64 did not participate in CFG");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestNewShaderRecompilerSetpcLongBranch() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 106, 0),              // s_getpc_b64 vcc
+      EncodeSop2(0x00, 106, 106, 255), 0x14u, // s_add_u32 vcc_lo, vcc_lo, 0x14
+      EncodeSop2(0x04, 107, 107, 128),       // s_addc_u32 vcc_hi, vcc_hi, 0
+      EncodeSop1(0x21, 125, 106),            // s_swappc_b64 null, vcc
+      EncodeSMovB32(0, 129),                 // skipped
+      0xbf810000u,                           // s_endpgm at 0x18
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  const auto graph = CFG::BuildGraph(decoded);
+  const auto* jump = graph.FindBlockByPc(0u);
+  const auto* target = graph.FindBlockByPc(0x18u);
+  Check(jump != nullptr && target != nullptr &&
+            jump->terminator.kind == CFG::TerminatorKind::Branch &&
+            jump->terminator.true_block == target->id,
+        "S_GETPC/S_ADD/S_ADDC long jump through VCC missed its target");
+  CheckSpirvBinaryValidates(RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute)).spirv);
 }
 
 void TestFusedShaderHandoffPreservesRegisters() {
@@ -18048,6 +18171,7 @@ int main(int argc, char **argv) {
     TestMeshWave32PackedSubgroupIsolation(true);
     return 0;
   }
+  TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -18175,9 +18299,11 @@ int main(int argc, char **argv) {
   TestPackedWave32FollowsHostSubgroupSize();
   TestVertexLaneWithoutHostVertexSubgroups();
   TestDisabledDebugBranches();
+  TestOrderedPsDoneEndsProgram();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestNewShaderRecompilerSetpcLongBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestScalarLeafCallSites();
