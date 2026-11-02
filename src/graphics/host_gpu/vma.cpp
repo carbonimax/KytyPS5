@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -169,9 +170,39 @@ bool GraphicContext::CreateAllocator() {
 	return true;
 }
 
+bool GraphicContext::CreateStorageBoundsVerify() {
+	EXIT_IF(allocator == nullptr || storage_bounds_verify_buffer != VK_NULL_HANDLE);
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size  = 64;
+	buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	VmaAllocationCreateInfo alloc_info {};
+	alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+	alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	VmaAllocationInfo allocation_info {};
+	if (vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &storage_bounds_verify_buffer,
+	                    &storage_bounds_verify_allocation, &allocation_info) != VK_SUCCESS ||
+	    allocation_info.pMappedData == nullptr) {
+		return false;
+	}
+	std::memset(allocation_info.pMappedData, 0, 64);
+	storage_bounds_verify_counters = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer           = storage_bounds_verify_buffer;
+	storage_bounds_verify_address = device.getBufferAddress(address_info);
+	return storage_bounds_verify_address != 0;
+}
+
 void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
+	}
+	if (storage_bounds_verify_buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(allocator, storage_bounds_verify_buffer, storage_bounds_verify_allocation);
+		storage_bounds_verify_buffer   = VK_NULL_HANDLE;
+		storage_bounds_verify_counters = nullptr;
+		storage_bounds_verify_address  = 0;
 	}
 	{
 		std::lock_guard lock(g_image_pool.mutex);

@@ -7,6 +7,24 @@
 #include <QStandardPaths>
 #endif
 
+#include <QRegularExpression>
+
+QString Configuration::NormalizeResolution(const QString& text) {
+	// Older settings stored the enum key, e.g. "R1920X1080".
+	static const QRegularExpression re(QStringLiteral("^\\s*R?(\\d+)\\s*[xX]\\s*(\\d+)\\s*$"));
+	const auto match = re.match(text);
+	if (!match.hasMatch()) {
+		return {};
+	}
+	const int width  = match.captured(1).toInt();
+	const int height = match.captured(2).toInt();
+	if (width < MIN_SCREEN_SIZE || height < MIN_SCREEN_SIZE || width > MAX_SCREEN_SIZE ||
+	    height > MAX_SCREEN_SIZE) {
+		return {};
+	}
+	return QStringLiteral("%1x%2").arg(width).arg(height);
+}
+
 QVariantMap Configuration::GameSettings() const {
 	QVariantMap values;
 #define KYTY_CFG_SET(n) values.insert(QStringLiteral(#n), QVariant::fromValue(n).toString())
@@ -19,6 +37,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(fullscreen_enabled);
 	KYTY_CFG_SET(hdr_enabled);
 	KYTY_CFG_SET(hide_cursor_enabled);
+	KYTY_CFG_SET(stretch_enabled);
 	KYTY_CFG_SET(readback_linear_images);
 	KYTY_CFG_SET(readback_tiled_images);
 	KYTY_CFG_SET(sync_raw_image_buffers);
@@ -30,6 +49,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(perf_overlay_enabled);
 	KYTY_CFG_SET(skip_notice_screen);
 	KYTY_CFG_SET(network_connected);
+	KYTY_CFG_SET(psn_emulation_enabled);
 	KYTY_CFG_SET(vblank_frequency);
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
@@ -45,6 +65,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(renderdoc_enabled);
 	KYTY_CFG_SET(pro_enabled);
 	KYTY_CFG_SET(amd_cpu_enabled);
+	KYTY_CFG_SET(guest_tsc_enabled);
 #if defined(_WIN32)
 	KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -65,7 +86,8 @@ QVariantMap Configuration::GameSettings() const {
 template <class Settings>
 void Configuration::ReadGameSettingsValues(const Settings& s) {
 #define KYTY_CFG_GET(n) n = s.value(QStringLiteral(#n)).template value<decltype(n)>()
-	KYTY_CFG_GET(screen_resolution);
+	const auto resolution = NormalizeResolution(s.value("screen_resolution").toString());
+	screen_resolution     = resolution.isEmpty() ? QStringLiteral("1280x720") : resolution;
 	user_name          = s.value("user_name", user_name).toString();
 	bool user_id_ok    = false;
 	auto saved_user_id = s.value("user_id", user_id).toInt(&user_id_ok);
@@ -81,6 +103,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(fullscreen_enabled);
 	KYTY_CFG_GET(hdr_enabled);
 	KYTY_CFG_GET(hide_cursor_enabled);
+	KYTY_CFG_GET(stretch_enabled);
 	KYTY_CFG_GET(readback_linear_images);
 	KYTY_CFG_GET(readback_tiled_images);
 	KYTY_CFG_GET(sync_raw_image_buffers);
@@ -92,6 +115,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);
 	KYTY_CFG_GET(network_connected);
+	KYTY_CFG_GET(psn_emulation_enabled);
 	vblank_frequency = s.value("vblank_frequency", vblank_frequency).toInt();
 	console_language = s.value("console_language", console_language).toInt();
 	if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {
@@ -109,6 +133,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(profiler_enabled);
 	KYTY_CFG_GET(renderdoc_enabled);
 	pro_enabled     = s.value("pro_enabled", false).toBool();
+	KYTY_CFG_GET(guest_tsc_enabled);
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
 #if defined(_WIN32)
 	red_zone_protection_enabled =
@@ -161,7 +186,9 @@ bool Configuration::SetGameSettings(const QJsonObject& settings, QString& error)
 		if (!it.value().isString()) {
 			return fail(tr("Game setting %1 must be a string.").arg(it.key()));
 		}
-		values.insert(it.key(), it.value().toString());
+		const auto value = it.value().toString();
+		values.insert(it.key(), it.key() == "screen_resolution" ? NormalizeResolution(value)
+		                                                       : value);
 	}
 
 	ReadGameSettingsValues(values);

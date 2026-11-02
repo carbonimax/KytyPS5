@@ -887,7 +887,11 @@ struct PipelineCache::ProgramCache {
 	      profile {.maintenance8 = graphics.maintenance8_enabled,
 		           .native_float_min_max =
 		               graphics.physical_device_properties.vendorID == 0x1002u,
-		           .device_clock_period_ps = graphics.device_clock_period_ps} {
+		           .device_clock_period_ps = graphics.device_clock_period_ps,
+		           .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
+		           .storage_bounds_alignment = graphics.storage_bounds_alignment,
+		           .storage_bounds_verify_address =
+		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -933,7 +937,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	if (GetShaderStoreMode() != ShaderStoreMode::Off) {
+	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
+		// The verify shaders embed this launch's counter address.
+		PipelineCacheLog("Shader store: disabled (KYTY_BOUNDS_MODE=2)");
+	} else if (GetShaderStoreMode() != ShaderStoreMode::Off) {
 		if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
 			m_store   = std::make_unique<ShaderStore>();
 			m_warm_up = std::thread([this, path = std::filesystem::path("_PipelineCache") /

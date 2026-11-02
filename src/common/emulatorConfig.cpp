@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/systemInfo.h"
 
 #include <algorithm>
 #include <memory>
@@ -105,6 +106,10 @@ bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
 
+bool StretchEnabled() {
+	return g_config->stretch_enabled;
+}
+
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }
@@ -115,6 +120,11 @@ bool Ps5ProEnabled() {
 
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
+}
+
+bool GuestTscEnabled() {
+	// The RDTSC rewrite is native x86-64 code (BMI2): never under Rosetta or on ARM hosts.
+	return g_config->guest_tsc_enabled && Common::GuestTscHostSupported();
 }
 
 uint32_t GetVblankFrequency() {
@@ -131,6 +141,10 @@ bool VulkanValidationEnabled() {
 
 bool IsNetworkConnected() {
 	return g_config->network_connected;
+}
+
+bool PsnEmulationEnabled() {
+	return g_config->psn_emulation_enabled;
 }
 
 bool ShaderValidationEnabled() {

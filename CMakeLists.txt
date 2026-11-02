@@ -564,6 +564,13 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
+add_executable(ajm_resample_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AjmResampleTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ajm_resample_tests common fmt::fmt FFmpeg::ffmpeg LibAtrac9 opus)
+target_include_directories(ajm_resample_tests PRIVATE ${inc_headers})
+
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
@@ -686,6 +693,9 @@ target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
+target_link_libraries(net_resolver_tests kyty_test_gtest)
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
@@ -706,16 +716,18 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
+	add_test(NAME net_resolver COMMAND $<TARGET_FILE:net_resolver_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME fatal_check_retires_speculative_thread COMMAND $<TARGET_FILE:shader_cfg_tests> --fatal-retire-only)
 	if(APPLE)
-		set(mad_default_rounding fused)
+		set(mad_default_rounding product)
 	else()
 		set(mad_default_rounding separate)
 	endif()
 	add_test(NAME shader_mad_rounding_default COMMAND ${CMAKE_COMMAND} -E env --unset=KYTY_MAD_SEPARATE_ROUNDING $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only ${mad_default_rounding})
 	add_test(NAME shader_mad_rounding_fused COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=0 $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only fused)
 	add_test(NAME shader_mad_rounding_separate COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=1 $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only separate)
+	add_test(NAME shader_mad_rounding_product COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=2 $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only product)
 	add_test(NAME shader_mad_rounding_invalid COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=invalid $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only ${mad_default_rounding})
 	add_test(NAME push_descriptor_policy COMMAND $<TARGET_FILE:push_descriptor_policy_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -750,6 +762,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME ajm_resample COMMAND $<TARGET_FILE:ajm_resample_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
@@ -764,12 +777,16 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_mad_f32 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-only)
 	add_test(NAME shader_recompiler_mad_f32_spirv COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-spirv-only)
+	add_test(NAME shader_recompiler_mad_f32_product COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-product-only)
+	add_test(NAME shader_recompiler_mad_f32_product_spirv COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-product-spirv-only)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
+	add_test(NAME shader_recompiler_storage_bounds
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-bounds-only)
 	add_test(NAME shader_recompiler_vop3_conversions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
 	add_test(NAME shader_recompiler_quadmask
@@ -883,6 +900,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		audio_out_timing_tests
 		ngs2_sampler_tests
+		ajm_resample_tests
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
@@ -999,6 +1017,7 @@ if(KYTY_BUILD_LAUNCHER)
 
 	if(LINUX)
 		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+		target_link_options(kyty_updater PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
 	endif()
 endif()
 if(KYTY_CLANG_CL)
