@@ -1128,12 +1128,6 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
-	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-	if (hdr && !m_presenter.IsHdrSupported() && !warned.test_and_set(std::memory_order_relaxed)) {
-		Log::WriteToConsoleAndLog(
-		    "Warning: HDR output is unavailable; HDR-to-SDR conversion is not implemented, "
-		    "displaying PQ video-out pixels unchanged.\n");
-	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
@@ -1217,12 +1211,13 @@ void FlipQueue::SignalDoneLocked() {
 	}
 }
 
-// A display buffer is safe for rendering once it is neither displayed nor waiting to be.
+// A display buffer is safe for rendering once no flip of it is queued or presenting. The
+// buffer on screen is safe: Present() has already consumed it, and waiting for the next flip
+// would cost a frame of overlap or stall a title that redraws the buffer it shows.
 bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-	const bool safe = cfg.flip_status.currentBuffer != index &&
-	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	const bool safe = std::none_of(m_requests.begin(), m_requests.end(), matches) &&
 	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	m_gpu_waiting = !safe;
 	return safe;
