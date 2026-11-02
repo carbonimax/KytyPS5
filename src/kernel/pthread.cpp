@@ -413,6 +413,8 @@ struct PthreadPrivate {
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Set by PthreadCancel; PthreadTestcancel honors it without winpthread's longjmp.
+	std::atomic_bool cancel_requested {false};
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
 #endif
@@ -3343,6 +3345,9 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->almost_done     = false;
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		created_thread->cancel_requested = false;
+#endif
 
 		result =
 		    pthread_create(&created_thread->p, &created_thread->attr->p, RunThread, created_thread);
@@ -3404,6 +3409,13 @@ int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
 		LOGF("\tthread join: %s, %d\n", thread->name.c_str(), result);
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// winpthread's PTHREAD_CANCELED is 0xDEADBEEF; the guest expects -1.
+	if (result == 0 && value != nullptr && *value == PTHREAD_CANCELED) {
+		*value = reinterpret_cast<void*>(-1);
+	}
+#endif
+
 	if (result == 0) {
 		FreeGuestStack(thread->attr);
 
@@ -3432,6 +3444,9 @@ int KYTY_SYSV_ABI PthreadCancel(Pthread thread) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	thread->cancel_requested = true;
+#endif
 	int result = pthread_cancel(thread->p);
 
 	LOGF("\tthread cancel: %s, %d\n", thread->name.c_str(), result);
@@ -3587,6 +3602,20 @@ int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 void KYTY_SYSV_ABI PthreadTestcancel() {
 	PRINT_NAME();
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(_M_X64))
+	// winpthread acts on a pending cancel with longjmp, whose SEH unwind cannot walk the guest
+	// stack (STATUS_BAD_STACK). Leave through PthreadExit instead, which returns to the host
+	// frame of RunOnGuestStack. Like winpthread, cancellation stays disabled from here on.
+	if (g_guest_entry_return_rsp != 0 && g_pthread_self != nullptr &&
+	    g_pthread_self->cancel_requested.load()) {
+		int state = PTHREAD_CANCEL_DISABLE;
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &state);
+		if (state == PTHREAD_CANCEL_ENABLE) {
+			PthreadExit(reinterpret_cast<void*>(-1)); // guest PTHREAD_CANCELED
+		}
+		pthread_setcancelstate(state, nullptr);
+	}
+#endif
 	pthread_testcancel();
 }
 
