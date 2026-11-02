@@ -1684,6 +1684,20 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		// Diagnostic: KYTY_TESS_SKIP=<TES hash>[,...] or "all" drops those patch draws.
+		static const std::string skip = [] {
+			const char* value = std::getenv("KYTY_TESS_SKIP");
+			return std::string(value != nullptr ? value : "");
+		}();
+		const bool small_patch = vertex_info[0].tess.input_control_points <= 4u;
+		if (!skip.empty() &&
+		    (skip == "all" || (skip == "small" && small_patch) ||
+		     (skip == "large" && !small_patch) ||
+		     skip.find(fmt::format("{:016x}", vertex_params[2].hash)) != std::string::npos ||
+		     skip.find(fmt::format("{:016x}", vertex_params[1].hash)) != std::string::npos)) {
+			vertex_info[0].stage = {};
+			return;
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
