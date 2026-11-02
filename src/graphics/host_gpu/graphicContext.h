@@ -60,6 +60,15 @@ struct GraphicContext {
 	bool                                      device_address_destruction_waits_for_queue = false;
 	bool                                      release_waits_for_submission_fence = false;
 	uint32_t                           device_clock_period_ps                = 0;
+	// KYTY_BOUNDS_MODE: storage buffer bounds (Spirv::StorageBounds: 0 shader, 1 select, 2 device),
+	// robustStorageBufferAccessSizeAlignment, and with mode 2 the verify counters (host-mapped).
+	uint8_t                            storage_bounds                        = 0;
+	uint32_t                           storage_bounds_alignment              = 4;
+	bool                               storage_bounds_verify                 = false;
+	uint64_t                           storage_bounds_verify_address         = 0;
+	const volatile uint32_t*           storage_bounds_verify_counters        = nullptr;
+	VkBuffer                           storage_bounds_verify_buffer          = VK_NULL_HANDLE;
+	VmaAllocation                      storage_bounds_verify_allocation      = nullptr;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
@@ -118,6 +127,8 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool CreateAllocator();
+	// KYTY_BOUNDS_MODE=2: allocates the verify counters (needs the allocator); false on failure.
+	[[nodiscard]] bool CreateStorageBoundsVerify();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }

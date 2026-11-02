@@ -137,6 +137,9 @@ struct BufferResource {
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
 	bool                   null_fallback      = false;
+	// Accessed through an 8- or 16-bit view: the descriptor keeps the exact range
+	// (Spirv::StorageDeviceRange).
+	bool                   subword            = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };

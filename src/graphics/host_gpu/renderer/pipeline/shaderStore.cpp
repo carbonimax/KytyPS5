@@ -522,7 +522,7 @@ std::vector<uint8_t> ShaderStoreHostKey(const GraphicContext& graphics) {
 	      graphics.null_descriptor_enabled, graphics.image_view_min_lod_enabled,
 	      graphics.mesh_shader_enabled, graphics.SupportsComputeWave64(),
 	      properties.limits.maxComputeSharedMemorySize, properties.deviceID,
-	      properties.driverVersion);
+	      properties.driverVersion, graphics.storage_bounds, graphics.storage_bounds_alignment);
 	key.Raw(properties.pipelineCacheUUID.data(), properties.pipelineCacheUUID.size());
 	for (const char* name: ShaderEnvironment) {
 		const char* value = std::getenv(name);

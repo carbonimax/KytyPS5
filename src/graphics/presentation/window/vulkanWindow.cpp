@@ -9,6 +9,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -458,6 +459,25 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// KYTY_BOUNDS_MODE: 0 = shader checks (branch around every storage buffer access), 1 (default) =
+// robustBufferAccess2 + nullDescriptor bound the accesses when the device has both, else
+// branch-free clamp + select, 2 = mode 1 plus counters checked against the shader checks.
+static void ChooseStorageBounds(GraphicContext& graphics, bool robust_buffer_access2,
+                                uint32_t alignment) {
+	const char* value = std::getenv("KYTY_BOUNDS_MODE");
+	const int   mode  = value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 1;
+	const bool  device =
+	    robust_buffer_access2 && graphics.null_descriptor_enabled && (alignment == 1u || alignment == 4u);
+	graphics.storage_bounds = mode == 0 ? 0 : device ? 2 : 1;
+	graphics.storage_bounds_alignment = device ? alignment : 4u;
+	graphics.storage_bounds_verify    = mode == 2;
+	LOGF("Vulkan storage bounds: KYTY_BOUNDS_MODE=%d robustBufferAccess2=%s nullDescriptor=%s "
+	     "robustStorageBufferAccessSizeAlignment=%u path=%s%s\n",
+	     mode, robust_buffer_access2 ? "true" : "false", graphics.null_descriptor_enabled ? "true" : "false",
+	     alignment, mode == 0 ? "shader checks" : device ? "robustBufferAccess2" : "clamp+select",
+	     mode == 2 ? " verify" : "");
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -670,8 +690,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
 	properties11.pNext = &subgroup_size_control;
 
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	robustness2_properties.pNext = &properties11;
 	vk::PhysicalDeviceFloatControlsProperties float_controls {};
-	float_controls.pNext = &properties11;
+	float_controls.pNext = robustness2_extension ? static_cast<void*>(&robustness2_properties)
+	                                             : static_cast<void*>(&properties11);
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &float_controls;
 
@@ -795,6 +818,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 	graphics.null_descriptor_enabled = robustness2_extension && supported_robustness2.nullDescriptor == VK_TRUE;
 	robustness2.nullDescriptor      = graphics.null_descriptor_enabled;
+	ChooseStorageBounds(graphics, robustness2_extension && supported_robustness2.robustBufferAccess2 == VK_TRUE,
+	                    robustness2_properties.robustStorageBufferAccessSizeAlignment);
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = robustness2_extension ? &robustness2 : robustness2.pNext;
@@ -1292,6 +1317,10 @@ void WindowContext::CreateVulkan() {
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
+	if (graphic_ctx.storage_bounds_verify && !graphic_ctx.CreateStorageBoundsVerify()) {
+		EXIT("Could not create the KYTY_BOUNDS_MODE=2 counters");
+	}
+	PerfStats::SetStorageBoundsCounters(graphic_ctx.storage_bounds_verify_counters);
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());

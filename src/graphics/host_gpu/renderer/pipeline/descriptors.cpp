@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -124,10 +125,16 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
+	const auto& graphics = context.GetGraphics();
+	const auto  profile  = ShaderRecompiler::Spirv::Profile {
+	     .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
+	     .storage_bounds_alignment = graphics.storage_bounds_alignment};
+	const bool device_bounds = profile.storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Device;
 	if (address == 0 || size == 0) {
+		// Without shader checks only a null descriptor reads zero and drops writes.
+		if (device_bounds) return {nullptr, 0, vk::WholeSize};
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
-	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
@@ -142,7 +149,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	// The shader still compares against size + adjustment; see Spirv::StorageDeviceRange.
+	const auto range = ShaderRecompiler::Spirv::StorageDeviceRange(profile, size + adjustment, resource.subword);
+	const vk::DescriptorBufferInfo result = range == 0
+	    ? vk::DescriptorBufferInfo {nullptr, 0, vk::WholeSize}
+	    : vk::DescriptorBufferInfo {buffer->Handle(), aligned_offset, range};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -1213,7 +1224,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
 						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.buffer == nullptr);
+							// Null views (StorageBounds::Device) have a whole-size range.
+							EXIT_IF(view.range == 0 || (view.buffer == nullptr && view.range != vk::WholeSize));
 						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
