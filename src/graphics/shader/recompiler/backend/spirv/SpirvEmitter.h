@@ -9,13 +9,51 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+// How storage buffer accesses past the bound range read zero and drop writes (KYTY_BOUNDS_MODE).
+enum class StorageBounds : uint8_t {
+	Shader, // A branch around every access.
+	Select, // Loads read a clamped element and select zero past the end; stores branch.
+	// robustBufferAccess2 and nullDescriptor bound the access. Loads and plain stores of dword-only
+	// bindings have no check: their range is cut to whole dwords (StorageDeviceRange). Bindings
+	// with 8/16-bit views keep the exact range, which the device rounds up to
+	// storage_bounds_alignment, so their loads select zero past it and their stores branch.
+	Device,
+};
+
+// Counters of KYTY_BOUNDS_MODE=2, at Profile::storage_bounds_verify_address.
+enum class StorageBoundsCounter : uint32_t {
+	OutOfRangeLoads,   // Loads without a branch that the shader check would read as zero.
+	NonZeroLoads,      // Of those, unchecked device loads that did not read zero (must stay 0).
+	OutOfRangeStores,  // Unchecked stores that the shader check would drop.
+	TailReads,         // Selected loads whose device value past the range was not zero.
+	Count,
+};
+
 // Host device capabilities that change the emitted SPIR-V. Built once per device.
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
 	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
+	StorageBounds storage_bounds = StorageBounds::Shader;
+	// robustStorageBufferAccessSizeAlignment (1 or 4) with StorageBounds::Device.
+	uint32_t storage_bounds_alignment = 4;
+	// KYTY_BOUNDS_MODE=2: device address of the StorageBoundsCounter words, 0 otherwise.
+	uint64_t storage_bounds_verify_address = 0;
 };
+
+// Descriptor range of a storage binding of `range` bytes whose shader leaves loads and plain stores
+// to the device. Without 8/16-bit views every access is a whole dword, so cutting the range to
+// whole dwords makes the device drop exactly the dwords the shader check drops, whatever the
+// robustness alignment. 0 means a null descriptor.
+[[nodiscard]] constexpr uint64_t StorageDeviceRange(const Profile& profile, uint64_t range,
+                                                   bool subword) {
+	if (profile.storage_bounds != StorageBounds::Device || subword ||
+	    profile.storage_bounds_alignment == 1u) {
+		return range;
+	}
+	return range & ~uint64_t {3};
+}
 
 inline constexpr Profile DefaultProfile {};
 

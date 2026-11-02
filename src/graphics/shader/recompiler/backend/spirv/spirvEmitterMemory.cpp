@@ -378,12 +378,85 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
 }
 
+// A GLC 32-bit load in a multi-wave workgroup is an OpAtomicLoad (LoadWordInBounds).
+bool IsAtomicWordLoad(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return (resource.memory_access & spv::MemoryAccessVolatileMask) != 0 &&
+	       resource.element_bits == 32u && !WorkgroupIsSingleWave(state);
+}
+
+// min(index, max(length, 1) - 1): an element inside the descriptor range, also of a null binding
+// (the shared 16-byte null buffer, length 0).
+uint32_t ClampedElement(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+	const auto last = Binary(state, spv::OpISub, TypeU32(state),
+	                         EmitUMax32(state, access.length, ConstantU32(state, 1)), ConstantU32(state, 1));
+	return EmitUMin32(state, index, last);
+}
+
+// KYTY_BOUNDS_MODE=2: counts the loads the shader check would read as zero, and among them the
+// device values that are not zero.
+void VerifyStorageLoad(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                       uint32_t value, bool selected) {
+	if (state.profile.storage_bounds_verify_address == 0u) return;
+	const auto outside = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index, access.length);
+	EmitIfCondition(state, outside, [&]() {
+		EmitStorageBoundsCount(state, StorageBoundsCounter::OutOfRangeLoads);
+		EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0)),
+		                [&]() {
+			                EmitStorageBoundsCount(state, selected ? StorageBoundsCounter::TailReads
+			                                                       : StorageBoundsCounter::NonZeroLoads);
+		                });
+	});
+}
+
+// One storage element load (`load(element)`), zero from access.length on, bounded as
+// access.bounds says. Out-of-range atomics return undefined values, so atomic loads select.
+template <typename Fn>
+uint32_t EmitBoundedLoad(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                         bool atomic, Fn&& load) {
+	auto bounds = access.bounds;
+	if (bounds == AccessBounds::Device && atomic) bounds = AccessBounds::DeviceSelect;
+	switch (bounds) {
+		case AccessBounds::Shader: break;
+		case AccessBounds::Select: {
+			const auto in_bounds = EmitMemoryElementInBounds(state, access, index);
+			const auto value     = load(ClampedElement(state, access, index));
+			return Select(state, TypeU32(state), in_bounds, value, ConstantU32(state, 0));
+		}
+		case AccessBounds::Device: {
+			const auto value = load(index);
+			VerifyStorageLoad(state, access, index, value, false);
+			return value;
+		}
+		case AccessBounds::DeviceSelect: {
+			const auto in_bounds = EmitMemoryElementInBounds(state, access, index);
+			const auto value     = load(index);
+			VerifyStorageLoad(state, access, index, value, true);
+			return Select(state, TypeU32(state), in_bounds, value, ConstantU32(state, 0));
+		}
+	}
+	return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, access, index),
+	                                  [&]() { return load(index); });
+}
+
+// Condition of a storage store before BufferIndexInBounds; true where the device drops it.
+// 32-bit views merge subword stores in a compare-exchange loop, so only `plain` stores qualify.
+uint32_t StorePayloadInBounds(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                              bool plain) {
+	if (access.bounds != AccessBounds::Device || !plain) {
+		return EmitMemoryElementInBounds(state, access, index);
+	}
+	if (state.profile.storage_bounds_verify_address != 0u) {
+		EmitIfCondition(state, Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), index, access.length),
+		                [&]() { EmitStorageBoundsCount(state, StorageBoundsCounter::OutOfRangeStores); });
+	}
+	return ConstantBool(state, true);
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
-	    [&]() { return LoadWordInBounds(ctx, resource, index); });
+	return EmitBoundedLoad(ctx.state, resource, index, IsAtomicWordLoad(ctx.state, resource),
+	                       [&](uint32_t element) { return LoadWordInBounds(ctx, resource, element); });
 }
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
@@ -401,10 +474,10 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto index = Binary(
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
-	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	return EmitBoundedLoad(ctx.state, resource, index, IsAtomicWordLoad(ctx.state, resource),
+	                       [&](uint32_t element) {
+		                       return LoadSubwordInBounds(ctx, resource, address, element, bits, sign_extend);
+	                       });
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -576,7 +649,7 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	EmitIfCondition(
 	    ctx.state, BufferIndexInBounds(ctx, inst, mem, resource,
-	        EmitMemoryElementInBounds(ctx.state, resource, index)), [&]() {
+	        StorePayloadInBounds(ctx.state, resource, index, resource.element_bits < 32u)), [&]() {
 		    StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
 	    });
 }
@@ -645,7 +718,7 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	if (resource.object_pointer == 0u) return;
 	const auto index = DwordIndex(ctx, inst, mem, resource.byte_offset);
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
-	    EmitMemoryElementInBounds(ctx.state, resource, index));
+	    StorePayloadInBounds(ctx.state, resource, index, true));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -786,14 +859,29 @@ uint32_t LoadFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto plan = resource.object_pointer == 0u ? PreparedFormattedMemory{.info = info}
 	                                              : PrepareFormattedMemory(ctx, inst, mem, resource, info);
 	const auto out_of_bounds = FormattedOutOfBoundsValue(ctx, mem, plan, count);
-	const auto value = resource.object_pointer == 0u ? out_of_bounds : EmitValueOrDefaultIfCondition(
-	    state, plan.in_bounds, TypeU32Composite(state, count), out_of_bounds, [&]() {
-		    std::array<uint32_t, 4> values {};
-		    for (uint32_t component = 0; component < count; component++) {
-			    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
-		    }
-		    return ConstructU32Composite(state, count, values);
-	    });
+	const bool device_bounded = resource.object_pointer != 0u && (resource.bounds == AccessBounds::Device ||
+	                                                              resource.bounds == AccessBounds::DeviceSelect);
+	auto value = out_of_bounds;
+	if (device_bounded) {
+		// The device bounds each component load, so read them all and keep the format's
+		// all-or-nothing result with a select instead of a branch.
+		std::array<uint32_t, 4> values {};
+		for (uint32_t component = 0; component < count; component++) {
+			values[component] = Select(
+			    state, TypeU32(state), plan.in_bounds, LoadFormattedInBounds(ctx, mem, plan, component),
+			    FormattedConstant(ctx, plan.info, ResolveFormattedSource(ctx, mem, plan.info, component).kind));
+		}
+		value = ConstructU32Composite(state, count, values);
+	} else if (resource.object_pointer != 0u) {
+		value = EmitValueOrDefaultIfCondition(
+		    state, plan.in_bounds, TypeU32Composite(state, count), out_of_bounds, [&]() {
+			    std::array<uint32_t, 4> values {};
+			    for (uint32_t component = 0; component < count; component++) {
+				    values[component] = LoadFormattedInBounds(ctx, mem, plan, component);
+			    }
+			    return ConstructU32Composite(state, count, values);
+		    });
+	}
 	if (mem.data_bits != 16u) return value;
 	const bool integer = info.type == Format::ComponentType::Uint ||
 	                     info.type == Format::ComponentType::Sint;
@@ -1627,13 +1715,19 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
-	const auto element = Binary(
+	auto element = Binary(
 	    state, spv::OpIAdd, TypeU32(state), index,
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
-	const auto condition = EmitMemoryElementInBounds(state, access, element);
-	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
+	// The device computes byte offsets in 32 bits, so elements from 2^30 on would wrap back into
+	// the range; the host prefix adds at most 63. Every such element is past any range.
+	constexpr uint32_t last_element = UINT32_MAX >> 2u;
+	if ((access.bounds == AccessBounds::Device || access.bounds == AccessBounds::DeviceSelect) &&
+	    (!offset.IsImmediate() || (offset.U32() >> 2u) + (mem.offset >> 2u) > last_element - 63u)) {
+		element = EmitUMin32(state, element, ConstantU32(state, last_element));
+	}
+	ctx.Define(inst, EmitBoundedLoad(state, access, element, false, [&](uint32_t selected) {
 		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		               state, EmitMemoryElementPointer(state, access, selected));
 	           }));
 }
 

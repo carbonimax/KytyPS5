@@ -452,6 +452,14 @@ void EmitMemoryBindings(EmitterState& state);
 uint32_t LdsDwordCount(const EmitterState& state);
 void EnsureLdsStorage(EmitterState& state);
 
+// How one storage buffer access is bounded (Profile::storage_bounds, BufferResource::subword).
+enum class AccessBounds : uint8_t {
+	Shader,       // Branch around the access.
+	Select,       // Loads: clamped element, zero selected past the end; stores branch.
+	Device,       // Loads and plain stores: no check, the descriptor range is exact.
+	DeviceSelect, // Loads: unclamped, zero selected past the end; stores branch.
+};
+
 struct MemoryResourceAccess {
 	IR::ResourceKind      kind             = IR::ResourceKind::None;
 	uint32_t              object_pointer   = 0;
@@ -461,6 +469,7 @@ struct MemoryResourceAccess {
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	AccessBounds          bounds           = AccessBounds::Shader;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
@@ -477,6 +486,8 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         st
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+// KYTY_BOUNDS_MODE=2: atomically increments one Spirv::StorageBoundsCounter.
+void EmitStorageBoundsCount(EmitterState& state, StorageBoundsCounter counter);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

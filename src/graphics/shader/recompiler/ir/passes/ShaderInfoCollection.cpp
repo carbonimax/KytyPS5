@@ -349,6 +349,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					const auto bits = StorageBufferElementBits(program, selected);
 					info.buffer_u8 |= bits == 8u;
 					info.buffer_u16 |= bits == 16u;
+					info.buffers[resource].subword |= bits < 32u;
 				};
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
@@ -582,7 +583,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
-	for (auto& buffer: info.buffers) buffer.live = false;
+	for (auto& buffer: info.buffers) buffer.live = buffer.subword = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
 	info.bvh = info.subgroup_ballot = info.subgroup_vote = info.subgroup_barrier =
@@ -608,6 +609,15 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
+	}
+	// Any candidate of a buffer table may be accessed through its root or a representative slot.
+	for (auto& buffer: info.buffers) {
+		if (buffer.indirect_resources.empty()) continue;
+		const bool subword = buffer.subword || std::ranges::any_of(buffer.indirect_resources, [&](uint32_t child) {
+			return info.buffers[child].subword;
+		});
+		buffer.subword = subword;
+		for (const auto child: buffer.indirect_resources) info.buffers[child].subword = subword;
 	}
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
