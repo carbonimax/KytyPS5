@@ -541,7 +541,10 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			if (!unresolved) unresolved.emplace(source.decoded.instructions[before].pc, code);
 			return Value(0u);
 		};
-		if (!definition) return fail();
+		// Several reaching definitions select the value on the GPU, so no SRT walk evaluates it:
+		// a target read through it reports an unsupported call site; a target that is itself
+		// GPU-selected stays unresolved below and disables the program.
+		if (!definition) return Value(&block.AppendNewInst(ValueOpcode::UndefU32));
 		const auto index = *definition;
 		if (index == UINT32_MAX) {
 			if (code < query.user_data_base || code - query.user_data_base >= query.user_data_count)

@@ -17,9 +17,15 @@
 
 namespace Libs::Graphics {
 
-enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11 };
+enum class ColorTransform : uint32_t { None, SwapBgra16, Reverse10_11_11, Rotate2_10_10_10 };
 
-enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64_64, Unsupported };
+enum class VideoOutCompression : uint8_t {
+	Uncompressed,
+	Dcc256_256_0,
+	Dcc256_64_64,
+	Dcc128_128_128,
+	Unsupported
+};
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc, Cmask };
 
@@ -99,6 +105,8 @@ struct ImageInfo {
 		switch (guest_format) {
 			case Prospero::BufferFormat::k10_11_11Float:
 				return ColorTransform::Reverse10_11_11;
+			case Prospero::BufferFormat::k2_10_10_10UNorm:
+				return ColorTransform::Rotate2_10_10_10;
 			default: return ColorTransform::None;
 		}
 	}
@@ -287,8 +295,9 @@ inline bool ImageInfo::IsDepth() const noexcept {
 [[nodiscard]] inline VideoOutCompression
 ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t dcc_control,
                             uint64_t dcc_clear_color) noexcept {
-	constexpr uint32_t DCC_256_256_0 = 0x00000048u;
-	constexpr uint32_t DCC_256_64_64 = 0x00000208u;
+	constexpr uint32_t DCC_256_256_0   = 0x00000048u;
+	constexpr uint32_t DCC_256_64_64   = 0x00000208u;
+	constexpr uint32_t DCC_128_128_128 = 0x00100024u;
 	if (!compressed) {
 		return metadata_address == 0 && dcc_control == 0 && dcc_clear_color == 0
 		           ? VideoOutCompression::Uncompressed
@@ -300,6 +309,7 @@ ClassifyVideoOutCompression(bool compressed, uint64_t metadata_address, uint32_t
 	switch (dcc_control) {
 		case DCC_256_256_0: return VideoOutCompression::Dcc256_256_0;
 		case DCC_256_64_64: return VideoOutCompression::Dcc256_64_64;
+		case DCC_128_128_128: return VideoOutCompression::Dcc128_128_128;
 		default: return VideoOutCompression::Unsupported;
 	}
 }
@@ -318,16 +328,22 @@ struct VideoOutFormatPolicy {
 
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
 inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070722000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ =
+    0xc001070700000000ull;
 
 [[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
 	switch (format) {
 		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
-		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ: return true;
 		default: return false;
 	}
 }
 
-inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
+inline constexpr std::array<VideoOutFormatPolicy, 10> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -343,6 +359,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
     {0xc001000600000000ull,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
+    {VIDEO_OUT_PIXEL_FORMAT_R16_G16_B16_A16_FLOAT_FOR_BT2100_PQ,
+     {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B16_G16_R16_A16_FLOAT_FOR_BT2100_PQ,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, true}},
 }};
 

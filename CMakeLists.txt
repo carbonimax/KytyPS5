@@ -328,7 +328,7 @@ function(add_gpu_blit_shader shader_name shader_file)
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" "${gpu_tiler_shader_dir}/gpu_video_out_hdr10_to_sdr.inc"
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -758,6 +758,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
 	add_test(NAME shader_recompiler_storage_bounds
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-bounds-only)
+	add_test(NAME shader_recompiler_vop3_conversions
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_quadmask
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
+	add_test(NAME shader_recompiler_integer16_ternary
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --integer16-ternary-only)
+	add_test(NAME shader_recompiler_mad_u16
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-u16-only)
+	add_test(NAME shader_recompiler_mul_hi24
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -789,6 +799,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wait-until-safe-for-rendering-only)
 	add_test(NAME pm4_flip
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --flip-only)
+	add_test(NAME video_out_hdr10_to_sdr
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --video-out-only)
 	add_test(NAME depth_bits
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME msaa_storage

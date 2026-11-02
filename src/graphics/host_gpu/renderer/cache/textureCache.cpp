@@ -664,17 +664,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
 	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
-	// PPSA04264
-	const bool raw_d16_texture =
-	    binding == BindingType::Texture && cached.info.IsDepth() &&
-	    cached.info.guest_format == Prospero::BufferFormat::k16UNorm &&
-	    requested.guest_format == Prospero::BufferFormat::k16UInt &&
-	    requested.pixel_format == vk::Format::eR16Uint && cached.backing.samples == 1 &&
-	    requested.samples == 1 && requested.data == cached.info.data &&
-	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
-	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
-	    !cached.info.HasMetadata();
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -698,12 +687,20 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+	// Depth bytes sampled through a color format no depth view provides (16_UINT, 8_8_UNORM)
+	// need a color copy of the whole single-sample depth layout.
+	const bool raw_depth_texture =
+	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
+	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
+	    requested.pitch == cached.info.pitch &&
+	    (requested.resources == cached.info.resources || retain_cached_layout) &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
 	bool recreate = cached.info.resources < requested.resources ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
-			recreate |= raw_d16_texture;
+			recreate |= raw_depth_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
@@ -1078,34 +1075,51 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
-	const auto range = desc.info.metadata.range;
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1) {
+		if (range.size == 0 || view.level_count != 1) {
 			return;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
-	// These one-mip surfaces use complete 4 KiB color metadata blocks.
+	// Color metadata slices consist of complete 4 KiB blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
-	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
-	const auto  first          = volume_texture ? 0u : metadata_base_layer;
-	const auto  image_first    = volume_texture ? 0u : view.base_layer;
-	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
+	const bool volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto first          = volume_texture ? 0u : metadata_base_layer;
+	const auto image_first    = volume_texture ? 0u : view.base_layer;
+	const auto count =
+	    volume_texture ? std::max(desc.info.extent.depth >> view.base_level, 1u) : view.layer_count;
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	const auto       slice_size = range.size / layers;
-	const GuestRange viewed {range.address + slice_size * first, slice_size * count};
+	const auto slice_size = range.size / layers;
+	// Each slice holds the viewed mip's metadata in one run; DCC mips past the first tail mip
+	// have none. FindImage moves base_level only for one-mip descriptors, which keep the slice.
+	TileSizeOffset mip {.size = static_cast<uint32_t>(slice_size)};
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc && desc.info.resources.levels > 1) {
+		std::array<TileSizeOffset, 16> mips {};
+		TileSizeAlign                  total {};
+		(void)TileGetDccSize(desc.info.extent.width, desc.info.extent.height, layers,
+		                     desc.info.bytes_per_block, desc.info.resources.levels,
+		                     desc.info.tile_mode, total, 0, mips.data());
+		mip = mips[view.base_level];
+	}
+	if (mip.size == 0) {
+		return;
+	}
+	const GuestRange viewed {range.address + slice_size * first + mip.offset,
+	                         slice_size * (count - 1) + mip.size};
+	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
 	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
 		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
 		uint32_t keys = 0;
@@ -1116,8 +1130,24 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				keys |= 1u << key;
 			}
 		}
-		// No selected key to clear, or none left since the last check.
-		if (m_buffer_cache.IsColorMetadataChecked(viewed.address, viewed.size, keys)) {
+		// No selected key to clear, or none left since the last check. A target rebound while no
+		// checked metadata was forgotten (mipmapped DCC targets bind each mip every frame) reuses
+		// its last result instead of looking up every slice and key again.
+		const Image::ColorClearCheck check {viewed.address, slice_size, mip.size, count, keys,
+		                                    m_buffer_cache.ColorMetadataEpoch()};
+		{
+			std::scoped_lock lock {m_lock};
+			if (m_slot_images[id].color_clear_check == check) {
+				return;
+			}
+		}
+		bool checked = true;
+		for (uint32_t slice = 0; slice < count && checked; slice++) {
+			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+		}
+		if (checked) {
+			std::scoped_lock lock {m_lock};
+			m_slot_images[id].color_clear_check = check;
 			return;
 		}
 		{
@@ -1142,9 +1172,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				const auto [buffer, offset] =
 				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
 				const auto predicates = m_tiler.CheckColorClear(
-				    {buffer->Handle(), offset, viewed.size}, count, keys, expand);
-				if (expand) {
-					m_buffer_cache.MarkColorMetadataChecked(viewed.address, viewed.size, keys);
+				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
+				for (uint32_t slice = 0; slice < count && expand; slice++) {
+					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
 				}
 				const auto command = m_scheduler.Current().Handle();
 				const auto area    = BeginColorRendering(image, view.format, view.base_level,
@@ -1177,7 +1207,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
-		const auto address = range.address + slice_size * (first + slice);
+		const auto address = run(slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
@@ -1186,7 +1216,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
+		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
@@ -1210,7 +1240,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
+			m_buffer_cache.InvalidateMemory(address, bytes.size());
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
@@ -1344,7 +1374,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		// The descriptor's base level and layer are relative to its own data. When it resolves
 		// into a larger image that starts before that data, offset them by where the data starts
 		// in the final image (a position taken from an earlier candidate may no longer apply).
-		if (desc.info.data.address != image.info.data.address) {
+		// A smaller mip can also start at the image's own address (mips stored smallest first);
+		// only a one-mip descriptor of a mip chain can be one (SliceOf needs both).
+		if (desc.info.data.address != image.info.data.address ||
+		    (desc.info.resources.levels == 1 && image.info.resources.levels > 1 &&
+		     desc.info.extent != image.info.extent)) {
 			const int32_t mip   = desc.info.MipOf(image.info);
 			const int32_t layer = mip >= 0 ? desc.info.SliceOf(image.info, mip) : -1;
 			if (layer >= 0) {

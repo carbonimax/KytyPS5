@@ -316,7 +316,7 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
+	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -663,7 +663,7 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer) {
+void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -765,9 +765,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
-	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
+	// The main bus ignores alpha.
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
+	                       (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
+	                       (layer.bus == 0 ? 16u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -859,11 +861,18 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
 	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
+	// An HDR10 frame on an SDR swapchain is converted by the layer shader instead of blitted.
+	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
+	const bool blit_source     = source != nullptr && !convert_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment = draw_overlay || draw_system_overlay;
-	if (source != nullptr) {
+	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
+	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
+	}
+	if (convert_source) {
+		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+		                vk::AccessFlagBits2::eShaderRead);
 	}
 	if (draw_overlay) {
 		overlay.frame->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -888,7 +897,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
-	if (source != nullptr) {
+	if (blit_source) {
 		const uint32_t level = DownscaleSource(vk_command, *source);
 		vk::ImageBlit  region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
@@ -908,7 +917,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
-	} else {
+	} else if (source == nullptr) {
+		// A converted source covers the whole image with an opaque layer.
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
 		                           &black, 1, &to_transfer.subresourceRange);
@@ -937,23 +947,31 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 	                           &to_present);
 	if (draw_attachment) {
+		// Each pass blends over the color writes of the previous one.
+		to_present.srcAccessMask      = vk::AccessFlagBits::eColorAttachmentWrite;
+		to_present.oldLayout          = vk::ImageLayout::eColorAttachmentOptimal;
+		const auto attachment_barrier = [&] {
+			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+			                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
+			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
+			                           &to_present);
+		};
+		if (convert_source) {
+			DrawLayer(vk_command, {source, 0, false});
+			if (draw_overlay || draw_system_overlay) {
+				attachment_barrier();
+			}
+		}
 		if (draw_overlay) {
-			DrawOverlay(vk_command, overlay);
+			DrawLayer(vk_command, overlay);
 			if (draw_system_overlay) {
-				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
-				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
-				vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-				                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
-				                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0,
-				                           nullptr, 1, &to_present);
+				attachment_barrier();
 			}
 		}
 		if (draw_system_overlay) {
 			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		}
-		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
-		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,

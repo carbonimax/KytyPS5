@@ -325,16 +325,23 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	vk::Result result = vk::Result::eSuccess;
 	if (!recycled) {
 		VmaAllocationCreateInfo alloc_info {};
-		alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		// Within budget, prefer device memory and fall back to host memory. While the pool may
+		// hold idle device memory, give it back before falling back.
+		if (ImagePoolEnabled()) {
+			alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		}
 		result = static_cast<vk::Result>(vmaCreateImage(
 		    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info), &alloc_info,
 		    &native_image, &image.allocation, nullptr));
 		if (result != vk::Result::eSuccess && ImagePoolEnabled()) {
-			// Out of device memory: give the pooled backings back and try again.
+			// Device memory over budget: give the pooled backings back and try again.
 			{
 				std::lock_guard lock(g_image_pool.mutex);
 				TrimImagePoolLocked(allocator, 0);
 			}
+			alloc_info.requiredFlags = 0;
 			result = static_cast<vk::Result>(vmaCreateImage(
 			    allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 			    &alloc_info, &native_image, &image.allocation, nullptr));

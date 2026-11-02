@@ -158,6 +158,17 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// TextureCache::MaterializeColorClear's last check that found none of `keys` left in these
+	// metadata runs. It holds while BufferCache::ColorMetadataEpoch() keeps the recorded value.
+	struct ColorClearCheck {
+		uint64_t address = 0;
+		uint64_t stride  = 0;
+		uint32_t size    = 0;
+		uint32_t count   = 0;
+		uint32_t keys    = 0;
+		uint64_t epoch   = UINT64_MAX;
+		bool     operator==(const ColorClearCheck&) const = default;
+	} color_clear_check;
 	size_t           lru_id             = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
