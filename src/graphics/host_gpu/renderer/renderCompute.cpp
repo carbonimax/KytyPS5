@@ -40,6 +40,25 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+// Profiling hack (never merge): KYTY_PROF_DISPATCH_BARRIERS=0 drops the barriers around direct
+// dispatches (upper bound of a dispatch barrier chain; rendering may differ).
+bool ProfSkipDispatchBarriers() noexcept {
+	static const bool skip = [] {
+		const char* value = std::getenv("KYTY_PROF_DISPATCH_BARRIERS");
+		const bool  on    = value != nullptr && value[0] == '0';
+		if (on) {
+			std::printf("PERF gput: KYTY_PROF_DISPATCH_BARRIERS=0, no barrier around direct dispatches
+");
+		}
+		return on;
+	}();
+	return skip;
+}
+} // namespace
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
@@ -395,7 +414,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	if (has_storage_writes && !ProfSkipDispatchBarriers()) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		{
@@ -492,7 +511,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	{
+	if (!ProfSkipDispatchBarriers()) {
 		CmdRecord::GpuTagScope gpu_tag_scope(CmdRecord::GpuTag::DispatchSync);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
