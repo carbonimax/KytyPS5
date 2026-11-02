@@ -30639,6 +30639,14 @@ TestCase VectorDppInactiveSource(bool row_shift, bool bound_ctrl, u32 wave_size)
   return test;
 }
 
+// The MAD form KYTY_MAD_SEPARATE_ROUNDING=2 selects (the Apple default, upstream KytyPS5 #1521):
+// fma(a, b, -0.0) rounds the product, then a plain add, so no NoContraction multiply.
+TestCase WithRoundedProductMad(TestCase test) {
+  test.required_spirv = {"OpFAdd", "Fma"};
+  test.forbidden_spirv = {"OpFMul"};
+  return test;
+}
+
 TestCase VectorMadF32RoundsProduct() {
   using O = ShaderOpcode;
 
@@ -30681,7 +30689,11 @@ TestCase VectorMadF32RoundsProduct() {
                   O::V_MAD_F32, O::V_MADMK_F32, O::V_MADAK_F32,
                   O::V_FMAC_F32, O::V_FMA_F32, O::V_FMAMK_F32, O::V_FMAAK_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+#if defined(__APPLE__)
+  test = WithRoundedProductMad(std::move(test));
+#else
   test.required_spirv = {"OpFMul", "OpFAdd", "NoContraction", "Fma"};
+#endif
   return test;
 }
 
@@ -54703,11 +54715,21 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
-  // The legacy MAD rounding fixtures require separate rounding before the emitter caches its policy.
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (_putenv_s("KYTY_MAD_SEPARATE_ROUNDING", "1") != 0) return 1;
+  // The legacy MAD rounding fixtures expect the platform's default MAD form whatever the caller's
+  // environment, so pin it before the emitter caches its policy: fma(a, b, -0.0) + c on Apple,
+  // a NoContraction multiply and add elsewhere. --mad-f32-product-* check the Apple form anywhere.
+  const bool mad_product =
+      argc == 2 && (std::strcmp(argv[1], "--mad-f32-product-only") == 0 ||
+                    std::strcmp(argv[1], "--mad-f32-product-spirv-only") == 0);
+#if defined(__APPLE__)
+  const char *mad_rounding = "2";
 #else
-  if (setenv("KYTY_MAD_SEPARATE_ROUNDING", "1", 1) != 0) return 1;
+  const char *mad_rounding = mad_product ? "2" : "1";
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding) != 0) return 1;
+#else
+  if (setenv("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding, 1) != 0) return 1;
 #endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
@@ -55574,6 +55596,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMadF32RoundsProduct());
+    RunCase(&vulkan, VectorMadF32FlushesDenorms());
+    RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
+    RunCase(&vulkan, VectorFloatArithmeticOps());
+    return 0;
+  }
+  if (mad_product && std::strcmp(argv[1], "--mad-f32-product-spirv-only") == 0) {
+    auto test = WithRoundedProductMad(VectorMadF32RoundsProduct());
+    test.compile_only = true;
+    RunCase(nullptr, test);
+    return 0;
+  }
+  if (mad_product) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WithRoundedProductMad(VectorMadF32RoundsProduct()));
     RunCase(&vulkan, VectorMadF32FlushesDenorms());
     RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
     RunCase(&vulkan, VectorFloatArithmeticOps());

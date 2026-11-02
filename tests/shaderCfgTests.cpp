@@ -17967,27 +17967,86 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvBlockSourceMapping(dispatcher_result);
 }
 
-void TestLegacyMadRoundingPolicy(bool separate) {
+// SPIR-V a legacy MAD adds to a shader, per KYTY_MAD_SEPARATE_ROUNDING form (see
+// LegacyMadRounding() in spirvEmitterAlu.cpp). CTest passes the expected form, so this file
+// does not repeat the emitter's environment parsing.
+struct MadCounts {
+  uint32_t fmul;
+  uint32_t fadd;
+  uint32_t fma;
+  uint32_t no_contraction;
+};
+
+struct MadRoundingExpectation {
+  const char *name;
+  MadCounts counts;
+};
+
+// 1: NoContraction multiply and add.
+constexpr MadRoundingExpectation kMadSeparate{"separate", {1u, 1u, 0u, 2u}};
+// 0: one fused Fma.
+constexpr MadRoundingExpectation kMadFused{"fused", {0u, 0u, 1u, 0u}};
+// 2: the product rounded by fma(a, b, -0.0), then a plain add (upstream KytyPS5 #1521).
+constexpr MadRoundingExpectation kMadRoundedProduct{"product", {0u, 1u, 1u, 0u}};
+
+// Ported from upstream KytyPS5 #1521 (AN0DIN): the MAD form is the same in every stage.
+void TestLegacyMadStageRounding(const MadRoundingExpectation &expected) {
   using namespace ShaderRecompiler;
-  const auto emit = [](IR::ValueOpcode opcode) {
+  const auto count = [](const CompileOptions &options, bool with_mad) {
     const uint32_t shader[] = {EncodeSopp(0x01)};
-    auto options = MakeCompileOptions(ShaderType::Compute);
     auto result = RecompileForTest(shader, options);
-    IR::IREmitter ir(result.program.blocks.front());
-    ir.Emit(opcode, {IR::Value::F32(1.000244140625f), IR::Value::F32(1.000244140625f), IR::Value::F32(-1.00048828125f)});
-    auto binary = Spirv::EmitProgram(result.program, options.input_info);
+    if (with_mad) {
+      IR::IREmitter ir(result.program.blocks.front());
+      ir.Emit(IR::ValueOpcode::FPMad32,
+              {IR::Value::F32(1.000244140625f), IR::Value::F32(1.000244140625f),
+               IR::Value::F32(-1.00048828125f)});
+    }
+    const auto binary = Spirv::EmitProgram(result.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
-    return binary;
+    return MadCounts{SpirvInstructionOpcodeCount(binary, spv::OpFMul),
+                     SpirvInstructionOpcodeCount(binary, spv::OpFAdd),
+                     SpirvExtInstCount(binary, 50u /* GLSLstd450Fma */),
+                     CountSourceOccurrences(DisassembleSpirvBinary(binary),
+                                            "NoContraction")};
   };
-  const char *value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
-  const auto mad = emit(IR::ValueOpcode::FPMad32);
-  const auto source = DisassembleSpirvBinary(mad);
-  Check(SpirvInstructionOpcodeCount(mad, spv::OpFMul) == (separate ? 1u : 0u) && SpirvInstructionOpcodeCount(mad, spv::OpFAdd) == (separate ? 1u : 0u), "MAD policy emitted the wrong FMul/FAdd count");
-  Check(SpirvInstructionOpcodeCount(mad, spv::OpExtInst) == (separate ? 0u : 1u) && SpirvContainsExtInst(mad, 50u) == !separate, "MAD policy must emit exactly one GLSL.std.450 Fma when fused");
-  Check(CountSourceOccurrences(source, "NoContraction") == (separate ? 2u : 0u), "MAD policy emitted the wrong NoContraction decorations");
-  const auto fma = emit(IR::ValueOpcode::FPFma32);
+  const auto check = [&](const CompileOptions &options, const char *text) {
+    const auto base = count(options, false);
+    const auto mad = count(options, true);
+    const bool ok = mad.fmul - base.fmul == expected.counts.fmul &&
+                    mad.fadd - base.fadd == expected.counts.fadd &&
+                    mad.fma - base.fma == expected.counts.fma &&
+                    mad.no_contraction - base.no_contraction ==
+                        expected.counts.no_contraction;
+    Check(ok, text);
+  };
+
+  check(MakeCompileOptions(ShaderType::Compute),
+        "compute shader MAD used the wrong rounding");
+  check(MakeCompileOptions(ShaderType::Pixel),
+        "pixel shader MAD used the wrong rounding");
+  check(MakeCompileOptions(ShaderType::Vertex),
+        "vertex shader MAD used the wrong rounding");
+  ShaderPixelInputInfo depth_export{};
+  depth_export.ps_depth_export_enable = true;
+  auto depth_options = MakeCompileOptions(ShaderType::Pixel);
+  depth_options.input_info.pixel = &depth_export;
+  check(depth_options,
+        "depth-exporting pixel shader MAD used the wrong rounding");
+}
+
+void TestLegacyMadRoundingPolicy(const MadRoundingExpectation &expected) {
+  using namespace ShaderRecompiler;
+  TestLegacyMadStageRounding(expected);
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  IR::IREmitter ir(result.program.blocks.front());
+  ir.Emit(IR::ValueOpcode::FPFma32, {IR::Value::F32(1.000244140625f), IR::Value::F32(1.000244140625f), IR::Value::F32(-1.00048828125f)});
+  const auto fma = Spirv::EmitProgram(result.program, options.input_info);
+  CheckSpirvBinaryValidates(fma);
   Check(SpirvInstructionOpcodeCount(fma, spv::OpExtInst) == 1u && SpirvContainsExtInst(fma, 50u) && CountSourceOccurrences(DisassembleSpirvBinary(fma), "NoContraction") == 1u, "explicit Fma must retain its upstream NoContraction behavior");
-  std::printf("MAD rounding CPU: env=%s separate=%d FMul=%u FAdd=%u Fma=%u NoContraction=%u; explicit Fma intact\n", value == nullptr ? "unset" : value, separate, SpirvInstructionOpcodeCount(mad, spv::OpFMul), SpirvInstructionOpcodeCount(mad, spv::OpFAdd), SpirvInstructionOpcodeCount(mad, spv::OpExtInst), CountSourceOccurrences(source, "NoContraction"));
+  const char *value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
+  std::printf("MAD rounding CPU: env=%s form=%s in compute, pixel, vertex and depth-exporting pixel shaders; explicit Fma intact\n", value == nullptr ? "unset" : value, expected.name);
 }
 
 #include "ShaderRayTracingTests.inc"
@@ -18032,8 +18091,13 @@ int main(int argc, char **argv) {
 
   EnsureConfigInitialized();
   if (argc >= 2 && std::strcmp(argv[1], "--mad-rounding-only") == 0) {
-    Check(argc == 3 && (std::strcmp(argv[2], "separate") == 0 || std::strcmp(argv[2], "fused") == 0), "MAD rounding expectation must be separate or fused");
-    TestLegacyMadRoundingPolicy(std::strcmp(argv[2], "separate") == 0);
+    Check(argc == 3, "MAD rounding expectation must be separate, fused or product");
+    const MadRoundingExpectation *expected = nullptr;
+    for (const auto *candidate : {&kMadSeparate, &kMadFused, &kMadRoundedProduct}) {
+      if (std::strcmp(argv[2], candidate->name) == 0) expected = candidate;
+    }
+    Check(expected != nullptr, "MAD rounding expectation must be separate, fused or product");
+    TestLegacyMadRoundingPolicy(*expected);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--fatal-retire-only") == 0) {
