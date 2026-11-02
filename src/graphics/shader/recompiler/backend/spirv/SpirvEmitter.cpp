@@ -223,7 +223,7 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    !program.shader_info_complete) {
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
-	IR::ValidateProgram(program, true);
+	IR::ValidateProgram(program);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info, profile);
 	state.resource_min_lod = host_features.resource_min_lod;

@@ -1950,6 +1950,42 @@ void TestVertexBufferGrouping() {
   Check(!input.fetch_embedded, "remapping a shader kept its previous vertex metadata");
 }
 
+void TestShaderProgramHash() {
+  using Binary = std::array<uint32_t, 22>;
+  // One code word, a 16-byte literal buffer at 16, 8 bytes of metadata, then the 0x30-byte
+  // footer, whose key and checksum cover the whole binary.
+  const auto Make = [](uint32_t literal, uint32_t metadata, uint32_t version = 1,
+                       uint32_t code_size = 4) {
+    Binary words{};
+    words[0] = EncodeSopp(0x01);
+    words[4] = literal;
+    words[8] = metadata;
+    std::memcpy(&words[10], "barefoot", 8);
+    words[12] = metadata;
+    words[14] = version;
+    words[15] = code_size;
+    words[16] = 16;
+    words[18] = metadata;
+    return words;
+  };
+  const auto Map = [](const Binary &binary) {
+    ShaderMappedData mapped{};
+    mapped.code_size_bytes = sizeof(binary);
+    HW::ComputeShaderInfo regs{};
+    regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(binary.data());
+    ShaderMapUserData(regs.cs_regs.data_addr, mapped);
+    ShaderComputeInputInfo input{};
+    return PrepareProgram(regs, input);
+  };
+  Check(Map(Make(7, 1)).hash == Map(Make(7, 2)).hash,
+        "binaries differing only in metadata got different programs");
+  Check(Map(Make(7, 1)).hash != Map(Make(8, 1)).hash, "the program hash missed the literal buffer");
+  Check(Map(Make(7, 1)).code.size() == 8, "translation must read only the hashed program bytes");
+  Check(Map(Make(7, 1, 2)).hash != Map(Make(7, 2, 2)).hash &&
+            Map(Make(7, 1, 1, 0)).hash != Map(Make(7, 2, 1, 0)).hash,
+        "a binary with an unknown footer must hash whole");
+}
+
 void TestNggVertexEntryState() {
   using namespace ShaderRecompiler;
   // PPSA03309 shader 5a39eb2021a5d2c1: retain its NGG prologue and replace
@@ -13128,7 +13164,7 @@ void TestTypedEntryStateIsMinimal() {
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values);
     IR::EliminateDeadCode(values.blocks);
-    IR::ValidateProgram(values, true);
+    IR::ValidateProgram(values);
   };
 
   check(32u);
@@ -13149,12 +13185,41 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
     } else {
       ir.Emit(ValueOpcode::ReferenceU32, {ir.GetScalarReg(ScalarReg{0})});
     }
-    ExpectFatal([&] { ValidateProgram(program, true); },
+    ExpectFatal([&] { ValidateProgram(program); },
                 "final SSA accepted a register-state pseudo operation");
   };
 
   check_rejected(false);
   check_rejected(true);
+}
+
+void TestEmitterValidatesFinalProgram() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x1c, 0, false), // buffer_store_dword v0
+      EncodeMubuf1(0, 12, 0),
+      0xbf810000u,
+  };
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  // Only emission validates, so a definition moved below its same-block user must be fatal.
+  bool moved = false;
+  for (auto *block : result.program.blocks) {
+    auto &list = block->Instructions();
+    for (auto user = list.begin(); !moved && user != list.end(); ++user) {
+      for (size_t arg = 0; !moved && arg < user->NumArgs(); ++arg) {
+        const auto *def = user->Arg(arg).TryInstruction();
+        if (def == nullptr || def->Parent() != block) continue;
+        const auto where = std::ranges::find_if(
+            list, [&](const IR::Inst &inst) { return &inst == def; });
+        list.splice(std::next(user), list, where);
+        moved = true;
+      }
+    }
+  }
+  Check(moved, "emitter fixture has no same-block definition");
+  ExpectFatal([&] { Spirv::EmitProgram(result.program, options.input_info); },
+              "SPIR-V emission accepted a use before its definition");
 }
 #endif
 
@@ -13238,7 +13303,7 @@ void TestValuePhiValidation() {
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const auto expect_invalid = [](const Program &program, const char *text) {
-    ExpectFatal([&] { ValidateProgram(program, true); }, text);
+    ExpectFatal([&] { ValidateProgram(program); }, text);
   };
 #endif
   const auto validate = [&](InvalidPhi invalid) {
@@ -13290,7 +13355,7 @@ void TestValuePhiValidation() {
     }
 
     if (invalid == InvalidPhi::None) {
-      ValidateProgram(program, true);
+      ValidateProgram(program);
     }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     else {
@@ -13656,7 +13721,7 @@ void TestLaneMaskProjection() {
               gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
           "mask projection changed a raw scalar mask consumer");
     RemoveIdentities(program);
-    ValidateProgram(program, true);
+    ValidateProgram(program);
   }
 }
 
@@ -13726,7 +13791,7 @@ void TestLateConstantPropagation() {
             "late constants did not reach Phi, nested mask patterns or new logical nodes");
       RemoveIdentities(program);
       Check(exit->condition == Value(true), "late constant lost its control-flow use");
-      ValidateProgram(program, true);
+      ValidateProgram(program);
     }
   }
 
@@ -13936,7 +14001,7 @@ void TestNativeWideValueValidation() {
     }
   };
   const auto check_rejected = [](const Program &program, const char *text) {
-    ExpectFatal([&] { ValidateProgram(program, true); }, text);
+    ExpectFatal([&] { ValidateProgram(program); }, text);
   };
 
   {
@@ -18001,6 +18066,7 @@ int main(int argc, char **argv) {
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
+  TestShaderProgramHash();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
@@ -18130,6 +18196,7 @@ int main(int argc, char **argv) {
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();
+  TestEmitterValidatesFinalProgram();
 #endif
   TestSsaRewriteSealsFilledBlocks();
   TestValuePhiValidation();
