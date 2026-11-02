@@ -2495,6 +2495,25 @@ public:
     return properties.vendorID == 0x1002u;
   }
 
+  // Host format of a 16-bit guest depth with stencil, chosen like production
+  // (ResolveHostDepthAttachmentFormat): the first stencil candidate the device supports as a
+  // depth target with this sample count. D24S8 is absent on some devices (AMD, Apple).
+  [[nodiscard]] vk::Format HostD16StencilFormat(u32 samples = 1) const {
+    const auto *policy = FindDepthFormatPolicy(Prospero::DepthFormat::kZ16);
+    for (const auto format : policy->stencil_attachment_formats) {
+      vk::ImageFormatProperties properties{};
+      if (format != vk::Format::eUndefined &&
+          m_physical_device.getImageFormatProperties(
+              format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
+              {}, &properties) == vk::Result::eSuccess &&
+          static_cast<bool>(properties.sampleCounts & vulkan_sample_count(samples))) {
+        return format;
+      }
+    }
+    Fail("VulkanHarness", "depth/stencil format",
+         "prerequisite missing: no D16/D24/D32 stencil format supports depth-target usage");
+  }
+
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
 
@@ -4695,7 +4714,7 @@ public:
             "unified depth view cache lost sampled/attachment identity");
 
     auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
+    depth_stencil_info.pixel_format = HostD16StencilFormat();
     depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
     depth_stencil_info.bytes_per_block = 2;
     Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
@@ -8004,12 +8023,12 @@ public:
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
-      ms_depth_desc.info.pixel_format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.info.pixel_format = HostD16StencilFormat(2);
       ms_depth_desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
       ms_depth_desc.info.bytes_per_block = 2;
       ms_depth_desc.info.samples = 2;
       ms_depth_desc.info.type = Prospero::ImageType::kColor2D;
-      ms_depth_desc.view_info.format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.view_info.format = ms_depth_desc.info.pixel_format;
       ms_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       ms_depth_desc.view_info.usage =
@@ -10529,7 +10548,7 @@ public:
       std::memset(memory + d16_fallback_stencil_offset, 0x6d, 4);
       auto d16_depth_desc = MakeLinearDesc(
           base + d16_fallback_offset, sizeof(d16_fallback_values),
-          vk::Format::eD24UnormS8Uint, Prospero::BufferFormat::k16UNorm,
+          HostD16StencilFormat(), Prospero::BufferFormat::k16UNorm,
           Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2, 1);
       d16_depth_desc.type = BindingType::DepthTarget;
       d16_depth_desc.info.stencil = {base + d16_fallback_stencil_offset, 4};
@@ -10615,12 +10634,21 @@ public:
       const auto d16_restenciled_words =
           read_texels(d16_restenciled_image, vk::ImageAspectFlagBits::eDepth);
       bool d16_promoted = d16_restenciled_image != d16_native_image;
+      // The promoted encoding follows the stencil format the device provides (D24S8 or D32S8).
+      const bool d16_promoted_to_d32 =
+          texture_cache.GetImage(d16_restenciled_image).backing.format ==
+          vk::Format::eD32SfloatS8Uint;
       for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
-        d16_promoted &= (d16_restenciled_words[i] & 0x00ffffffu) ==
-                        EncodeD16AsD24(d16_fallback_values[i]);
+        d16_promoted &= d16_promoted_to_d32
+                            ? d16_restenciled_words[i] == EncodeD16AsD32(d16_fallback_values[i])
+                            : (d16_restenciled_words[i] & 0x00ffffffu) ==
+                                  EncodeD16AsD24(d16_fallback_values[i]);
       }
-      Require(name, "D16 native depth/fallback depth copy", d16_promoted,
-              "D16 depth lost its values when its target regained the stencil");
+      std::string d16_promoted_detail =
+          "D16 depth lost its values when its target regained the stencil: format " +
+          vk::to_string(texture_cache.GetImage(d16_restenciled_image).backing.format) + " words";
+      for (const auto word : d16_restenciled_words) d16_promoted_detail += " " + Hex(word);
+      Require(name, "D16 native depth/fallback depth copy", d16_promoted, d16_promoted_detail);
 
       if (!texture_cache.GetImage(combined_destination_image).IsGpuModified()) {
         texture_cache.MarkGpuWritten(combined_destination_image);
@@ -20263,7 +20291,12 @@ public:
       state.vertex_info[0].stage.module = &vertex_shader;
       state.ps_input_info.stage.handle = &pixel_shader.handle;
       state.ps_input_info.stage.module = &pixel_shader;
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      // Without the dynamic loop state, the feedback loop is baked into the pipeline, as in
+      // RenderExecutor's draw path.
+      const bool baked_feedback = !m_feedback_loop_dynamic && depth_feedback &&
+                                  depth.depth_write_enable;
+      return context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state, {state.color_info, state.color_count}, baked_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
@@ -20333,7 +20366,9 @@ public:
       }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_feedback_loop_dynamic) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23780,6 +23815,9 @@ public:
 private:
   Mode m_mode = Mode::Full;
   bool m_rasterization_supported = true;
+  // VK_EXT_attachment_feedback_loop_dynamic_state is optional in production as well: without it
+  // the depth feedback loop is a pipeline property instead of per-draw state.
+  bool m_feedback_loop_dynamic = false;
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
@@ -23830,6 +23868,7 @@ private:
       Require("ImageMinLodFallback", "subgroup", m_runtime_context.subgroup_size == 32 || m_runtime_context.subgroup_size == 64, "missing GPU qualification: production bindings require a 32- or 64-lane subgroup");
     }
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_dynamic = m_feedback_loop_dynamic;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
@@ -24086,22 +24125,33 @@ private:
               available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     }
-    m_rasterization_supported = full && available_features.fillModeNonSolid &&
-                                available_features.tessellationShader &&
-                                available_features.drawIndirectFirstInstance &&
-                                available_features.multiDrawIndirect &&
-                                available_features.depthBounds &&
-                                available_features.fragmentStoresAndAtomics &&
-                                available_depth_clip.depthClipEnable &&
-                                available_clip_control.depthClipControl &&
-                                available_color_write.colorWriteEnable &&
-                                available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
-                                available_provoking_vertex.provokingVertexLast;
+    const std::pair<const char *, bool> rasterization_prerequisites[] = {
+        {"fillModeNonSolid", available_features.fillModeNonSolid},
+        {"tessellationShader", available_features.tessellationShader},
+        {"drawIndirectFirstInstance", available_features.drawIndirectFirstInstance},
+        {"multiDrawIndirect", available_features.multiDrawIndirect},
+        {"depthBounds", available_features.depthBounds},
+        {"fragmentStoresAndAtomics", available_features.fragmentStoresAndAtomics},
+        {"depthClipEnable", available_depth_clip.depthClipEnable},
+        {"depthClipControl", available_clip_control.depthClipControl},
+        {"colorWriteEnable", available_color_write.colorWriteEnable},
+        {"attachmentFeedbackLoopLayout", available_feedback_layout.attachmentFeedbackLoopLayout},
+        {"provokingVertexLast", available_provoking_vertex.provokingVertexLast}};
+    std::string missing_rasterization;
+    for (const auto &[feature, supported] : rasterization_prerequisites) {
+      if (!supported) missing_rasterization += std::string(missing_rasterization.empty() ? "" : ", ") + feature;
+    }
+    m_rasterization_supported = full && missing_rasterization.empty();
+    m_feedback_loop_dynamic = m_rasterization_supported &&
+                              available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                              std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
+                                return std::strcmp(extension.extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) == 0;
+                              });
     if (!m_rasterization_supported) {
       std::printf(
-          "[host]    ProductionRasterization   unavailable, rasterization cases "
-          "will be skipped\n");
+          "[host]    ProductionRasterization   unavailable (prerequisite missing: %s), "
+          "rasterization cases will be skipped\n",
+          full ? missing_rasterization.c_str() : "full harness mode");
     }
 
     float priority = 1.0f;
@@ -24162,7 +24212,8 @@ private:
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.pNext = m_feedback_loop_dynamic ? static_cast<void *>(&feedback_dynamic)
+                                                       : static_cast<void *>(&feedback_layout);
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -24191,6 +24242,22 @@ private:
                                   : m_conditional_rendering_enabled
                                         ? static_cast<const void *>(&conditional_rendering)
                                         : static_cast<const void *>(&robustness2);
+    // Outside Apple the production renderer always records vkCmdSetColorWriteEnableEXT
+    // (VK_EXT_color_write_enable is a hard device requirement there), so the portable graphics
+    // fixtures, which draw through it, need the extension too.
+    vk::PhysicalDeviceColorWriteEnableFeaturesEXT portable_color_write{};
+#if !defined(__APPLE__)
+    const bool portable_color_write_needed = portable_graphics;
+#else
+    const bool portable_color_write_needed = false;
+#endif
+    if (portable_color_write_needed) {
+      Require("VulkanHarness", "graphics", available_color_write.colorWriteEnable == true,
+              "prerequisite missing: colorWriteEnable (VK_EXT_color_write_enable) is not supported");
+      portable_color_write.colorWriteEnable = true;
+      portable_color_write.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &portable_color_write;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = full;
     device_features.shaderStorageImageMultisample = full && available_features.shaderStorageImageMultisample;
@@ -24228,14 +24295,19 @@ private:
       if (portable_graphics || min_lod_fallback) {
         device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
       }
+      if (portable_color_write_needed) {
+        device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+      }
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_loop_dynamic) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     if (m_barycentric_supported) device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
@@ -51507,12 +51579,18 @@ void CheckImageTransitionState(RenderContext &renderer) {
   scheduler.Finish();
   download.Invalidate(download_offset, 128);
   download.Invalidate(buffered_download_offset, buffered_expected.size());
-  Require(name, "depth/stencil mip contents",
-          std::memcmp(download_data, expected_depth.data(),
-                      sizeof(expected_depth)) == 0 &&
-              std::memcmp(download_data + 64, expected_stencil.data(),
-                          sizeof(expected_stencil)) == 0,
-          "combined depth/stencil mip copy lost an aspect");
+  {
+    std::array<uint32_t, 4> depth_words{};
+    std::array<uint8_t, 4> stencil_bytes{};
+    std::memcpy(depth_words.data(), download_data, sizeof(depth_words));
+    std::memcpy(stencil_bytes.data(), download_data + 64, sizeof(stencil_bytes));
+    std::string detail = "combined depth/stencil mip copy lost an aspect: depth";
+    for (const auto word : depth_words) detail += " " + Hex(word);
+    detail += " stencil";
+    for (const auto byte : stencil_bytes) detail += " " + Hex(byte);
+    Require(name, "depth/stencil mip contents",
+            depth_words == expected_depth && stencil_bytes == expected_stencil, detail);
+  }
   Require(name, "buffered-copy chunk contents",
           std::memcmp(buffered_download_data, buffered_expected.data(),
                       buffered_expected.size()) == 0,
