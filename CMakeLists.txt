@@ -788,7 +788,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-retire-only)
 	set_tests_properties(buffer_cache_device_address_retire PROPERTIES
 		ENVIRONMENT "MTL_DEBUG_LAYER=1;MTL_DEBUG_LAYER_ERROR_MODE=assert"
-		PASS_REGULAR_EXPRESSION "BufferCacheDeviceAddressRetire +ok")
+		PASS_REGULAR_EXPRESSION "BufferCacheDeviceAddressRetire +ok"
+		# Drivers whose release policy keeps per-use retire ticks have nothing to check here.
+		SKIP_REGULAR_EXPRESSION "BufferCacheDeviceAddressRetire +skipped")
 	add_test(NAME stream_buffer_ring
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
