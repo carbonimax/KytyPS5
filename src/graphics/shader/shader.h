@@ -145,6 +145,17 @@ struct ShaderTessellationInputInfo {
 
 struct ShaderPixelInputInfo;
 
+// GS user-data slots an indirect draw packet writes its record's base vertex and first instance
+// to (from upstream a5b3673a).
+struct ShaderIndirectOffsets {
+	static constexpr uint8_t None = UINT8_MAX;
+
+	uint8_t vertex   = None;
+	uint8_t instance = None;
+
+	bool operator==(const ShaderIndirectOffsets&) const = default;
+};
+
 struct ShaderVertexInputInfo {
 	const ShaderPixelInputInfo* pixel_input = nullptr;
 	static constexpr int RES_MAX = 32;
@@ -168,6 +179,11 @@ struct ShaderVertexInputInfo {
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
+	// Mesh programs of an indirect draw whose records the GPU reads (KYTY_MESH_INDIRECT_GPU): a
+	// task shader passes each record's draw parameters in its payload, and the patched user-data
+	// slots below take the record's bases.
+	ShaderIndirectOffsets   indirect_offsets;
+	bool                    indirect_draw       = false;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };

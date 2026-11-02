@@ -36,7 +36,7 @@ using ShaderRecompiler::IR::Writer;
 
 constexpr std::array<char, 8> StoreMagic {'K', 'Y', 'S', 'H', 'S', 'T', 'O', 'R'};
 // Bumped when the frame or record encoding changes.
-constexpr uint32_t StoreFormatVersion = 3;
+constexpr uint32_t StoreFormatVersion = 4;
 
 enum class Record : uint8_t {
 	Program          = 1,
@@ -157,7 +157,7 @@ template <class S, class M> void IoModule(S& io, M& record) {
 	auto& module = record.module;
 	IoAll(io, record.stage, record.hash, record.user_data_count, record.code_size,
 	      record.static_state, module.handle.id, module.program, module.specialization,
-	      module.vertex_formats, module.rect_parameters, record.translation_id);
+	      module.vertex_formats, module.rect_parameters, module.mesh_task, record.translation_id);
 }
 
 template <class S, class P> void IoPipeline(S& io, P& pipeline) {

@@ -45,6 +45,8 @@ bool ShaderPredictPixelProgram(const ShaderMappedData& data, ShaderPixelInputInf
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
+// Whether PrepareProgram selects the host mesh stage for these registers (merged or native NGG).
+bool ShaderVertexStageIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context);
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info);

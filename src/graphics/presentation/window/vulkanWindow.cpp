@@ -661,6 +661,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		EXIT("Experimental mesh requires VK_EXT_mesh_shader and meshShader support\n");
 	}
 #endif
+	// Indirect mesh draws can launch their records' groups from a task shader
+	// (KYTY_MESH_INDIRECT_GPU); without one, the CPU reads the records.
+	graphics.task_shader_enabled = graphics.mesh_shader_enabled && supported_mesh.taskShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -808,6 +811,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
 	mesh_features.pNext                 = &features13;
 	mesh_features.meshShader            = graphics.mesh_shader_enabled;
+	mesh_features.taskShader            = graphics.task_shader_enabled;
 	void* feedback_next =
 	    mesh_extension ? static_cast<void*>(&mesh_features) : static_cast<void*>(&features13);
 	if (graphics.attachment_feedback_loop_dynamic) {

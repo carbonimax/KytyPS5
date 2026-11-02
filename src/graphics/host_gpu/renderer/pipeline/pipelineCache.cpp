@@ -509,6 +509,8 @@ struct PipelineCache::ProgramCache {
 		           options.input_info.pixel->parameter_mode == ShaderPixelParameterMode::Rectangle) {
 			permutation.rect_parameters = RectListParameters(*options.input_info.pixel,
 			                                                 permutation.program);
+		} else if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr) {
+			permutation.mesh_task = options.input_info.vertex->indirect_draw;
 		}
 		if (spirv != nullptr) {
 			*spirv = std::move(result.spirv);
@@ -829,6 +831,7 @@ struct PipelineCache::ProgramCache {
 		store_record.module.specialization  = module.specialization;
 		store_record.module.vertex_formats  = module.vertex_formats;
 		store_record.module.rect_parameters = module.rect_parameters;
+		store_record.module.mesh_task       = module.mesh_task;
 		store_record.translation_id         = 0;
 		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			if (params.back_code.empty()) {
@@ -1523,6 +1526,18 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 				    vertex_params[0].hash));
 			}
 			return;
+		}
+		// A task shader launches each record's groups and passes its draw parameters in a
+		// payload beside the LDS, the allocation pair and the Layer array; without room for
+		// it, or past the task launch limits, the CPU reads the records.
+		if (state.indirect_count != 0 && m_graphics.task_shader_enabled &&
+		    state.indirect_count <= std::min(limits.maxTaskWorkGroupCount[0],
+		                                     limits.maxTaskWorkGroupTotalCount) &&
+		    (mesh.lds_size_dwords + 2u + mesh.max_vertices +
+		     ShaderRecompiler::IR::PushData::MeshTaskPayloadDwordCount) * sizeof(uint32_t) <=
+		        limits.maxMeshPayloadAndSharedMemorySize) {
+			vertex_info[0].indirect_offsets = state.indirect_offsets;
+			vertex_info[0].indirect_draw    = true;
 		}
 	}
 	ShaderParams pixel_params;
