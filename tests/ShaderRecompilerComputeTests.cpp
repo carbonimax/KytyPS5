@@ -40783,7 +40783,8 @@ TestCase CoherentBufferPairContention(u32 wave_size) {
 TestCase Wave64AppendIndexFromExecRank() {
   using O = ShaderOpcode;
   std::vector<u32> code;
-  AppendSMovLiteral(&code, 124, 8);
+  // M0 = GDS base 0, size 24: the region must cover the counter dword at offset 20.
+  AppendSMovLiteral(&code, 124, 24);
   AppendVMovU32(&code, 2, 1);
   AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
   code.push_back(EncodeDs0(0x3e, 20, true));
@@ -48500,7 +48501,8 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
 GraphicsCase GraphicsDsAppendHelperQuad() {
   using O = ShaderOpcode;
   std::vector<u32> code;
-  AppendSMovLiteral(&code, 124, 8);
+  // M0 = GDS base 0, size 24: the region must cover the counter dword at offset 20.
+  AppendSMovLiteral(&code, 124, 24);
   AppendVMovU32(&code, 2, 1);
   AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
   code.push_back(EncodeDs0(0x3e, 20, true));
