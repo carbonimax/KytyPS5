@@ -51,8 +51,7 @@ bool ProfSkipDispatchBarriers() noexcept {
 		const char* value = std::getenv("KYTY_PROF_DISPATCH_BARRIERS");
 		const bool  on    = value != nullptr && value[0] == '0';
 		if (on) {
-			std::printf("PERF gput: KYTY_PROF_DISPATCH_BARRIERS=0, no barrier around direct dispatches
-");
+			std::printf("PERF gput: KYTY_PROF_DISPATCH_BARRIERS=0, no barrier around direct dispatches\n");
 		}
 		return on;
 	}();

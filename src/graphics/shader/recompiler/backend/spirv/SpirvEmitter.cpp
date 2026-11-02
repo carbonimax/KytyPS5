@@ -231,8 +231,7 @@ bool ProfSelectStorageBounds() noexcept {
 		const char* value = std::getenv("KYTY_PROF_STORAGE_BOUNDS");
 		const bool  on    = value != nullptr && value[0] == '2';
 		if (on) {
-			std::printf("PERF gput: KYTY_PROF_STORAGE_BOUNDS=2, storage buffer loads clamped and selected (no branch)
-");
+			std::printf("PERF gput: KYTY_PROF_STORAGE_BOUNDS=2, storage buffer loads clamped and selected (no branch)\n");
 		}
 		return on;
 	}();
