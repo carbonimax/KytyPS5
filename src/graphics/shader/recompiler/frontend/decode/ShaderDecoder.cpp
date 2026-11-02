@@ -517,6 +517,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B32:
 		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B32:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
 		case Opcode::S_ORN2_SAVEEXEC_B32:
@@ -552,6 +553,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:
 		case Opcode::S_INST_PREFETCH:
+		case Opcode::S_CLAUSE:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
 			                                               magic_enum::enum_name(inst.opcode),
 			                                               OperandToString(inst.src0).c_str()));
@@ -739,6 +741,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ2ST64_B64:
 		case Opcode::DS_READ_B96:
 		case Opcode::DS_READ_B128:
+		case Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
 		case Opcode::DS_WRITE_B8_D16_HI:

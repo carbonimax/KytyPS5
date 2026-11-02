@@ -16,6 +16,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -563,6 +564,11 @@ private:
 		bool     has_sampler = false;
 	};
 
+	struct MemoryIndexUse {
+		const Inst* owner = nullptr;
+		uint32_t    count = 0;
+	};
+
 	struct ResolvedHandle {
 		const Inst* handle;
 		uint32_t pc;
@@ -829,6 +835,7 @@ private:
 		if (value.IsImmediate()) return;
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+		if (m_srt_visited.contains(inst)) return;
 		const auto cycle = std::ranges::find(m_srt_visiting, inst);
 		if (cycle != m_srt_visiting.end()) {
 			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
@@ -836,7 +843,6 @@ private:
 			})) return;
 			Fail(use_pc, "cyclic typed planning value without a phi");
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
 		m_srt_visiting.push_back(inst);
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*inst, memory_index);
@@ -858,7 +864,7 @@ private:
 				CollectScalarRead(inst->Arg(arg), use_pc);
 		}
 		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
+		m_srt_visited.insert(inst);
 		if (memory == nullptr) return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
@@ -1098,22 +1104,25 @@ private:
 		           : nullptr;
 	}
 
-	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) {
+		if (m_memory_index_uses.empty()) {
+			// Only descriptor planning asks, and it adds no memory instructions.
+			m_memory_index_uses.resize(m_program.memory_info.size());
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					const auto op = inst.GetOpcode();
+					if (BufferAccessOf(op) != BufferAccess::None ||
+					    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+					    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+						auto& use = m_memory_index_uses[inst.Flags<MemoryFlags>().index];
+						use.owner = &inst;
+						use.count++;
+					}
 				}
 			}
 		}
-		return true;
+		const auto& use = m_memory_index_uses[index];
+		return use.count == 0 || (use.count == 1 && use.owner == &owner);
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -4022,10 +4031,10 @@ private:
 		}
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
-				Merge(m_info.buffers[i], memory, inst, pc);
+				Merge(m_info.buffers[i], memory, op, pc);
 				return i;
 			}
 		}
@@ -4035,14 +4044,13 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
-		Merge(resource, memory, inst, pc);
+		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
 	}
 
-	static void Merge(BufferResource& resource, const MemoryInfo& memory, const Inst& inst,
+	static void Merge(BufferResource& resource, const MemoryInfo& memory, ValueOpcode op,
 	                  uint32_t pc) {
-		const auto op            = inst.GetOpcode();
 		const auto access        = BufferAccessOf(op);
 		const bool atomic        = access == BufferAccess::Atomic;
 		const bool write         = access == BufferAccess::Write || atomic;
@@ -4050,13 +4058,6 @@ private:
 		resource.max_byte_extent = std::max(resource.max_byte_extent, ByteExtent(memory));
 		resource.read            = resource.read || !write || atomic;
 		resource.written         = resource.written || write;
-		if (write) {
-			// Formatted stores write the whole format; otherwise zero index, VGPR and SGPR offsets
-			// leave only the immediate offset.
-			const bool fixed = !memory.formatted && inst.Arg(1).Resolve() == Value(0u) &&
-			                   inst.Arg(2).Resolve() == Value(0u) && inst.Arg(3).Resolve() == Value(0u);
-			resource.write_extent = std::max(resource.write_extent, fixed ? ByteExtent(memory) : UINT32_MAX);
-		}
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
@@ -4188,7 +4189,7 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect) {
+		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect) {
 			m_info.uses_dma = true;
 			return;
 		}
@@ -4232,7 +4233,7 @@ private:
 				m_info.uses_dma                         = true;
 				return;
 			}
-			resource = AddBuffer(source, memory, inst, flags.pc);
+			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 			}
@@ -4356,7 +4357,8 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visited;
+	std::vector<MemoryIndexUse>                m_memory_index_uses;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

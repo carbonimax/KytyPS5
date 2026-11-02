@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <map>
 #include <memory>
@@ -129,6 +130,11 @@ public:
 	// until a GPU write or download.
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	// Advances whenever a checked range is forgotten, so an IsColorMetadataChecked result seen
+	// under an unchanged epoch still holds.
+	[[nodiscard]] uint64_t ColorMetadataEpoch() const {
+		return m_color_metadata_epoch.load(std::memory_order_relaxed);
+	}
 	void               ProcessFaultBuffer();
 	// Synchronizes the queued BDA ranges that are mapped, with deferred uploads (see
 	// BeginDeferredUploads).
@@ -264,6 +270,7 @@ private:
 	std::mutex                                        m_gpu_ranges_mutex;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
 	std::mutex                                        m_pending_mutex;
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
