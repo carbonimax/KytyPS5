@@ -323,9 +323,9 @@ struct TextureCacheTestAccess {
   }
 
   static std::vector<ImageId> FindImages(TextureCache &cache, uint64_t address,
-                                         uint64_t size, bool page_overlap) {
+                                         uint64_t size) {
     std::lock_guard lock(cache.m_lock);
-    const auto found = cache.FindImagesInRegion(address, size, page_overlap);
+    const auto found = cache.FindImagesInRegion(address, size);
     std::vector<ImageId> result;
     result.reserve(found.size());
     for (const auto id : found) {
@@ -6406,6 +6406,13 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+    texture_cache.UnmapMemory(read_write_meta,
+                              write_only_meta - read_write_meta);
+    Require(name, "unmapped metadata range",
+            texture_cache.IsMeta(read_only_meta) &&
+                !texture_cache.IsMeta(read_write_meta) &&
+                texture_cache.IsMeta(write_only_meta),
+            "unmapping erased metadata outside its range or kept one inside");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -6780,12 +6787,12 @@ public:
         return ids.size() == 1 && ids.front() == expected;
       };
       const auto exact_byte_miss =
-          TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, false);
+          TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1);
       const auto touched_page_hit =
-          TextureCacheTestAccess::FindImages(texture_cache, base + 8, 1, true);
+          TextureCacheTestAccess::FindImages(texture_cache, base, 0x1000);
       const auto next_page_miss = TextureCacheTestAccess::FindImages(
-          texture_cache, base + 0x1000, 1, true);
-      Require(name, "exact and 4-KiB page filtering",
+          texture_cache, base + 0x1000, 0x1000);
+      Require(name, "exact byte filtering",
               exact_byte_miss.empty() && IsOnlyImage(touched_page_hit, first) &&
                   next_page_miss.empty(),
               "coarse candidates did not preserve exact-byte and touched-page "
@@ -6803,8 +6810,7 @@ public:
       const auto spanning =
           TextureCacheTestAccess::InsertImage(texture_cache, spanning_info);
       const auto spanning_results = TextureCacheTestAccess::FindImages(
-          texture_cache, spanning_info.data.address, spanning_info.data.size,
-          false);
+          texture_cache, spanning_info.data.address, spanning_info.data.size);
       Require(name, "one-MiB cross-page deduplication",
               spanning && IsOnlyImage(spanning_results, spanning) &&
                   TextureCacheTestAccess::PageOwnerCount(
@@ -6819,9 +6825,9 @@ public:
                   texture_cache, spanning_info.data.address) == 0 &&
                   TextureCacheTestAccess::PageOwnerCount(
                       texture_cache, spanning_info.data.End() - 1) == 0 &&
-                  TextureCacheTestAccess::FindImages(
-                      texture_cache, spanning_info.data.address,
-                      spanning_info.data.size, false)
+                  TextureCacheTestAccess::FindImages(texture_cache,
+                                                     spanning_info.data.address,
+                                                     spanning_info.data.size)
                       .empty(),
               "cross-page unregister left a stale coarse-page membership");
 
@@ -6831,8 +6837,7 @@ public:
       const auto shared_second =
           TextureCacheTestAccess::InsertImage(texture_cache, shared_info);
       const auto shared_results = TextureCacheTestAccess::FindImages(
-          texture_cache, shared_info.data.address, shared_info.data.size,
-          false);
+          texture_cache, shared_info.data.address, shared_info.data.size);
       Require(name, "shared coarse-page registration",
               shared_results.size() == 2 &&
                   std::find(shared_results.begin(), shared_results.end(),
@@ -6842,8 +6847,7 @@ public:
               "two registered owners were not retained in one coarse page");
       TextureCacheTestAccess::DeleteImage(texture_cache, shared_first);
       const auto shared_survivor = TextureCacheTestAccess::FindImages(
-          texture_cache, shared_info.data.address, shared_info.data.size,
-          false);
+          texture_cache, shared_info.data.address, shared_info.data.size);
       Require(name, "shared coarse-page unregister",
               IsOnlyImage(shared_survivor, shared_second) &&
                   TextureCacheTestAccess::PageOwnerCount(
@@ -6960,10 +6964,7 @@ public:
       const auto mip = subresource.MipOf(chain);
       Require(name, "overlap resolution",
               mip == 0 && subresource.SliceOf(chain, mip) == 0 &&
-                  ImageRangeOverlaps(chain.data, subresource.data) &&
-                  ImagePageRangesOverlap(chain.data.address, chain.data.size,
-                                         subresource.data.address,
-                                         subresource.data.size),
+                  ImageRangeOverlaps(chain.data, subresource.data),
               "captured PS5 atlas mip/slice overlap did not resolve");
 
       auto exact_desc = compatible_desc;
@@ -17402,7 +17403,6 @@ public:
       Require(name, "storage prefetch purity",
               storage_discovery.images[0].image_view == nullptr &&
                   texture_cache.GetImage(storage_id).binding.is_bound &&
-                  !texture_cache.GetImage(storage_id).usage.storage &&
                   !TextureCacheTestAccess::PendingDownload(texture_cache,
                                                            storage_id),
               "the first descriptor pass performed final storage acquisition");
@@ -17469,7 +17469,6 @@ public:
       const auto &sampled_binding = graphics_bindings.pixel.images[0];
       Require(name, "storage final acquisition",
               storage_binding.image_view != nullptr &&
-                  texture_cache.GetImage(storage_id).usage.storage &&
                   texture_cache.GetImage(storage_id).IsGpuModified() &&
                   TextureCacheTestAccess::PendingDownload(texture_cache,
                                                           storage_id),
@@ -17480,8 +17479,7 @@ public:
                   sampled_binding.image_id == storage_id &&
                   texture_cache.GetImage(storage_id).binding.force_general &&
                   texture_cache.GetImage(storage_id).binding.shader_write &&
-                  texture_cache.GetImage(storage_id).IsGpuModified() &&
-                  texture_cache.GetImage(storage_id).usage.storage,
+                  texture_cache.GetImage(storage_id).IsGpuModified(),
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
@@ -19366,10 +19364,9 @@ public:
       scheduler.Finish();
       const auto stencil_result = ReadBuffer(name, stencil_readback, 2);
       Require(name, "stencil clear retains depth",
-          stencil_result[0] == std::bit_cast<uint32_t>(0.625f) &&
-              (stencil_result[1] & 0xffu) == 0x35 &&
-              !texture_cache.GetImage(depth_id).usage.storage,
-          "stencil clear altered depth, lost its scalar value, or used a storage view");
+              stencil_result[0] == std::bit_cast<uint32_t>(0.625f) &&
+                  (stencil_result[1] & 0xffu) == 0x35,
+              "stencil clear altered depth or lost its scalar value");
       DestroyBuffer(&stencil_readback);
 
       // Buffer writes to the independent tiled stencil plane must reach the

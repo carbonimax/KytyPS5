@@ -1058,9 +1058,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			PerfStats::ScopedTimer view_timer(PerfStats::Counter::BindViewNs, PerfStats::SrtProfEnabled());
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
-		auto&      image   = texture_cache.GetImage(binding.image_id);
-		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
 	}
 }
 

@@ -941,7 +941,6 @@ void Validate(const ImageInfo& info) {
 	if (info.pixel_format == vk::Format::eUndefined) {
 		const bool metadata_empty =
 		    info.metadata.range.Empty() && info.metadata.kind == ImageMetadataKind::None &&
-		    info.metadata.control == 0 &&
 		    info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    !info.metadata.stencil_compressed;
 		if (info.data.Empty() || info.HasStencil() || !metadata_empty || info.extent.width == 0 ||
@@ -983,7 +982,7 @@ void Validate(const ImageInfo& info) {
 	}
 	switch (info.metadata.kind) {
 		case ImageMetadataKind::None:
-			if (!info.metadata.range.Empty() || info.metadata.control != 0 ||
+			if (!info.metadata.range.Empty() ||
 			    info.metadata.compression != VideoOutCompression::Uncompressed ||
 			    info.metadata.stencil_compressed) {
 				EXIT("metadata-free image has metadata state\n");
