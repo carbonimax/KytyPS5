@@ -296,6 +296,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
+	AddFlag(args, info.pro_enabled, "--trinity");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)
