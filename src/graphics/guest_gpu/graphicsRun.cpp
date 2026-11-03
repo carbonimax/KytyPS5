@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
-#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
@@ -13,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -22,7 +22,6 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "libs/agc.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -48,11 +47,6 @@ static thread_local Pm4Execution* g_current_execution = nullptr;
 // Fork: also set on the CP pipeline's back thread (MarkHostGpuThread), which has no g_gpu_state.
 static thread_local bool          g_gpu_thread        = false;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
-
-static bool GraphicsRunDebugDumpEnabled() {
-	return Config::GraphicsDebugDumpEnabled() &&
-	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
-}
 
 // KYTY_EOP_AT_GPU=1 (default 0): RELEASE_MEM labels reach guest memory when the host GPU has
 // completed the work recorded before the packet, in stream order, instead of when the command
@@ -352,7 +346,6 @@ void Report(double seconds) {
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
-	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -440,7 +433,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 		return;
 	}
 	Submission submission;
-	submission.type     = SubmissionType::Graphics;
+	submission.type     = SubmissionType::Commands;
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
@@ -453,7 +446,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 
 	const auto compute_queue = queue - ComputeQueueBase;
 	Submission submission;
-	submission.type     = SubmissionType::Compute;
+	submission.type     = SubmissionType::Commands;
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
@@ -741,7 +734,8 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
-	if (submission.type == SubmissionType::Compute && submission.queue_id - 1 < 64 &&
+	if (submission.type == SubmissionType::Commands && submission.queue_id != 0 &&
+	    submission.queue_id - 1 < 64 &&
 	    ((ComputePreemptMask() >> (submission.queue_id - 1)) & 1u) != 0) {
 		m_compute_enqueued.fetch_add(1, std::memory_order_release);
 	}
@@ -877,10 +871,7 @@ void GuestGpu::ThreadRun(void* data) {
 }
 
 bool GuestGpu::Process(Submission& submission) {
-	const bool first_slice = !submission.started;
-	auto&      cp          = GetProcessor(submission.queue_id);
-
-	submission.started = true;
+	auto& cp = GetProcessor(submission.queue_id);
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
@@ -889,22 +880,7 @@ bool GuestGpu::Process(Submission& submission) {
 	bool complete = true;
 
 	switch (submission.type) {
-		case SubmissionType::Compute:
-			if (first_slice) {
-				const auto      num_dw = static_cast<uint32_t>(submission.commands.size());
-				const auto*     buffer = submission.commands.data();
-				static uint32_t compute_batch_log_count = 0;
-				if (num_dw <= 128 && compute_batch_log_count++ < 32) {
-					LOGF("compute direct batch: data=0x%016" PRIx64 ", num_dw=%" PRIu32 "\n",
-					     reinterpret_cast<uint64_t>(buffer), num_dw);
-					for (uint32_t i = 0; i < std::min<uint32_t>(num_dw, 16); i++) {
-						LOGF("\t compute[%02" PRIu32 "] = 0x%08" PRIx32 "\n", i, buffer[i]);
-					}
-				}
-				GraphicsDbgDumpDcb("cc", num_dw, buffer);
-			}
-			[[fallthrough]];
-		case SubmissionType::Graphics:
+		case SubmissionType::Commands:
 			complete =
 			    cp.Process(submission.execution, submission.commands) == Pm4ProcessResult::Complete;
 			// Only graphics yields (before a sync packet) to queued compute work.
@@ -1032,6 +1008,7 @@ static bool IsSyncPointPacket(uint32_t opcode) {
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	static const bool idle_submit     = CommandScheduler::IdleSubmitEnabled();
 	static const bool reprotect_batch = BufferCache::ReprotectBatchEnabled();
+	const bool        debug_dump      = graphics_debug_dump_enabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1072,7 +1049,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
-		if (GraphicsRunDebugDumpEnabled()) {
+		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
 			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
@@ -1385,21 +1362,16 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 	{
 		frame_num = m_renderer.GetGpu().GetFrameNum();
-		if (GraphicsRunDebugDumpEnabled()) {
+		if (graphics_debug_dump_enabled()) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {
 				const auto& cs = m_sh_ctx.GetCs().cs_regs;
-				const auto& oa = m_ucfg.GetGdsOaCounter(m_ucfg.GetGdsOaState().GetIndex());
 				LOGF("QueuePoint DispatchDirect: frame=%u groups=%ux%ux%u local=%ux%ux%u "
-				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64
-				     " oa_index=%u oa_enabled=%s oa_addr=0x%04" PRIx32 " oa_space=0x%08" PRIx32
-				     "\n",
+				     "mode=0x%08" PRIx32 " wave=%u cs=0x%016" PRIx64 "\n",
 				     frame_num, thread_group_x, thread_group_y, thread_group_z,
 				     std::max(cs.num_thread_x, 1u), std::max(cs.num_thread_y, 1u),
 				     std::max(cs.num_thread_z, 1u), mode, static_cast<uint32_t>(cs.wave_size),
-				     cs.data_addr, m_ucfg.GetGdsOaState().GetIndex(),
-				     oa.IsCounterEnabled() ? "true" : "false", oa.GetAddressBytes(),
-				     oa.GetSpaceAvailable());
+				     cs.data_addr);
 			}
 		}
 
@@ -1466,7 +1438,7 @@ void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size)
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
 		     "\t interrupt_selector = %" PRIu32 "\n"
@@ -1708,7 +1680,7 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
 		     "\t event_index = 0x%08" PRIx32 "\n"
@@ -1785,7 +1757,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 }
 
 void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_arg) {
-	if (GraphicsRunDebugDumpEnabled()) {
+	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
