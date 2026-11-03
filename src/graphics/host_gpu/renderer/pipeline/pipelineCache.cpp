@@ -1749,9 +1749,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto* pixel_program  = state.ps_input_info.stage.handle;
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
-	EXIT_IF(vertex_program == nullptr);
 	const bool ps_active = state.ps_active;
-	EXIT_IF(ps_active && pixel_program == nullptr);
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
@@ -1962,9 +1960,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     vs_id, static_cast<void*>(vertex_program->module), ps_id,
-		     ps_active ? static_cast<void*>(pixel_program->module) : nullptr);
 	}
 
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
@@ -2010,7 +2005,6 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	WaitWarmUp();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(input_info.stage.module == nullptr);
 	const auto& compute_program = input_info.stage.module->handle;
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(compute_program.id);

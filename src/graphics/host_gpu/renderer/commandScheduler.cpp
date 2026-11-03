@@ -178,7 +178,7 @@ void CommandScheduler::Shutdown() {
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_pending_releases.empty() ||
-		        !m_priority_operations.empty() || m_priority_active);
+		        !m_priority_operations.empty() || m_priority_active_tick != 0);
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
@@ -311,7 +311,7 @@ void CommandScheduler::QueueOperation(std::queue<PendingOperation>& queue, Commo
 
 bool CommandScheduler::HasPendingPriorityOperations() {
 	std::lock_guard lock(m_operation_mutex);
-	return !m_priority_operations.empty() || m_priority_active;
+	return !m_priority_operations.empty() || m_priority_active_tick != 0;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -327,7 +327,6 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			}
 			operation = std::move(m_priority_operations.front());
 			m_priority_operations.pop();
-			m_priority_active      = true;
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
@@ -336,7 +335,6 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active      = false;
 			m_priority_active_tick = 0;
 		}
 		m_operation_available.notify_all();
@@ -347,14 +345,15 @@ void CommandScheduler::DrainPriorityOperations() {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(
-	    lock, [this] { return m_priority_operations.empty() && !m_priority_active; });
+	    lock, [this] { return m_priority_operations.empty() && m_priority_active_tick == 0; });
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
-		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
+		const bool active_before_or_at =
+		    m_priority_active_tick != 0 && m_priority_active_tick <= tick;
 		const bool queued_before_or_at =
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
