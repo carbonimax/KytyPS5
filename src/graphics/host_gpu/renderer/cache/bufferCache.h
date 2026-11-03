@@ -105,18 +105,27 @@ public:
 	// GPU thread: while a batch is open, the CPU-data uploads into cache buffers share one leading
 	// and one trailing barrier. The trailing barrier is recorded at the latest when the batch
 	// closes, or before anything else is recorded (CommandBuffer::Handle).
+	// While a batch is open nothing may be recorded through a command buffer handle taken before
+	// one of its uploads (CommandBuffer::Handle records the pending uploads first).
+	// `resources`: a batch around the buffer uploads of one draw or dispatch, opened only when
+	// KYTY_UPLOAD_BATCH is on.
 	class UploadBatch {
 	public:
-		explicit UploadBatch(BufferCache& cache) noexcept: m_cache(cache) {
-			m_cache.BeginUploadBatch();
+		explicit UploadBatch(BufferCache& cache, bool resources = false) noexcept
+		    : m_cache(cache), m_open(!resources || UploadBatchMode() != 0) {
+			if (m_open) m_cache.BeginUploadBatch();
 		}
-		~UploadBatch() { m_cache.EndUploadBatch(); }
+		~UploadBatch() {
+			if (m_open) m_cache.EndUploadBatch();
+		}
 		UploadBatch(const UploadBatch&)            = delete;
 		UploadBatch& operator=(const UploadBatch&) = delete;
 
 	private:
 		BufferCache& m_cache;
+		bool         m_open;
 	};
+	[[nodiscard]] static int UploadBatchMode();
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);

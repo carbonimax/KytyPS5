@@ -1410,21 +1410,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
-	PreparedVertexBuffers vertex_bindings;
-	PreparedIndexBuffer   index_binding;
-	if (!mesh_active) {
-		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
-	}
+	PreparedVertexBuffers        vertex_bindings;
+	PreparedIndexBuffer          index_binding;
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	uint64_t                     args_size = 0;
-	if (emit.indirect.address != 0) {
-		args_size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		            (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
-		                              : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
-		EXIT_IF((args_buffer.second & 3u) != 0);
+	{
+		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
+		if (!mesh_active) {
+			LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+			index_binding   = PrepareIndexBuffer(buffer, index_source);
+		}
+		if (emit.indirect.address != 0) {
+			args_size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
+			            (draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+			                              : sizeof(vk::DrawIndirectCommand));
+			args_buffer =
+			    m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
+			EXIT_IF((args_buffer.second & 3u) != 0);
+		}
 	}
 	// Without the dynamic loop state the loop is a pipeline property: find out before the pipeline.
 	bool depth_feedback = false;
