@@ -519,7 +519,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
-	key.push_back(info.user_clip_planes);
+	// UCP_ENA uses the low 6 bits; the indirect mesh variant goes above them, so other keys are
+	// unchanged.
+	key.push_back(info.user_clip_planes |
+	              (info.indirect_draw ? 1u << 31u | uint32_t {info.indirect_offsets.vertex} << 8u |
+	                                        uint32_t {info.indirect_offsets.instance} << 16u
+	                                  : 0u));
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -725,6 +730,19 @@ bool ShaderPredictPixelProgram(const ShaderMappedData& data, ShaderPixelInputInf
 	user_data_count = KYTY_PM4_GET(rsrc2->value, SPI_SHADER_PGM_RSRC2_PS, USER_SGPR) +
 	                  (KYTY_PM4_GET(rsrc2->value, SPI_SHADER_PGM_RSRC2_PS, USER_SGPR_MSB) << 5u);
 	return user_data_count <= HW::UserSgprInfo::SGPRS_MAX;
+}
+
+bool ShaderVertexStageIsMesh(const HW::VertexShaderInfo& regs, const HW::Context& context) {
+	if ((context.GetShaderStages() & 0x20u) != 0) {
+		return true;
+	}
+	if (regs.gs_regs.rsrc2.lds_size == 0 || g_shader_map == nullptr) {
+		return false;
+	}
+	std::scoped_lock lock(g_shader_map_mutex);
+	const auto       iter = g_shader_map->find(regs.es_regs.data_addr);
+	return iter != g_shader_map->end() &&
+	       iter->second.data.type == Prospero::ShaderBinaryType::kGs;
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

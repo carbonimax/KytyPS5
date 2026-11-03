@@ -119,6 +119,8 @@ struct ShaderModule {
 	std::vector<vk::Format>                      vertex_formats;
 	// Rectangle-list PS: the parameters it reads.
 	std::vector<RectListParameter>               rect_parameters;
+	// Indirect mesh draw: a task shader reads the records and launches the groups.
+	bool                                         mesh_task = false;
 	// Loaded from the shader store: 1 + the index of its SPIR-V there (ShaderStore::ReadSpirv),
 	// from which the handle module is created when a pipeline needs it; 0 otherwise.
 	uint32_t                                     store_spirv = 0;
@@ -142,6 +144,11 @@ struct DrawRenderState {
 	bool                                 ps_active                                = false;
 	std::array<ShaderVertexInputInfo, 3> vertex_info;
 	ShaderPixelInputInfo                 ps_input_info;
+	// Input: an indirect draw whose records the GPU reads, with the user-data slots it patches.
+	// A mesh draw then reads them from a task shader when the payload fits
+	// (vertex_info[0].indirect_draw).
+	ShaderIndirectOffsets                indirect_offsets;
+	uint32_t                             indirect_count = 0;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -160,6 +167,8 @@ public:
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
+		// The push constant range's stages, which every update names.
+		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
 		// Prewarmed from the shader store and not used yet in this launch: its record id.

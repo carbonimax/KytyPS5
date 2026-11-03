@@ -496,11 +496,12 @@ struct RenderExecutorTestAccess {
     pipeline_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
     pipeline_info.setLayoutCount = 1;
     pipeline_info.pSetLayouts = &pipeline.descriptor_set_layout;
-    const vk::PushConstantRange push_range {
+    pipeline.push_stages =
         compute ? vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute}
                 : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eVertex |
-                                       vk::ShaderStageFlagBits::eFragment},
-        0, ShaderRecompiler::IR::NativePushConstantSize};
+                                       vk::ShaderStageFlagBits::eFragment};
+    const vk::PushConstantRange push_range {pipeline.push_stages, 0,
+                                            ShaderRecompiler::IR::NativePushConstantSize};
     pipeline_info.pushConstantRangeCount = 1;
     pipeline_info.pPushConstantRanges = &push_range;
     EXIT_IF(device.createPipelineLayout(&pipeline_info, nullptr,
@@ -21371,6 +21372,129 @@ public:
         check("auto native fetch", vertex_address, false, 6);
       }
 
+      // Mesh (NGG) indirect draws take their records from the GPU copy; the CPU backing holds
+      // zeros. Subgroups carry two triangles, and only vertex ids 8/9 with instance id 5 cover
+      // the target, after the shader adds the bases in s8/s9. Needs task shaders
+      // (KYTY_MESH_INDIRECT_GPU), so it is skipped where the device has none (MoltenVK).
+      if (!m_mesh_task_enabled) {
+        std::printf("GpuMeshIndirectDraw: skipped, no mesh and task shaders\n");
+        m_skipped_cases++;
+      } else {
+        static const auto mesh_code = [] {
+          std::vector<u32> code{
+              // m0 = subgroup vertices | primitives << 12, from s2.
+              EncodeSop2(0x20, 0, 2, InlineU32(12)), EncodeSop2(0x0e, 0, 0, 255), 0x3ffu,
+              EncodeSop2(0x20, 1, 2, InlineU32(22)), EncodeSop2(0x1e, 1, 1, InlineU32(12)),
+              EncodeSop2(0x10, 124, 0, 1), EncodeSopp(0x10, 9),
+              // The primitive's local vertices sit in v0[10:2], v0[26:18] and v1[10:2].
+              EncodeVop2(0x16, 10, InlineU32(2), 0), EncodeVop2(0x1b, 10, 255, 10), 0x1ffu,
+              EncodeVop2(0x16, 11, InlineU32(18), 0), EncodeVop2(0x1a, 11, InlineU32(10), 11),
+              EncodeVop2(0x1c, 10, Vgpr(11), 10), EncodeVop2(0x16, 11, InlineU32(2), 1),
+              EncodeVop2(0x1a, 11, InlineU32(20), 11), EncodeVop2(0x1c, 10, Vgpr(11), 10),
+              EncodeExp0(0x14, 0x1, false), EncodeExp1(10, 0, 0, 0),
+              EncodeVop2(0x25, 5, 8, 5), EncodeVop2(0x25, 8, 9, 8)};
+          AppendVMovLiteral(&code, 1, 0xbf800000u);
+          AppendVMovLiteral(&code, 2, 0x40400000u);
+          code.insert(code.end(),
+                      {EncodeVopc(0xc2, InlineU32(8), 5), EncodeVop2(0x01, 3, Vgpr(1), 2),
+                       EncodeVopc(0xc2, InlineU32(9), 5), EncodeVop2(0x01, 4, Vgpr(1), 2),
+                       EncodeVopc(0xc2, InlineU32(5), 8), EncodeVop2(0x01, 3, Vgpr(1), 3),
+                       EncodeVop2(0x01, 4, Vgpr(1), 4)});
+          AppendVMovU32(&code, 0, 0);
+          AppendVMovLiteral(&code, 6, 0x3f800000u);
+          code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(3, 4, 0, 6)});
+          for (u32 parameter = 0; parameter < 8; parameter++) {
+            code.insert(code.end(), {EncodeExp0(0x20 + parameter, 0xf), EncodeExp1(0, 0, 0, 0)});
+          }
+          AppendEnd(&code);
+          return code;
+        }();
+        const auto mesh_address = reinterpret_cast<uint64_t>(mesh_code.data());
+        ShaderMapUserData(mesh_address,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+             .code_size_bytes = static_cast<uint32_t>(mesh_code.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(mesh_address);
+        shaders.SetGsShaderResource2({.user_sgpr = 2, .lds_size = 1});
+        shaders.SetGsUserSgpr(0, 7);
+        shaders.SetGsUserSgpr(1, 5);
+        registers.SetMaxOutputPerSubgroup(6);
+        registers.SetNggSubgrpCntl(1);
+        registers.SetGsOutPrimType(2);
+        user_config.SetGeControl({2, 6});
+
+        // Writes to the cached argument pages fault into this context's buffer cache.
+        LibKernel::Memory::InstallGpuResources(&context);
+        constexpr uint64_t mesh_indices_address = depth_address + 0x38000;
+        constexpr uint64_t mesh_args_address = mesh_indices_address + 0x100;
+        constexpr uint32_t stride = 32;
+        constexpr std::array<u32, 9> mesh_indices{5, 5, 5, 5, 5, 5, 0, 1, 2};
+        // Indexed: empty; the third triangle in the second subgroup; first index 6 with
+        // instance 1 covering; bases ignored without patched SGPRs.
+        const vk::DrawIndexedIndirectCommand indexed_records[]{
+            {0, 1, 0, 0, 0}, {9, 1, 0, 7, 5}, {3, 2, 6, 7, 4}, {3, 1, 6, 100, 50}};
+        // Auto: empty; vertices 6..8 plus base 1 in the second subgroup.
+        const vk::DrawIndirectCommand auto_records[]{{0, 1, 0, 0}, {9, 1, 1, 5}};
+        std::memcpy(reinterpret_cast<void *>(mesh_indices_address), mesh_indices.data(),
+                    sizeof(mesh_indices));
+        for (u32 i = 0; i < 4; i++) {
+          std::memcpy(reinterpret_cast<void *>(mesh_args_address + i * stride),
+                      &indexed_records[i], sizeof(indexed_records[i]));
+        }
+        for (u32 i = 0; i < 2; i++) {
+          std::memcpy(reinterpret_cast<void *>(mesh_args_address + (4 + i) * stride),
+                      &auto_records[i], sizeof(auto_records[i]));
+        }
+        // Larger than a caching page, so the arguments are cached instead of streamed.
+        (void)context.GetBufferCache().ObtainBuffer(
+            mesh_indices_address, BufferCache::CACHING_PAGESIZE * 2, false);
+        const std::array<u32, 6 * stride / 4> zeros{};
+        Require("GpuMeshIndirectDraw", "CPU backing",
+                LibKernel::Memory::TryWriteBacking(mesh_args_address, zeros.data(),
+                                                   sizeof(zeros)),
+                "the CPU copy of the arguments could not be cleared");
+        const auto read_covered = [&](const char *step, bool drawn, bool covered = true) {
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            const u32 color = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+            Require("GpuMeshIndirectDraw", step,
+                    drawn && pixels[component] == (covered ? color : 0u),
+                    "the mesh draw did not launch its expected subgroups");
+          }
+        };
+        const auto check = [&](const char *step, bool indexed, u32 first, u32 count,
+                               ShaderIndirectOffsets offsets, u32 index_buffer_size = 9,
+                               bool covered = true) {
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const DrawIndirectArgs records{mesh_args_address + first * stride, count, stride,
+                                         offsets};
+          read_covered(step, indexed
+              ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                    {.index_count = index_buffer_size,
+                     .index_addr = reinterpret_cast<const void *>(mesh_indices_address),
+                     .index_type_and_size = 1, .indirect = records})
+              : RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                   {.indirect = records}),
+              covered);
+        };
+        // The direct draw takes the user SGPRs 7/5 as bases.
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        read_covered("direct draw", RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1}));
+        check("unpatched bases", true, 3, 1, {});
+        // The patched SGPRs replace user data 0/0 with the records' bases.
+        shaders.SetGsUserSgpr(0, 0);
+        shaders.SetGsUserSgpr(1, 0);
+        check("indexed subgroups", true, 0, 2, {0, 1});
+        check("first index and instances", true, 2, 1, {0, 1});
+        check("auto subgroups", false, 4, 2, {0, 1});
+        // Index reads stop at INDEX_BUFFER_SIZE: two of the record's three indices remain.
+        check("index buffer size", true, 2, 1, {0, 1}, 8, false);
+        LibKernel::Memory::InstallGpuResources(nullptr);
+      }
+
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
       const ShaderBufferResource rect_buffer{{
           static_cast<u32>(rect_address),
@@ -23832,6 +23956,8 @@ private:
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
+  // Full rasterization mode with VK_EXT_mesh_shader mesh and task shaders.
+  bool m_mesh_task_enabled = false;
   u32 m_robust_storage_alignment = 0;           // Full mode with robustBufferAccess2 (as the emulator).
   u32   m_skipped_cases          = 0;
 
@@ -23873,6 +23999,15 @@ private:
     m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
     m_runtime_context.shader_resource_min_lod_enabled = m_resource_min_lod_enabled;
     m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_enabled;
+    if (m_mesh_task_enabled) {
+      vk::PhysicalDeviceProperties2 mesh_properties{};
+      mesh_properties.pNext = &m_runtime_context.mesh_shader_properties;
+      m_physical_device.getProperties2(&mesh_properties);
+      m_runtime_context.mesh_shader_enabled = true;
+      m_runtime_context.task_shader_enabled = true;
+      // Mesh programs size their host workgroups from the subgroup size.
+      m_runtime_context.subgroup_size = SubgroupSize();
+    }
     if (m_mode == Mode::MinLodFallback) {
       m_runtime_context.sample_rate_shading_enabled = true;
       m_runtime_context.subgroup_size = SubgroupSize();
@@ -24057,7 +24192,9 @@ private:
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT available_conditional_rendering{};
     available_conditional_rendering.pNext = &available_robustness2;
     available_barycentric.pNext = &available_conditional_rendering;
-    available_features2.pNext = &available_barycentric;
+    vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
+    available_mesh.pNext = &available_barycentric;
+    available_features2.pNext = &available_mesh;
     m_physical_device.getFeatures2(&available_features2);
     uint32_t extension_count = 0;
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
@@ -24075,6 +24212,10 @@ private:
     });
     m_barycentric_supported = portable_graphics && available_barycentric.fragmentShaderBarycentric && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
+    });
+    // Also requires the rasterization features, checked below.
+    m_mesh_task_enabled = full && available_mesh.meshShader && available_mesh.taskShader && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
+      return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
     });
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
@@ -24249,6 +24390,13 @@ private:
                                   : m_conditional_rendering_enabled
                                         ? static_cast<const void *>(&conditional_rendering)
                                         : static_cast<const void *>(&robustness2);
+    m_mesh_task_enabled = m_mesh_task_enabled && m_rasterization_supported;
+    vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
+    if (m_mesh_task_enabled) {
+      mesh.meshShader = mesh.taskShader = true;
+      mesh.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &mesh;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = full;
     device_features.shaderStorageImageMultisample = full && available_features.shaderStorageImageMultisample;
@@ -24281,6 +24429,9 @@ private:
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
     if (m_conditional_rendering_enabled) {
       device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+    }
+    if (m_mesh_task_enabled) {
+      device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     }
     if (!full) {
       device_extensions.clear();
