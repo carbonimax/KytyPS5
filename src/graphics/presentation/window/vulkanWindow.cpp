@@ -39,8 +39,6 @@
 
 // IWYU pragma: no_include <intrin.h>
 
-#define KYTY_ENABLE_DEBUG_PRINTF
-
 namespace Libs::Graphics {
 
 struct VulkanExtensions {
@@ -132,14 +130,9 @@ static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::Surfa
 	EXIT_NOT_IMPLEMENTED(r.present_modes.empty());
 }
 
-static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
+static bool CheckFormat(vk::PhysicalDevice device, vk::Format format,
                         vk::FormatFeatureFlags features) {
-	vk::FormatProperties format_props {};
-	device.getFormatProperties(format, &format_props);
-
-	const auto supported_features =
-	    (tile ? format_props.optimalTilingFeatures : format_props.linearTilingFeatures);
-	return (supported_features & features) == features;
+	return (device.getFormatProperties(format).optimalTilingFeatures & features) == features;
 }
 
 static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR surface) {
@@ -395,7 +388,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		const auto check_format = [&](vk::Format format, vk::FormatFeatureFlags features,
 		                              const char* usage) {
-			if (!skip_device && !CheckFormat(device, format, true, features)) {
+			if (!skip_device && !CheckFormat(device, format, features)) {
 				reject(fmt::format("Format vk::Format::e{} cannot be used as {}",
 				                   vk::to_string(format), usage));
 			}
@@ -415,16 +408,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_format(vk::Format::eR8Unorm, texture_features, "texture");
 		check_format(vk::Format::eR8G8Unorm, texture_features, "texture");
 
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eR8G8B8A8Unorm, storage_features, "storage image");
-		}
-
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eB8G8R8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eB8G8R8A8Unorm, storage_features, "storage image");
+		for (const auto [srgb, unorm]:
+		     {std::pair {vk::Format::eR8G8B8A8Srgb, vk::Format::eR8G8B8A8Unorm},
+		      std::pair {vk::Format::eB8G8R8A8Srgb, vk::Format::eB8G8R8A8Unorm}}) {
+			if (!skip_device && !CheckFormat(device, srgb, storage_features)) {
+				LOGF("Format vk::Format::e%s cannot be used as storage image\n",
+				     vk::to_string(srgb).c_str());
+				check_format(unorm, storage_features, "storage image");
+			}
 		}
 
 		if (!skip_device && device_properties.limits.maxSamplerAnisotropy < 16.0f) {
@@ -1094,16 +1085,11 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[2]    = {};
 	uint32_t                       enabled_features_count = 0;
-#ifdef KYTY_ENABLE_BEST_PRACTICES
-	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
-#endif
-#ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eDebugPrintf;
 	}
-#endif
 	if (Config::GpuAssistedValidationEnabled()) {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eGpuAssisted;
 		LOGF("Vulkan GPU-assisted validation is enabled; expect a large slowdown\n");
@@ -1201,11 +1187,9 @@ void WindowContext::CreateVulkan() {
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 #endif
 
-#ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
 		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
 	}
-#endif
 
 	std::string rejected_devices;
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
