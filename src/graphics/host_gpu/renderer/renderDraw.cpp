@@ -457,7 +457,6 @@ struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
 	uint32_t instance_count = 0;
-	uint32_t first_instance = 0;
 
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
@@ -1069,9 +1068,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
 	if (prepared == DrawPrepared::No) {
-		if (draw.indexed) {
-			LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
-		}
 		CpSplitProf::LookupScope lookup;
 		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
 	}
@@ -1079,9 +1075,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// compiled.
 	if (!state.vertex_info[0].stage) {
 		return false;
-	}
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
@@ -1102,9 +1095,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
 			     resolved, state.aliased_passes);
 		}
-	}
-	if (draw.indexed) {
-		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
@@ -1289,7 +1279,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	vk::ImageAspectFlags feedback;
 	const auto rendering = AcquireRenderTargets(buffer, &color, 1, depth, feedback);
 	if (depth.load_clear_aspects) {
-		m_context.GetCommandScheduler().BeginRendering(rendering);
+		buffer.BeginRendering(rendering);
 	}
 	auto& cache = m_context.GetTextureCache();
 	auto& source = cache.GetImage(depth.image_id);
@@ -1307,7 +1297,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 		     color.desc.view_info.base_layer, 1}, {rect.left, rect.top, 0},
 		    {static_cast<uint32_t>(rect.right - rect.left),
 		     static_cast<uint32_t>(rect.bottom - rect.top), 1}};
-		m_context.GetCommandScheduler().EndRendering();
+		buffer.EndRendering();
 		const auto command = buffer.Handle();
 		source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 		               {}, command);
@@ -1383,7 +1373,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
-	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1405,7 +1394,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	{
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		if (!mesh_active) {
-			LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 			index_binding   = PrepareIndexBuffer(buffer, index_source);
 		}
@@ -1469,9 +1457,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto* colors = passes ? state.color_info + pass : state.color_info;
 		const auto count = passes ? 1u : state.color_count;
-		if (draw.indexed) {
-			LogDrawPhase(draw.Name(), "CreatePipeline");
-		}
 		pipelines[pass] = &m_context.GetPipelineCache().GetGraphicsPipeline(
 		    buffer, state, std::span {colors, count}, depth_feedback);
 		renderings[pass] = AcquireRenderTargets(buffer, colors, count, state.depth_info, feedback[pass], stages);
@@ -1580,8 +1565,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			                                        : shader_write_stages;
 			ShaderWriteHazardBarrier(vk_buffer, hazard_stages);
 		}
-		LogDrawPhase(draw.Name(), "BeginRendering");
-		m_context.GetCommandScheduler().BeginRendering(renderings[pass]);
+		buffer.BeginRendering(renderings[pass]);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 		// Every aliased-target pass rasterizes the same samples: only the first one counts them.
 		auto&         occlusion_queries = m_context.GetOcclusionQueries();
@@ -1610,7 +1594,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
-	LogDrawPhase(draw.Name(), "DrawComplete");
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
@@ -1659,7 +1642,6 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
 
-	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1743,10 +1725,8 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
 	}
 
-	const DrawCallInfo draw {true, args.index_count,
-	                        args.instance_count, args.first_instance};
-	if (!PrepareDrawRenderState(buffer, draw, state, record,
-	                            stage)) {
+	const DrawCallInfo draw {true, args.index_count, args.instance_count};
+	if (!PrepareDrawRenderState(buffer, draw, state, record, stage)) {
 		ResetBindings();
 		return true;
 	}
@@ -1780,7 +1760,6 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
 
-	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1821,7 +1800,7 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {false, args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
 	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
 	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};

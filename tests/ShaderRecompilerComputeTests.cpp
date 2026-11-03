@@ -2989,7 +2989,7 @@ public:
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
             "rebinding guest state replaced the active command recording");
-    scheduler.FlushAndWait();
+    scheduler.Finish();
     Require("SchedulerTimeline", "guest context after recording restart",
             scheduler.Active() && &scheduler.Current() == command &&
                 &command->GetRegisters() == &next_registers &&
@@ -17950,7 +17950,7 @@ public:
                     MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
                     MakeImageInfo(pixel_depth).imageLayout == expected_layout,
                 "a deferred clear sampled by vertex and pixel stages missed depth feedback");
-        scheduler.BeginRendering(bounds_rendering);
+        scheduler.Current().BeginRendering(bounds_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         const vk::BufferImageCopy copy{pass * depth_bytes, 0, 0,
@@ -18022,7 +18022,7 @@ public:
                     !texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 86) &&
                     texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 85),
                 "high slice was cleared repeatedly or consumed its neighbor's state");
-        scheduler.BeginRendering(rendering);
+        scheduler.Current().BeginRendering(rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         const vk::BufferImageCopy copy{pass * 2 * sizeof(uint32_t), 0, 0,
@@ -18376,7 +18376,7 @@ public:
                     shared_image.backing.state.access_mask == expected_access,
                 "stencil sampling and writes lost the feedback aspect, shared "
                 "layout, or attachment access");
-        scheduler.BeginRendering(shared_rendering);
+        scheduler.Current().BeginRendering(shared_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         Require(name, "attachment binding reset",
@@ -18637,7 +18637,7 @@ public:
         clear_attachment.colorAttachment = 0;
         clear_attachment.clearValue.color.uint32[0] = after;
         const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
-        scheduler.BeginRendering(rendering);
+        scheduler.Current().BeginRendering(rendering);
         scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
@@ -18964,7 +18964,7 @@ public:
               texture_cache.GetImage(stencil_proxy_id).depth_id == depth_id,
           "the final target pass did not acquire color before depth and "
           "build the dynamic render state");
-      scheduler.BeginRendering(rebound_rendering);
+      scheduler.Current().BeginRendering(rebound_rendering);
       scheduler.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
       Require(name, "draw-scoped target reset",

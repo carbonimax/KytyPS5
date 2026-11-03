@@ -1,7 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -169,10 +168,6 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	if (!m_bda_logged) {
-		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		m_bda_logged = true;
-	}
 	BufferCache::UploadBatch upload_batch(m_buffer_cache);
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);

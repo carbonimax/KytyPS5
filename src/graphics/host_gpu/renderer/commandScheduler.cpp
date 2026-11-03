@@ -199,15 +199,10 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
-void CommandScheduler::BeginRendering(const RenderState& state) {
-	Current().BeginRendering(state);
-}
-
 void CommandScheduler::EndRendering() {
+	// Fork: the CP pipeline's front thread waits for the back thread's recorded draws first.
 	CpPipeline::Drain();
-	if (Active() && !m_command.IsInvalid()) {
-		Current().EndRendering();
-	}
+	m_command.EndRendering();
 }
 
 void CommandScheduler::Flush() {
@@ -218,13 +213,6 @@ void CommandScheduler::Flush() {
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	CpPipeline::Drain();
 	Submit(submit);
-	BeginNext();
-}
-
-void CommandScheduler::FlushAndWait() {
-	CpPipeline::Drain();
-	const auto tick = Submit();
-	m_master.Wait(tick);
 	BeginNext();
 }
 
@@ -529,8 +517,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_pre_submit != nullptr) [[unlikely]] {
 		m_pre_submit(m_pre_submit_context);
 	}
-	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
-	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
 	if (m_external_wait_value > m_external_waited) {
 		if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
