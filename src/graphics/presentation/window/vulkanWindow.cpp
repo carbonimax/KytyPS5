@@ -785,7 +785,6 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
 	}
-	graphics.sample_rate_shading_enabled                 = true;
 	// Occlusion queries reset their queries from the host and count samples exactly where they can.
 	graphics.occlusion_queries_enabled =
 	    Config::OcclusionQueriesEnabled() && supported_features12.hostQueryReset;

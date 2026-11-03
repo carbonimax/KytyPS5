@@ -12404,7 +12404,7 @@ public:
     constexpr u32 side = 64, last = 6;
     EnsureRuntimeContext();
     Require(name, "enabled features", !m_runtime_context.image_view_min_lod_enabled && m_runtime_context.shader_resource_min_lod_enabled &&
-        !m_runtime_context.maintenance8_enabled && !m_runtime_context.null_descriptor_enabled && m_runtime_context.sample_rate_shading_enabled &&
+        !m_runtime_context.maintenance8_enabled && !m_runtime_context.null_descriptor_enabled &&
         !m_runtime_context.shader_buffer_int64_atomics_enabled && !m_runtime_context.shader_image_int64_atomics_enabled, "fixture must exercise the unsupported-native path with truthful renderer features");
     std::array<std::vector<u32>, 3> codes;
     for (u32 sample_mode = 0; sample_mode < codes.size(); ++sample_mode) {
@@ -19187,7 +19187,7 @@ public:
         plane_depth.info.data = {base + 0x900000, plane_size};
         plane_depth.info.stencil = {plane_address, plane_size};
         plane_depth.info.extent = {3, 2, 1};
-        plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
+        plane_depth.info.pitch = TileGetRenderTargetPitch(3, sizeof(uint32_t));
         plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
         plane_depth.info.UpdateSize();
         const auto plane_depth_id = texture_cache.FindImage(plane_depth);
@@ -19199,7 +19199,7 @@ public:
         sampled_plane.info.pixel_format = vk::Format::eR8Uint;
         sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
         sampled_plane.info.bytes_per_block = 1;
-        sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
+        sampled_plane.info.pitch = TileGetRenderTargetPitch(3, 1);
         sampled_plane.info.UpdateSize();
         sampled_plane.view_info.format = vk::Format::eR8Uint;
         sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -19215,9 +19215,11 @@ public:
             stencil_initial);
 
         TileBlockLayout stencil_block{};
-        Require(name, "independent stencil tile pitch",
+        Require(
+            name, "independent stencil tile pitch",
             TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block) &&
-                plane_depth.info.pitch == 128 && TileGetDepthPitch(3, 1) == 256,
+                plane_depth.info.pitch == 128 &&
+                TileGetRenderTargetPitch(3, 1) == 256,
             "stencil must use its own one-byte tile layout");
         std::vector<uint32_t> plane_words(plane_size / sizeof(uint32_t), 0);
         auto *plane_bytes = reinterpret_cast<uint8_t *>(plane_words.data());
@@ -20377,8 +20379,41 @@ public:
           scheduler.Current(), state, {state.color_info, state.color_count}, baked_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+    if (!depth_feedback && !packed_vertex_color) {
+      auto msaa = color;
+      auto &info = msaa.desc.info;
+      info.data = {depth_address + 0x14000, 8 * 8 * 16 * 4};
+      info.mip_layout[0] = {0, info.data.size, 8, 8, 0, info.data.size, 8};
+      info.linear_slice_stride = info.data.size;
+      info.extent = {8, 8, 1};
+      info.pitch = 8;
+      info.samples = 4;
+      msaa.image_id = cache.FindImage(msaa.desc);
+      auto per_sample = pixel;
+      per_sample.ps_sample_shading = true;
+      DrawRenderState state{.color_info = {msaa}, .color_count = 1,
+                            .topology = vk::PrimitiveTopology::eTriangleList,
+                            .ps_active = true, .vertex_info = {vertex},
+                            .ps_input_info = per_sample};
+      // Fork: the pipeline cache reads the stage handles (as in the pipeline lambda above).
+      state.vertex_info[0].stage.handle = &vertex_shader.handle;
+      state.vertex_info[0].stage.module = &vertex_shader;
+      state.ps_input_info.stage.handle = &pixel_shader.handle;
+      state.ps_input_info.stage.module = &pixel_shader;
+      Require(name, "per-sample shading",
+              static_cast<bool>(context.GetPipelineCache()
+                                    .GetGraphicsPipeline(scheduler.Current(), state)
+                                    .pipeline),
+              "a 4x per-sample-shaded pipeline was not built");
+    }
+    const auto draw = [&](const PipelineCache::Pipeline &selected,
+                          uint32_t vertex_count = 3,
                           std::array<u32, 4> clear_value = {}) {
+      vk::ClearValue clear{};
+      clear.color.uint32 = clear_value;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -20404,8 +20439,6 @@ public:
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
-      rendering.color_attachments[0].is_clear = true;
-      rendering.color_attachments[0].clear_value = clear_value;
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
@@ -24080,7 +24113,6 @@ private:
       m_runtime_context.subgroup_size = SubgroupSize();
     }
     if (m_mode == Mode::MinLodFallback) {
-      m_runtime_context.sample_rate_shading_enabled = true;
       m_runtime_context.subgroup_size = SubgroupSize();
       Require("ImageMinLodFallback", "subgroup", m_runtime_context.subgroup_size == 32 || m_runtime_context.subgroup_size == 64, "missing GPU qualification: production bindings require a 32- or 64-lane subgroup");
     }
@@ -53870,8 +53902,8 @@ void CheckNativeMsaaState() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
   Require("NativeMsaaState", "8x depth/stencil footprint",
-          TileGetDepthPitch(1920, 4, 3) == 1920 &&
-              TileGetDepthSize(1920, 1080, 0, Prospero::DepthFormat::kZ32F,
+          TileGetRenderTargetPitch(1920, 4, 3) == 1920 &&
+              TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ32F,
                                Prospero::StencilFormat::k8UInt, true, stencil,
                                htile, depth, 3) &&
               depth.align == 0x10000 && depth.size == 0x03fc0000 &&
@@ -54053,12 +54085,11 @@ void CheckDynamicRenderingState() {
   first.num_color_attachments = 1;
   first.color_attachments[0].image_layout =
       vk::ImageLayout::eColorAttachmentOptimal;
-  first.color_attachments[0].clear_value = {1, 2, 3, 4};
-  first.color_attachments[0].is_clear = true;
+  first.depth_stencil_attachment.depth_clear = true;
   auto changed = first;
   Require("DynamicRenderingState", "identical state", first == changed,
           "fieldwise RenderState identity rejected an identical scope");
-  changed.color_attachments[0].is_clear = false;
+  changed.depth_stencil_attachment.depth_clear = false;
   Require("DynamicRenderingState", "clear identity", first != changed,
           "clear/load state did not participate in rendering identity");
   changed = first;
@@ -54148,7 +54179,7 @@ void CheckDepthTargetFootprints() {
             "PS5 depth/stencil attachment mapping changed");
   }
   Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
-          TileGetDepthSize(1920, 1080, 0, Prospero::DepthFormat::kZ16,
+          TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ16,
                            Prospero::StencilFormat::k8UInt, false, stencil,
                            htile, depth) &&
               depth.size == 0x480000 && depth.align == 0x10000 &&
@@ -54250,7 +54281,7 @@ void CheckDepthTargetFootprints() {
             "D16 host promotion changed the represented depth value");
   }
   Require("DepthTargetFootprints", "640x360 Z32S8 without HTile",
-          TileGetDepthSize(640, 360, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(640, 360, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, false, stencil,
                            htile, depth),
           "valid non-HTile depth/stencil footprint was rejected");
@@ -54273,7 +54304,7 @@ void CheckDepthTargetFootprints() {
 
   Require(
       "DepthTargetFootprints", "960x540 Z32S8 with HTile",
-      TileGetDepthSize(960, 540, 0, Prospero::DepthFormat::kZ32F,
+      TileGetDepthSize(960, 540, Prospero::DepthFormat::kZ32F,
                        Prospero::StencilFormat::k8UInt, true, stencil, htile,
                        depth) &&
           depth.size == 0x280000 && depth.align == 0x10000 &&
@@ -54281,14 +54312,14 @@ void CheckDepthTargetFootprints() {
           htile.size == 0x10000 && htile.align == 0x8000,
       "generic Prospero HTile block calculation rejected the title footprint");
   Require("DepthTargetFootprints", "known HTile extent",
-          TileGetDepthSize(1280, 720, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(1280, 720, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, true, stencil,
                            htile, depth) &&
               depth.size == 0x3c0000 && stencil.size == 0xf0000 &&
               htile.size == 0x20000,
           "validated 1280x720 HTile footprint regressed");
   Require("DepthTargetFootprints", "PPSA06228 3840x2160 Z32S8 with HTile",
-          TileGetDepthSize(3840, 2160, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(3840, 2160, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, true, stencil,
                            htile, depth) &&
               depth.size == 0x1fe0000 && depth.align == 0x10000 &&
@@ -54297,20 +54328,20 @@ void CheckDepthTargetFootprints() {
           "captured 3840x2160 depth/stencil/HTile footprint disagrees with "
           "Prospero rules");
   Require("DepthTargetFootprints", "invalid depth format",
-          !TileGetDepthSize(960, 540, 0, static_cast<Prospero::DepthFormat>(2u),
+          !TileGetDepthSize(960, 540, static_cast<Prospero::DepthFormat>(2u),
                             Prospero::StencilFormat::k8UInt, true, stencil,
                             htile, depth),
           "unsupported depth format was silently admitted");
   Require("DepthTargetFootprints", "invalid stencil format",
-          !TileGetDepthSize(960, 540, 0, Prospero::DepthFormat::kZ32F,
+          !TileGetDepthSize(960, 540, Prospero::DepthFormat::kZ32F,
                             static_cast<Prospero::StencilFormat>(2u), true,
                             stencil, htile, depth),
           "unsupported stencil format was silently admitted");
   Require("DepthTargetFootprints", "invalid extent",
-          !TileGetDepthSize(0, 540, 0, Prospero::DepthFormat::kZ32F,
+          !TileGetDepthSize(0, 540, Prospero::DepthFormat::kZ32F,
                             Prospero::StencilFormat::k8UInt, true, stencil,
                             htile, depth) &&
-              !TileGetDepthSize(16385, 540, 0, Prospero::DepthFormat::kZ32F,
+              !TileGetDepthSize(16385, 540, Prospero::DepthFormat::kZ32F,
                                 Prospero::StencilFormat::k8UInt, true, stencil,
                                 htile, depth),
           "invalid HTile extent was silently admitted");

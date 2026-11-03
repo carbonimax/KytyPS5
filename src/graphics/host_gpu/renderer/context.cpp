@@ -164,10 +164,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		const auto& attachment = state.color_attachments[i];
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp =
-		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
-		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
-		colors[i].clearValue.color.uint32 = attachment.clear_value;
+		colors[i].loadOp       = vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp      = vk::AttachmentStoreOp::eStore;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
@@ -195,11 +193,8 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
-	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
-	for (auto& color: m_render_state.color_attachments) {
-		color.is_clear = false;
-	}
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
@@ -210,8 +205,7 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
-	m_rendering    = false;
-	m_render_state = {};
+	m_rendering = false;
 	if (m_draw_write_stages) {
 		const auto stages   = m_draw_write_stages;
 		m_draw_write_stages = {};
