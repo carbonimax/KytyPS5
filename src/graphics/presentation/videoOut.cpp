@@ -204,9 +204,7 @@ struct VideoOutConfig {
 class FlipQueue {
 public:
 	FlipQueue(Graphics::Presenter& presenter, uint32_t width, uint32_t height)
-	    : m_presenter(presenter), m_width(width), m_height(height) {
-		EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	}
+	    : m_presenter(presenter), m_width(width), m_height(height) {}
 	~FlipQueue();
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
@@ -220,7 +218,7 @@ public:
 	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
 
 private:
-	enum class RequestState { Reserved, Recording, Ready, Presenting };
+	enum class RequestState { Reserved, Ready, Presenting };
 
 	struct Request {
 		uint64_t                    id;
@@ -930,7 +928,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 				++it;
 				continue;
 			}
-			if (it->state == RequestState::Reserved || it->state == RequestState::Recording) {
+			if (it->state == RequestState::Reserved) {
 				auto cancelled = it++;
 				m_cancelled_requests.splice(m_cancelled_requests.end(), *queue, cancelled);
 				continue;
@@ -964,26 +962,14 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 			auto pending = std::find_if(m_cpu_requests.begin(), m_cpu_requests.end(),
 			                            [request_id](const auto& r) { return r.id == request_id; });
 			if (pending == m_cpu_requests.end()) {
-				auto cancelled =
-				    std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
-				                 [request_id](const auto& r) { return r.id == request_id; });
-				if (cancelled == m_cancelled_requests.end() ||
-				    cancelled->state != RequestState::Reserved) {
-					EXIT("cannot prepare video-out request id=%" PRIu64 "\n", request_id);
-				}
-				cancelled->state = RequestState::Recording;
-				return;
+				return; // Cancelled before recording; Complete releases it.
 			}
 			request = m_requests.insert(m_requests.end(), *pending);
 			m_cpu_requests.erase(pending);
 		}
-		if (request->state != RequestState::Reserved) {
-			EXIT("cannot prepare video-out request id=%" PRIu64 "\n", request_id);
-		}
-		request->state = RequestState::Recording;
-		cfg            = request->cfg;
-		generation     = request->generation;
-		index          = request->index;
+		cfg        = request->cfg;
+		generation = request->generation;
+		index      = request->index;
 	}
 
 	bool                special = IsSpecialBufferIndex(index);
@@ -1033,23 +1019,13 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	}
 
 	Common::LockGuard lock(m_mutex);
-	Request*          prepared = nullptr;
-	if (const auto request =
-	        std::find_if(m_requests.begin(), m_requests.end(),
-	                     [request_id](const auto& r) { return r.id == request_id; });
-	    request != m_requests.end()) {
-		prepared = &*request;
-	} else if (const auto cancelled =
-	               std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
-	                            [request_id](const auto& r) { return r.id == request_id; });
-	           cancelled != m_cancelled_requests.end()) {
-		prepared = &*cancelled;
+	auto prepared = std::find_if(m_requests.begin(), m_requests.end(),
+	                             [request_id](const auto& r) { return r.id == request_id; });
+	if (prepared == m_requests.end()) {
+		prepared = std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
+		                        [request_id](const auto& r) { return r.id == request_id; });
 	}
-	if (prepared == nullptr || prepared->state != RequestState::Recording ||
-	    prepared->frame != nullptr) {
-		EXIT("video-out request changed while recording, id=%" PRIu64 "\n", request_id);
-	}
-	prepared->frame = frame;
+	prepared->frame               = frame;
 	prepared->premultiplied_alpha = premultiplied_alpha;
 }
 
@@ -1058,21 +1034,13 @@ void FlipQueue::Complete(uint64_t request_id) {
 	auto request = std::find_if(m_requests.begin(), m_requests.end(),
 	                            [request_id](const auto& r) { return r.id == request_id; });
 	if (request != m_requests.end()) {
-		if (request->state != RequestState::Recording || request->frame == nullptr) {
-			m_mutex.Unlock();
-			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
-		}
 		request->state = RequestState::Ready;
 		m_mutex.Unlock();
 		return;
 	}
-	auto cancelled = std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
-	                              [request_id](const auto& r) { return r.id == request_id; });
-	if (cancelled == m_cancelled_requests.end() || cancelled->state != RequestState::Recording) {
-		m_mutex.Unlock();
-		EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
-	}
-	auto* frame = cancelled->frame;
+	auto  cancelled = std::find_if(m_cancelled_requests.begin(), m_cancelled_requests.end(),
+	                               [request_id](const auto& r) { return r.id == request_id; });
+	auto* frame     = cancelled->frame;
 	m_cancelled_requests.erase(cancelled);
 	m_done_cond_var.SignalAll();
 	m_mutex.Unlock();
