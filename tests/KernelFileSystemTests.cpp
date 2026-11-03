@@ -2309,12 +2309,55 @@ void CheckSocketWakeup() {
                    address.data(), address_size) == sizeof(payload) &&
             *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net sendto delivers to a guest sockaddr and preserves errno on success");
-  Check(net_recvfrom(datagram, received.data(), received.size(), 0,
-                     peer.data(), &peer_size) == sizeof(payload) &&
+  // Loopback datagrams are not always readable as soon as sendto returns (Windows queues them
+  // asynchronously), so a nonblocking receive may report EWOULDBLOCK for a moment. Only the
+  // receive is retried; nothing is sent again.
+  const auto receive_datagram = [&](void *from, uint32_t *from_size) {
+    int result = Libs::Network::NET_ERROR_EWOULDBLOCK;
+    for (int attempt = 0; attempt < 2000 && result == Libs::Network::NET_ERROR_EWOULDBLOCK;
+         ++attempt) {
+      if (attempt != 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      *net_errno = Libs::Posix::POSIX_EINVAL;
+      if (from_size != nullptr) *from_size = static_cast<uint32_t>(peer.size());
+      result = net_recvfrom(datagram, received.data(), received.size(), 0, from, from_size);
+    }
+    return result;
+  };
+  // UDP may deliver a datagram more than once, and some Windows hosts do so on loopback (one
+  // sendto, two identical datagrams). Consume exact copies of the datagram just received, so
+  // the empty-socket checks below start from an empty queue. Anything else is a failure.
+  const auto drain_duplicates = [&] {
+    int duplicates = 0;
+    for (int idle = 0; idle < 20; ++idle) {
+      std::array<char, sizeof(payload)> copy {};
+      std::array<uint8_t, 16> copy_peer {};
+      uint32_t copy_peer_size = copy_peer.size();
+      const int result = net_recvfrom(datagram, copy.data(), copy.size(), 0, copy_peer.data(),
+                                      &copy_peer_size);
+      if (result == Libs::Network::NET_ERROR_EWOULDBLOCK) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      Check(result == static_cast<int>(sizeof(payload)) &&
+                std::memcmp(copy.data(), payload, sizeof(payload)) == 0 &&
+                copy_peer_size == expected_peer_size && copy_peer == expected_peer,
+            "only duplicate copies of the sent datagram are queued");
+      ++duplicates;
+      idle = -1;
+    }
+    if (duplicates != 0) {
+      std::printf("KernelFileSystemTests: host delivered %d duplicate loopback datagram(s); "
+                  "drained before the empty-socket check\n",
+                  duplicates);
+    }
+  };
+  const int received_bytes = receive_datagram(peer.data(), &peer_size);
+  Check(received_bytes == static_cast<int>(sizeof(payload)) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
             peer_size == expected_peer_size && peer == expected_peer &&
             *net_errno == Libs::Posix::POSIX_EINVAL,
         "Net recvfrom returns datagram bytes and sender address while preserving errno");
+  drain_duplicates();
   Check(net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
             Libs::Network::NET_ERROR_EWOULDBLOCK &&
             *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
@@ -2324,8 +2367,8 @@ void CheckSocketWakeup() {
             *net_errno == Libs::Posix::POSIX_EINVAL &&
             net_sendto(datagram_writer, payload, sizeof(payload), 0, nullptr, 0) ==
                 sizeof(payload) && *net_errno == Libs::Posix::POSIX_EINVAL &&
-            net_recvfrom(datagram, received.data(), received.size(), 0, nullptr, nullptr) ==
-                sizeof(payload) && std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+            receive_datagram(nullptr, nullptr) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
         "Net connect selects the peer used by sendto with an omitted destination");
   Check(net_connect(-1, address.data(), address_size) == Libs::Network::NET_ERROR_EBADF &&
             *net_errno == Libs::Posix::POSIX_EBADF,
