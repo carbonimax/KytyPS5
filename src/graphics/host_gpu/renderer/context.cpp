@@ -20,10 +20,6 @@ namespace Libs::Graphics {
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
-bool CommandBuffer::IsInvalid() const {
-	return m_buffer == nullptr;
-}
-
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
 	if (m_upload_post_pending) {

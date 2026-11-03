@@ -149,7 +149,7 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const;
+	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
