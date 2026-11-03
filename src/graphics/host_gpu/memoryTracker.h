@@ -30,9 +30,7 @@ public:
 	// without the region lock. False means no byte of the range can be GPU-dirty.
 	[[nodiscard]] bool MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
-	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
-	void               UntrackMemory(uint64_t vaddr, uint64_t size);
 	// Only for ranges whose complete tracker pages have no cache-buffer owner.
 	void               ReleaseUnownedRegion(uint64_t vaddr, uint64_t size);
 	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
@@ -43,7 +41,6 @@ public:
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
-
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
@@ -74,7 +71,6 @@ public:
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
-		CheckNotInUploadCallback();
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			std::scoped_lock lock(manager->lock);
 			const auto       address = manager->GetCpuAddr() + offset;
@@ -122,6 +118,8 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	// The fork keeps the re-entry check on its fault, reprotect and upload paths: with fault
+	// readback windows a guest fault can hit a page an upload callback is still copying.
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
 	void CheckNotInUploadCallback() const noexcept {
