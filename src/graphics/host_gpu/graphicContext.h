@@ -49,6 +49,8 @@ struct GraphicContext {
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Task shaders, for indirect mesh draws from GPU-read records (KYTY_MESH_INDIRECT_GPU).
+	bool                                      task_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	bool                               vertex_subgroups_supported            = false;

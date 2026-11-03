@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -327,6 +328,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
+	// Indirect mesh draws: the task shader reads the records (gpu_mesh_indirect.task).
+	EXIT_NOT_IMPLEMENTED(vertex.mesh_task && !graphics.task_shader_enabled);
+	const auto task_module =
+	    vertex.mesh_task ? CompileSPV(GPU_MESH_INDIRECT_SPV, graphics.device) : vk::ShaderModule {};
 
 	if (rect_list) {
 		const auto shaders = BuildRectListShaders(
@@ -354,6 +359,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	for (const auto* stage: vertex_stages) {
 		shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->program.stage),
 		                                       .module = stage->handle.module,
+		                                       .pName  = "main"};
+	}
+	if (task_module) {
+		shader_stages[shader_stage_count++] = {.stage  = vk::ShaderStageFlagBits::eTaskEXT,
+		                                       .module = task_module,
 		                                       .pName  = "main"};
 	}
 	if (rect_list) {
@@ -481,19 +491,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_blending.pAttachments    = color_blend_attachment;
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	pipeline.push_stages = vk::ShaderStageFlagBits::eFragment;
+	if (task_module) {
+		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+	}
 	for (const auto* stage: vertex_stages) {
 		const auto native_stage = NativeShaderStage(stage->program.stage);
 		AddLayoutBindings(descriptor_bindings, stage->program, native_stage);
 		pipeline.uses_image_heap |= stage->program.info.uses_image_heap;
-		graphics_stages |= native_stage;
+		pipeline.push_stages |= native_stage;
 	}
 	if (ps_active) {
 		AddLayoutBindings(descriptor_bindings, pixel->program, vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_image_heap |= pixel->program.info.uses_image_heap;
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {graphics_stages, 0,
+	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
 
@@ -616,6 +629,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (tess_eval_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	}
+	if (task_module) {
+		graphics.device.destroyShaderModule(task_module, nullptr);
+	}
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -640,7 +656,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	AddLayoutBindings(descriptor_bindings, compute.program, vk::ShaderStageFlagBits::eCompute);
 	pipeline.uses_image_heap = compute.program.info.uses_image_heap;
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
+	pipeline.push_stages = vk::ShaderStageFlagBits::eCompute;
+	const vk::PushConstantRange push_constants {pipeline.push_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 	const std::array set_layouts {pipeline.descriptor_set_layout, graphics.image_heap_layout};
 

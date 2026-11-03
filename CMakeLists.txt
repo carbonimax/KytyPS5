@@ -338,6 +338,8 @@ add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
+# At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
+add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -493,6 +495,11 @@ add_executable(aliased_color_pass_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AliasedColorPassPolicyTests.cpp"
 )
 target_include_directories(aliased_color_pass_policy_tests PRIVATE ${inc_headers})
+
+add_executable(dispatch_chain_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DispatchChainPolicyTests.cpp"
+)
+target_include_directories(dispatch_chain_policy_tests PRIVATE ${inc_headers})
 
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
@@ -677,6 +684,12 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
+	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
+target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
+
+# GoogleTest from the fmt submodule, for upstream tests written against gtest.
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
 	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
 target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
@@ -718,6 +731,7 @@ if(BUILD_TESTING)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME net_resolver COMMAND $<TARGET_FILE:net_resolver_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME gpu_blit_shaders COMMAND $<TARGET_FILE:gpu_blit_shader_tests>)
 	add_test(NAME fatal_check_retires_speculative_thread COMMAND $<TARGET_FILE:shader_cfg_tests> --fatal-retire-only)
 	if(APPLE)
 		set(mad_default_rounding product)
@@ -750,6 +764,7 @@ if(BUILD_TESTING)
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
 	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
+	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
 	add_test(NAME aliased_mrt_incompatible COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-incompatible-only)
@@ -892,6 +907,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		resource_tracking_tests
 		aliased_color_pass_policy_tests
+		dispatch_chain_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
