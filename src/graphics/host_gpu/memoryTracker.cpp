@@ -81,7 +81,7 @@ uint64_t MemoryTracker::ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcep
 		std::scoped_lock lock(manager->lock);
 		marked = manager->UnmodifiedPrefix<DirtySource::Gpu>(vaddr % TRACKER_REGION_SIZE, size);
 		if (marked != 0) {
-			manager->ChangeState<DirtySource::Cpu, true>(vaddr, marked);
+			manager->ChangeState<DirtySource::Cpu, true>(vaddr % TRACKER_REGION_SIZE, marked);
 		}
 	}
 	return marked;
@@ -110,14 +110,14 @@ bool MemoryTracker::MaybeGpuModifiedOnGpuThread(uint64_t vaddr, uint64_t size) {
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		manager->ChangeState<DirtySource::Cpu, true>(offset, bytes);
 	});
 }
 
 void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		manager->ChangeState<DirtySource::Gpu, false>(manager->GetCpuAddr() + offset, bytes);
+		manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
 	});
 }
 
@@ -125,9 +125,8 @@ void MemoryTracker::ReleaseUnownedRegion(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
-		const auto address = manager->GetCpuAddr() + offset;
-		manager->ChangeState<DirtySource::Gpu, false>(address, bytes);
-		manager->ChangeState<DirtySource::Cpu, true>(address, bytes);
+		manager->ChangeState<DirtySource::Gpu, false>(offset, bytes);
+		manager->ChangeState<DirtySource::Cpu, true>(offset, bytes);
 	});
 }
 

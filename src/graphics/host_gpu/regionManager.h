@@ -83,24 +83,23 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
-	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end] = GetPageRange(offset, size);
 		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
 	// Bytes of [offset, offset + size) before the first page modified by `source`.
 	template <DirtySource source>
 	[[nodiscard]] uint64_t UnmodifiedPrefix(uint64_t offset, uint64_t size) const {
-		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
+		const auto [start, end] = GetPageRange(offset, size);
 		const auto first        = std::min<uint64_t>(GetBits<source>().FirstRangeFrom(start).first, end);
 		return first > start ? (first - start) * TRACKER_PAGE_SIZE : 0;
 	}
 
 	template <DirtySource source, bool enable>
-	void ChangeState(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void ChangeState(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
@@ -120,8 +119,8 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
-		const auto [start, end] = GetPageRange(vaddr, size);
+	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(offset, size);
 		auto&      bits         = GetBits<source>();
 		if (bits.FirstRangeFrom(start).first >= end) {
 			return;
@@ -173,8 +172,7 @@ private:
 		}
 	}
 
-	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
-		const auto offset = vaddr - m_cpu_addr;
+	[[nodiscard]] static std::pair<size_t, size_t> GetPageRange(uint64_t offset, uint64_t size) {
 		return {static_cast<size_t>(offset / TRACKER_PAGE_SIZE),
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}

@@ -1,8 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MULTILEVELPAGETABLE_H_
 
-#include "common/assert.h"
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -17,7 +15,7 @@
 namespace Libs::Graphics {
 
 // Sparse two-level lookup for texture-cache page ownership.
-// Entries are selected by guest page number; queries never allocate L1 buckets.
+// Entries are selected by guest page number below kPageCount; queries never allocate L1 buckets.
 template <typename EntryT, size_t PageBits = 20, size_t AddressSpaceBits = 40,
           size_t FirstLevelBits = 10>
 class MultiLevelPageTable final {
@@ -61,17 +59,14 @@ public:
 	}
 
 	[[nodiscard]] Entry& operator[](size_t page) {
-		if (!IsValidPage(page)) {
-			EXIT("MultiLevelPageTable page is outside the guest address space");
-		}
 		auto& bucket = m_first_level[FirstLevelIndex(page)];
 		if (bucket == nullptr) {
 			bucket = std::make_unique<Bucket>();
-			++m_allocated_buckets;
 		}
 		return (*bucket)[SecondLevelIndex(page)];
 	}
 
+	// Kept by the fork: the buffer cache write-tick table probes arbitrary pages.
 	[[nodiscard]] static constexpr bool IsValidPage(size_t page) { return page < kPageCount; }
 
 	// Returns the half-open page interval touched by a non-empty byte range.
@@ -87,8 +82,6 @@ public:
 		return true;
 	}
 
-	[[nodiscard]] size_t AllocatedBucketCount() const { return m_allocated_buckets; }
-
 private:
 	using Bucket = std::array<Entry, kBucketEntries>;
 
@@ -100,7 +93,6 @@ private:
 	}
 
 	std::vector<std::unique_ptr<Bucket>> m_first_level;
-	size_t                               m_allocated_buckets = 0;
 };
 
 // Inline owner storage for page-table entries. Texture pages normally have only a
