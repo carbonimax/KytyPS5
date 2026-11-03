@@ -24209,11 +24209,13 @@ private:
                               std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
                                 return std::strcmp(extension.extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) == 0;
                               });
-    if (!m_rasterization_supported) {
+    if (!full) {
+      std::printf("[host]    ProductionRasterization   not used in portable harness modes\n");
+    } else if (!m_rasterization_supported) {
       std::printf(
           "[host]    ProductionRasterization   unavailable (prerequisite missing: %s), "
           "rasterization cases will be skipped\n",
-          full ? missing_rasterization.c_str() : "full harness mode");
+          missing_rasterization.c_str());
     }
 
     float priority = 1.0f;
