@@ -217,6 +217,13 @@ public:
 	[[nodiscard]] bool UploadPostPending() const noexcept { return m_upload_post_pending; }
 	void               DeferUploadPost() const noexcept { m_upload_post_pending = true; }
 	void               FlushUploadPost() const;
+	// KYTY_UPLOAD_BATCH=1: the copies of a batch are recorded with its barriers when it is flushed
+	// (leading barrier, one vkCmdCopyBuffer per source and destination pair, trailing barrier).
+	// The same rule as the trailing barrier applies: nothing else is recorded before the flush, so
+	// the copies keep their place in the command stream. A region over bytes that a pending copy
+	// writes flushes the pending ones first (write-after-write order).
+	void DeferUploadCopies(vk::Buffer source, vk::Buffer destination,
+	                       std::span<const vk::BufferCopy> regions) const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context& GetRegisters() const noexcept {
@@ -253,6 +260,13 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_upload_post_pending = false;
+	struct PendingUploadCopy {
+		vk::Buffer     source;
+		vk::Buffer     destination;
+		vk::BufferCopy region;
+	};
+	mutable std::vector<PendingUploadCopy> m_upload_copies;
+	mutable std::vector<vk::BufferCopy>    m_upload_regions; // flush scratch
 	mutable vk::PipelineStageFlags m_draw_write_stages {};
 	mutable uint64_t               m_draw_write_epoch = 0;
 	mutable DispatchChain::State   m_dispatch_chain;

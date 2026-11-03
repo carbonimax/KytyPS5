@@ -1181,6 +1181,18 @@ static bool UploadBarrierBatchEnabled() {
 	return enabled;
 }
 
+// KYTY_UPLOAD_BATCH: 1 (default) = the copies of an upload batch are recorded together when the
+// batch flushes, one vkCmdCopyBuffer per source and destination pair, between one leading and one
+// trailing barrier, and the draw and dispatch resource uploads run in batches; 0 = one copy per
+// upload as recorded, batches only around buffer discovery and BDA synchronization.
+int BufferCache::UploadBatchMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
+		return value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10) != 0);
+	}();
+	return UploadBarrierBatchEnabled() ? mode : 0;
+}
+
 void BufferCache::BeginUploadBatch() noexcept {
 	if (UploadBarrierBatchEnabled()) {
 		m_upload_batch_depth++;
@@ -1246,6 +1258,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			                       vk::PipelineStageFlagBits::eAllCommands,
 			                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0,
 			                       nullptr);
+		} else if (UploadBatchMode() != 0) {
+			// The copy is recorded with the batch's barriers when the batch flushes.
+			command.DeferUploadCopies(source, buffer.Handle(), copies);
 		} else {
 			// Destination ranges of this batch's copies: a later copy over the same bytes needs an
 			// explicit write-after-write dependency (the pending trailing barrier is not one).

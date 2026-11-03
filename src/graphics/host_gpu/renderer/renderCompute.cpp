@@ -627,7 +627,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
-	RebindBuffers(bindings);
+	{
+		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
+		RebindBuffers(bindings);
+	}
 
 	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
 	// own tracked accesses), its barrier and the dispatch are recorded: a dispatch chain stays open.
@@ -800,10 +803,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
+	std::optional<BufferCache::UploadBatch> upload_batch;
+	upload_batch.emplace(m_context.GetBufferCache(), true);
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	upload_batch.reset();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	if (HasShaderBufferWrites(input_info.stage)) {
