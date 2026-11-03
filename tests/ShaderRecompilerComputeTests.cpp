@@ -56228,6 +56228,15 @@ int main(int argc, char **argv) {
 #else
   if (setenv("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding, 1) != 0) return 1;
 #endif
+  // GpuMeshIndirectDraw (in CheckRasterization) checks the task-shader path that reads indirect
+  // mesh records on the GPU; the CPU copy of its records is zeroed on purpose. That path is
+  // opt-in (KYTY_MESH_INDIRECT_GPU, read once at the first mesh draw), and that case is the only
+  // indirect mesh draw in these tests, so enable it for the whole process.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_MESH_INDIRECT_GPU", "1") != 0) return 1;
+#else
+  if (setenv("KYTY_MESH_INDIRECT_GPU", "1", 1) != 0) return 1;
+#endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
