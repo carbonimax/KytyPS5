@@ -29,6 +29,9 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	if (m_upload_post_pending) {
 		FlushUploadPost();
 	}
+	if (m_dispatch_chain.pending && !m_dispatch_recording) {
+		FlushDispatchChain();
+	}
 	return m_buffer;
 }
 
@@ -120,6 +123,8 @@ void CommandBuffer::FlushUploadPost() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_dispatch_chain.Reset();
+	m_dispatch_recording = false;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -132,6 +137,10 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
+	// The trailing barrier of a dispatch chain is recorded before the end.
+	if (m_dispatch_chain.pending) {
+		FlushDispatchChain();
+	}
 	auto buffer = Handle();
 
 	auto result = buffer.end();

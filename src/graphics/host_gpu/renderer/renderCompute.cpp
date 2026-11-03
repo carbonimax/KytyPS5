@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -32,7 +33,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -246,6 +250,253 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	bindings.shared_memory = {storage.Handle(), 0, size};
 }
 
+int DispatchChainMode() {
+	static const int mode = [] {
+		const char* env   = std::getenv("KYTY_DISPATCH_CHAIN");
+		int         value = 1;
+		if (env != nullptr && env[0] != '\0') {
+			value = std::atoi(env);
+		}
+		if (value < 0 || value > 2) {
+			value = 0;
+		}
+		std::printf("Dispatch chain: mode %d\n", value);
+		return value;
+	}();
+	return mode;
+}
+
+namespace DispatchChain {
+
+enum class Counter : uint32_t {
+	Direct,       // direct dispatches recorded
+	DirectWrites, // of which write memory (the previous behavior's hazard barrier)
+	Indirect,     // indirect dispatches (never chained)
+	Chained,      // no barrier before the dispatch inside a chain
+	Hazard,       // hazard barriers (ALL_COMMANDS -> COMPUTE)
+	Order,        // COMPUTE -> COMPUTE barriers
+	Flush,        // deferred trailing barriers (COMPUTE -> ALL_COMMANDS)
+	Fresh,        // dispatches starting a chain
+	Epoch,        // ordered: guest sync point
+	Conflict,     // ordered: RAW, WAR or WAW on a host range
+	Unknown,      // ordered: address, GDS or image heap accesses
+	Cap,          // ordered: tracking cap
+	HazardReason, // hazard inside a chain (first writer)
+	Alias,        // of the conflicts: guest memory only (different host resources)
+	Missed,       // verification: guest overlap left without a barrier
+	Count
+};
+
+namespace {
+
+std::array<std::atomic<uint64_t>, static_cast<size_t>(Counter::Count)> g_counters {};
+
+// Writes after reads need only the execution dependency; writes become visible to later reads
+// and writes of the next dispatches.
+void ComputeOrderBarrier(vk::CommandBuffer vk_buffer) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+	                        vk::AccessFlagBits::eUniformRead;
+	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                          vk::PipelineStageFlagBits::eComputeShader, vk::DependencyFlags {}, 1,
+	                          &barrier, 0, nullptr, 0, nullptr);
+}
+
+uint64_t HandleKey(vk::Buffer buffer) noexcept {
+	return reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer));
+}
+
+// What a direct dispatch reads and writes, from its final bindings: host buffer ranges and images,
+// and the guest address ranges behind them (an image and a buffer can cover the same guest memory).
+// Accesses that the bindings do not describe make the dispatch unknown. With guest != nullptr the
+// guest ranges also go there (verification).
+void CollectAccesses(RenderContext& context, const ShaderComputeInputInfo& input,
+                     const PreparedBindings& bindings, bool writes, Accesses& host,
+                     std::vector<Access>* guest) {
+	using ShaderRecompiler::IR::DescriptorBindingKind;
+	const auto& program = *input.stage.program;
+	const auto& counts  = program.bindings.descriptor_counts;
+	host.Clear();
+	host.writes  = writes;
+	host.unknown = program.has_address_writes || program.info.uses_dma ||
+	               program.info.uses_image_heap || program.info.uses_gds ||
+	               bindings.gds.buffer != nullptr ||
+	               counts[static_cast<size_t>(DescriptorBindingKind::Gds)] != 0 ||
+	               counts[static_cast<size_t>(DescriptorBindingKind::BdaPagetable)] != 0 ||
+	               counts[static_cast<size_t>(DescriptorBindingKind::FaultBuffer)] != 0;
+	if (guest != nullptr) {
+		guest->clear();
+	}
+	for (const auto& resource: program.info.buffers) {
+		const auto index = resource.descriptor_index;
+		if (index == UINT32_MAX || index >= bindings.buffers.size() ||
+		    index >= bindings.buffer_sources.size()) {
+			continue;
+		}
+		const auto& source = bindings.buffer_sources[index];
+		if (source.size == 0) {
+			continue; // null binding: no access reaches memory
+		}
+		const auto& view = bindings.buffers[index];
+		if (!view.buffer) {
+			// Null descriptor (KYTY_BOUNDS_MODE device path, binding under one dword): the device
+			// reads zero and drops writes, so no access reaches memory. Its handle key would also be
+			// GuestMemory.
+			continue;
+		}
+		const auto  end  = view.range == VK_WHOLE_SIZE ? UINT64_MAX : view.offset + view.range;
+		host.ranges.push_back({HandleKey(view.buffer), view.offset, end, resource.written});
+		const Access memory {GuestMemory, source.address, source.address + source.size, resource.written};
+		host.ranges.push_back(memory);
+		if (guest != nullptr) {
+			guest->push_back(memory);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size() && i < bindings.images.size(); i++) {
+		const auto id = bindings.images[i].image_id;
+		if (!id) {
+			continue;
+		}
+		const bool write = program.info.images[i].written;
+		host.ranges.push_back({ImageKey(id.index), 0, UINT64_MAX, write});
+		const auto& info = context.GetTextureCache().GetImage(id).info;
+		for (const auto range: {info.data, info.stencil}) {
+			if (range.size != 0) {
+				const Access memory {GuestMemory, range.address, range.address + range.size, write};
+				host.ranges.push_back(memory);
+				if (guest != nullptr) {
+					guest->push_back(memory);
+				}
+			}
+		}
+	}
+	if (bindings.shared_memory.buffer != nullptr) {
+		// LDS backing: one utility buffer range that every such dispatch rewrites.
+		const auto&  view = bindings.shared_memory;
+		const Access access {HandleKey(view.buffer), view.offset, view.offset + view.range, true};
+		host.ranges.push_back(access);
+		if (guest != nullptr) {
+			guest->push_back(access);
+		}
+	}
+}
+
+} // namespace
+
+void Add(Counter counter, uint64_t value = 1) noexcept {
+	g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
+}
+
+void Report(double seconds, uint64_t frames) {
+	if (DispatchChainMode() != 2) {
+		return;
+	}
+	std::array<uint64_t, static_cast<size_t>(Counter::Count)> v {};
+	for (size_t i = 0; i < v.size(); i++) {
+		v[i] = g_counters[i].exchange(0, std::memory_order_relaxed);
+	}
+	const auto n = [&](Counter c) { return v[static_cast<size_t>(c)]; };
+	std::printf("PERF dchain %.1fs: frames=%" PRIu64 " direct=%" PRIu64 " writers=%" PRIu64
+	            " indirect=%" PRIu64 " before=%" PRIu64 " after=%" PRIu64 " hazard=%" PRIu64
+	            " order=%" PRIu64 " flush=%" PRIu64 " chained=%" PRIu64 " fresh=%" PRIu64
+	            " epoch=%" PRIu64 " conflict=%" PRIu64 " unknown=%" PRIu64 " cap=%" PRIu64
+	            " hazard_in_chain=%" PRIu64 " alias=%" PRIu64 " missed=%" PRIu64 "\n",
+	            seconds, frames, n(Counter::Direct), n(Counter::DirectWrites), n(Counter::Indirect),
+	            n(Counter::DirectWrites) + n(Counter::Direct),
+	            n(Counter::Hazard) + n(Counter::Order) + n(Counter::Flush), n(Counter::Hazard),
+	            n(Counter::Order), n(Counter::Flush), n(Counter::Chained), n(Counter::Fresh),
+	            n(Counter::Epoch), n(Counter::Conflict), n(Counter::Unknown), n(Counter::Cap),
+	            n(Counter::HazardReason), n(Counter::Alias), n(Counter::Missed));
+}
+
+} // namespace DispatchChain
+
+void CommandBuffer::FlushDispatchChain() const {
+	EXIT_IF(!m_dispatch_chain.pending || IsInvalid());
+	m_dispatch_chain.Reset();
+	// The trailing barrier of the chain, as each dispatch recorded it before chaining.
+	ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (DispatchChainMode() == 2) {
+		DispatchChain::Add(DispatchChain::Counter::Flush);
+	}
+}
+
+// Records the barrier a direct dispatch of a chain needs before it and updates the chain.
+static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& buffer,
+                                 vk::CommandBuffer vk_buffer, const ShaderComputeInputInfo& input,
+                                 const PreparedBindings& bindings, bool writes,
+                                 DispatchChain::Accesses& accesses,
+                                 std::vector<DispatchChain::Access>& guest) {
+	using namespace DispatchChain;
+	const bool verify = DispatchChainMode() == 2;
+	CollectAccesses(context, input, bindings, writes, accesses, verify ? &guest : nullptr);
+	auto&      state    = buffer.DispatchChainState();
+	const auto epoch    = GuestSyncEpoch();
+	const auto decision = Decide(state, accesses, epoch);
+	if (verify) {
+		Add(Counter::Direct);
+		if (writes) {
+			Add(Counter::DirectWrites);
+		}
+		constexpr std::array reasons {Counter::Chained,  Counter::Fresh,   Counter::Epoch,
+		                              Counter::Conflict, Counter::Unknown, Counter::Cap,
+		                              Counter::HazardReason};
+		Add(reasons[static_cast<size_t>(decision.reason)]);
+		if (decision.reason == Reason::Conflict) {
+			// Same check on the host ranges alone: a guest-only overlap is an image and a buffer
+			// (or two images) over the same guest memory.
+			const auto host_only = [](const Access& a) { return a.resource != GuestMemory; };
+			bool host_conflict = false;
+			for (const auto& a: accesses.ranges) {
+				for (const auto& b: state.window) {
+					host_conflict |= host_only(a) && host_only(b) && Overlaps(a, b);
+				}
+			}
+			if (!host_conflict) {
+				Add(Counter::Alias);
+			}
+		}
+		if (decision.barrier == Barrier::None && state.pending) {
+			// Independent check on guest addresses: a dispatch left unordered after another one
+			// must not touch guest memory that the other writes, nor write what it reads.
+			for (const auto& a: guest) {
+				const auto hit = std::find_if(state.guest_window.begin(), state.guest_window.end(),
+				                              [&](const Access& b) { return Overlaps(a, b); });
+				if (hit != state.guest_window.end()) {
+					Add(Counter::Missed);
+					static std::atomic<uint32_t> logged {0};
+					if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+						std::printf("PERF dchain missed: shader=0x%016" PRIx64 " range=0x%" PRIx64
+						            "-0x%" PRIx64 "%s against 0x%" PRIx64 "-0x%" PRIx64 "%s\n",
+						            input.stage.program->shader_hash, a.begin, a.end,
+						            a.write ? " w" : " r", hit->begin, hit->end,
+						            hit->write ? " w" : " r");
+					}
+					break;
+				}
+			}
+		}
+	}
+	if (decision.barrier == Barrier::Hazard) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	} else if (decision.barrier == Barrier::ComputeToCompute) {
+		ComputeOrderBarrier(vk_buffer);
+	}
+	if (verify) {
+		if (decision.barrier == Barrier::Hazard) {
+			Add(Counter::Hazard);
+		} else if (decision.barrier == Barrier::ComputeToCompute) {
+			Add(Counter::Order);
+		}
+		if (!state.pending || decision.barrier != Barrier::None) {
+			state.guest_window.clear();
+		}
+		state.guest_window.insert(state.guest_window.end(), guest.begin(), guest.end());
+	}
+	Commit(state, accesses, epoch, decision.barrier);
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -381,6 +632,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		RebindBuffers(bindings);
 	}
 
+	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
+	// own tracked accesses), its barrier and the dispatch are recorded: a dispatch chain stays open.
+	// The image heap commit may record more, so it closes the chain first.
+	const int                        chain_mode = DispatchChainMode();
+	CommandBuffer::DispatchRecording recording(buffer, chain_mode != 0 && !program.info.uses_image_heap);
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -397,7 +653,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	if (chain_mode != 0) {
+		ChainDispatchBarrier(m_context, buffer, vk_buffer, input_info, bindings, has_storage_writes,
+		                     m_chain_accesses, m_chain_guest_accesses);
+	} else if (has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -487,8 +746,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The removed host fence also ordered read-only dispatches before later writers. A chain
+	// defers this barrier to the next command that is not a chained dispatch.
+	if (chain_mode == 0) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
 	ResetBindings();
 }
 
@@ -562,6 +824,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    });
 	if (has_storage_writes) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (DispatchChainMode() == 2) {
+		DispatchChain::Add(DispatchChain::Counter::Indirect);
 	}
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;

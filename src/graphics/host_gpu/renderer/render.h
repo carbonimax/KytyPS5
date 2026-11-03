@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -142,6 +143,16 @@ inline void                  NoteGuestSync() noexcept {
 	return g_guest_sync_epoch.load(std::memory_order_relaxed);
 }
 
+// KYTY_DISPATCH_CHAIN: 0 = a barrier pair around every direct dispatch (previous behavior);
+// 1 = direct dispatches recorded back to back share one barrier pair while no guest sync point and
+// no resource overlap separates them (dispatchChainPolicy.h; default); 2 = 1 plus verification:
+// guest address overlaps between dispatches left without a barrier are counted as missed
+// hazards, and "PERF dchain" reports the barrier counts.
+[[nodiscard]] int DispatchChainMode();
+namespace DispatchChain {
+void Report(double seconds, uint64_t frames); // "PERF dchain" line in mode 2
+} // namespace DispatchChain
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
@@ -171,6 +182,32 @@ public:
 	[[nodiscard]] bool DrawWritesStale(uint64_t sync_epoch) const noexcept {
 		return m_draw_write_stages && m_draw_write_epoch != sync_epoch;
 	}
+
+	// Direct dispatches recorded back to back defer their trailing barrier (KYTY_DISPATCH_CHAIN).
+	// Every Handle() use outside a DispatchRecording scope records it first, so anything else
+	// recorded after a chain of dispatches is ordered after all of them, as without chaining.
+	[[nodiscard]] DispatchChain::State& DispatchChainState() const noexcept { return m_dispatch_chain; }
+	void                                FlushDispatchChain() const;
+	class DispatchRecording {
+	public:
+		DispatchRecording(const CommandBuffer& buffer, bool active) noexcept
+		    : m_buffer(buffer), m_active(active) {
+			if (m_active) {
+				m_buffer.m_dispatch_recording = true;
+			}
+		}
+		~DispatchRecording() {
+			if (m_active) {
+				m_buffer.m_dispatch_recording = false;
+			}
+		}
+		DispatchRecording(const DispatchRecording&)            = delete;
+		DispatchRecording& operator=(const DispatchRecording&) = delete;
+
+	private:
+		const CommandBuffer& m_buffer;
+		bool                 m_active;
+	};
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	// Buffer-cache upload batches: the trailing barrier of an upload is deferred. Every Handle()
@@ -232,6 +269,8 @@ private:
 	mutable std::vector<vk::BufferCopy>    m_upload_regions; // flush scratch
 	mutable vk::PipelineStageFlags m_draw_write_stages {};
 	mutable uint64_t               m_draw_write_epoch = 0;
+	mutable DispatchChain::State   m_dispatch_chain;
+	mutable bool                   m_dispatch_recording = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
@@ -322,6 +361,8 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	DispatchChain::Accesses              m_chain_accesses;
+	std::vector<DispatchChain::Access>   m_chain_guest_accesses;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
