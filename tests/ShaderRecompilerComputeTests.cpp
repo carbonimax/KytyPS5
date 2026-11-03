@@ -21124,7 +21124,6 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
       registers.SetRenderTargetMask(0xf00f);
       registers.SetShaderMask(0xf00f);
       registers.SetPsInControl(0x8000);
@@ -21731,7 +21730,6 @@ public:
         registers.SetScreenScissor(0, 0, extent, extent);
         registers.SetWindowScissor(0, 0, extent, extent, false);
         registers.SetGenericScissor(0, 0, extent, extent, false);
-        registers.SetViewportScissor(0, 0, 0, extent, extent, false);
         registers.SetRenderTargetMask((7u << (4u * test.slot)) | (0xfu << (4u * float_slot)));
         registers.SetShaderMask(test.slot == 2 ? 0x0fffffffu : 0xfffff0ffu);
         registers.SetPsInControl(test.wave == 32 ? 0x8000 : 0);
@@ -23711,7 +23709,8 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetViewportScissorTL(0, 0, 0, false);
+      registers.SetViewportScissorBR(0, extent, extent);
       registers.SetRenderTargetMask(slots[0].mask | (slots[1].mask << 4u));
       registers.SetShaderMask(0xff);
       registers.SetPsInControl(0x8000);
@@ -23951,7 +23950,8 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetViewportScissorTL(0, 0, 0, false);
+      registers.SetViewportScissorBR(0, extent, extent);
       registers.SetRenderTargetMask(0xc3);
       registers.SetShaderMask(0xff);
       registers.SetPsInControl(per_vertex ? 0x8001 : 0x8000);
@@ -54615,7 +54615,7 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
       0x00100801u};
   Pm4Execution execution;
   const auto result = processor.Process(execution, packet);
-  const auto &stencil = processor.GetCtx().GetDepthStencilInfo();
+  const auto &stencil = processor.GetCtx().GetDepthRenderTarget().stencil_info;
   Require("Pm4StencilInfoValueLane", "standalone register value",
           result == Pm4ProcessResult::Complete &&
               stencil.format == Prospero::StencilFormat::k8UInt &&
@@ -56044,6 +56044,16 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                 commands[1] == value,
             "a NOP payload executed or blocked the following packet");
   }
+  // Debug markers carry an opaque string; the packet after a push/pop pair must run.
+  std::array<uint32_t, 10> markers{KYTY_PM4(3, Pm4::IT_NOP, Pm4::R_PUSH_MARKER), 0x00636261u, 0u,
+                                   KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_POP_MARKER), 0u};
+  std::copy(completion.begin(), completion.end(), markers.begin() + 5);
+  selected = 0;
+  Pm4Execution marker_execution;
+  Require(name, "debug markers",
+          processor.Process(marker_execution, markers) == Pm4ProcessResult::Complete &&
+              selected == 7,
+          "a debug marker consumed the wrong length or hid the packet after it");
   alignas(8) uint64_t released = 0;
   std::array<uint32_t, 20> disabled_commands{};
   const auto disabled_write = write(&returned, 99);
