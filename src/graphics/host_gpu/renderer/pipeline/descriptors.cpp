@@ -1096,6 +1096,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
+	BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
 	}
