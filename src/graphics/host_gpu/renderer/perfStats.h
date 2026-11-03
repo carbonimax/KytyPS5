@@ -104,6 +104,8 @@ void               Add(Counter counter, uint64_t value) noexcept;
 void               MarkGpuThread() noexcept;
 [[nodiscard]] bool IsGpuThread() noexcept;
 void               MaybeReport() noexcept;
+// KYTY_BOUNDS_MODE=2 counters (Spirv::StorageBoundsCounter, host-mapped), reported with the stats.
+void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept;
 // A pipeline creation reported by VK_EXT_pipeline_creation_feedback (core in Vulkan 1.3).
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept;
 

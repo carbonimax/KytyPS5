@@ -116,20 +116,37 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 
 namespace {
 
-// On Apple, fuse legacy MAD to avoid SPIRV-Cross NoContraction helpers; this changes rounding (KhronosGroup/SPIRV-Cross#1999, #2156).
-bool MadSeparateRounding() {
-	static const bool enabled = [] {
+// How a legacy MAD (V_MAD_F32, V_MAC_F32...) keeps its two roundings. SPIRV-Cross keeps a
+// NoContraction multiply and add apart in MSL with two calls to [[clang::optnone]] helpers
+// (spvFMul, spvFAdd; KhronosGroup/SPIRV-Cross#1999, #2156), which are slow on Apple GPUs.
+// KYTY_MAD_SEPARATE_ROUNDING selects the form:
+//   1: NoContraction multiply, then NoContraction add (default outside Apple);
+//   2: fma(a, b, -0.0) + c (default on Apple): fma rounds the product once (-0.0 keeps the sign
+//      of a zero product) and the Metal compiler does not contract it with the add, so the
+//      results are those of separate roundings without the helpers, except for the sign of a
+//      zero result when the GPU flushes a negative denormal addend (upstream KytyPS5 #1521);
+//   0: one fused fma(a, b, c): fast, but rounds once, so the last bit can differ.
+// Any other value keeps the platform default.
+enum class MadRounding { Fused, Separate, RoundedProduct };
+
+MadRounding LegacyMadRounding() {
+	static const MadRounding mode = [] {
 		const char* value = std::getenv("KYTY_MAD_SEPARATE_ROUNDING");
-		if (value != nullptr && (value[0] == '0' || value[0] == '1') && value[1] == '\0') {
-			return value[0] == '1';
+		if (value != nullptr && value[0] != '\0' && value[1] == '\0') {
+			switch (value[0]) {
+				case '0': return MadRounding::Fused;
+				case '1': return MadRounding::Separate;
+				case '2': return MadRounding::RoundedProduct;
+				default: break;
+			}
 		}
 #if defined(__APPLE__)
-		return false;
+		return MadRounding::RoundedProduct;
 #else
-		return true;
+		return MadRounding::Separate;
 #endif
 	}();
-	return enabled;
+	return mode;
 }
 
 } // namespace
@@ -141,8 +158,15 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	if (!MadSeparateRounding()) {
-		return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+	switch (LegacyMadRounding()) {
+		case MadRounding::Fused: return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+		case MadRounding::RoundedProduct: {
+			// No NoContraction here: that decoration is what makes SPIRV-Cross emit the helpers.
+			const auto product =
+			    EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, ConstantF32(state, 0x80000000u));
+			return EmitFPAdd32(state, product, c);
+		}
+		case MadRounding::Separate: break;
 	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
 	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
