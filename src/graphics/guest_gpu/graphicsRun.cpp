@@ -410,6 +410,7 @@ void GuestGpu::ProcessCommands() {
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		// Per command: one may arrive after the check above (it records and submits like the back).
 		CpPipeline::Drain();
+		FlushBatchedUploads();
 		Common::UniqueFunction<void> command;
 		{
 			Common::LockGuard lock(m_queue_mutex);
@@ -909,6 +910,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
+	FlushBatchedUploads();
 	cp.BufferInit();
 	bool complete = true;
 
@@ -951,6 +953,8 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 	}
 
+	// KYTY_REPROTECT_BATCH: nothing batched outlives a slice (the guest may resume at its end).
+	FlushBatchedUploads();
 	return complete;
 }
 
@@ -1037,8 +1041,33 @@ static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 	}
 }
 
+// KYTY_REPROTECT_BATCH: non-pipelined packets that are guest sync points, i.e. after which the guest
+// may observe command-processor progress or the command processor waits for the guest (labels,
+// memory writes, flips and other custom packets, memory waits). Dispatches, indirect draws and cache
+// or state packets are not: batched re-protections stay pending across them.
+static bool IsSyncPointPacket(uint32_t opcode) {
+	switch (opcode) {
+		case Pm4::IT_DISPATCH_DIRECT:
+		case Pm4::IT_DISPATCH_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT:
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI:
+		case Pm4::IT_DISPATCH_DRAW:
+		case Pm4::IT_CONTEXT_CONTROL:
+		case Pm4::IT_PFP_SYNC_ME:
+		case Pm4::IT_ACQUIRE_MEM:
+		case Pm4::IT_SURFACE_SYNC:
+		case Pm4::IT_SET_PREDICATION:
+		case Pm4::IT_SET_CONFIG_REG:
+		case Pm4::IT_SET_QUEUE_REG: return false;
+		default: return true;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
-	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
+	static const bool idle_submit     = CommandScheduler::IdleSubmitEnabled();
+	static const bool reprotect_batch = BufferCache::ReprotectBatchEnabled();
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
@@ -1106,6 +1135,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
 		if (!IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
 			CpPipeline::Drain();
+			if (reprotect_batch && IsSyncPointPacket(opcode) && g_gpu_state != nullptr) {
+				g_gpu_state->FlushBatchedUploads();
+			}
 		}
 
 		if (handler == nullptr) {
@@ -1821,6 +1853,13 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 bool GuestGpu::IsGpuThread() noexcept {
 	return g_gpu_thread;
+}
+
+void GuestGpu::FlushBatchedUploads() {
+	static const bool enabled = BufferCache::ReprotectBatchEnabled();
+	if (enabled) {
+		m_renderer.GetBufferCache().FlushBatchedUploads();
+	}
 }
 
 void GuestGpu::MarkHostGpuThread() noexcept {

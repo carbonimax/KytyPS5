@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -734,6 +735,16 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 	};
 }
 
+// KYTY_REPROTECT_BATCH: 0 (default) = off, 1 = on, 2 = on with checks; other values = off.
+static int ReprotectBatchMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_REPROTECT_BATCH");
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
+	}();
+	return mode;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -765,6 +776,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
 	if (graphics.readback_queue != nullptr && AsyncFaultReadbacks()) {
 		m_readback_queue = std::make_unique<ReadbackQueue>(graphics, scheduler);
+	}
+	m_reprotect_batch = ReprotectBatchEnabled() && m_staging_buffer.IsCoherent();
+	if (ReprotectBatchMode() == 2) {
+		PageManager::SetDeferredVerify(true);
 	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
@@ -1202,6 +1217,9 @@ void BufferCache::EndUploadBatch() {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	if (m_reprotect_batch && !is_written) {
+		EnsureReprotectBatch();
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -1311,7 +1329,35 @@ static bool ProtectCoalesceEnabled() {
 	return enabled;
 }
 
+bool BufferCache::ReprotectBatchEnabled() noexcept {
+	return ReprotectBatchMode() != 0;
+}
+
+void BufferCache::EnsureReprotectBatch() {
+	if (!GuestGpu::IsGpuThread()) {
+		return;
+	}
+	if (!m_deferring_uploads) {
+		m_deferring_uploads = true;
+		m_scheduler.SetPreSubmit(
+		    [](void* context) { static_cast<BufferCache*>(context)->FlushDeferredUploads(); }, this);
+	}
+	if (!PageManager::DeferringProtect()) {
+		PageManager::BeginDeferredProtect();
+	}
+}
+
+void BufferCache::FlushBatchedUploads() {
+	if (m_reprotect_batch && m_deferring_uploads) {
+		FlushDeferredUploads();
+	}
+}
+
 bool BufferCache::BeginDeferredUploads() {
+	if (m_reprotect_batch) {
+		EnsureReprotectBatch();
+		return false;
+	}
 	if (!ProtectCoalesceEnabled() || !m_staging_buffer.IsCoherent() || m_deferring_uploads) {
 		return false;
 	}
@@ -1325,12 +1371,26 @@ bool BufferCache::BeginDeferredUploads() {
 // Order matters: the recorded protections first, then the bytes. A guest write that lands
 // before a page's protection is applied is in the copy; a later one faults and is logged.
 void BufferCache::FlushDeferredUploads() {
+	// One flush at a time: the protections of everything recorded so far, then all their copies.
+	std::lock_guard lock(m_deferred_mutex);
 	PageManager::FlushDeferredProtect();
 	for (const auto& copy: m_deferred_copies) {
 		if (!LibKernel::Memory::CopySparseMemory(copy.address, copy.destination, copy.size)) {
 			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 		}
 		(void)EopAtGpu::OverlayPending(copy.address, copy.destination, copy.size);
+	}
+	if (ReprotectBatchMode() == 2 && !m_deferred_copies.empty()) [[unlikely]] {
+		static uint64_t flushes = 0;
+		static uint64_t copies  = 0;
+		copies += m_deferred_copies.size();
+		if ((++flushes & 0x3fffu) == 0) {
+			const auto stats = PageManager::GetDeferredVerifyStats();
+			std::printf("BufferCache: KYTY_REPROTECT_BATCH=2 flushes=%" PRIu64 " copies=%" PRIu64
+			            " pages_checked=%" PRIu64 " mismatches=%" PRIu64 "\n",
+			            flushes, copies, stats.checked, stats.mismatch);
+			std::fflush(stdout);
+		}
 	}
 	m_deferred_copies.clear();
 }
@@ -1348,10 +1408,13 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
-	if (m_deferring_uploads && may_defer) {
+	// Only a thread whose re-protections were deferred defers the copy (its protections are
+	// applied by the flush, before the copy).
+	if (PageManager::DeferringProtect() && m_deferring_uploads && may_defer) {
 		// No wait for ring space here (a wait submits): such uploads take the immediate path.
 		const auto [mapped, offset] = m_staging_buffer.Map(total_size, 4, false);
 		if (mapped != nullptr) {
+			std::lock_guard lock(m_deferred_mutex);
 			for (auto& copy: copies) {
 				m_deferred_copies.push_back(
 				    {buffer.CpuAddress() + copy.dstOffset, mapped + copy.srcOffset, copy.size});
