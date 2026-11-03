@@ -75,6 +75,8 @@ static void PrintUsage() {
 	    "  --stretch                            Stretch the image to the window. Default: off.\n");
 	::printf("  --no-splash                          Disable the startup splash screen.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for supported titles\n"
+	         "                                       (PSSR uses linear scaling). Default: off.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -207,6 +209,7 @@ static constexpr Flag FLAGS[] = {
     {"--stretch", &ConfigOptions::stretch_enabled},
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
+    {"--trinity", &ConfigOptions::pro_enabled},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},

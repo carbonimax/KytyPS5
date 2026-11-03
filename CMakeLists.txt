@@ -337,6 +337,7 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
@@ -683,9 +684,6 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
-target_compile_definitions(virtual_memory_allocation_tests PRIVATE
-	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
-
 add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/GpuBlitShaderTests.cpp"
 	"${gpu_blit_generated_dir}/gpu_mesh_indirect_spv.h")
@@ -695,6 +693,18 @@ target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
 	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
 target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
+
+add_executable(psml_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(psml_tests common kyty_test_gtest)
+target_include_directories(psml_tests PRIVATE ${inc_headers})
+target_compile_definitions(virtual_memory_allocation_tests PRIVATE
+	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
 target_link_libraries(net_resolver_tests kyty_test_gtest)
@@ -812,6 +822,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME trinity_mode
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline

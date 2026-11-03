@@ -67,6 +67,7 @@ struct ConfigOptions {
 	bool                   stretch_enabled             = false;
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
+	bool                   pro_enabled                 = false;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -130,6 +131,7 @@ bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
+bool     Ps5ProEnabled();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();

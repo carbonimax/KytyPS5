@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -23948,6 +23949,8 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+
+#include "PssrGpuTests.inc"
 
 private:
   Mode m_mode = Mode::Full;
@@ -54436,13 +54439,16 @@ void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
       static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
       0x80000000u, 1u,
   };
-  Pm4Execution execution;
   const bool handler_present =
       g_hw_uc_indirect_func[Pm4::UC_PARAMETER_OVERSUBSCRIPTION] != nullptr;
-  Require("Pm4IndirectUconfigRegisters", "indirect UCONFIG register stream",
-          handler_present &&
-              processor.Process(execution, command) == Pm4ProcessResult::Complete,
-          "UCONFIG register was rejected by SET_UCONFIG_REG_INDIRECT");
+  for (uint32_t mode = 0; mode <= 1; ++mode) {
+    command[0] = KYTY_PM4(5, Pm4::IT_SET_UCONFIG_REG_INDIRECT, mode);
+    Pm4Execution execution;
+    Require("Pm4IndirectUconfigRegisters", "indirect UCONFIG register stream",
+            handler_present &&
+                processor.Process(execution, command) == Pm4ProcessResult::Complete,
+            "UCONFIG register was rejected by SET_UCONFIG_REG_INDIRECT");
+  }
   std::printf("[host]    %-32s ok\n", "Pm4IndirectUconfigRegisters");
 }
 
@@ -57139,6 +57145,12 @@ int main(int argc, char **argv) {
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPssr();
+    CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-wait-only") == 0) {
