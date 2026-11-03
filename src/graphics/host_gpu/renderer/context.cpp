@@ -76,7 +76,10 @@ void CommandBuffer::FlushUploadPost() const {
 	m_upload_post_pending = false;
 	if (!m_upload_copies.empty()) {
 		// Everything recorded before orders and becomes visible before the batch's copies (global
-		// scope: the copies may target several buffers).
+		// scope: the copies may target several buffers). A dispatch chain may still be pending
+		// here (uploads record outside Handle()); this barrier then also orders the chained
+		// dispatches' reads and writes before the copies, as the chain's trailing barrier would,
+		// and the trailing barrier below makes the copies visible to the next dispatch.
 		vk::MemoryBarrier2 before {};
 		before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 		before.srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
