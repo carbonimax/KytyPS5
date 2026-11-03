@@ -139,6 +139,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		// KYTY_REPROTECT_BATCH: batched protections and copies may cover this range; they read and
+		// protect the old mapping, so they are applied before the range goes away. Guest commands
+		// already flush first; this also covers a command run inline on a GPU thread.
+		m_buffer_cache.FlushBatchedUploads();
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
