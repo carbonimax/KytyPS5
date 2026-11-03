@@ -830,45 +830,88 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
+	// One value on the scalar read walk path. A typed scalar read visits its resource handle's
+	// descriptor dwords first (planned at the read's pc), then its own operands from arg 1.
+	struct SrtCollectFrame {
+		Inst*            inst       = nullptr;
+		uint32_t         use_pc     = 0;
+		uint32_t         width      = 0;
+		uint32_t         phis_above = 0; // phis on the walk path above this value
+		size_t           next       = 0;
+		bool             read       = false;
+		DescriptorSource source;
+	};
+
+	uint32_t SrtPathPhis() const {
+		if (m_srt_stack.empty()) return 0;
+		const auto& top = m_srt_stack.back();
+		return top.phis_above + (top.inst->GetOpcode() == ValueOpcode::Phi ? 1u : 0u);
+	}
+
+	void EnterScalarRead(Value value, uint32_t use_pc) {
 		value = value.Resolve();
 		if (value.IsImmediate()) return;
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
 		if (m_srt_visited.contains(inst)) return;
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
+		if (const auto cycle = m_srt_path.find(inst); cycle != m_srt_path.end()) {
+			// The cycle is the walk path from the repeated value down to the current value.
+			if (SrtPathPhis() > m_srt_stack[cycle->second].phis_above) return;
 			Fail(use_pc, "cyclic typed planning value without a phi");
 		}
-		m_srt_visiting.push_back(inst);
+		const auto phis_above = SrtPathPhis();
+		m_srt_path.emplace(inst, m_srt_stack.size());
+		auto& frame      = m_srt_stack.emplace_back();
+		frame.inst       = inst;
+		frame.use_pc     = use_pc;
+		frame.phis_above = phis_above;
 		uint32_t memory_index = 0;
 		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.insert(inst);
 		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
+		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+		const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+		if (handle == nullptr || handle->GetOpcode() !=
+		        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
+			Fail(use_pc, "scalar read has an invalid resource handle");
+		frame.read  = true;
+		frame.width = width;
+		MakeSource(*handle, width, false, false, ScalarReadBase(*inst), frame.source,
+		           inst->Flags<MemoryFlags>().pc);
+	}
+
+	// Depth-first walk over the values feeding a descriptor; records every typed scalar read
+	// with an immediate offset in post-order. The walk keeps its path on the heap: guest
+	// shaders can chain thousands of dependent scalar values.
+	void CollectScalarRead(Value value, uint32_t use_pc) {
+		EnterScalarRead(value, use_pc);
+		while (!m_srt_stack.empty()) {
+			auto& frame = m_srt_stack.back();
+			Value    child;
+			uint32_t child_pc  = frame.use_pc;
+			bool     has_child = true;
+			if (frame.read && frame.next < frame.width) {
+				child    = frame.source.dwords[frame.next];
+				child_pc = frame.inst->Flags<MemoryFlags>().pc;
+			} else {
+				const auto arg = frame.read ? frame.next - frame.width + 1u : frame.next;
+				has_child      = arg < frame.inst->NumArgs();
+				if (has_child) child = frame.inst->Arg(arg);
+			}
+			if (has_child) {
+				++frame.next;
+				EnterScalarRead(child, child_pc);
+				continue;
+			}
+			auto*      inst = frame.inst;
+			const bool read = frame.read;
+			m_srt_stack.pop_back();
+			m_srt_path.erase(inst);
+			m_srt_visited.insert(inst);
+			if (!read) continue;
+			const auto offset = inst->Arg(1).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32) continue;
+			m_scalar_reads.push_back(inst);
+		}
 	}
 
 	void PlanScalarReads() {
@@ -4356,7 +4399,8 @@ private:
 	ShaderStageInputInfo                       m_input;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
-	std::vector<const Inst*>                   m_srt_visiting;
+	std::vector<SrtCollectFrame>               m_srt_stack;
+	std::unordered_map<const Inst*, size_t>    m_srt_path;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<MemoryIndexUse>                m_memory_index_uses;
 	std::vector<Inst*>                         m_scalar_reads;
