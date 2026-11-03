@@ -10634,15 +10634,21 @@ public:
       const auto d16_restenciled_words =
           read_texels(d16_restenciled_image, vk::ImageAspectFlagBits::eDepth);
       bool d16_promoted = d16_restenciled_image != d16_native_image;
-      // The promoted encoding follows the stencil format the device provides (D24S8 or D32S8).
-      const bool d16_promoted_to_d32 =
-          texture_cache.GetImage(d16_restenciled_image).backing.format ==
-          vk::Format::eD32SfloatS8Uint;
-      for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
-        d16_promoted &= d16_promoted_to_d32
-                            ? d16_restenciled_words[i] == EncodeD16AsD32(d16_fallback_values[i])
-                            : (d16_restenciled_words[i] & 0x00ffffffu) ==
-                                  EncodeD16AsD24(d16_fallback_values[i]);
+      // The depth encoding follows the stencil format the device provides: D16S8 keeps the
+      // 16-bit values (two texels per readback word), D24S8 and D32S8 promote them.
+      const auto d16_restenciled_format =
+          texture_cache.GetImage(d16_restenciled_image).backing.format;
+      if (d16_restenciled_format == vk::Format::eD16UnormS8Uint) {
+        d16_promoted &= std::memcmp(d16_restenciled_words.data(), d16_fallback_values.data(),
+                                    sizeof(d16_fallback_values)) == 0;
+      } else {
+        const bool d16_promoted_to_d32 = d16_restenciled_format == vk::Format::eD32SfloatS8Uint;
+        for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
+          d16_promoted &= d16_promoted_to_d32
+                              ? d16_restenciled_words[i] == EncodeD16AsD32(d16_fallback_values[i])
+                              : (d16_restenciled_words[i] & 0x00ffffffu) ==
+                                    EncodeD16AsD24(d16_fallback_values[i]);
+        }
       }
       std::string d16_promoted_detail =
           "D16 depth lost its values when its target regained the stencil: format " +
