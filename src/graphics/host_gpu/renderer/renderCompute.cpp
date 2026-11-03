@@ -339,6 +339,12 @@ void CollectAccesses(RenderContext& context, const ShaderComputeInputInfo& input
 			continue; // null binding: no access reaches memory
 		}
 		const auto& view = bindings.buffers[index];
+		if (!view.buffer) {
+			// Null descriptor (KYTY_BOUNDS_MODE device path, binding under one dword): the device
+			// reads zero and drops writes, so no access reaches memory. Its handle key would also be
+			// GuestMemory.
+			continue;
+		}
 		const auto  end  = view.range == VK_WHOLE_SIZE ? UINT64_MAX : view.offset + view.range;
 		host.ranges.push_back({HandleKey(view.buffer), view.offset, end, resource.written});
 		const Access memory {GuestMemory, source.address, source.address + source.size, resource.written};
