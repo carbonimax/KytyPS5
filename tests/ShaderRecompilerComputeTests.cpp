@@ -102,6 +102,7 @@
 #include <set>
 #include <span>
 #include <sstream>
+#include <list>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -2489,6 +2490,44 @@ public:
   }
   ~VulkanHarness() { Destroy(); }
   // Host float min/max is used on AMD GPUs, as in Kyty.
+  // An empty storage binding: the shared 16-byte null buffer with shader checks, a null
+  // descriptor when the device bounds the accesses (KYTY_BOUNDS_MODE=1 with robustBufferAccess2).
+  void CheckStorageBoundsNullDescriptor() {
+    constexpr const char *name = "StorageBoundsNullDescriptor";
+    EnsureRuntimeContext();
+    const auto saved = m_runtime_context.storage_bounds;
+    for (const uint8_t bounds : {uint8_t{0}, uint8_t{2}}) {
+      m_runtime_context.storage_bounds = bounds;
+      RenderContext context(m_runtime_context);
+      auto &executor = context.GetRenderExecutor();
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Compute;
+      program.info.buffers.push_back({.packed_stride = 1, .written = true});
+      program.info.buffers[0].descriptor_index = 0;
+      program.bindings.descriptor_counts[0] = 1;
+      program.bindings.descriptor_mask = 1;
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      snapshot.buffers.emplace_back().dword_count = 4;
+      ShaderStageRuntime runtime{&program, &snapshot};
+      PreparedBindings bindings;
+      executor.PrepareBindings(runtime, bindings);
+      std::array<PreparedBindings *, 1> stages{&bindings};
+      executor.FindBuffers(stages);
+      executor.RebindBuffers(bindings);
+      const auto &view = bindings.buffers[0];
+      const bool null_view = view.buffer == nullptr && view.offset == 0 && view.range == vk::WholeSize;
+      Require(name, bounds == 0 ? "shader checks" : "device bounds",
+              (bounds == 0 ? view.buffer != nullptr && view.range == 16 : null_view) &&
+                  bindings.shader_data[program.bindings.MemorySizeDword()] == 0,
+              "an empty storage binding has the wrong descriptor or a nonzero length");
+    }
+    m_runtime_context.storage_bounds = saved;
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // robustStorageBufferAccessSizeAlignment with robustBufferAccess2 enabled (full mode), else 0.
+  [[nodiscard]] u32 RobustStorageAlignment() const { return m_robust_storage_alignment; }
+
   [[nodiscard]] bool SupportsNativeFloatMinMax() const {
     vk::PhysicalDeviceProperties properties;
     m_physical_device.getProperties(&properties);
@@ -19798,6 +19837,15 @@ public:
                   "storage buffer descriptor range exceeds backing buffer");
         }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
+        // The emulator's descriptor for shaders that leave the bounds to the device
+        // (RenderExecutor NativeStorageBuffer).
+        const auto device_range = ShaderRecompiler::Spirv::StorageDeviceRange(
+            *test.profile, info.range, compiled.program.info.buffers[resource].subword);
+        if (device_range == 0) {
+          info = vk::DescriptorBufferInfo{nullptr, 0, vk::WholeSize};
+        } else {
+          info.range = device_range;
+        }
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -23784,6 +23832,7 @@ private:
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
+  u32 m_robust_storage_alignment = 0;           // Full mode with robustBufferAccess2 (as the emulator).
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -24014,6 +24063,13 @@ private:
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
     std::vector<vk::ExtensionProperties> extensions(extension_count);
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, extensions.data()), "vkEnumerateDeviceExtensionProperties");
+    if (full && available_robustness2.robustBufferAccess2 && available_features.robustBufferAccess) {
+      vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+      vk::PhysicalDeviceProperties2 properties2{};
+      properties2.pNext = &robustness2_properties;
+      m_physical_device.getProperties2(&properties2);
+      m_robust_storage_alignment = robustness2_properties.robustStorageBufferAccessSizeAlignment;
+    }
     m_conditional_rendering_enabled = full && available_conditional_rendering.conditionalRendering && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME) == 0;
     });
@@ -24178,6 +24234,8 @@ private:
     maintenance8.pNext = &shader_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
+    // As the emulator: StorageBounds::Device leaves storage buffer bounds to the device.
+    robustness2.robustBufferAccess2 = m_robust_storage_alignment != 0;
     robustness2.pNext = &maintenance8;
     // Conditional rendering is optional in production (graphics.conditional_rendering_enabled):
     // the full mode enables it only where the device reports it.
@@ -24200,6 +24258,7 @@ private:
     m_resource_min_lod_enabled = device_features.shaderResourceMinLod == VK_TRUE;
     Require("ImageMinLodFallback", "device", !min_lod_fallback || m_resource_min_lod_enabled, "shaderResourceMinLod is not supported");
     device_features.shaderInt64 = true;
+    device_features.robustBufferAccess = m_robust_storage_alignment != 0;
     device_features.fragmentStoresAndAtomics = portable_graphics;
     device_features.dualSrcBlend = portable_graphics && available_features.dualSrcBlend;
     device_features.shaderFloat64 = full && available_features.shaderFloat64;
@@ -31403,6 +31462,14 @@ TestCase VectorDppInactiveSource(bool row_shift, bool bound_ctrl, u32 wave_size)
   return test;
 }
 
+// The MAD form KYTY_MAD_SEPARATE_ROUNDING=2 selects (the Apple default, upstream KytyPS5 #1521):
+// fma(a, b, -0.0) rounds the product, then a plain add, so no NoContraction multiply.
+TestCase WithRoundedProductMad(TestCase test) {
+  test.required_spirv = {"OpFAdd", "Fma"};
+  test.forbidden_spirv = {"OpFMul"};
+  return test;
+}
+
 TestCase VectorMadF32RoundsProduct() {
   using O = ShaderOpcode;
 
@@ -31445,7 +31512,11 @@ TestCase VectorMadF32RoundsProduct() {
                   O::V_MAD_F32, O::V_MADMK_F32, O::V_MADAK_F32,
                   O::V_FMAC_F32, O::V_FMA_F32, O::V_FMAMK_F32, O::V_FMAAK_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+#if defined(__APPLE__)
+  test = WithRoundedProductMad(std::move(test));
+#else
   test.required_spirv = {"OpFMul", "OpFAdd", "NoContraction", "Fma"};
+#endif
   return test;
 }
 
@@ -35904,6 +35975,254 @@ TestCase BufferLoadDwordx2SnapshotsOverlappingAddress() {
   test.user_data = MakeStructuredStorageBufferData(8, 2);
   test.has_user_data = true;
   return test;
+}
+
+// Storage buffer bounds (KYTY_BOUNDS_MODE). Every StorageBounds must give the shader-check
+// results: past the binding's last byte, loads read zero and stores drop, to the element, also when
+// the range ends inside a dword and the device rounds its robustness range up to 4 bytes.
+constexpr ShaderProfile StorageBoundsSelectProfile{
+    .maintenance8 = true, .storage_bounds = ShaderRecompiler::Spirv::StorageBounds::Select};
+constexpr ShaderProfile StorageBoundsDevice4Profile{
+    .maintenance8 = true, .storage_bounds = ShaderRecompiler::Spirv::StorageBounds::Device,
+    .storage_bounds_alignment = 4};
+constexpr ShaderProfile StorageBoundsDevice1Profile{
+    .maintenance8 = true, .storage_bounds = ShaderRecompiler::Spirv::StorageBounds::Device,
+    .storage_bounds_alignment = 1};
+
+const char *StorageBoundsName(const char *base, u32 range, const ShaderProfile *profile) {
+  static std::list<std::string> names;
+  const char *mode = profile->storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Shader ? "Shader"
+                     : profile->storage_bounds == ShaderRecompiler::Spirv::StorageBounds::Select ? "Select"
+                     : profile->storage_bounds_alignment == 1u ? "Device1" : "Device4";
+  names.push_back(std::string(base) + std::to_string(range) + mode +
+                  (profile->storage_bounds_verify_address != 0 ? "Verify" : ""));
+  return names.back().c_str();
+}
+
+// Input V# in s[0:3] over guest bytes [0, range); outputs through s[48:51], a view at byte 128 (output i is dword 32 + i). Two wave32
+// waves, so GLC loads are atomic loads; stores never touch the dwords the loads read.
+void StorageBoundsLayout(TestCase *test, u32 range, const ShaderProfile *profile) {
+  test->initial = {0x10101010u, 0x11111111u, 0x22222222u, 0x33333333u,
+                   0x44332211u, 0xc5c5c5c5u, 0xc6c6c6c6u, 0xc7c7c7c7u};
+  test->initial.resize(64);
+  test->expected = test->initial;
+  test->user_data = MakeStructuredStorageBufferData(0, range);
+  test->user_data[50] = 128;
+  test->user_data[51] = test->user_data[3];
+  test->has_user_data = true;
+  test->storage_buffer_ranges = {{0, range}, {128, 128}};
+  test->compute_info.threads_num[0] = 64;
+  test->compute_info.threads_num[1] = test->compute_info.threads_num[2] = 1;
+  test->compute_info.wave_size = 32;
+  test->has_compute_info = true;
+  test->profile = profile;
+}
+
+// Dword-only binding: raw dword loads, scalar loads, a GLC load and dword stores. The device path
+// cuts the descriptor to whole dwords (18 -> 16 bytes; 2 -> null descriptor).
+TestCase StorageBoundsDwordTail(u32 range, const ShaderProfile *profile) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = StorageBoundsName("StorageBoundsDwordTail", range, profile);
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 8);
+  code.insert(code.end(), {EncodeMubuf0(0x0eu), EncodeMubuf1(0, 0, 20),
+                           EncodeSmem0(0x0au, 24), EncodeSmem1(8, 125)});
+  AppendVMovU32(&code, 21, 16);
+  code.insert(code.end(), {EncodeMubuf0(0x0cu), EncodeMubuf1(4, 0, 21),
+                           EncodeMubuf0(0x0cu, 0, false, true, true), EncodeMubuf1(5, 0, 21)});
+  AppendVMovLiteral(&code, 14, 0x50000000u);
+  AppendVMovLiteral(&code, 15, 0x50000001u);
+  AppendVMovLiteral(&code, 18, 0x123456eeu);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 23, 4);
+  AppendVMovU32(&code, 24, 20);
+  code.insert(code.end(), {EncodeMubuf0(0x1cu), EncodeMubuf1(14, 0, 22),   // dword 0
+                           EncodeMubuf0(0x1cu), EncodeMubuf1(18, 0, 23),   // dword 1
+                           EncodeMubuf0(0x1du), EncodeMubuf1(14, 0, 21),   // dwords 4-5
+                           EncodeMubuf0(0x1cu), EncodeMubuf1(18, 0, 24)}); // dword 5
+  for (u32 i = 0; i < 6; ++i) AppendStoreVgpr(&code, i, i);
+  for (u32 i = 0; i < 4; ++i) AppendStoreSgpr(&code, 24 + i, 6 + i);
+  AppendEnd(&code);
+  StorageBoundsLayout(&test, range, profile);
+  const auto dword = [&](u32 index) { return (index + 1u) * 4u <= range ? test.initial[index] : 0u; };
+  const std::array<u32, 10> outputs{dword(2), dword(3), dword(4), dword(5), dword(4),
+                                     dword(4), dword(2), dword(3), dword(4), dword(5)};
+  std::copy(outputs.begin(), outputs.end(), test.expected.begin() + 32);
+  if (range >= 4) test.expected[0] = 0x50000000u;
+  if (range >= 8) test.expected[1] = 0x123456eeu;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::BUFFER_STORE_DWORDX2,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// Binding with 8/16-bit views: its descriptor keeps the exact range, so the device reads the
+// bytes past it up to the next dword and the shader must still return zero for them.
+TestCase StorageBoundsSubwordTail(u32 range, const ShaderProfile *profile) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = StorageBoundsName("StorageBoundsSubwordTail", range, profile);
+  auto &code = test.code;
+  for (const auto [opcode, dst, offset] :
+       {std::array{0x0au, 0u, 16u}, std::array{0x0au, 1u, 18u}, std::array{0x08u, 2u, 17u},
+        std::array{0x08u, 3u, 18u}, std::array{0x0cu, 4u, 16u}, std::array{0x0cu, 5u, 12u},
+        std::array{0x08u, 6u, 19u}}) {
+    AppendVMovU32(&code, 20, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(dst, 0, 20)});
+  }
+  AppendVMovLiteral(&code, 12, 0x123456eeu);
+  for (const auto [opcode, offset] : {std::array{0x18u, 1u}, std::array{0x1au, 6u},
+                                      std::array{0x18u, range}, std::array{0x1au, 18u},
+                                      std::array{0x1cu, 16u}}) {
+    AppendVMovU32(&code, 21, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(12, 0, 21)});
+  }
+  for (u32 i = 0; i < 7; ++i) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  StorageBoundsLayout(&test, range, profile);
+  const auto byte = [&](u32 offset) {
+    return offset < range ? (test.initial[offset / 4u] >> (8u * (offset % 4u))) & 0xffu : 0u;
+  };
+  const auto half = [&](u32 offset) { return offset + 2u <= range ? byte(offset) | byte(offset + 1u) << 8u : 0u; };
+  const std::array<u32, 7> outputs{half(16), half(18), byte(17), byte(18), range >= 20 ? test.initial[4] : 0u,
+                                    test.initial[3], byte(19)};
+  std::copy(outputs.begin(), outputs.end(), test.expected.begin() + 32);
+  test.expected[0] = 0x1010ee10u;
+  test.expected[1] = 0x56ee1111u;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// Formatted loads are all or nothing: one byte of the format past the range zeroes every
+// component. Device-bounded bindings select that result instead of branching.
+TestCase StorageBoundsFormattedTail(u32 range, const ShaderProfile *profile, bool half) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = StorageBoundsName(half ? "StorageBoundsFormatted16Tail" : "StorageBoundsFormatted32Tail",
+                                range, profile);
+  auto &code = test.code;
+  u32 dst = 0;
+  const auto load = [&](u32 opcode, u32 offset, Prospero::BufferFormat format, u32 components) {
+    AppendVMovU32(&code, 20, offset);
+    AppendTBufferLoadFormatOpcode(&code, opcode, dst, 20, format);
+    dst += components;
+  };
+  if (half) {
+    load(0x01u, 12, Prospero::BufferFormat::k16_16UInt, 2);
+    load(0x01u, 16, Prospero::BufferFormat::k16_16UInt, 2);
+  } else {
+    load(0x03u, 0, Prospero::BufferFormat::k32_32_32_32UInt, 4);
+    load(0x03u, 4, Prospero::BufferFormat::k32_32_32_32UInt, 4);
+    load(0x01u, 8, Prospero::BufferFormat::k32_32UInt, 2);
+    load(0x01u, 12, Prospero::BufferFormat::k32_32UInt, 2);
+  }
+  for (u32 i = 0; i < dst; ++i) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  StorageBoundsLayout(&test, range, profile);
+  std::vector<u32> outputs;
+  const auto words = [&](u32 offset, u32 count) {
+    for (u32 i = 0; i < count; ++i)
+      outputs.push_back(offset + count * 4u <= range ? test.initial[offset / 4u + i] : 0u);
+  };
+  if (half) {
+    for (const u32 offset : {12u, 16u}) {
+      const bool inside = offset + 4u <= range;
+      outputs.push_back(inside ? test.initial[offset / 4u] & 0xffffu : 0u);
+      outputs.push_back(inside ? test.initial[offset / 4u] >> 16u : 0u);
+    }
+  } else {
+    words(0, 4);
+    words(4, 4);
+    words(8, 2);
+    words(12, 2);
+  }
+  std::copy(outputs.begin(), outputs.end(), test.expected.begin() + 32);
+  test.opcodes = {O::V_MOV_B32, half ? O::TBUFFER_LOAD_FORMAT_XY : O::TBUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (!half) test.opcodes.push_back(O::TBUFFER_LOAD_FORMAT_XY);
+  return test;
+}
+
+// One full wave32 needs no lane compare, so OpULessThan comes only from bounds checks: the device
+// path of a dword-only binding has none, the select path has no branch around the load.
+TestCase StorageBoundsSpirv(const ShaderProfile *profile) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = StorageBoundsName("StorageBoundsSpirv", 18, profile);
+  AppendVMovU32(&test.code, 20, 12);
+  test.code.insert(test.code.end(), {EncodeMubuf0(0x0cu), EncodeMubuf1(0, 0, 20)});
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  StorageBoundsLayout(&test, 18, profile);
+  test.compute_info.threads_num[0] = 32;
+  test.expected[32] = test.initial[3];
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  switch (profile->storage_bounds) {
+    case ShaderRecompiler::Spirv::StorageBounds::Shader: test.required_spirv = {"OpULessThan"}; break;
+    case ShaderRecompiler::Spirv::StorageBounds::Select:
+      test.required_spirv = {"OpULessThan", "UMin", "OpSelect"};
+      break;
+    case ShaderRecompiler::Spirv::StorageBounds::Device: test.forbidden_spirv = {"OpULessThan"}; break;
+  }
+  return test;
+}
+
+void CheckStorageDeviceRange() {
+  using ShaderRecompiler::Spirv::StorageDeviceRange;
+  constexpr const char *name = "StorageDeviceRange";
+  Require(name, "range",
+          StorageDeviceRange(StorageBoundsDevice4Profile, 18, false) == 16 &&
+              StorageDeviceRange(StorageBoundsDevice4Profile, 18, true) == 18 &&
+              StorageDeviceRange(StorageBoundsDevice4Profile, 3, false) == 0 &&
+              StorageDeviceRange(StorageBoundsDevice4Profile, 20, false) == 20 &&
+              StorageDeviceRange(StorageBoundsDevice1Profile, 18, false) == 18 &&
+              StorageDeviceRange(StorageBoundsSelectProfile, 18, false) == 18 &&
+              StorageDeviceRange(Maintenance8Profile, 2, false) == 2,
+          "device range is not the shader check's range cut to whole dwords");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// KYTY_BOUNDS_MODE=2: the counters see the out-of-range accesses, the unchecked device loads read
+// zero there, and with a 4-byte robustness alignment the device exposes the subword tail that
+// the select hides.
+void CheckStorageBoundsVerify(VulkanHarness &vulkan) {
+  for (const bool subword : {false, true}) {
+    auto counters = vulkan.CreateStorageBuffer("StorageBoundsVerify", {0, 0, 0, 0}, 4, true);
+    ShaderProfile profile = StorageBoundsDevice4Profile;
+    profile.storage_bounds_verify_address = counters.device_address;
+    auto test = subword ? StorageBoundsSubwordTail(18, &profile) : StorageBoundsDwordTail(18, &profile);
+    test.required_spirv = {"OpAtomicIAdd", "OpConvertUToPtr"};
+    RunCase(&vulkan, test);
+    const auto values = vulkan.ReadBuffer(test.name, counters, 4);
+    const u32 tail = subword && vulkan.RobustStorageAlignment() == 4u ? values[0] : 0u;
+    Require(test.name, "verify counters",
+            values[0] != 0 && values[1] == 0 && (values[2] != 0) == !subword && values[3] == tail,
+            "oob_loads=" + std::to_string(values[0]) + " nonzero_loads=" + std::to_string(values[1]) +
+                " oob_stores=" + std::to_string(values[2]) + " tail_reads=" + std::to_string(values[3]));
+    std::printf("[gpu]     %-32s counters %u %u %u %u\n", test.name, values[0], values[1], values[2],
+                values[3]);
+    vulkan.DestroyBuffer(&counters);
+  }
+}
+
+void RunStorageBoundsTests(VulkanHarness &vulkan) {
+  CheckStorageDeviceRange();
+  vulkan.CheckStorageBoundsNullDescriptor();
+  const auto alignment = vulkan.RobustStorageAlignment();
+  std::vector<const ShaderProfile *> profiles{&Maintenance8Profile, &StorageBoundsSelectProfile};
+  if (alignment != 0) profiles.push_back(&StorageBoundsDevice4Profile);
+  if (alignment == 1) profiles.push_back(&StorageBoundsDevice1Profile);
+  if (alignment == 0) std::printf("[gpu]     StorageBounds device paths skipped (no robustBufferAccess2)\n");
+  for (const auto *profile : profiles) {
+    for (const u32 range : {18u, 2u}) RunCase(&vulkan, StorageBoundsDwordTail(range, profile));
+    for (const u32 range : {18u, 19u}) RunCase(&vulkan, StorageBoundsSubwordTail(range, profile));
+    RunCase(&vulkan, StorageBoundsFormattedTail(18, profile, false));
+    RunCase(&vulkan, StorageBoundsFormattedTail(18, profile, true));
+    RunCase(&vulkan, StorageBoundsSpirv(profile));
+  }
+  if (alignment != 0) CheckStorageBoundsVerify(vulkan);
 }
 
 TestCase CoherentBufferLoadDwordx2Bounds(u32 wave, u32 prefix) {
@@ -55587,11 +55906,21 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
-  // The legacy MAD rounding fixtures require separate rounding before the emitter caches its policy.
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  if (_putenv_s("KYTY_MAD_SEPARATE_ROUNDING", "1") != 0) return 1;
+  // The legacy MAD rounding fixtures expect the platform's default MAD form whatever the caller's
+  // environment, so pin it before the emitter caches its policy: fma(a, b, -0.0) + c on Apple,
+  // a NoContraction multiply and add elsewhere. --mad-f32-product-* check the Apple form anywhere.
+  const bool mad_product =
+      argc == 2 && (std::strcmp(argv[1], "--mad-f32-product-only") == 0 ||
+                    std::strcmp(argv[1], "--mad-f32-product-spirv-only") == 0);
+#if defined(__APPLE__)
+  const char *mad_rounding = "2";
 #else
-  if (setenv("KYTY_MAD_SEPARATE_ROUNDING", "1", 1) != 0) return 1;
+  const char *mad_rounding = mad_product ? "2" : "1";
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding) != 0) return 1;
+#else
+  if (setenv("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding, 1) != 0) return 1;
 #endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
@@ -56368,6 +56697,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferOffsetsUsePackedWords(true));
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-bounds-only") == 0) {
+    VulkanHarness vulkan;
+    RunStorageBoundsTests(vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
     VulkanHarness vulkan;
     for (const u32 wave : {32u, 64u}) {
@@ -56509,6 +56843,20 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMadF32RoundsProduct());
+    RunCase(&vulkan, VectorMadF32FlushesDenorms());
+    RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
+    RunCase(&vulkan, VectorFloatArithmeticOps());
+    return 0;
+  }
+  if (mad_product && std::strcmp(argv[1], "--mad-f32-product-spirv-only") == 0) {
+    auto test = WithRoundedProductMad(VectorMadF32RoundsProduct());
+    test.compile_only = true;
+    RunCase(nullptr, test);
+    return 0;
+  }
+  if (mad_product) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WithRoundedProductMad(VectorMadF32RoundsProduct()));
     RunCase(&vulkan, VectorMadF32FlushesDenorms());
     RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
     RunCase(&vulkan, VectorFloatArithmeticOps());
@@ -57031,6 +57379,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
+  RunStorageBoundsTests(vulkan);
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();

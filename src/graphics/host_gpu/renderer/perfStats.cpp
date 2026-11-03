@@ -207,6 +207,14 @@ void NotePresentedFrame() noexcept {
 	}
 }
 
+namespace {
+std::atomic<const volatile uint32_t*> g_bounds_counters {nullptr};
+} // namespace
+
+void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept {
+	g_bounds_counters.store(counters, std::memory_order_relaxed);
+}
+
 void MaybeReport() noexcept {
 	if (!Enabled()) {
 		return;
@@ -277,6 +285,11 @@ void MaybeReport() noexcept {
 		            walk.fault_reads, walk.protected_calls, static_cast<double>(walk.protected_ns) / 1e6,
 		            walk.protected_synced, walk.protected_evictions, walk.reuse_hits, walk.reuse_checks,
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
+	}
+	if (const auto* bounds = g_bounds_counters.load(std::memory_order_relaxed); bounds != nullptr) {
+		// Totals since launch; nonzero_loads must stay 0.
+		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
+		            bounds[0], bounds[1], bounds[2], bounds[3]);
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

@@ -284,7 +284,20 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		                       ConstantU32(state, shift));
 	}
 	// Keep the real backing handle valid, but discard every access, including 64-bit atomics.
-	if (state.program.info.buffers[mem.resource].null_fallback) access.length = ConstantU32(state, 0);
+	const auto& resource = state.program.info.buffers[mem.resource];
+	if (resource.null_fallback) {
+		access.length = ConstantU32(state, 0);
+		return access;
+	}
+	switch (state.profile.storage_bounds) {
+		case StorageBounds::Shader: break;
+		case StorageBounds::Select: access.bounds = AccessBounds::Select; break;
+		case StorageBounds::Device:
+			// Bindings with 8/16-bit views keep their exact range, which the device rounds up.
+			access.bounds = state.profile.storage_bounds_alignment == 1u || !resource.subword
+			                    ? AccessBounds::Device : AccessBounds::DeviceSelect;
+			break;
+	}
 	return access;
 }
 
@@ -342,6 +355,16 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 	const auto in_bounds = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), in_bounds, index, access.length);
 	return in_bounds;
+}
+
+void EmitStorageBoundsCount(EmitterState& state, StorageBoundsCounter counter) {
+	const auto address = state.profile.storage_bounds_verify_address + 4u * static_cast<uint32_t>(counter);
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+	                           ConstantU64(state, address));
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1));
 }
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
