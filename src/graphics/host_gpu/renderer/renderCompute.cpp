@@ -787,7 +787,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	upload_batch.emplace(m_context.GetBufferCache(), true);
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
-	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	upload_batch.reset();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

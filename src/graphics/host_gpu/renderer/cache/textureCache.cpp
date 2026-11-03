@@ -1342,9 +1342,6 @@ uint32_t TextureCache::FindImageMemoMode() noexcept {
 // rest (view offset, access tick, LRU touch, metadata clears, video-out check) still runs.
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMemo* memo) {
 	auto& command = m_scheduler.Current();
-	if (command.IsInvalid()) {
-		EXIT("TextureCache: image lookup requires a valid command buffer\n");
-	}
 	const auto memo_mode           = memo != nullptr ? FindImageMemoMode() : 0u;
 	const auto metadata_base_layer = desc.view_info.base_layer;
 

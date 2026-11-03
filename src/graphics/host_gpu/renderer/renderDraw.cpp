@@ -1182,9 +1182,6 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
-	for (uint32_t i = 0; i < prepared.count; i++) {
-		EXIT_IF(prepared.buffers[i] == nullptr);
-	}
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
 		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
@@ -1381,9 +1378,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
 	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+		PrepareBindings(state.ps_input_info.stage, bindings.pixel);
+		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
@@ -2025,9 +2021,6 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer) {
 	RenderColorInfo dst {};
 	ResolveRenderColorTarget(buffer, src, 0, true, true);
 	ResolveRenderColorTarget(buffer, dst, 1, true, true);
-	if (!src.image_id || !dst.image_id) {
-		return false;
-	}
 	if (src.desc.info.data.address == dst.desc.info.data.address &&
 	    src.guest_mip_level == dst.guest_mip_level &&
 	    src.guest_array_layer == dst.guest_array_layer) {
