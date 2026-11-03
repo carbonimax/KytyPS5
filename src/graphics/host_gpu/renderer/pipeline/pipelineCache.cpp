@@ -965,9 +965,7 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
-	if (m_driver_cache != nullptr) {
-		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 
 void PipelineCache::JoinWarmUp() {
@@ -1897,13 +1895,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 	EXIT_IF(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
-
-	if (ps_active && depth.depth_test_enable && ps_input_info.ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
-		}
-	}
 
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
