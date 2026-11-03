@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -294,6 +295,7 @@ void MaybeReport() noexcept {
 	EopAtGpu::Report(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
+	DispatchChain::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);
