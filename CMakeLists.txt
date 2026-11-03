@@ -495,6 +495,11 @@ add_executable(aliased_color_pass_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(aliased_color_pass_policy_tests PRIVATE ${inc_headers})
 
+add_executable(dispatch_chain_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DispatchChainPolicyTests.cpp"
+)
+target_include_directories(dispatch_chain_policy_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -749,6 +754,7 @@ if(BUILD_TESTING)
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
 	add_test(NAME srt_walk_reuse COMMAND ${CMAKE_COMMAND} -E env KYTY_SRT_WALK_REUSE=1 $<TARGET_FILE:resource_tracking_tests> --walk-reuse-only)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
+	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
 	add_test(NAME aliased_mrt_incompatible COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-incompatible-only)
@@ -889,6 +895,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		resource_tracking_tests
 		aliased_color_pass_policy_tests
+		dispatch_chain_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests
