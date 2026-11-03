@@ -87,8 +87,7 @@ struct VideoOutEventState;
 struct VideoOutEventRegistration {
 	EventQueue::KernelEqueue            handle = EventQueue::KERNEL_EQUEUE_INVALID;
 	std::shared_ptr<VideoOutEventState> state;
-	uint64_t                            generation = 0;
-	VideoOutEventKind                   kind       = VideoOutEventKind::Flip;
+	VideoOutEventKind                   kind = VideoOutEventKind::Flip;
 };
 
 using VideoOutEventRegistrationRef = std::shared_ptr<VideoOutEventRegistration>;
@@ -190,17 +189,15 @@ struct VideoOutConfig {
 	std::shared_ptr<VideoOutEventState> events      = std::make_shared<VideoOutEventState>();
 	uint32_t                            width       = 0;
 	uint32_t                            height      = 0;
-	uint64_t                            generation  = 0;
+	uint64_t                            generation  = 0; // Bumped on every open and close.
 	bool                                opened      = false;
-	bool                                closing     = false;
 	int                                 bus         = 0;
 	VideoOutConfig*                     master      = nullptr;
 	uint32_t                            slave_count = 0;
 	int                                 flip_rate   = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
-	float                               gamma       = 1.0f;
+	uint64_t                            pre_vblanks = 0;
 	VideoOutFlipStatus                  flip_status;
-	VideoOutVblankStatus                pre_vblank_status;
 	VideoOutVblankStatus                vblank_status;
 	std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX>                 buffers;
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
@@ -220,7 +217,7 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
-	bool Flip(uint32_t micros);
+	bool Flip();
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
 
@@ -245,13 +242,11 @@ private:
 
 	Graphics::Presenter& m_presenter;
 	Common::Mutex        m_mutex;
-	Common::CondVar      m_submit_cond_var;
 	Common::CondVar      m_submit_slot_cond_var;
 	Common::CondVar      m_done_cond_var;
 	std::list<Request>   m_requests;
 	std::list<Request>   m_cpu_requests;
 	std::list<Request>   m_cancelled_requests;
-	bool                 m_processing      = false;
 	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
 };
@@ -275,8 +270,6 @@ public:
 	int             Open(int bus_type, int index);
 	bool            Close(int handle);
 	VideoOutConfig* Get(int handle);
-	VideoOutConfig* Get(int handle, uint64_t& generation);
-	bool            IsOpened(int handle);
 	int             SetFlipMaster(int slave_handle, int master_handle);
 
 	void                     Init(uint32_t width, uint32_t height);
@@ -289,6 +282,10 @@ public:
 	void PresentThread(std::stop_token token);
 
 private:
+	[[nodiscard]] bool IsOpenedLocked(int handle) const {
+		return handle > 0 && handle < VIDEO_OUT_NUM_MAX && m_video_out_ctx[handle].opened;
+	}
+
 	Common::Mutex            m_mutex;
 	VideoOutConfig           m_video_out_ctx[VIDEO_OUT_NUM_MAX];
 	Graphics::RenderContext& m_renderer;
@@ -386,9 +383,6 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		queues = VideoOutEventQueuesFor(*video_out.events, kind);
 	}
 	for (const auto& registration: queues) {
-		if (!registration || registration->generation != video_out.generation) {
-			continue;
-		}
 		const auto result =
 		    EventQueue::KernelTriggerEvent(registration->handle, VideoOutEventId(kind),
 		                                   EventQueue::KERNEL_EVFILT_VIDEO_OUT, trigger_data);
@@ -399,9 +393,6 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 
 static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEventKind kind) {
 	for (const auto& registration: queues) {
-		if (!registration) {
-			continue;
-		}
 		const auto result = EventQueue::KernelDeleteEvent(
 		    registration->handle, VideoOutEventId(kind), EventQueue::KERNEL_EVFILT_VIDEO_OUT);
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
@@ -411,14 +402,13 @@ static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEven
 
 static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind,
                                  void* udata) {
-	uint64_t generation = 0;
-	auto*    video_out  = DriverState().Get(handle, generation);
+	auto* video_out = DriverState().Get(handle);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
 	Common::LockGuard lock(video_out->mutex);
-	if (!video_out->opened || video_out->closing || video_out->generation != generation) {
+	if (!video_out->opened) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (kind == VideoOutEventKind::OutputMode) {
@@ -455,14 +445,13 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 	{
 		Common::LockGuard event_lock(event_state->mutex);
 		const auto        existing =
-		    std::find_if(queues.begin(), queues.end(), [&](const auto& candidate) {
-			    return candidate->handle == eq && candidate->generation == generation;
-		    });
+		    std::find_if(queues.begin(), queues.end(),
+			             [eq](const auto& candidate) { return candidate->handle == eq; });
 		if (existing != queues.end()) {
 			registration = *existing;
 		} else {
-			registration = std::make_shared<VideoOutEventRegistration>(VideoOutEventRegistration {
-			    .handle = eq, .state = event_state, .generation = generation, .kind = kind});
+			registration = std::make_shared<VideoOutEventRegistration>(
+			    VideoOutEventRegistration {.handle = eq, .state = event_state, .kind = kind});
 			queues.push_back(registration);
 			add_queue = true;
 		}
@@ -481,13 +470,12 @@ static int RegisterVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoO
 }
 
 static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOutEventKind kind) {
-	uint64_t generation = 0;
-	auto*    video_out  = DriverState().Get(handle, generation);
+	auto* video_out = DriverState().Get(handle);
 	if (video_out == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	Common::LockGuard lock(video_out->mutex);
-	if (!video_out->opened || video_out->closing || video_out->generation != generation) {
+	if (!video_out->opened) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (!EventQueue::KernelPinEqueue(eq)) {
@@ -501,10 +489,7 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
-	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
-		return false;
-	}
+static bool IsFlipDueLocked(const VideoOutConfig& cfg) {
 	const int interval = cfg.flip_rate + 1;
 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
@@ -546,7 +531,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
 	}
 	// The headset port can flip before its reprojection buffers are registered; those show blank.
-	if (video_out->closing ||
+	if (!video_out->opened ||
 	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied() &&
 	     video_out->bus != VIDEO_OUT_BUS_TYPE_HMD2_MAIN)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
@@ -680,9 +665,8 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 		EXIT_IF(group.occupied);
 	}
 
-	config.closing = false;
-	config.opened  = true;
-	config.bus     = bus_type;
+	config.opened = true;
+	config.bus    = bus_type;
 	if (++config.generation == 0) {
 		EXIT("video-out port generation wrapped\n");
 	}
@@ -691,7 +675,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.flip_status.count         = 0;
-	config.pre_vblank_status         = VideoOutVblankStatus();
+	config.pre_vblanks               = 0;
 	config.vblank_status             = VideoOutVblankStatus();
 
 	return handle;
@@ -700,7 +684,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 bool VideoOutDriver::Impl::Close(int handle) {
 	Common::LockGuard lock(m_mutex);
 
-	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
+	if (!IsOpenedLocked(handle)) {
 		return false;
 	}
 
@@ -712,12 +696,8 @@ bool VideoOutDriver::Impl::Close(int handle) {
 	VideoOutConfig* master = nullptr;
 	{
 		Common::LockGuard config_lock(config.mutex);
-		if (config.closing) {
-			return false;
-		}
 		EXIT_IF(config.slave_count != 0);
-		config.opened  = false;
-		config.closing = true;
+		config.opened = false;
 		if (++config.generation == 0) {
 			EXIT("video-out port generation wrapped\n");
 		}
@@ -765,39 +745,13 @@ bool VideoOutDriver::Impl::Close(int handle) {
 
 VideoOutConfig* VideoOutDriver::Impl::Get(int handle) {
 	Common::LockGuard lock(m_mutex);
-	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
-		return nullptr;
-	}
 
-	return m_video_out_ctx + handle;
-}
-
-VideoOutConfig* VideoOutDriver::Impl::Get(int handle, uint64_t& generation) {
-	Common::LockGuard lock(m_mutex);
-	if (handle <= 0 || handle >= VIDEO_OUT_NUM_MAX || !m_video_out_ctx[handle].opened) {
-		return nullptr;
-	}
-
-	auto*             config = m_video_out_ctx + handle;
-	Common::LockGuard config_lock(config->mutex);
-	if (!config->opened || config->closing) {
-		return nullptr;
-	}
-	generation = config->generation;
-	return config;
-}
-
-bool VideoOutDriver::Impl::IsOpened(int handle) {
-	Common::LockGuard lock(m_mutex);
-
-	return handle > 0 && handle < VIDEO_OUT_NUM_MAX && m_video_out_ctx[handle].opened;
+	return IsOpenedLocked(handle) ? m_video_out_ctx + handle : nullptr;
 }
 
 int VideoOutDriver::Impl::SetFlipMaster(int slave_handle, int master_handle) {
 	Common::LockGuard lock(m_mutex);
-	if (slave_handle <= 0 || slave_handle >= VIDEO_OUT_NUM_MAX ||
-	    master_handle <= 0 || master_handle >= VIDEO_OUT_NUM_MAX ||
-	    !m_video_out_ctx[slave_handle].opened || !m_video_out_ctx[master_handle].opened) {
+	if (!IsOpenedLocked(slave_handle) || !IsOpenedLocked(master_handle)) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	auto& slave  = m_video_out_ctx[slave_handle];
@@ -825,13 +779,8 @@ void VideoOutDriver::Impl::VblankBegin() {
 		auto& ctx = m_video_out_ctx[i];
 		if (ctx.opened) {
 			ctx.mutex.Lock();
-			ctx.pre_vblank_status.count++;
-			ctx.pre_vblank_status.processTime        = LibKernel::KernelGetProcessTime();
-			ctx.pre_vblank_status.reserved           = LibKernel::KernelReadTsc();
-			ctx.pre_vblank_status.processTimeCounter = LibKernel::KernelGetProcessTimeCounter();
-
 			TriggerVideoOutEvents(ctx, VideoOutEventKind::PreVblankStart,
-			                      reinterpret_cast<void*>(ctx.pre_vblank_status.count));
+			                      reinterpret_cast<void*>(++ctx.pre_vblanks));
 			ctx.mutex.Unlock();
 		}
 	}
@@ -876,14 +825,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
 		const auto period  = std::chrono::nanoseconds(std::chrono::seconds(1)) / refresh;
 
-		if (m_presenter.IsGuestPaused()) {
-			(void)m_presenter.PresentLastFrame();
-			total_wait += period - (Clock::now() - frame_begin);
-			continue;
-		}
-
 		VblankBegin();
-		bool presented = m_flip_queue.Flip(0);
+		bool presented = m_flip_queue.Flip();
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (m_presenter.PresentLastFrame()) {
 				presented = true;
@@ -1004,9 +947,9 @@ FlipQueue::~FlipQueue() {
 void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	std::vector<Graphics::Presenter::Frame*> frames;
 	m_mutex.Lock();
-	while (m_processing && std::any_of(m_requests.begin(), m_requests.end(), [&cfg](const auto& r) {
-		       return r.cfg == &cfg && r.state == RequestState::Presenting;
-	       })) {
+	while (std::any_of(m_requests.begin(), m_requests.end(), [&cfg](const auto& r) {
+		return r.cfg == &cfg && r.state == RequestState::Presenting;
+	})) {
 		m_done_cond_var.Wait(&m_mutex);
 	}
 	for (auto* queue: {&m_requests, &m_cpu_requests}) {
@@ -1020,9 +963,6 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 				m_cancelled_requests.splice(m_cancelled_requests.end(), *queue, cancelled);
 				continue;
 			}
-			if (it->state == RequestState::Presenting) {
-				EXIT("video-out cancellation retained a presenting request\n");
-			}
 			if (it->frame != nullptr) {
 				frames.push_back(it->frame);
 			}
@@ -1031,7 +971,6 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 	}
 	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
-	m_submit_cond_var.SignalAll();
 	m_mutex.Unlock();
 	for (auto* frame: frames) {
 		m_presenter.Discard(*frame);
@@ -1085,7 +1024,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	bool                headset             = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
-		current = cfg->opened && !cfg->closing && cfg->generation == generation;
+		current = cfg->generation == generation;
 		headset = cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
 		special = special || (headset && !cfg->buffers[index].Occupied());
 		if (current && special) {
@@ -1163,7 +1102,6 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
-		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
 	}
@@ -1216,14 +1154,10 @@ bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
 	return safe;
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+bool FlipQueue::Flip() {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
-	if (m_requests.empty()) {
-		m_submit_cond_var.WaitFor(&m_mutex, micros);
-	}
-	EXIT_IF(m_processing);
 	const auto owner = std::find_if(m_requests.begin(), m_requests.end(),
 	                               [](const auto& r) { return r.group == r.id; });
 	if (owner == m_requests.end()) {
@@ -1248,7 +1182,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 			requests[count++] = request;
 		}
 	}
-	m_processing = true;
 	m_mutex.Unlock();
 
 	// Lock each port in bus order, then present and complete the whole group at one Vblank.
@@ -1261,9 +1194,9 @@ bool FlipQueue::Flip(uint32_t micros) {
 	for (size_t i = 0; i < count; i++) {
 		auto& r = requests[i];
 		r.cfg->mutex.Lock();
-		due &= r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation;
+		due &= r.cfg->generation == r.generation;
 		if (r.id == group) {
-			due &= IsFlipDueLocked(*r.cfg, r.generation);
+			due &= IsFlipDueLocked(*r.cfg);
 		}
 		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
 		    g_headset_mirror.load(std::memory_order_relaxed)) {
@@ -1309,7 +1242,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 		it = m_requests.erase(it);
 	}
-	m_processing = false;
 	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_mutex.Unlock();
@@ -1550,7 +1482,7 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	if (ctx->closing) {
+	if (!ctx->opened) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (ctx->groups[set_index].occupied) {
@@ -1597,7 +1529,7 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 
 	Common::LockGuard lock(ctx->mutex);
 	const auto&       current = ctx->groups[set_index];
-	if (ctx->closing || !current.occupied) {
+	if (!ctx->opened || !current.occupied) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
@@ -1628,7 +1560,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
-	if (ctx->closing) {
+	if (!ctx->opened) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (!ctx->groups[set_index].occupied) {
@@ -1881,7 +1813,7 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 }
 
 KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle) {
-	if (!DriverState().IsOpened(handle)) {
+	if (DriverState().Get(handle) == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	return OK;
@@ -1914,7 +1846,7 @@ KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
 
 static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options,
                                 void* reserved_ptr, uint64_t reserved) {
-	if (!DriverState().IsOpened(handle)) {
+	if (DriverState().Get(handle) == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
@@ -2059,19 +1991,7 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
 	}
 
-	if (!DriverState().IsOpened(handle)) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
-	auto* ctx = DriverState().Get(handle);
-	if (ctx == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-	ctx->mutex.Lock();
-	ctx->gamma = settings->gamma;
-	ctx->mutex.Unlock();
-
-	return OK;
+	return DriverState().Get(handle) == nullptr ? VIDEO_OUT_ERROR_INVALID_HANDLE : OK;
 }
 
 } // namespace Libs::VideoOut
