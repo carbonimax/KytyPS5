@@ -2096,8 +2096,14 @@ void TestNetCtlHostIpv4() {
 }
 #endif
 
+// Each instantiation must keep its own address: the NP layer rejects a callback pointer that is
+// already registered, and identical-code folding (/OPT:ICF in MSVC-style Release links) would
+// merge instantiations with the same body. The volatile store of Mode keeps the bodies distinct.
+inline volatile int g_last_np_state_mode = -1;
+
 template <int Mode>
 void KYTY_SYSV_ABI RecordNpState(int user_id, uint32_t state, void* arg) {
+  g_last_np_state_mode = Mode;
   auto& event = *static_cast<std::array<int, 3>*>(arg);
   ++event[0];
   event[1] = user_id;
