@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
-#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
@@ -22,20 +21,6 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
 
-void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
-                       uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
-                       uint32_t arg3, uint64_t arg4) {
-	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
-	     debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::printf("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
-	            " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
-	            debug_submit, arg0, arg1, arg2, arg3, arg4);
-	std::fflush(stdout);
-}
-
 // KYTY_CP_RECORD_THREAD with KYTY_CP_RECORD_SUBMIT: the main queue submission, run by the recorder
 // thread after the command buffer's recorded calls (CmdRecord::Call copies this record).
 struct DeferredSubmit {
@@ -43,10 +28,6 @@ struct DeferredSubmit {
 	vk::CommandBuffer buffer;
 	SubmitInfo        submit;
 	uint64_t          tick;
-	uint32_t          debug_op;
-	uint64_t          debug_submit_id;
-	uint32_t          debug_arg[4];
-	uint64_t          debug_arg4;
 
 	static void Run(void* data) {
 		auto& d = *static_cast<DeferredSubmit*>(data);
@@ -71,11 +52,9 @@ struct DeferredSubmit {
 			result = d.graphics->queue.submit(1, &submit_info, nullptr);
 		}
 		if (result != vk::Result::eSuccess) {
-			ReportVulkanFatal("vkQueueSubmit", result, d.tick, d.debug_op, d.debug_submit_id,
-			                  d.debug_arg[0], d.debug_arg[1], d.debug_arg[2], d.debug_arg[3],
-			                  d.debug_arg4);
+			EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(),
+			     d.tick);
 		}
-		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
 };
 static_assert(std::is_trivially_copyable_v<DeferredSubmit>);
@@ -582,17 +561,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
 		DeferredSubmit deferred {};
-		deferred.graphics        = &graphics;
-		deferred.buffer          = buffer;
-		deferred.submit          = submit;
-		deferred.tick            = tick;
-		deferred.debug_op        = m_command.m_debug_op;
-		deferred.debug_submit_id = m_command.m_debug_submit_id;
-		deferred.debug_arg[0]    = m_command.m_debug_arg0;
-		deferred.debug_arg[1]    = m_command.m_debug_arg1;
-		deferred.debug_arg[2]    = m_command.m_debug_arg2;
-		deferred.debug_arg[3]    = m_command.m_debug_arg3;
-		deferred.debug_arg4      = m_command.m_debug_arg4;
+		deferred.graphics = &graphics;
+		deferred.buffer   = buffer;
+		deferred.submit   = submit;
+		deferred.tick     = tick;
 		CmdRecord::Call(&DeferredSubmit::Run, &deferred, sizeof(deferred));
 		result = vk::Result::eSuccess;
 	} else {
@@ -627,12 +599,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	PerfStats::Add(PerfStats::Counter::Submits, 1);
 
 	if (result != vk::Result::eSuccess) {
-		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
-		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
-		                  m_command.m_debug_arg1, m_command.m_debug_arg2, m_command.m_debug_arg3,
-		                  m_command.m_debug_arg4);
+		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
 	return tick;
