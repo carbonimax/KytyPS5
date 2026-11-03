@@ -252,7 +252,7 @@ private:
 	// copied into the (coherent) staging memory only after them: at End, or before any
 	// submission. Begin returns false (nothing deferred) when the switch is off or staging is
 	// not coherent.
-	// KYTY_REPROTECT_BATCH=1 (default 0; 2 = 1 plus a read-back of the applied protections)
+	// KYTY_REPROTECT_BATCH=1 (default; 0 = off; 2 = 1 plus a read-back of the applied protections)
 	// extends that deferral to every read-only synchronization of the GPU threads (GPU thread and
 	// command-processor back thread), and keeps it open across synchronizations: the deferred
 	// re-protections and copies are applied before every submission (pre-submit) and at every

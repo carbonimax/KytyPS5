@@ -735,11 +735,12 @@ void BufferCache::RecordCollected(Buffer& buffer, std::vector<vk::BufferCopy> co
 	};
 }
 
-// KYTY_REPROTECT_BATCH: 0 (default) = off, 1 = on, 2 = on with checks; other values = off.
+// KYTY_REPROTECT_BATCH: 1 (default, also when unset) = on, 0 = off, 2 = on with checks; other
+// values = off.
 static int ReprotectBatchMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_REPROTECT_BATCH");
-		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 0;
+		const auto  v     = value != nullptr ? std::strtol(value, nullptr, 10) : 1;
 		return v == 1 || v == 2 ? static_cast<int>(v) : 0;
 	}();
 	return mode;
