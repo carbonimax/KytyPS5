@@ -24834,6 +24834,58 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+// Runs host-native V_MIN_F32/V_MAX_F32 with a signaling NaN operand, either loaded at run time or
+// as shader literals (which the driver compiler may fold): sNaN against 2.0, and a quiet NaN
+// (S0) against the sNaN. The emulated rules return 2.0 and S0. Vulkan lets any floating-point
+// instruction quiet a signaling NaN, and NMin/NMax of two NaNs may return either NaN ("Precision
+// and Operation of SPIR-V Instructions", GLSL.std.450), so a driver may differ here. Returns the
+// difference this device shows for this operand kind, or nullptr when it matches the emulated
+// rules; the matching sNaN expectations then do not apply to the native path.
+const char *ProbeNativeMinMaxSignalingNan(VulkanHarness *vulkan, const ShaderProfile *profile,
+                                          bool literal_operands) {
+  using O = ShaderOpcode;
+  constexpr u32 snan = 0x7fa00001u, two = 0x40000000u, qnan = 0x7fc01234u;
+  TestCase probe;
+  probe.name =
+      literal_operands ? "NativeMinMaxLiteralSnanProbe" : "NativeMinMaxRuntimeSnanProbe";
+  probe.profile = profile;
+  probe.initial = {snan, two, qnan, 0u, 0u, 0u, 0u};
+  probe.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_F32, O::V_MAX_F32,
+                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (literal_operands) {
+    std::erase(probe.opcodes, O::BUFFER_LOAD_DWORD);
+    for (u32 operand = 0; operand < 3; ++operand)
+      AppendVMovLiteral(&probe.code, operand, probe.initial[operand]);
+  } else {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&probe.code, 30, operand * 4u);
+      AppendBufferLoadDword(&probe.code, operand, 30);
+    }
+  }
+  probe.code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+  probe.code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+  probe.code.push_back(EncodeVop2(0x0f, 12, Vgpr(2), 0));
+  probe.code.push_back(EncodeVop2(0x10, 13, Vgpr(2), 0));
+  for (u32 result = 0; result < 4; ++result) AppendStoreVgpr(&probe.code, 10 + result, 3 + result);
+  AppendEnd(&probe.code);
+  auto compiled = CompileCase(probe, vulkan->SubgroupSize());
+  auto buffer = vulkan->CreateStorageBuffer(probe.name, probe.initial, probe.initial.size());
+  vulkan->Dispatch(probe, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr);
+  const auto actual = vulkan->ReadBuffer(probe.name, buffer, probe.initial.size());
+  vulkan->DestroyBuffer(&buffer);
+  const char *difference = nullptr;
+  if (actual[3] != two || actual[4] != two) {
+    difference = "a signaling NaN against a number returns a NaN";
+  } else if (actual[5] != qnan || actual[6] != qnan) {
+    difference = "a quiet NaN against a signaling NaN returns the signaling NaN";
+  }
+  std::printf("[host]    %-32s min(sNaN,2)=0x%08x max(sNaN,2)=0x%08x min(qNaN,sNaN)=0x%08x "
+              "max(qNaN,sNaN)=0x%08x (%s)\n",
+              probe.name, actual[3], actual[4], actual[5], actual[6],
+              difference != nullptr ? difference : "matches the emulated rules");
+  return difference;
+}
+
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
     vulkan->SkipRasterizationCases(1);
@@ -31991,7 +32043,9 @@ TestCase VectorFloatArithmeticOps() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
+// signaling_nan = false drops the two outputs fed by a signaling NaN (see
+// ProbeNativeMinMaxSignalingNan).
+TestCase VectorMinMaxF32NanAndSignedZeroEdges(bool signaling_nan = true) {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -32012,16 +32066,22 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
   AppendVop3(&code, 0x151, 16, Vgpr(0), Vgpr(1), Vgpr(4));
   AppendVop3(&code, 0x154, 17, Vgpr(0), Vgpr(1), Vgpr(5));
 
-  for (u32 i = 0; i < 8; i++) {
-    AppendStoreVgpr(&code, 10 + i, i);
+  std::vector<u32> outputs = {10, 11, 12, 13, 14, 15, 16, 17};
+  std::vector<u32> expected = {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u,
+                               0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u};
+  if (!signaling_nan) {
+    outputs.erase(outputs.begin() + 4, outputs.begin() + 6);
+    expected.erase(expected.begin() + 4, expected.begin() + 6);
+  }
+  for (u32 i = 0; i < static_cast<u32>(outputs.size()); i++) {
+    AppendStoreVgpr(&code, outputs[i], i);
   }
   AppendEnd(&code);
 
   return {"VectorMinMaxF32NanAndSignedZeroEdges",
           code,
           {},
-          {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x40000000u,
-           0x40000000u, 0x40000000u, 0x40000000u},
+          expected,
           {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32,
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -32030,7 +32090,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
 // the emulated rules: a NaN operand yields the other (S0 for two NaNs) and signed zeros are
 // ordered.
 // Denormal operands are left out; their expected results are not pinned down here.
-TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
+// signaling_nan = false drops the rows with a signaling NaN operand.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave, bool signaling_nan = true) {
   using O = ShaderOpcode;
   const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
   const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
@@ -32055,6 +32116,12 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
       {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
       {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u},
       {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u}};
+  const auto signaling = [&](u32 v) { return nan(v) && (v & 0x00400000u) == 0u; };
+  std::vector<std::array<u32, 3>> rows;
+  for (const auto &values : cases) {
+    if (signaling_nan || std::ranges::none_of(values, signaling))
+      rows.push_back({values[0], values[1], values[2]});
+  }
   TestCase test;
   test.name = "VectorMinMaxF32RuntimeEdges";
   test.has_compute_info = true;
@@ -32062,16 +32129,16 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
   test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
       test.compute_info.threads_num[2] = 1u;
-  for (const auto &values : cases)
-    test.initial.insert(test.initial.end(), values, values + 3);
+  for (const auto &values : rows)
+    test.initial.insert(test.initial.end(), values.begin(), values.end());
   test.expected = test.initial;
   auto &code = test.code;
-  for (u32 index = 0; index < std::size(cases); ++index) {
+  for (u32 index = 0; index < static_cast<u32>(rows.size()); ++index) {
     for (u32 operand = 0; operand < 3; ++operand) {
       AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
       AppendBufferLoadDword(&code, operand, 30);
     }
-    const auto [a, b, c] = cases[index];
+    const auto [a, b, c] = rows[index];
     code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
     code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
     AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
@@ -49470,7 +49537,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3Int16Ops);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
-  AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
+  cases.push_back(VectorMinMaxF32NanAndSignedZeroEdges());
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
   cases.push_back(VectorMinMaxF32RuntimeEdges(32));
@@ -55783,10 +55850,29 @@ int main(int argc, char **argv) {
                                                   .native_float_min_max = true};
     VulkanHarness vulkan;
     const bool supported = vulkan.SupportsNativeFloatMinMax();
+    // The emulated path always checks signaling NaNs. The native path skips only the sNaN
+    // expectations of the operand kind (literal or runtime) where the probe sees the device
+    // differ from the emulated rules in a way Vulkan allows.
+    const auto native_snan = [&](bool literal_operands) {
+      if (!supported) return true;
+      const char *difference =
+          ProbeNativeMinMaxSignalingNan(&vulkan, &native_profile, literal_operands);
+      if (difference == nullptr) return true;
+      std::printf("[compute] %-32s skipped (native NMin/NMax with %s signaling NaNs: %s, which "
+                  "Vulkan allows)\n",
+                  literal_operands ? "LiteralSnanMinMax" : "RuntimeSnanMinMax",
+                  literal_operands ? "literal" : "runtime", difference);
+      return false;
+    };
+    const bool native_literal_snan = native_snan(true);
+    const bool native_runtime_snan = native_snan(false);
     for (bool native : {false, true}) {
+      const bool literal_snan = !native || native_literal_snan;
+      const bool runtime_snan = !native || native_runtime_snan;
       for (auto test :
-           {VectorMinMaxF32NanAndSignedZeroEdges(),
-            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+           {VectorMinMaxF32NanAndSignedZeroEdges(literal_snan),
+            VectorMinMaxF32RuntimeEdges(32, runtime_snan),
+            VectorMinMaxF32RuntimeEdges(64, runtime_snan)}) {
         auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
         test.profile = native ? &native_profile : &Maintenance8Profile;
