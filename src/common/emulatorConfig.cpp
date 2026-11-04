@@ -155,10 +155,6 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
-ShaderOptimizationType GetShaderOptimizationType() {
-	return g_config->shader_optimization_type;
-}
-
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
