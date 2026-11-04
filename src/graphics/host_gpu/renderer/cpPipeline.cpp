@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <atomic>
@@ -126,6 +127,7 @@ void BackThread() {
 	// The back part runs GPU-thread code paths (caches, recording, inline fault resolution).
 	GuestGpu::MarkHostGpuThread();
 	PerfStats::MarkGpuThread();
+	GpuIdleTrace::SetThreadName("back");
 	auto& s = S();
 	for (;;) {
 		const auto tail = s.tail.load(std::memory_order_relaxed);
@@ -144,7 +146,10 @@ void BackThread() {
 			}
 		}
 		const auto start = NowNs();
-		s.execute(s.context, Slot(tail));
+		{
+			GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::BackBusy);
+			s.execute(s.context, Slot(tail));
+		}
 		s.back_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
 		s.tail.store(tail + 1, std::memory_order_seq_cst);
 		NotifyFront();
@@ -200,7 +205,9 @@ bool BackIdle() noexcept {
 void Drain() noexcept {
 	if (!FrontActive() || S().slots == nullptr) return;
 	auto& s = S();
+	uint64_t trace_start = 0;
 	if (s.tail.load(std::memory_order_acquire) != s.head.load(std::memory_order_relaxed)) {
+		if (GpuIdleTrace::On()) trace_start = GpuIdleTrace::NowUs();
 		const auto start = NowNs();
 		FrontWait([&] {
 			if (s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_relaxed)) {
@@ -218,6 +225,7 @@ void Drain() noexcept {
 		// Parked on a request this lookup cannot serve: it touches nothing until served.
 		return t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr;
 	});
+	if (trace_start != 0) GpuIdleTrace::Span(GpuIdleTrace::Tag::Drain, trace_start, GpuIdleTrace::NowUs());
 	if (!t_in_lookup) ApplyFeedback();
 }
 

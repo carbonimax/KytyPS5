@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
@@ -105,6 +106,27 @@ void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) n
 
 uint64_t SteadyUs() noexcept {
 	return NowUs();
+}
+
+void TraceTimer(Counter time, std::chrono::steady_clock::time_point start,
+                std::chrono::steady_clock::time_point end) noexcept {
+	if (!GpuIdleTrace::On()) return;
+	using GpuIdleTrace::Tag;
+	Tag tag {};
+	switch (time) {
+		case Counter::GpuBusyNs: tag = Tag::Busy; break;
+		case Counter::RecompileNs: tag = Tag::Translate; break;
+		case Counter::GfxPipelineNs: tag = Tag::GfxPipeline; break;
+		case Counter::CsPipelineNs: tag = Tag::CsPipeline; break;
+		case Counter::WaitGpuThreadNs: tag = Tag::WaitGpu; break;
+		case Counter::WaitOtherNs: tag = Tag::WaitOther; break;
+		case Counter::SideReadNs: tag = Tag::SideRead; break;
+		default: return;
+	}
+	const auto us = [](std::chrono::steady_clock::time_point t) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(t - g_epoch).count());
+	};
+	GpuIdleTrace::Span(tag, us(start), us(end));
 }
 
 namespace {

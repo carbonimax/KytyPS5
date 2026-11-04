@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -789,6 +790,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	PerfStats::MarkGpuThread();
+	GpuIdleTrace::SetThreadName("cp");
 
 	for (;;) {
 		Submission                   submission;
@@ -800,6 +802,7 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				GpuIdleTrace::Scope idle(GpuIdleTrace::Tag::IdleEmpty);
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -824,6 +827,7 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
+						GpuIdleTrace::Scope idle(GpuIdleTrace::Tag::IdleBlocked);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					}
 					for (auto& queue: gpu->m_queues) {
@@ -855,6 +859,7 @@ void GuestGpu::ThreadRun(void* data) {
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
 				CpSplitProf::BusyBegin();
 				CpPipeline::Drain();
+				GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::Command);
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -1863,6 +1868,7 @@ bool GuestGpu::IsGpuThread() noexcept {
 void GuestGpu::FlushBatchedUploads() {
 	static const bool enabled = BufferCache::ReprotectBatchEnabled();
 	if (enabled) {
+		GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::Reprotect);
 		m_renderer.GetBufferCache().FlushBatchedUploads();
 	}
 }

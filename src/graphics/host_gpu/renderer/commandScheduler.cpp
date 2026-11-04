@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
@@ -69,6 +70,8 @@ struct DeferredSubmit {
 		{
 			Common::LockGuard lock(d.graphics->queue_mutex);
 			result = d.graphics->queue.submit(1, &submit_info, nullptr);
+			GpuIdleTrace::NoteSubmit(d.graphics->device, d.submit.signal_semaphores[d.submit.num_signal_semaphores - 1],
+			                         d.tick, d.submit.num_wait_semaphores);
 		}
 		if (result != vk::Result::eSuccess) {
 			ReportVulkanFatal("vkQueueSubmit", result, d.tick, d.debug_op, d.debug_submit_id,
@@ -594,6 +597,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		deferred.debug_arg[3]    = m_command.m_debug_arg3;
 		deferred.debug_arg4      = m_command.m_debug_arg4;
 		CmdRecord::Call(&DeferredSubmit::Run, &deferred, sizeof(deferred));
+		GpuIdleTrace::NoteQueued(tick);
 		result = vk::Result::eSuccess;
 	} else {
 		CmdRecord::Drain(); // End may be queued; wait before taking the queue lock.
@@ -618,6 +622,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, fence);
+		GpuIdleTrace::NoteSubmit(graphics.device, m_master.Handle(), tick, submit.num_wait_semaphores);
 		if (fence != nullptr && result == vk::Result::eSuccess) {
 			std::lock_guard fences(m_fence_mutex);
 			m_submitted_fences.push_back({tick, fence});

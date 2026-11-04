@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
@@ -177,6 +178,7 @@ uint64_t Replay(uint64_t from, uint64_t to) {
 }
 
 void RecorderThread() {
+	GpuIdleTrace::SetThreadName("rec");
 	uint64_t read = 0;
 	for (;;) {
 		uint64_t write = g_write.load(std::memory_order_acquire);
@@ -211,6 +213,7 @@ void RecorderThread() {
 			}
 		}
 		const auto t0 = Ticks();
+		GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::RecBusy);
 		read          = Replay(read, write);
 		g_read.store(read, std::memory_order_release);
 		g_rec_busy_ticks.fetch_add(Ticks() - t0, std::memory_order_relaxed);
