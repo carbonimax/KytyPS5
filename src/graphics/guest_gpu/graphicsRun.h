@@ -66,6 +66,9 @@ private:
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
+		// KYTY_CP_LABEL_PROF: guest enqueue and first-slice times (0 when the profile is off).
+		uint64_t prof_enqueue_ns = 0;
+		uint64_t prof_start_ns   = 0;
 	};
 
 	void              Enqueue(Submission submission);

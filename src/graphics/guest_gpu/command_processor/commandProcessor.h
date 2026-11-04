@@ -122,7 +122,8 @@ public:
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
 private:
-	void WriteEopLabel(void* dst, const void* data, uint64_t size);
+	// Returns true when the label went through the GPU-owned path.
+	bool WriteEopLabel(void* dst, const void* data, uint64_t size);
 	void ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* address, uint64_t data,
 	                     uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);

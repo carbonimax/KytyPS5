@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/guest_gpu/cpLabelProf.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -213,6 +214,9 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	if (CpLabelProf::Enabled()) {
+		CpLabelProf::InterruptDelivered(event_id);
+	}
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

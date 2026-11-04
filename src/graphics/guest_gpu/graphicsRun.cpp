@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/cpLabelProf.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
@@ -632,8 +633,16 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	const auto value        = ReadFrontValue<T>(addr, &from_pending);
 	if (!TestWaitRegMemValue(value, ref, mask, func)) {
 		SuspendPm4();
-	} else if (from_pending && EopAtGpuMode() == 1 && !TestWaitRegMemValue(*addr, ref, mask, func)) {
-		g_eop_stats.front_passes.fetch_add(1, std::memory_order_relaxed);
+		if (CpLabelProf::Enabled()) {
+			CpLabelProf::WaitBlocked(addr);
+		}
+	} else {
+		if (from_pending && EopAtGpuMode() == 1 && !TestWaitRegMemValue(*addr, ref, mask, func)) {
+			g_eop_stats.front_passes.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (CpLabelProf::Enabled()) {
+			CpLabelProf::WaitPassed(addr, ref, mask, func);
+		}
 	}
 }
 
@@ -669,6 +678,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// KYTY_CP_LABEL_PROF: writes of one or two dwords are label candidates.
+	const auto prof_label = [&](CpLabelProf::Path path) {
+		if (dw_num > 2 && !write_one_address) {
+			return;
+		}
+		const bool two   = !write_one_address && dw_num == 2;
+		const auto value = two ? (uint64_t {src[0]} | (uint64_t {src[1]} << 32u)) : uint64_t {src[dw_num - 1]};
+		CpLabelProf::Label(CpLabelProf::Kind::WriteData, dst, two ? 8u : 4u, value, path);
+	};
+
 	// Destinations whose bytes the GPU owns: write through the command stream.
 	{
 		const auto address = reinterpret_cast<uint64_t>(dst);
@@ -677,6 +696,9 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		if (m_renderer.GetBufferCache().WriteGpuOwned(
 		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
 			m_renderer.GetTextureCache().InvalidateMemory(address, bytes);
+			if (CpLabelProf::Enabled()) {
+				prof_label(CpLabelProf::Path::GpuOwned);
+			}
 			return;
 		}
 	}
@@ -686,6 +708,9 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
+	}
+	if (CpLabelProf::Enabled()) {
+		prof_label(CpLabelProf::Path::CpuStore);
 	}
 }
 
@@ -762,6 +787,9 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	if (CpLabelProf::Enabled()) {
+		submission.prof_enqueue_ns = CpLabelProf::NowNs();
+	}
 	if (submission.type == SubmissionType::Compute && submission.queue_id - 1 < 64 &&
 	    ((ComputePreemptMask() >> (submission.queue_id - 1)) & 1u) != 0) {
 		m_compute_enqueued.fetch_add(1, std::memory_order_release);
@@ -799,7 +827,13 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				if (CpLabelProf::Enabled()) {
+					CpLabelProf::IdleBegin(0);
+				}
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				if (CpLabelProf::Enabled()) {
+					CpLabelProf::IdleEnd(0);
+				}
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -823,7 +857,13 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
+						if (CpLabelProf::Enabled()) {
+							CpLabelProf::IdleBegin(0);
+						}
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						if (CpLabelProf::Enabled()) {
+							CpLabelProf::IdleEnd(0);
+						}
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -906,6 +946,26 @@ bool GuestGpu::Process(Submission& submission) {
 		submission.started = true;
 		cp.SetSubmitId(++m_submit_id);
 	}
+	// KYTY_CP_LABEL_PROF: the packets of this slice belong to this ring and submission.
+	struct ProfSlice {
+		ProfSlice(Submission& s, bool first) {
+			on = CpLabelProf::Enabled();
+			if (on) {
+				if (first) {
+					s.prof_start_ns = CpLabelProf::NowNs();
+				}
+				CpLabelProf::SliceBegin(s.queue_id, s.prof_enqueue_ns, s.prof_start_ns);
+			}
+		}
+		~ProfSlice() {
+			if (on) {
+				CpLabelProf::SliceEnd();
+			}
+		}
+		ProfSlice(const ProfSlice&)            = delete;
+		ProfSlice& operator=(const ProfSlice&) = delete;
+		bool on                                = false;
+	} prof_slice(submission, first_slice);
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
@@ -942,6 +1002,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			if (CpLabelProf::Enabled()) {
+				CpLabelProf::Frame();
+			}
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -1463,14 +1526,15 @@ static bool GpuOwnedEopLabelEnabled() {
 	return enabled;
 }
 
-void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size) {
+bool CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size) {
 	const auto address = reinterpret_cast<uint64_t>(dst);
 	if (GpuOwnedEopLabelEnabled() &&
 	    m_renderer.GetBufferCache().WriteGpuOwned(address, data, size)) {
 		m_renderer.GetTextureCache().InvalidateMemory(address, size);
-		return;
+		return true;
 	}
 	std::memcpy(dst, data, size);
+	return false;
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -1509,18 +1573,19 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	uint32_t label_size = 0;
+	bool     gpu_owned  = false;
 	switch (data_sel) {
 		case 0: break;
 		case 1: {
 			const auto value = static_cast<uint32_t>(data);
-			WriteEopLabel(address, &value, sizeof(value));
-			label_size = sizeof(value);
-			data       = value;
+			gpu_owned        = WriteEopLabel(address, &value, sizeof(value));
+			label_size       = sizeof(value);
+			data             = value;
 			break;
 		}
 		case 3: data = Sync::ReadReferenceClock(); [[fallthrough]];
 		case 2:
-			WriteEopLabel(address, &data, sizeof(data));
+			gpu_owned  = WriteEopLabel(address, &data, sizeof(data));
 			label_size = sizeof(data);
 			break;
 		case 5: {
@@ -1531,6 +1596,15 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 			break;
 		}
 		default: EXIT("unknown release_mem data selector: %" PRIu32 "\n", data_sel);
+	}
+	if (CpLabelProf::Enabled()) {
+		if (label_size != 0) {
+			CpLabelProf::Label(CpLabelProf::Kind::ReleaseMem, address, label_size, data,
+			                   gpu_owned ? CpLabelProf::Path::GpuOwned : CpLabelProf::Path::CpuStore);
+		}
+		if (interrupt) {
+			CpLabelProf::InterruptPacket(m_interrupt_event_id);
+		}
 	}
 
 	if (eop_mode == 2) {
@@ -1639,6 +1713,15 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 			deferred = true;
 		}
 	}
+	if (CpLabelProf::Enabled()) {
+		if (label_size != 0) {
+			CpLabelProf::Label(CpLabelProf::Kind::ReleaseMem, address, label_size, value,
+			                   deferred ? CpLabelProf::Path::Deferred : CpLabelProf::Path::GpuOwned);
+		}
+		if (interrupt) {
+			CpLabelProf::InterruptPacket(m_interrupt_event_id);
+		}
+	}
 	if (!deferred && !interrupt) {
 		return;
 	}
@@ -1704,6 +1787,9 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 			st.deferred.fetch_add(1, std::memory_order_relaxed);
 			st.checked.fetch_add(1, std::memory_order_relaxed);
 			NoteLatency(released_ns);
+			if (CpLabelProf::Enabled()) {
+				CpLabelProf::LabelDelivered(address_value);
+			}
 		}
 		if (interrupt) {
 			st.interrupts.fetch_add(1, std::memory_order_relaxed);

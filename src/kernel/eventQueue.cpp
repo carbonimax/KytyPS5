@@ -1,5 +1,6 @@
 #include "kernel/eventQueue.h"
 #include "kernel/syncTrace.h"
+#include "graphics/guest_gpu/cpLabelProf.h"
 
 #include <optional>
 
@@ -187,14 +188,28 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	Common::Timer t;
 	t.Start();
 	std::optional<SyncTrace::Wait> trace;
+	// KYTY_CP_LABEL_PROF: guest CPU waits that return a graphics interrupt.
+	const bool prof       = ::Libs::Graphics::CpLabelProf::Enabled();
+	const auto prof_start = prof ? ::Libs::Graphics::CpLabelProf::NowNs() : 0;
+	bool       prof_slept = false;
 
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
 
 		if (ret != 0 || (elapsed >= micros && micros != 0)) {
 			if (trace && ret == 0) trace->SetResult(1);
+			if (prof && ret > 0) {
+				for (int i = 0; i < ret; i++) {
+					if (ev[i].filter == KERNEL_EVFILT_GRAPHICS) {
+						::Libs::Graphics::CpLabelProf::CpuWaitDone(static_cast<uint64_t>(ev[i].ident), prof_start,
+						                                   prof_slept);
+						break;
+					}
+				}
+			}
 			return ret;
 		}
+		prof_slept = true;
 		if (!trace && SyncTrace::Enabled()) {
 			trace.emplace(SyncTrace::Kind::Equeue, this, m_name.c_str(), 0,
 			              micros == 0 ? -1 : static_cast<int64_t>(micros));
