@@ -108,6 +108,20 @@ static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
 }
 
+// POSIX reports ENOTDIR when a path walks through a file ("file/child"); Windows reports
+// ERROR_PATH_NOT_FOUND, which std::filesystem maps to no_such_file_or_directory.
+static bool HasNonDirectoryAncestor(const std::filesystem::path& path) {
+	for (auto parent = path.parent_path(); !parent.empty() && parent != parent.parent_path();
+	     parent = parent.parent_path()) {
+		std::error_code error;
+		const auto      status = std::filesystem::status(parent, error);
+		if (!error && std::filesystem::exists(status)) {
+			return !std::filesystem::is_directory(status);
+		}
+	}
+	return false;
+}
+
 static void FillRandomBuffer(void* buf, size_t nbytes) {
 	auto*              out = reinterpret_cast<uint8_t*>(buf);
 	std::random_device random;
@@ -1282,7 +1296,7 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 	const auto      status = std::filesystem::status(real_name, error);
 	if (!error) {
 		if (!std::filesystem::exists(status)) {
-			return KERNEL_ERROR_ENOENT;
+			return HasNonDirectoryAncestor(real_name) ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
 		}
 		if (std::filesystem::is_directory(status)) {
 			return KERNEL_ERROR_EISDIR;
@@ -1290,6 +1304,10 @@ int KYTY_SYSV_ABI KernelTruncate(const char* path, int64_t length) {
 		if (std::filesystem::is_regular_file(status)) {
 			std::filesystem::resize_file(real_name, static_cast<uint64_t>(length), error);
 		}
+	} else if (static_cast<std::errc>(error.default_error_condition().value()) ==
+	               std::errc::no_such_file_or_directory &&
+	           HasNonDirectoryAncestor(real_name)) {
+		return KERNEL_ERROR_ENOTDIR;
 	}
 	if (error) {
 		switch (static_cast<std::errc>(error.default_error_condition().value())) {

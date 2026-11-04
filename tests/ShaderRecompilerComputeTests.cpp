@@ -2536,6 +2536,25 @@ public:
     return properties.vendorID == 0x1002u;
   }
 
+  // Host format of a 16-bit guest depth with stencil, chosen like production
+  // (ResolveHostDepthAttachmentFormat): the first stencil candidate the device supports as a
+  // depth target with this sample count. D24S8 is absent on some devices (AMD, Apple).
+  [[nodiscard]] vk::Format HostD16StencilFormat(u32 samples = 1) const {
+    const auto *policy = FindDepthFormatPolicy(Prospero::DepthFormat::kZ16);
+    for (const auto format : policy->stencil_attachment_formats) {
+      vk::ImageFormatProperties properties{};
+      if (format != vk::Format::eUndefined &&
+          m_physical_device.getImageFormatProperties(
+              format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
+              {}, &properties) == vk::Result::eSuccess &&
+          static_cast<bool>(properties.sampleCounts & vulkan_sample_count(samples))) {
+        return format;
+      }
+    }
+    Fail("VulkanHarness", "depth/stencil format",
+         "prerequisite missing: no D16/D24/D32 stencil format supports depth-target usage");
+  }
+
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
 
@@ -4736,7 +4755,7 @@ public:
             "unified depth view cache lost sampled/attachment identity");
 
     auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
+    depth_stencil_info.pixel_format = HostD16StencilFormat();
     depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
     depth_stencil_info.bytes_per_block = 2;
     Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
@@ -8045,12 +8064,12 @@ public:
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
-      ms_depth_desc.info.pixel_format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.info.pixel_format = HostD16StencilFormat(2);
       ms_depth_desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
       ms_depth_desc.info.bytes_per_block = 2;
       ms_depth_desc.info.samples = 2;
       ms_depth_desc.info.type = Prospero::ImageType::kColor2D;
-      ms_depth_desc.view_info.format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.view_info.format = ms_depth_desc.info.pixel_format;
       ms_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       ms_depth_desc.view_info.usage =
@@ -10570,7 +10589,7 @@ public:
       std::memset(memory + d16_fallback_stencil_offset, 0x6d, 4);
       auto d16_depth_desc = MakeLinearDesc(
           base + d16_fallback_offset, sizeof(d16_fallback_values),
-          vk::Format::eD24UnormS8Uint, Prospero::BufferFormat::k16UNorm,
+          HostD16StencilFormat(), Prospero::BufferFormat::k16UNorm,
           Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2, 1);
       d16_depth_desc.type = BindingType::DepthTarget;
       d16_depth_desc.info.stencil = {base + d16_fallback_stencil_offset, 4};
@@ -10656,12 +10675,27 @@ public:
       const auto d16_restenciled_words =
           read_texels(d16_restenciled_image, vk::ImageAspectFlagBits::eDepth);
       bool d16_promoted = d16_restenciled_image != d16_native_image;
-      for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
-        d16_promoted &= (d16_restenciled_words[i] & 0x00ffffffu) ==
-                        EncodeD16AsD24(d16_fallback_values[i]);
+      // The depth encoding follows the stencil format the device provides: D16S8 keeps the
+      // 16-bit values (two texels per readback word), D24S8 and D32S8 promote them.
+      const auto d16_restenciled_format =
+          texture_cache.GetImage(d16_restenciled_image).backing.format;
+      if (d16_restenciled_format == vk::Format::eD16UnormS8Uint) {
+        d16_promoted &= std::memcmp(d16_restenciled_words.data(), d16_fallback_values.data(),
+                                    sizeof(d16_fallback_values)) == 0;
+      } else {
+        const bool d16_promoted_to_d32 = d16_restenciled_format == vk::Format::eD32SfloatS8Uint;
+        for (size_t i = 0; i < d16_fallback_values.size(); ++i) {
+          d16_promoted &= d16_promoted_to_d32
+                              ? d16_restenciled_words[i] == EncodeD16AsD32(d16_fallback_values[i])
+                              : (d16_restenciled_words[i] & 0x00ffffffu) ==
+                                    EncodeD16AsD24(d16_fallback_values[i]);
+        }
       }
-      Require(name, "D16 native depth/fallback depth copy", d16_promoted,
-              "D16 depth lost its values when its target regained the stencil");
+      std::string d16_promoted_detail =
+          "D16 depth lost its values when its target regained the stencil: format " +
+          vk::to_string(texture_cache.GetImage(d16_restenciled_image).backing.format) + " words";
+      for (const auto word : d16_restenciled_words) d16_promoted_detail += " " + Hex(word);
+      Require(name, "D16 native depth/fallback depth copy", d16_promoted, d16_promoted_detail);
 
       if (!texture_cache.GetImage(combined_destination_image).IsGpuModified()) {
         texture_cache.MarkGpuWritten(combined_destination_image);
@@ -20313,7 +20347,12 @@ public:
       state.vertex_info[0].stage.module = &vertex_shader;
       state.ps_input_info.stage.handle = &pixel_shader.handle;
       state.ps_input_info.stage.module = &pixel_shader;
-      return context.GetPipelineCache().GetGraphicsPipeline(scheduler.Current(), state);
+      // Without the dynamic loop state, the feedback loop is baked into the pipeline, as in
+      // RenderExecutor's draw path.
+      const bool baked_feedback = !m_feedback_loop_dynamic && depth_feedback &&
+                                  depth.depth_write_enable;
+      return context.GetPipelineCache().GetGraphicsPipeline(
+          scheduler.Current(), state, {state.color_info, state.color_count}, baked_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
@@ -20383,7 +20422,9 @@ public:
       }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      if (m_feedback_loop_dynamic) {
+        cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
+      }
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -23955,6 +23996,9 @@ public:
 private:
   Mode m_mode = Mode::Full;
   bool m_rasterization_supported = true;
+  // VK_EXT_attachment_feedback_loop_dynamic_state is optional in production as well: without it
+  // the depth feedback loop is a pipeline property instead of per-draw state.
+  bool m_feedback_loop_dynamic = false;
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
@@ -24017,6 +24061,7 @@ private:
       Require("ImageMinLodFallback", "subgroup", m_runtime_context.subgroup_size == 32 || m_runtime_context.subgroup_size == 64, "missing GPU qualification: production bindings require a 32- or 64-lane subgroup");
     }
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.attachment_feedback_loop_dynamic = m_feedback_loop_dynamic;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
@@ -24286,22 +24331,35 @@ private:
               available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     }
-    m_rasterization_supported = full && available_features.fillModeNonSolid &&
-                                available_features.tessellationShader &&
-                                available_features.drawIndirectFirstInstance &&
-                                available_features.multiDrawIndirect &&
-                                available_features.depthBounds &&
-                                available_features.fragmentStoresAndAtomics &&
-                                available_depth_clip.depthClipEnable &&
-                                available_clip_control.depthClipControl &&
-                                available_color_write.colorWriteEnable &&
-                                available_feedback_layout.attachmentFeedbackLoopLayout &&
-                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
-                                available_provoking_vertex.provokingVertexLast;
-    if (!m_rasterization_supported) {
+    const std::pair<const char *, bool> rasterization_prerequisites[] = {
+        {"fillModeNonSolid", available_features.fillModeNonSolid},
+        {"tessellationShader", available_features.tessellationShader},
+        {"drawIndirectFirstInstance", available_features.drawIndirectFirstInstance},
+        {"multiDrawIndirect", available_features.multiDrawIndirect},
+        {"depthBounds", available_features.depthBounds},
+        {"fragmentStoresAndAtomics", available_features.fragmentStoresAndAtomics},
+        {"depthClipEnable", available_depth_clip.depthClipEnable},
+        {"depthClipControl", available_clip_control.depthClipControl},
+        {"colorWriteEnable", available_color_write.colorWriteEnable},
+        {"attachmentFeedbackLoopLayout", available_feedback_layout.attachmentFeedbackLoopLayout},
+        {"provokingVertexLast", available_provoking_vertex.provokingVertexLast}};
+    std::string missing_rasterization;
+    for (const auto &[feature, supported] : rasterization_prerequisites) {
+      if (!supported) missing_rasterization += std::string(missing_rasterization.empty() ? "" : ", ") + feature;
+    }
+    m_rasterization_supported = full && missing_rasterization.empty();
+    m_feedback_loop_dynamic = m_rasterization_supported &&
+                              available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                              std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
+                                return std::strcmp(extension.extensionName, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) == 0;
+                              });
+    if (!full) {
+      std::printf("[host]    ProductionRasterization   not used in portable harness modes\n");
+    } else if (!m_rasterization_supported) {
       std::printf(
-          "[host]    ProductionRasterization   unavailable, rasterization cases "
-          "will be skipped\n");
+          "[host]    ProductionRasterization   unavailable (prerequisite missing: %s), "
+          "rasterization cases will be skipped\n",
+          missing_rasterization.c_str());
     }
 
     float priority = 1.0f;
@@ -24362,7 +24420,8 @@ private:
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
-      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.pNext = m_feedback_loop_dynamic ? static_cast<void *>(&feedback_dynamic)
+                                                       : static_cast<void *>(&feedback_layout);
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
@@ -24393,6 +24452,22 @@ private:
                                   : m_conditional_rendering_enabled
                                         ? static_cast<const void *>(&conditional_rendering)
                                         : static_cast<const void *>(&robustness2);
+    // Outside Apple the production renderer always records vkCmdSetColorWriteEnableEXT
+    // (VK_EXT_color_write_enable is a hard device requirement there), so the portable graphics
+    // fixtures, which draw through it, need the extension too.
+    vk::PhysicalDeviceColorWriteEnableFeaturesEXT portable_color_write{};
+#if !defined(__APPLE__)
+    const bool portable_color_write_needed = portable_graphics;
+#else
+    const bool portable_color_write_needed = false;
+#endif
+    if (portable_color_write_needed) {
+      Require("VulkanHarness", "graphics", available_color_write.colorWriteEnable == true,
+              "prerequisite missing: colorWriteEnable (VK_EXT_color_write_enable) is not supported");
+      portable_color_write.colorWriteEnable = true;
+      portable_color_write.pNext = const_cast<void *>(device_info.pNext);
+      device_info.pNext = &portable_color_write;
+    }
     m_mesh_task_enabled = m_mesh_task_enabled && m_rasterization_supported;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     if (m_mesh_task_enabled) {
@@ -24441,14 +24516,19 @@ private:
       if (portable_graphics || min_lod_fallback) {
         device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
       }
+      if (portable_color_write_needed) {
+        device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+      }
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
-      device_extensions.push_back(
-          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      if (m_feedback_loop_dynamic) {
+        device_extensions.push_back(
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      }
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
     }
     if (m_barycentric_supported) device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
@@ -24967,6 +25047,58 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyBuffer(&buffer);
   CompareWords(test, "readback", test.expected, actual);
   std::printf("[compute] %-32s ok\n", test.name);
+}
+
+// Runs host-native V_MIN_F32/V_MAX_F32 with a signaling NaN operand, either loaded at run time or
+// as shader literals (which the driver compiler may fold): sNaN against 2.0, and a quiet NaN
+// (S0) against the sNaN. The emulated rules return 2.0 and S0. Vulkan lets any floating-point
+// instruction quiet a signaling NaN, and NMin/NMax of two NaNs may return either NaN ("Precision
+// and Operation of SPIR-V Instructions", GLSL.std.450), so a driver may differ here. Returns the
+// difference this device shows for this operand kind, or nullptr when it matches the emulated
+// rules; the matching sNaN expectations then do not apply to the native path.
+const char *ProbeNativeMinMaxSignalingNan(VulkanHarness *vulkan, const ShaderProfile *profile,
+                                          bool literal_operands) {
+  using O = ShaderOpcode;
+  constexpr u32 snan = 0x7fa00001u, two = 0x40000000u, qnan = 0x7fc01234u;
+  TestCase probe;
+  probe.name =
+      literal_operands ? "NativeMinMaxLiteralSnanProbe" : "NativeMinMaxRuntimeSnanProbe";
+  probe.profile = profile;
+  probe.initial = {snan, two, qnan, 0u, 0u, 0u, 0u};
+  probe.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_F32, O::V_MAX_F32,
+                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (literal_operands) {
+    std::erase(probe.opcodes, O::BUFFER_LOAD_DWORD);
+    for (u32 operand = 0; operand < 3; ++operand)
+      AppendVMovLiteral(&probe.code, operand, probe.initial[operand]);
+  } else {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&probe.code, 30, operand * 4u);
+      AppendBufferLoadDword(&probe.code, operand, 30);
+    }
+  }
+  probe.code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+  probe.code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+  probe.code.push_back(EncodeVop2(0x0f, 12, Vgpr(2), 0));
+  probe.code.push_back(EncodeVop2(0x10, 13, Vgpr(2), 0));
+  for (u32 result = 0; result < 4; ++result) AppendStoreVgpr(&probe.code, 10 + result, 3 + result);
+  AppendEnd(&probe.code);
+  auto compiled = CompileCase(probe, vulkan->SubgroupSize());
+  auto buffer = vulkan->CreateStorageBuffer(probe.name, probe.initial, probe.initial.size());
+  vulkan->Dispatch(probe, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr);
+  const auto actual = vulkan->ReadBuffer(probe.name, buffer, probe.initial.size());
+  vulkan->DestroyBuffer(&buffer);
+  const char *difference = nullptr;
+  if (actual[3] != two || actual[4] != two) {
+    difference = "a signaling NaN against a number returns a NaN";
+  } else if (actual[5] != qnan || actual[6] != qnan) {
+    difference = "a quiet NaN against a signaling NaN returns the signaling NaN";
+  }
+  std::printf("[host]    %-32s min(sNaN,2)=0x%08x max(sNaN,2)=0x%08x min(qNaN,sNaN)=0x%08x "
+              "max(qNaN,sNaN)=0x%08x (%s)\n",
+              probe.name, actual[3], actual[4], actual[5], actual[6],
+              difference != nullptr ? difference : "matches the emulated rules");
+  return difference;
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
@@ -32138,7 +32270,9 @@ TestCase VectorFloatArithmeticOps() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
+// signaling_nan = false drops the two outputs fed by a signaling NaN (see
+// ProbeNativeMinMaxSignalingNan).
+TestCase VectorMinMaxF32NanAndSignedZeroEdges(bool signaling_nan = true) {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -32159,16 +32293,22 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
   AppendVop3(&code, 0x151, 16, Vgpr(0), Vgpr(1), Vgpr(4));
   AppendVop3(&code, 0x154, 17, Vgpr(0), Vgpr(1), Vgpr(5));
 
-  for (u32 i = 0; i < 8; i++) {
-    AppendStoreVgpr(&code, 10 + i, i);
+  std::vector<u32> outputs = {10, 11, 12, 13, 14, 15, 16, 17};
+  std::vector<u32> expected = {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u,
+                               0x40000000u, 0x40000000u, 0x40000000u, 0x40000000u};
+  if (!signaling_nan) {
+    outputs.erase(outputs.begin() + 4, outputs.begin() + 6);
+    expected.erase(expected.begin() + 4, expected.begin() + 6);
+  }
+  for (u32 i = 0; i < static_cast<u32>(outputs.size()); i++) {
+    AppendStoreVgpr(&code, outputs[i], i);
   }
   AppendEnd(&code);
 
   return {"VectorMinMaxF32NanAndSignedZeroEdges",
           code,
           {},
-          {0x40000000u, 0x40000000u, 0x80000000u, 0x00000000u, 0x40000000u,
-           0x40000000u, 0x40000000u, 0x40000000u},
+          expected,
           {O::V_MOV_B32, O::V_MIN_F32, O::V_MAX_F32, O::V_MIN3_F32,
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -32177,7 +32317,8 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
 // the emulated rules: a NaN operand yields the other (S0 for two NaNs) and signed zeros are
 // ordered.
 // Denormal operands are left out; their expected results are not pinned down here.
-TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
+// signaling_nan = false drops the rows with a signaling NaN operand.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave, bool signaling_nan = true) {
   using O = ShaderOpcode;
   const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
   const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
@@ -32202,6 +32343,12 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
       {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
       {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u},
       {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u}};
+  const auto signaling = [&](u32 v) { return nan(v) && (v & 0x00400000u) == 0u; };
+  std::vector<std::array<u32, 3>> rows;
+  for (const auto &values : cases) {
+    if (signaling_nan || std::ranges::none_of(values, signaling))
+      rows.push_back({values[0], values[1], values[2]});
+  }
   TestCase test;
   test.name = "VectorMinMaxF32RuntimeEdges";
   test.has_compute_info = true;
@@ -32209,16 +32356,16 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
   test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
       test.compute_info.threads_num[2] = 1u;
-  for (const auto &values : cases)
-    test.initial.insert(test.initial.end(), values, values + 3);
+  for (const auto &values : rows)
+    test.initial.insert(test.initial.end(), values.begin(), values.end());
   test.expected = test.initial;
   auto &code = test.code;
-  for (u32 index = 0; index < std::size(cases); ++index) {
+  for (u32 index = 0; index < static_cast<u32>(rows.size()); ++index) {
     for (u32 operand = 0; operand < 3; ++operand) {
       AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
       AppendBufferLoadDword(&code, operand, 30);
     }
-    const auto [a, b, c] = cases[index];
+    const auto [a, b, c] = rows[index];
     code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
     code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
     AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
@@ -41256,7 +41403,8 @@ TestCase CoherentBufferPairContention(u32 wave_size) {
 TestCase Wave64AppendIndexFromExecRank() {
   using O = ShaderOpcode;
   std::vector<u32> code;
-  AppendSMovLiteral(&code, 124, 8);
+  // M0 = GDS base 0, size 24: the region must cover the counter dword at offset 20.
+  AppendSMovLiteral(&code, 124, 24);
   AppendVMovU32(&code, 2, 1);
   AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
   code.push_back(EncodeDs0(0x3e, 20, true));
@@ -48973,7 +49121,8 @@ GraphicsCase GraphicsDsAddtidScratchExport() {
 GraphicsCase GraphicsDsAppendHelperQuad() {
   using O = ShaderOpcode;
   std::vector<u32> code;
-  AppendSMovLiteral(&code, 124, 8);
+  // M0 = GDS base 0, size 24: the region must cover the counter dword at offset 20.
+  AppendSMovLiteral(&code, 124, 24);
   AppendVMovU32(&code, 2, 1);
   AppendVop3(&code, 0x366, 1, 127u, InlineU32(0));
   code.push_back(EncodeDs0(0x3e, 20, true));
@@ -49863,7 +50012,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3Int16Ops);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
-  AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
+  cases.push_back(VectorMinMaxF32NanAndSignedZeroEdges());
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
   cases.push_back(VectorMinMaxF32RuntimeEdges(32));
@@ -51978,12 +52127,18 @@ void CheckImageTransitionState(RenderContext &renderer) {
   scheduler.Finish();
   download.Invalidate(download_offset, 128);
   download.Invalidate(buffered_download_offset, buffered_expected.size());
-  Require(name, "depth/stencil mip contents",
-          std::memcmp(download_data, expected_depth.data(),
-                      sizeof(expected_depth)) == 0 &&
-              std::memcmp(download_data + 64, expected_stencil.data(),
-                          sizeof(expected_stencil)) == 0,
-          "combined depth/stencil mip copy lost an aspect");
+  {
+    std::array<uint32_t, 4> depth_words{};
+    std::array<uint8_t, 4> stencil_bytes{};
+    std::memcpy(depth_words.data(), download_data, sizeof(depth_words));
+    std::memcpy(stencil_bytes.data(), download_data + 64, sizeof(stencil_bytes));
+    std::string detail = "combined depth/stencil mip copy lost an aspect: depth";
+    for (const auto word : depth_words) detail += " " + Hex(word);
+    detail += " stencil";
+    for (const auto byte : stencil_bytes) detail += " " + Hex(byte);
+    Require(name, "depth/stencil mip contents",
+            depth_words == expected_depth && stencil_bytes == expected_stencil, detail);
+  }
   Require(name, "buffered-copy chunk contents",
           std::memcmp(buffered_download_data, buffered_expected.data(),
                       buffered_expected.size()) == 0,
@@ -56079,6 +56234,15 @@ int main(int argc, char **argv) {
 #else
   if (setenv("KYTY_MAD_SEPARATE_ROUNDING", mad_rounding, 1) != 0) return 1;
 #endif
+  // GpuMeshIndirectDraw (in CheckRasterization) checks the task-shader path that reads indirect
+  // mesh records on the GPU; the CPU copy of its records is zeroed on purpose. That path is
+  // opt-in (KYTY_MESH_INDIRECT_GPU, read once at the first mesh draw), and that case is the only
+  // indirect mesh draw in these tests, so enable it for the whole process.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_MESH_INDIRECT_GPU", "1") != 0) return 1;
+#else
+  if (setenv("KYTY_MESH_INDIRECT_GPU", "1", 1) != 0) return 1;
+#endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
@@ -56183,10 +56347,29 @@ int main(int argc, char **argv) {
                                                   .native_float_min_max = true};
     VulkanHarness vulkan;
     const bool supported = vulkan.SupportsNativeFloatMinMax();
+    // The emulated path always checks signaling NaNs. The native path skips only the sNaN
+    // expectations of the operand kind (literal or runtime) where the probe sees the device
+    // differ from the emulated rules in a way Vulkan allows.
+    const auto native_snan = [&](bool literal_operands) {
+      if (!supported) return true;
+      const char *difference =
+          ProbeNativeMinMaxSignalingNan(&vulkan, &native_profile, literal_operands);
+      if (difference == nullptr) return true;
+      std::printf("[compute] %-32s skipped (native NMin/NMax with %s signaling NaNs: %s, which "
+                  "Vulkan allows)\n",
+                  literal_operands ? "LiteralSnanMinMax" : "RuntimeSnanMinMax",
+                  literal_operands ? "literal" : "runtime", difference);
+      return false;
+    };
+    const bool native_literal_snan = native_snan(true);
+    const bool native_runtime_snan = native_snan(false);
     for (bool native : {false, true}) {
+      const bool literal_snan = !native || native_literal_snan;
+      const bool runtime_snan = !native || native_runtime_snan;
       for (auto test :
-           {VectorMinMaxF32NanAndSignedZeroEdges(),
-            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+           {VectorMinMaxF32NanAndSignedZeroEdges(literal_snan),
+            VectorMinMaxF32RuntimeEdges(32, runtime_snan),
+            VectorMinMaxF32RuntimeEdges(64, runtime_snan)}) {
         auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
         test.profile = native ? &native_profile : &Maintenance8Profile;
