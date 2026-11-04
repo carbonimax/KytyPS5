@@ -172,6 +172,8 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
 
+std::atomic<WalkLoadsHook> g_walk_loads_hook {nullptr};
+
 std::atomic<bool>     g_walk_stats {false};
 std::atomic<uint64_t> g_walks {0};
 std::atomic<uint64_t> g_walk_ns {0};
@@ -1582,10 +1584,13 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		}
 		if (hold && reuse == 1u) {
 			flat = plan.srt_memo_flat;
+			const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
 			if (reads != nullptr) {
-				const auto* captures = plan.srt_scratch.data() + plan.srt_captures / 8u;
 				for (uint32_t load = 0; load < plan.srt_memo_loads; ++load)
 					reads->emplace_back(captures[load * 2u], sizeof(uint32_t));
+			}
+			if (const auto hook = g_walk_loads_hook.load(std::memory_order_relaxed)) {
+				hook(captures, plan.srt_memo_loads, 2u);
 			}
 			return true;
 		}
@@ -1614,6 +1619,9 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (reads != nullptr) {
 		for (const auto* read = captures; read != end; read += stride)
 			reads->emplace_back(*read, sizeof(uint32_t));
+	}
+	if (const auto hook = g_walk_loads_hook.load(std::memory_order_relaxed)) {
+		hook(captures, static_cast<size_t>(end - captures) / stride, stride);
 	}
 	if (reuse != 0) {
 		const auto loads = static_cast<uint32_t>((end - captures) / 2);
@@ -1699,6 +1707,10 @@ void EnableWalkStats() noexcept {
 
 bool WalkStatsEnabled() noexcept {
 	return g_walk_stats.load(std::memory_order_relaxed);
+}
+
+void SetWalkLoadsHook(WalkLoadsHook hook) noexcept {
+	g_walk_loads_hook.store(hook, std::memory_order_relaxed);
 }
 
 void SetProtectedLoadReader(ProtectedLoadReader reader) noexcept {

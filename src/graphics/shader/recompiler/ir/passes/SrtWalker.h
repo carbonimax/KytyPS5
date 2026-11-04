@@ -114,6 +114,10 @@ void      EnableWalkStats() noexcept;
 [[nodiscard]] bool WalkStatsEnabled() noexcept;
 void      NoteWalkerFaultRead(bool backing) noexcept;
 WalkStats TakeWalkStats() noexcept;
+// Measurement (KYTY_CP_SPLIT_PROF): called after every walk, reused or run, with its guest load
+// addresses (`count` of them, one every `stride` entries). Null (the default) calls nothing.
+using WalkLoadsHook = void (*)(const uint64_t* addresses, size_t count, size_t stride);
+void SetWalkLoadsHook(WalkLoadsHook hook) noexcept;
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);

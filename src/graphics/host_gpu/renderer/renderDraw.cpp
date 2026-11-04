@@ -1115,6 +1115,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
 	// compiled.
 	if (!state.vertex_info[0].stage) {
+		CpSplitProf::NoteItemInline();
 		return false;
 	}
 	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
@@ -1719,9 +1720,15 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	return DrawEmitInfo {vertex_offset + first_vertex, instance_offset};
 }
 
+static bool SplitProfDrawQueueable(CommandBuffer& buffer, const DrawIndexArgs* index_args,
+                                   const DrawAutoArgs* auto_args);
+
 bool RenderExecutor::DrawIndex(CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
+	if (CpSplitProf::Enabled() && !SplitProfDrawQueueable(buffer, &args, nullptr)) {
+		CpSplitProf::NoteItemFallback();
+	}
 	if (CpPipeline::FrontActive() && PipelineDraw(buffer, &args, nullptr)) {
 		return true;
 	}
@@ -1834,6 +1841,9 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Draw);
+	if (CpSplitProf::Enabled() && !SplitProfDrawQueueable(buffer, nullptr, &args)) {
+		CpSplitProf::NoteItemFallback();
+	}
 	if (CpPipeline::FrontActive() && PipelineDraw(buffer, nullptr, &args)) {
 		return true;
 	}
@@ -1957,6 +1967,30 @@ static void CopySnapshots(CpPipeline::DrawRecord& record) {
 		record.snapshots[3] = *ps.resources;
 		ps.resources        = &record.snapshots[3];
 	}
+}
+
+// KYTY_CP_SPLIT_PROF (s21r/s24 models): the checks PipelineDraw makes before its lookup, whatever
+// KYTY_CP_PIPELINE and its engagement threshold say.
+static bool SplitProfDrawQueueable(CommandBuffer& buffer, const DrawIndexArgs* index_args,
+                                   const DrawAutoArgs* auto_args) {
+	const bool indexed  = index_args != nullptr;
+	const auto source   = indexed ? index_args->offset_source : auto_args->offset_source;
+	const auto indirect = indexed ? index_args->indirect.address : auto_args->indirect.address;
+	const bool empty    = indexed ? index_args->index_count == 0 || index_args->instance_count == 0
+	                              : auto_args->vertex_count == 0 || auto_args->instance_count == 0;
+	if (source != DrawOffsetSource::DrawState || indirect != 0 || empty ||
+	    graphics_debug_dump_enabled()) {
+		return false;
+	}
+	const auto& hw   = buffer.GetRegisters();
+	const auto  mode = static_cast<CbColorMode>(hw.GetColorControl().mode);
+	if ((mode != CbColorMode::Normal && mode != CbColorMode::Disable) ||
+	    (mode == CbColorMode::Disable && DepthStencilCopyRequested(hw))) {
+		return false;
+	}
+	vk::PrimitiveTopology topology {};
+	return DrawHasValidVertexShader(buffer.GetShaders()) &&
+	       GetDrawTopology(buffer.GetUserConfig(), topology);
 }
 
 static bool DrawWritesMemory(const DrawRenderState& state) {

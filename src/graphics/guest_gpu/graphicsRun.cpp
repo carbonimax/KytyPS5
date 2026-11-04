@@ -679,7 +679,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 
 	bool       from_pending = false;
 	const auto value        = ReadFrontValue<T>(addr, &from_pending);
-	if (!TestWaitRegMemValue(value, ref, mask, func)) {
+	const bool satisfied    = TestWaitRegMemValue(value, ref, mask, func);
+	CpSplitProf::WaitMemory(reinterpret_cast<uint64_t>(addr), sizeof(T), satisfied);
+	if (!satisfied) {
 		SuspendPm4();
 	} else if (from_pending && EopAtGpuMode() == 1 && !TestWaitRegMemValue(*addr, ref, mask, func)) {
 		g_eop_stats.front_passes.fetch_add(1, std::memory_order_relaxed);
@@ -1652,6 +1654,13 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
 
+	// KYTY_CP_SPLIT_PROF: the label a queued RELEASE_MEM writes; a GDS readback waits for the GPU.
+	if (data_sel == 5) {
+		CpSplitProf::NoteItemFallback(CpSplitProf::Cause::ReleaseMem);
+	} else if (data_sel != 0) {
+		CpSplitProf::NoteLabel(reinterpret_cast<uint64_t>(address), data_sel == 1 ? 4u : 8u);
+	}
+
 	const int eop_mode = EopAtGpuMode();
 	if (eop_mode == 1) {
 		ReleaseMemAtGpu(data_sel, interrupt, address, data, interrupt_context_id);
@@ -1926,6 +1935,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			CpSplitProf::NoteLabel(event_address, 16u * 2u * sizeof(uint64_t));
 			if (auto& queries = m_renderer.GetOcclusionQueries(); queries.Enabled()) {
 				queries.Dump(event_address);
 				break;
