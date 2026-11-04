@@ -25,6 +25,8 @@ void SetFatalRetiresThread(RetireHandler on_retire) noexcept {
 	t_retire_handler = on_retire;
 }
 
+// A fatal check on a speculative worker (shader pretranslation) retires that thread instead of
+// ending the process: the handler records the report, then the thread parks forever.
 static void RetireThreadIfSpeculative(const char* title, std::string_view text, const char* file,
                                       int line) {
 	auto* on_retire = t_retire_handler;
@@ -38,38 +40,26 @@ static void RetireThreadIfSpeculative(const char* title, std::string_view text, 
 	}
 }
 
-static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
+[[noreturn]] static void DbgReport(const char* title, std::string_view text, const char* file,
+                                   int line) {
 	RetireThreadIfSpeculative(title, text, file, line);
-	Log::WriteFatal(BuildFatalReport(title, text, file, line));
-	Subsystems::EmergencyShutdownActive();
-	return 1;
-}
-
-int DbgExitIfHandler(const char* expr, const char* file, int line) {
-	return DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr),
-	                 file, line);
-}
-
-int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
-	return DbgReport("--- Fatal Error ---", fmt::format("Not implemented ({})", expr), file, line);
-}
-
-int DbgExitHandler(const char* file, int line, std::string_view text) {
-	RetireThreadIfSpeculative("--- Error ---", text, file, line);
-	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
-	return 1;
-}
-
-int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
-	RetireThreadIfSpeculative("--- Error ---", text, file, line);
-	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
-	return 1;
-}
-
-void DbgExit(int status) {
+	Log::WriteToConsoleAndLog(BuildFatalReport(title, text, file, line));
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
-	std::_Exit(status);
+	std::_Exit(321);
+}
+
+void DbgExitIfHandler(const char* expr, const char* file, int line) {
+	DbgReport("--- Fatal Error ---", fmt::format("Error: condition ({}) is true", expr), file,
+	          line);
+}
+
+void DbgNotImplementedHandler(const char* expr, const char* file, int line) {
+	DbgReport("--- Fatal Error ---", fmt::format("Not implemented ({})", expr), file, line);
+}
+
+void DbgExitHandler(const char* file, int line, std::string_view text) {
+	DbgReport("--- Error ---", text, file, line);
 }
 
 } // namespace Common

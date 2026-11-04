@@ -587,7 +587,7 @@ struct PthreadStaticObject {
 class PthreadStaticObjects {
 public:
 	PthreadStaticObjects() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PthreadStaticObjects() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PthreadStaticObjects() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PthreadStaticObjects);
 
@@ -617,7 +617,7 @@ static thread_local std::unique_ptr<PthreadSpecificValue[]> g_pthread_specific;
 class PthreadPool {
 public:
 	PthreadPool() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PthreadPool() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PthreadPool() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PthreadPool);
 
@@ -633,7 +633,7 @@ private:
 class PThreadContext {
 public:
 	PThreadContext() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
-	virtual ~PThreadContext() { KYTY_NOT_IMPLEMENTED; }
+	virtual ~PThreadContext() { EXIT_NOT_IMPLEMENTED(true); }
 
 	KYTY_CLASS_NO_COPY(PThreadContext);
 

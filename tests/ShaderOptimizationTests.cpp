@@ -177,16 +177,12 @@ void TestLaunchedLaneKept() {
 // The IR asserts report through these; the passes under test never reach them.
 namespace Common {
 
-int DbgExitIfHandler(const char*, const char*, int) {
-	return 1;
-}
-
-int DbgExitHandler(const char*, int, std::string_view text) {
-	throw std::runtime_error(std::string(text));
-}
-
-void DbgExit(int) {
+void DbgExitIfHandler(const char*, const char*, int) {
 	std::abort();
+}
+
+void DbgExitHandler(const char*, int, std::string_view text) {
+	throw std::runtime_error(std::string(text));
 }
 
 } // namespace Common
