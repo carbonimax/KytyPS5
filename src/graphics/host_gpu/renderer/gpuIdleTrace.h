@@ -10,9 +10,10 @@
 //   G <sem> <tick> <waits> <submit_us> <done_us>  every main-queue submission, in queue order; the
 //                                                 completion is observed by a waiter thread
 //   Q <tick> <us>                                 the GPU thread handed a submission to the recorder
-//   S <tag> <thread> <start_us> <end_us>          a state of an emulator thread (spans of one tag on
-//                                                 one thread closer than 100 us are merged)
-// Timer-based tags (busy, translate, pipelines, waits, side reads) need KYTY_PERF_STATS=1.
+//   S <tag> <thread> <start_us> <end_us>          a state of an emulator thread
+// Timer-based tags (busy, translate, pipelines, waits, side reads) need KYTY_PERF_STATS=1. Spans of the
+// tiling states (busy, idle, back/recorder busy) closer than 20 us are merged; other spans under 5 us
+// are dropped.
 namespace Libs::Graphics::GpuIdleTrace {
 
 enum class Tag : uint8_t {
@@ -34,6 +35,8 @@ enum class Tag : uint8_t {
 	Readback,    // color metadata readback
 	Acquire,     // vkAcquireNextImageKHR (with the slot wait before it)
 	Present,     // vkQueuePresentKHR
+	Program,     // program lookup (resources + permutation search) of 200 us or more
+	DrawSlow,    // draw or dispatch packet of 500 us or more
 	Count
 };
 

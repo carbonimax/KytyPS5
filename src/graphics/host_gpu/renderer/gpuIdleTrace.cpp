@@ -20,12 +20,13 @@ namespace Libs::Graphics::GpuIdleTrace {
 
 namespace {
 
-constexpr uint64_t MergeUs = 100;
+constexpr uint64_t MergeUs = 20; // tiling states closer than this are merged
+constexpr uint64_t MinUs   = 5;  // other states shorter than this are dropped
 
 const char* const g_tag_names[static_cast<size_t>(Tag::Count)] = {
     "busy",    "command", "idle_empty", "idle_blocked", "translate", "gfx_pipe", "cs_pipe",
     "wait_gpu", "wait_other", "side_read", "drain", "back_busy", "rec_busy", "reprotect",
-    "fault",   "readback", "acquire", "present"};
+    "fault",   "readback", "acquire", "present", "program", "draw_slow"};
 
 struct Pending {
 	vk::Semaphore semaphore;
@@ -138,6 +139,15 @@ void SetThreadName(const char* name) noexcept {
 
 void Span(Tag tag, uint64_t start_us, uint64_t end_us) noexcept {
 	if (!On()) return;
+	// Only states that tile the thread's time are merged; a merged short state (a no-op flush at
+	// every slice) would cover the work between its calls.
+	const bool tiling = tag == Tag::Busy || tag == Tag::IdleEmpty || tag == Tag::IdleBlocked ||
+	                    tag == Tag::BackBusy || tag == Tag::RecBusy;
+	if (!tiling) {
+		const uint64_t min = tag == Tag::Program ? 200 : tag == Tag::DrawSlow ? 500 : MinUs;
+		if (end_us >= start_us + min) Write(tag, start_us, end_us);
+		return;
+	}
 	auto& [s, e] = t_pending[static_cast<size_t>(tag)];
 	if (e != 0 && start_us <= e + MergeUs) {
 		e = std::max(e, end_us);
