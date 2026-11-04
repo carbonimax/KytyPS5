@@ -870,6 +870,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &conditional_rendering;
 	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl_features {};
+	gpl_features.graphicsPipelineLibrary = VK_TRUE;
+	if (graphics.gpl_probe != 0) {
+		gpl_features.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext  = &gpl_features;
+	}
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
 	// depth- or stencil-writing fragment shader needs an epilog.
@@ -1298,6 +1304,25 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		if (const char* probe = std::getenv("KYTY_GPL_PROBE"); probe != nullptr && (probe[0] == '1' || probe[0] == '2')) {
+			const bool available =
+			    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+			    HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+			vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_properties {};
+			vk::PhysicalDeviceProperties2                         properties {};
+			properties.pNext = &gpl_properties;
+			if (available) {
+				graphic_ctx.physical_device.getProperties2(&properties);
+				device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+				device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+				graphic_ctx.gpl_probe = static_cast<uint32_t>(probe[0] - '0');
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GPL probe: mode {} extension={} fastLinking={} independentInterpolationDecoration={}\n",
+			    graphic_ctx.gpl_probe, available ? 1 : 0,
+			    gpl_properties.graphicsPipelineLibraryFastLinking ? 1 : 0,
+			    gpl_properties.graphicsPipelineLibraryIndependentInterpolationDecoration ? 1 : 0));
+		}
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);

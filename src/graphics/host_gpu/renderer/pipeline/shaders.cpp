@@ -306,6 +306,128 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
 }
 
+// KYTY_GPL_PROBE: builds the pipeline of `mono` from its four graphics pipeline libraries, then
+// links them. `render` (mode 2): libraries from `cache`, returns the fast-linked pipeline and keeps
+// its libraries. Otherwise (mode 1): cold libraries, a fast link and an optimized link, all timed
+// on a G line of KYTY_COMPILE_LOG and destroyed; returns null.
+// shortcut: mode 2 never destroys the libraries of the pipelines it renders with (diagnostic only).
+static vk::Pipeline GplProbe(GraphicContext& graphics, const vk::GraphicsPipelineCreateInfo& mono,
+                             const vk::PipelineRenderingCreateInfo& rendering_in,
+                             vk::PipelineCache cache, bool render) {
+	using Lib = vk::GraphicsPipelineLibraryFlagBitsEXT;
+	auto rendering  = rendering_in;
+	rendering.pNext = nullptr;
+	// Each library names the dynamic states of its own state subset.
+	std::array<std::vector<vk::DynamicState>, 4> dynamic;
+	for (uint32_t i = 0; mono.pDynamicState != nullptr && i < mono.pDynamicState->dynamicStateCount; i++) {
+		const auto state = mono.pDynamicState->pDynamicStates[i];
+		switch (state) {
+			case vk::DynamicState::eViewportWithCount:
+			case vk::DynamicState::eScissorWithCount:
+			case vk::DynamicState::eLineWidth:
+			case vk::DynamicState::eCullMode:
+			case vk::DynamicState::eFrontFace:
+			case vk::DynamicState::eDepthBiasEnable:
+			case vk::DynamicState::eDepthBias: dynamic[1].push_back(state); break;
+			case vk::DynamicState::eBlendConstants:
+			case vk::DynamicState::eColorWriteEnableEXT: dynamic[3].push_back(state); break;
+			default: dynamic[2].push_back(state); break;
+		}
+	}
+	std::array<vk::PipelineDynamicStateCreateInfo, 4> dynamic_info;
+	for (size_t i = 0; i < 4; i++) {
+		dynamic_info[i].dynamicStateCount = static_cast<uint32_t>(dynamic[i].size());
+		dynamic_info[i].pDynamicStates    = dynamic[i].data();
+	}
+	std::vector<vk::PipelineShaderStageCreateInfo> pre_stages;
+	std::vector<vk::PipelineShaderStageCreateInfo> fragment_stages;
+	for (uint32_t i = 0; i < mono.stageCount; i++) {
+		(mono.pStages[i].stage == vk::ShaderStageFlagBits::eFragment ? fragment_stages : pre_stages)
+		    .push_back(mono.pStages[i]);
+	}
+	const auto create_flags = render ? vk::PipelineCreateFlagBits::eLibraryKHR
+	                                 : vk::PipelineCreateFlagBits::eLibraryKHR |
+	                                       vk::PipelineCreateFlagBits::eRetainLinkTimeOptimizationInfoEXT;
+	std::array<vk::Pipeline, 4> libraries {};
+	std::array<uint64_t, 6>     us {};
+	bool                        ok = true;
+	const auto now_us = [] { return PerfStats::SteadyUs(); };
+	for (uint32_t i = 0; i < 4 && ok; i++) {
+		vk::GraphicsPipelineLibraryCreateInfoEXT library {};
+		vk::GraphicsPipelineCreateInfo           create {};
+		create.flags         = create_flags;
+		create.pDynamicState = &dynamic_info[i];
+		create.pNext         = &library;
+		switch (i) {
+			case 0:
+				library.flags              = Lib::eVertexInputInterface;
+				create.pVertexInputState   = mono.pVertexInputState;
+				create.pInputAssemblyState = mono.pInputAssemblyState;
+				break;
+			case 1:
+				library.flags              = Lib::ePreRasterizationShaders;
+				library.pNext              = &rendering;
+				create.stageCount          = static_cast<uint32_t>(pre_stages.size());
+				create.pStages             = pre_stages.data();
+				create.pViewportState      = mono.pViewportState;
+				create.pRasterizationState = mono.pRasterizationState;
+				create.pTessellationState  = mono.pTessellationState;
+				create.layout              = mono.layout;
+				break;
+			case 2:
+				library.flags             = Lib::eFragmentShader;
+				library.pNext             = &rendering;
+				create.stageCount         = static_cast<uint32_t>(fragment_stages.size());
+				create.pStages            = fragment_stages.data();
+				create.pMultisampleState  = mono.pMultisampleState;
+				create.pDepthStencilState = mono.pDepthStencilState;
+				create.layout             = mono.layout;
+				break;
+			default:
+				library.flags            = Lib::eFragmentOutputInterface;
+				library.pNext            = &rendering;
+				create.pColorBlendState  = mono.pColorBlendState;
+				create.pMultisampleState = mono.pMultisampleState;
+				break;
+		}
+		const auto begin = now_us();
+		ok    = graphics.device.createGraphicsPipelines(cache, 1, &create, nullptr, &libraries[i]) ==
+		     vk::Result::eSuccess;
+		us[i] = now_us() - begin;
+	}
+	vk::Pipeline fast      = nullptr;
+	vk::Pipeline optimized = nullptr;
+	if (ok) {
+		vk::PipelineLibraryCreateInfoKHR linked {};
+		linked.libraryCount = 4;
+		linked.pLibraries   = libraries.data();
+		vk::GraphicsPipelineCreateInfo create {};
+		create.pNext  = &linked;
+		create.layout = mono.layout;
+		auto begin    = now_us();
+		ok = graphics.device.createGraphicsPipelines(cache, 1, &create, nullptr, &fast) == vk::Result::eSuccess;
+		us[4] = now_us() - begin;
+		if (ok && !render) {
+			create.flags = vk::PipelineCreateFlagBits::eLinkTimeOptimizationEXT;
+			begin        = now_us();
+			ok = graphics.device.createGraphicsPipelines(cache, 1, &create, nullptr, &optimized) ==
+			     vk::Result::eSuccess;
+			us[5] = now_us() - begin;
+		}
+	}
+	// G time ok render vi_us pre_us fs_us fo_us fast_link_us optimized_link_us
+	PerfStats::CompileLogLine("G %" PRIu64 " %d %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+	                          " %" PRIu64 " %" PRIu64,
+	                          now_us(), ok ? 1 : 0, render ? 1 : 0, us[0], us[1], us[2], us[3], us[4], us[5]);
+	if (render && ok) {
+		return fast;
+	}
+	for (const auto pipeline: {fast, optimized, libraries[0], libraries[1], libraries[2], libraries[3]}) {
+		if (pipeline) graphics.device.destroyPipeline(pipeline, nullptr);
+	}
+	return nullptr;
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&        rendering,
@@ -612,9 +734,23 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
-	NoteCreationFeedback(result, creation_feedback, true);
+	// KYTY_GPL_PROBE: depth feedback loops need a per-pipeline flag the probe does not split.
+	const bool gpl = graphics.gpl_probe != 0 && !mesh && !task_module &&
+	                 !(rendering.depth_feedback && !graphics.attachment_feedback_loop_dynamic);
+	if (gpl && graphics.gpl_probe == 2) {
+		pipeline.pipeline = GplProbe(graphics, pipeline_info, rendering_info, driver_cache, true);
+	}
+	if (pipeline.pipeline) {
+		result = vk::Result::eSuccess;
+		NoteCreationFeedback(result, {}, true);
+	} else {
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+		NoteCreationFeedback(result, creation_feedback, true);
+		if (gpl && graphics.gpl_probe == 1) {
+			(void)GplProbe(graphics, pipeline_info, rendering_info, nullptr, false);
+		}
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));

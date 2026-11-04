@@ -43,6 +43,9 @@ struct GraphicContext {
 	// Also VK_EXT_attachment_feedback_loop_dynamic_state: the loop is toggled per draw instead.
 	bool                               attachment_feedback_loop_dynamic      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// KYTY_GPL_PROBE (diagnostic, default 0): 1 = time graphics pipeline libraries beside each
+	// pipeline, 2 = render with fast-linked library pipelines. 0 when the device lacks the extension.
+	uint32_t                           gpl_probe                             = 0;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
