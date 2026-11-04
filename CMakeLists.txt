@@ -552,6 +552,10 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(shader_optimization_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ShaderOptimizationTests.cpp")
+target_link_libraries(shader_optimization_tests fmt::fmt xbyak::xbyak)
+target_include_directories(shader_optimization_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -711,7 +715,7 @@ target_link_libraries(net_resolver_tests kyty_test_gtest)
 
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
-	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
+	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests shader_optimization_tests
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
@@ -759,6 +763,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME shader_optimization COMMAND $<TARGET_FILE:shader_optimization_tests>)
 	# These count the walker's guest reads: KYTY_SRT_WALK_REUSE validation would add reads.
 	set_tests_properties(shader_cfg resource_materialization resource_tracking PROPERTIES
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
@@ -908,6 +913,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
+		shader_optimization_tests
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		event_queue_lifetime_tests

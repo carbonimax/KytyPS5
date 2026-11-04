@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/LaunchedLaneFolding.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -903,6 +904,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
 		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
+	}
+	// With real vertex subgroups every invocation of a wave64 vertex shader is a launched lane.
+	if ((options.optimizations & IR::ShaderOptLaunchedLanes) != 0 &&
+	    options.host_features.vertex_subgroups) {
+		if (const auto folded = IR::FoldLaunchedLaneTests(ir); folded != 0) {
+			LOGF("%s launched-lane folding: tests=%" PRIu32 "\n", GetDumpLabel(options), folded);
+		}
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();

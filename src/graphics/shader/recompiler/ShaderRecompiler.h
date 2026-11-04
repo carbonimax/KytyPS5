@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/Optimizations.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
@@ -30,6 +31,8 @@ struct CompileOptions {
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
 	ShaderHostFeatures        host_features;
+	// IR::ShaderOptimization bits of the optional passes.
+	uint32_t                    optimizations = IR::ShaderOptimizationsFromEnvironment();
 };
 
 struct TranslateResult {
