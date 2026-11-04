@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
@@ -1684,6 +1685,7 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
 	NoteGuestSync();
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Sync);
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
@@ -1812,6 +1814,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	if (CpSplitProf::Enabled()) {
+		CpSplitProf::FrontRead(reinterpret_cast<uint64_t>(indirect_buffer),
+		                       uint64_t {indirect_num_dw} * sizeof(uint32_t),
+		                       CpSplitProf::ReadSource::Pm4);
+	}
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 
@@ -2066,6 +2073,7 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 	NoteGuestSync();
+	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Sync);
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0064900);
 

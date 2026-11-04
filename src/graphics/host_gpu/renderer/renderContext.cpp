@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
+#include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -70,6 +71,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// (it would otherwise publish GPU bytes as a read and report the fault handled).
 	constexpr uint64_t fault_size = 1;
 	// KYTY_CP_PIPELINE: a GPU-thread fault resolves through the caches the back thread uses.
+	CpSplitProf::Fault(fault_vaddr);
 	CpPipeline::Drain();
 	if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) || !IsMapped(fault_vaddr, fault_size)) {
 		return false;

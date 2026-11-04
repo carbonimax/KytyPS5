@@ -893,6 +893,9 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool TryReadCleanBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (Graphics::CpSplitProf::Enabled()) {
+		Graphics::CpSplitProf::FrontRead(vaddr, size, Graphics::CpSplitProf::ReadSource::Backing);
+	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread() ||
 		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
@@ -915,13 +918,16 @@ bool MaybeGpuModifiedPage(uint64_t vaddr) {
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (Graphics::CpSplitProf::Enabled()) {
+		Graphics::CpSplitProf::FrontRead(vaddr, size, Graphics::CpSplitProf::ReadSource::Backing);
+	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
+			Graphics::CpSplitProf::SyncRead(vaddr, size);
 			Graphics::CpPipeline::Drain();
 			buffers.ReadMemoryWindow(vaddr, size);
 		}

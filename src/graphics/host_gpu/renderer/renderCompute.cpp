@@ -497,6 +497,44 @@ static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& bu
 	Commit(state, accesses, epoch, decision.barrier);
 }
 
+// KYTY_CP_SPLIT_PROF (s24 models): the guest ranges a direct dispatch writes, from its final
+// bindings (storage buffers and storage images written by the program). A dispatch whose writes the
+// bindings do not describe (address writes, device addresses, image heap, GDS, fault buffer) stays
+// on the front, as for DispatchChain::CollectAccesses.
+static void SplitProfNoteDispatch(RenderContext& context, const ShaderComputeInputInfo& input,
+                                  const PreparedBindings& bindings) {
+	using ShaderRecompiler::IR::DescriptorBindingKind;
+	const auto& program = *input.stage.program;
+	const auto& counts  = program.bindings.descriptor_counts;
+	if (program.has_address_writes || program.info.uses_dma || program.info.uses_image_heap ||
+	    program.info.uses_gds || bindings.gds.buffer != nullptr ||
+	    counts[static_cast<size_t>(DescriptorBindingKind::Gds)] != 0 ||
+	    counts[static_cast<size_t>(DescriptorBindingKind::BdaPagetable)] != 0 ||
+	    counts[static_cast<size_t>(DescriptorBindingKind::FaultBuffer)] != 0) {
+		CpSplitProf::NoteItemInline();
+		return;
+	}
+	for (const auto& resource: program.info.buffers) {
+		const auto index = resource.descriptor_index;
+		if (!resource.written || index == UINT32_MAX || index >= bindings.buffers.size() ||
+		    index >= bindings.buffer_sources.size() || !bindings.buffers[index].buffer) {
+			continue;
+		}
+		const auto& source = bindings.buffer_sources[index];
+		CpSplitProf::NoteItemWriteRange(source.address, source.size);
+	}
+	for (uint32_t i = 0; i < program.info.images.size() && i < bindings.images.size(); i++) {
+		const auto id = bindings.images[i].image_id;
+		if (!id || !program.info.images[i].written) {
+			continue;
+		}
+		const auto& info = context.GetTextureCache().GetImage(id).info;
+		for (const auto range: {info.data, info.stencil}) {
+			CpSplitProf::NoteItemWriteRange(range.address, range.size);
+		}
+	}
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -585,6 +623,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
+		CpSplitProf::NoteItemInline();
 		ResetBindings();
 		return;
 	}
@@ -630,6 +669,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	{
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		RebindBuffers(bindings);
+	}
+	if (CpSplitProf::Enabled()) {
+		SplitProfNoteDispatch(m_context, input_info, bindings);
 	}
 
 	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
@@ -759,6 +801,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
+	CpSplitProf::NoteItemFallback();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
