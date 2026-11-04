@@ -9,7 +9,6 @@
 #include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,10 +23,12 @@
 #include "loader/systemContent.h"
 
 #include <SDL3/SDL.h>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -735,8 +736,11 @@ void WindowContext::ProcessEvent(double time_s) {
 }
 
 void WindowContext::Run() {
-	Common::Timer timer;
-	timer.Start();
+	// Event times leave out the time the guest spends paused.
+	using Clock                = std::chrono::steady_clock;
+	const auto      start      = Clock::now();
+	Clock::duration paused_for {};
+	std::optional<Clock::time_point> paused_at;
 
 	loop.event     = {};
 	loop.need_exit = false;
@@ -748,11 +752,12 @@ void WindowContext::Run() {
 
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
-			if (!timer.IsPaused()) {
-				timer.Pause();
+			if (!paused_at) {
+				paused_at = Clock::now();
 			}
-		} else if (timer.IsPaused()) {
-			timer.Resume();
+		} else if (paused_at) {
+			paused_for += Clock::now() - *paused_at;
+			paused_at.reset();
 		}
 
 		// Refresh the title on the main thread without making presentation wait for it.
@@ -771,7 +776,8 @@ void WindowContext::Run() {
 		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
 			continue;
 		}
-		ProcessEvent(timer.GetTimeS());
+		const auto event_time = paused_at.value_or(Clock::now()) - start - paused_for;
+		ProcessEvent(std::chrono::duration<double>(event_time).count());
 	}
 }
 

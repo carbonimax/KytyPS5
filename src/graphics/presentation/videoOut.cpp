@@ -9,7 +9,6 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -29,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -859,32 +859,27 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
-	const auto frequency = Common::Timer::QueryPerformanceFrequency();
-	EXIT_IF(frequency == 0);
+	using Clock = std::chrono::steady_clock;
 
-	int64_t total_wait = 0;
+	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
-		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
-			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
-			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+		const auto sleep_begin = Clock::now();
+		if (total_wait.count() > 0) {
+			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
 		}
 		if (token.stop_requested()) {
 			break;
 		}
-		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
+		const auto frame_begin = Clock::now();
+		total_wait -= frame_begin - sleep_begin;
 
+		// The refresh rate is re-read every vblank: it can change while the thread runs.
 		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		const auto period  = std::chrono::nanoseconds(std::chrono::seconds(1)) / refresh;
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
-			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait +=
-			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			total_wait += period - (Clock::now() - frame_begin);
 			continue;
 		}
 
@@ -906,7 +901,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && total_wait.count() < 0) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -925,9 +920,8 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 		VblankEnd();
 
-		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
-		if (total_wait < 0) {
+		total_wait += period - (Clock::now() - frame_begin);
+		if (total_wait.count() < 0) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
 		}
 	}
