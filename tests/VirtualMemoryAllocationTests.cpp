@@ -177,7 +177,6 @@ void InitSubsystems() {
 	}
 
 	static Common::Subsystems subsystems;
-	Common::VirtualMemory::Init();
 	Common::InitializeThreads();
 	subsystems.Initialize<Config::Lifecycle>();
 
