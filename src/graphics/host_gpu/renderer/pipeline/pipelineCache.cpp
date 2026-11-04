@@ -500,6 +500,39 @@ struct PipelineCache::ProgramCache {
 		};
 		permutation.handle.id = ModuleId(key, permutation.program.bindings.push_data_start_dword,
 		                                 permutation.specialization, function_code);
+		if (diag_log) {
+			// M time module_id stage hash push_start function_words static=<words> B=<buffers>
+			//   I=<images> S=<samplers>: what the module id hashes, to diff variants across launches.
+			const auto& spec = permutation.specialization;
+			std::string line = fmt::format("M {} {:016x} {} {:016x} {} {} static=", PerfStats::SteadyUs(),
+			                               permutation.handle.id, static_cast<int>(key.stage), key.hash,
+			                               permutation.program.bindings.push_data_start_dword,
+			                               function_code.size());
+			for (const auto word: key.static_state) line += fmt::format("{:x},", word);
+			line += " B=";
+			for (const auto& b: spec.buffers) {
+				line += fmt::format("{:x}/{}/{:x}/{}{}/{:x}/{:x}/{}/{};", b.packed_stride,
+				                    static_cast<int>(b.descriptor_format), b.descriptor_swizzle,
+				                    b.zero_stride_oob ? 1 : 0, b.scalar_empty ? 1 : 0, b.indirect_root,
+				                    b.indirect_mapping_offset, b.indirect_search_iterations,
+				                    b.null_fallback ? 1 : 0);
+			}
+			line += " I=";
+			for (const auto& i: spec.images) {
+				line += fmt::format("{}/{}/{}/{}/{:x}/{:x}/{:x}/{}/{}{}/{}/{}/{}{};",
+				                    static_cast<int>(i.numeric_class), static_cast<int>(i.dimension),
+				                    i.mip_count, static_cast<int>(i.conversion_format), i.shader_swizzle,
+				                    i.indirect_root, i.indirect_mapping_offset, i.indirect_search_iterations,
+				                    i.cube ? 1 : 0, i.fmask ? 1 : 0, i.sample_min_lod, i.view_min_level,
+				                    i.null_fallback ? 1 : 0, i.heap ? 1 : 0);
+			}
+			line += " S=";
+			for (const auto& s: spec.samplers) {
+				line += fmt::format("{:x}/{:x}/{};", s.indirect_root, s.indirect_mapping_offset,
+				                    s.indirect_search_iterations);
+			}
+			PerfStats::CompileLogLine("%s", line.c_str());
+		}
 		// The inputs of these come from the stage's static key.
 		if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 		    options.input_info.vertex != nullptr) {
@@ -2003,6 +2036,28 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin,
 		                          feedback.valid ? (feedback.hit ? 1 : 0) : -1,
 		                          PerfStats::SteadyUs() - diag_begin, vs_id, ps_id);
+		// K time hit vs0 vs1 vs2 ps | color_count formats depth stencil feedback | bindings
+		//   (stride:instance) attributes (offset:binding) | static parameters (packed bytes):
+		//   the whole key, to diff variants across launches.
+		std::string line = fmt::format("K {} {} {:x} {:x} {:x} {:x} | {}", diag_begin,
+		                               feedback.valid ? (feedback.hit ? 1 : 0) : -1,
+		                               key.vertex_shader_ids[0], key.vertex_shader_ids[1],
+		                               key.vertex_shader_ids[2], key.ps_shader_id, rendering.color_count);
+		for (const auto format: rendering.color_formats) line += fmt::format(",{}", static_cast<int>(format));
+		line += fmt::format(" {} {} {} |", static_cast<int>(rendering.depth_format),
+		                    static_cast<int>(rendering.stencil_format), rendering.depth_feedback ? 1 : 0);
+		const auto& vi = key.vertex_input;
+		for (uint32_t i = 0; i < vi.binding_count; i++) {
+			line += fmt::format(" {}:{}", vi.bindings[i].stride, vi.bindings[i].instance ? 1 : 0);
+		}
+		line += " /";
+		for (uint32_t i = 0; i < vi.attribute_count; i++) {
+			line += fmt::format(" {}:{}", vi.attributes[i].offset, vi.attributes[i].binding);
+		}
+		line += " | ";
+		const auto* sp = reinterpret_cast<const uint8_t*>(&static_params);
+		for (size_t i = 0; i < sizeof(static_params); i++) line += fmt::format("{:02x}", sp[i]);
+		PerfStats::CompileLogLine("%s", line.c_str());
 	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
