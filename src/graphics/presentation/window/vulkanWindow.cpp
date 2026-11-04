@@ -649,6 +649,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.sampler_filter_minmax_enabled      = supported_features12.samplerFilterMinmax;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -658,6 +659,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	workgroup_layout.pNext = &depth_clip_control;
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
+	features12.samplerFilterMinmax = supported_features12.samplerFilterMinmax;
 	auto features11 = WindowContext::RequiredVulkan11Features();
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
