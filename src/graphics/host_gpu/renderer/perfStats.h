@@ -126,6 +126,10 @@ void NoteFlipArg(int64_t arg) noexcept;
 [[nodiscard]] uint64_t SteadyUs() noexcept;
 void                   CompileLogLine(const char* format, ...) noexcept;
 
+// KYTY_GPU_IDLE_TRACE (gpuIdleTrace.h): a timer span on the trace timeline (no-op when the trace is off).
+void TraceTimer(Counter time, std::chrono::steady_clock::time_point start,
+                std::chrono::steady_clock::time_point end) noexcept;
+
 // Draws and dispatches recorded (GPU thread, and the KYTY_CP_PIPELINE back thread), always counted:
 // KYTY_IDLE_SUBMIT reads it (CommandScheduler::IdleSubmitDue).
 inline std::atomic<uint64_t> t_work_recorded {0};
@@ -146,10 +150,10 @@ public:
 		if (!m_on) {
 			return;
 		}
-		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                    std::chrono::steady_clock::now() - m_start)
-		                    .count();
+		const auto now = std::chrono::steady_clock::now();
+		const auto ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_start).count();
 		Add(m_time, static_cast<uint64_t>(ns));
+		TraceTimer(m_time, m_start, now);
 		if (m_count != Counter::Count) {
 			Add(m_count, 1);
 		}

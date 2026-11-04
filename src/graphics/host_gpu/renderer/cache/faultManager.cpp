@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
@@ -75,6 +76,7 @@ FaultManager::~FaultManager() {
 }
 
 void FaultManager::ProcessFaultBuffer() {
+	GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::Fault);
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();

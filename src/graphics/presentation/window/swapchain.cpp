@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuIdleTrace.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -630,6 +631,7 @@ bool Swapchain::NeedsResize() const {
 
 Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::Acquire);
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
@@ -1037,7 +1039,8 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		GpuIdleTrace::Scope traced(GpuIdleTrace::Tag::Present);
+		Common::LockGuard   lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
