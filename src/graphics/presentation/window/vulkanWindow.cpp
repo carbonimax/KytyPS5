@@ -9,6 +9,7 @@
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1321,6 +1322,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create the KYTY_BOUNDS_MODE=2 counters");
 	}
 	PerfStats::SetStorageBoundsCounters(graphic_ctx.storage_bounds_verify_counters);
+	graphic_ctx.stencil_copy_via_buffer = ResolveStencilCopyViaBuffer(graphic_ctx);
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());
