@@ -121,6 +121,9 @@ void TraceTimer(Counter time, std::chrono::steady_clock::time_point start,
 		case Counter::WaitGpuThreadNs: tag = Tag::WaitGpu; break;
 		case Counter::WaitOtherNs: tag = Tag::WaitOther; break;
 		case Counter::SideReadNs: tag = Tag::SideRead; break;
+		case Counter::ProgramNs: tag = Tag::Program; break;
+		case Counter::DrawNs:
+		case Counter::DispatchNs: tag = Tag::DrawSlow; break;
 		default: return;
 	}
 	const auto us = [](std::chrono::steady_clock::time_point t) {
