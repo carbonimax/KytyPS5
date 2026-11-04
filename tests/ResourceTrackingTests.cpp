@@ -6216,6 +6216,38 @@ void TestSrtWalkReuse() {
         "other user data validated the last walk");
 }
 
+void TestDeepScalarReadChain() {
+  // Each scalar read takes its buffer base from the previous one, and the consumer's block
+  // comes first, so planning reaches the whole chain from its last read. It must not
+  // recurse once per link: guest shaders chain thousands of dependent scalar values.
+  constexpr uint32_t Depth = 10000;
+  Fixture fixture;
+  auto *chain = fixture.AddBlock();
+  Value base = fixture.UserData(0);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  for (uint32_t link = 0; link < Depth; ++link) {
+    const uint32_t pc = 0x100u + link * 4u;
+    scalar.offset = link * sizeof(uint32_t);
+    const auto table = fixture.Emit(ValueOpcode::GetBufferResource,
+                                    {base, Value(0u), Value(64u), Value(0u)},
+                                    MemoryFlags{0, pc}, chain);
+    base = fixture.Emit(ValueOpcode::ReadConstBuffer, {table, Value(0u)},
+                        fixture.AddMemory(scalar, pc), chain);
+  }
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {fixture.Buffer({base, Value(0u), Value(64u), Value(0u)}), Value(0u),
+                Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 0x100u + Depth * 4u));
+  fixture.PlanAndTrack();
+  Check(fixture.program.srt_reads.size() == Depth,
+        "deep scalar read chain did not plan one SRT slot per read");
+  Check(fixture.program.info.buffers.size() == 1,
+        "deep scalar read chain lost its buffer");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -9399,6 +9431,7 @@ int main(int argc, char **argv) {
     Run("counted row image selector", TestCountedRowImageSelector);
     Run("shared append selector bounds", TestSharedAppendSelectorBounds);
     Run("descending image range", TestDescendingImageRange);
+    Run("deep scalar read chain", TestDeepScalarReadChain);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("scalar data control flow", TestScalarDataReadControlFlow);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
