@@ -152,6 +152,11 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] RangeSet TakeBdaSync();
+	// KYTY_REPROTECT_BATCH (see BeginDeferredUploads): GPU thread, at a guest sync point (after
+	// the command-processor back thread drained). Applies the batched re-protections, then copies
+	// their bytes. No-op when the batch is off or empty.
+	void                   FlushBatchedUploads();
+	[[nodiscard]] static bool ReprotectBatchEnabled() noexcept;
 	void               RunGarbageCollector();
 
 private:
@@ -256,9 +261,18 @@ private:
 	// copied into the (coherent) staging memory only after them: at End, or before any
 	// submission. Begin returns false (nothing deferred) when the switch is off or staging is
 	// not coherent.
+	// KYTY_REPROTECT_BATCH=1 (default; 0 = off; 2 = 1 plus a read-back of the applied protections)
+	// extends that deferral to every read-only synchronization of the GPU threads (GPU thread and
+	// command-processor back thread), and keeps it open across synchronizations: the deferred
+	// re-protections and copies are applied before every submission (pre-submit) and at every
+	// guest sync point (FlushBatchedUploads: non-pipelined packets that may publish progress or
+	// wait for the guest, guest commands, command-processor slice boundaries). A page written by
+	// the guest before the flush stays writable meanwhile and its new bytes are in the copy; a
+	// write after the flush faults as before. Begin/End then do nothing (Begin returns false).
 	[[nodiscard]] bool BeginDeferredUploads();
 	void               FlushDeferredUploads();
 	void               EndDeferredUploads();
+	void               EnsureReprotectBatch();
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
@@ -306,6 +320,8 @@ private:
 		uint64_t size;
 	};
 	bool                                              m_deferring_uploads = false;
+	bool                                              m_reprotect_batch   = false;
+	std::mutex                                        m_deferred_mutex; // deferred protections + copies
 	std::vector<DeferredCopy>                         m_deferred_copies;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
