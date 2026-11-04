@@ -841,6 +841,8 @@ void GuestGpu::ThreadRun(void* data) {
 		if (command) {
 			{
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+				Common::DebugCounters::ScopedTimer overlay_busy(
+				    Common::DebugCounters::Counter::GpuThreadBusyNs);
 				CpSplitProf::BusyBegin();
 				CpPipeline::Drain();
 				command();
@@ -859,6 +861,8 @@ void GuestGpu::ThreadRun(void* data) {
 		bool complete = false;
 		{
 			PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
+			Common::DebugCounters::ScopedTimer overlay_busy(
+			    Common::DebugCounters::Counter::GpuThreadBusyNs);
 			CpSplitProf::BusyBegin();
 			complete = gpu->Process(submission);
 			CpSplitProf::BusyEnd();
