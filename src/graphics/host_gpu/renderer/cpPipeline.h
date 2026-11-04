@@ -32,9 +32,37 @@
 // Modes: 0 = off (every draw runs on the GPU thread); 1 = back thread (default when the variable is
 // unset); 2 = records executed inline on the GPU thread (checks that a record holds everything its
 // draw reads, no concurrency). Any other value is off.
+//
+// KYTY_CP_PIPELINE_DISPATCH=1 (default 0, slice 2.4a/2.4b): direct dispatches are queued too,
+// buffer-writing ones included. The front derives the guest ranges a queued dispatch may write
+// from its looked-up snapshot (written V# and storage T#) and keeps them in a pending-write set
+// until the back is idle. Front reads check that set (per-range hazard): SRT walks run
+// optimistically and their captured loads are validated after the lookup (overlap: drain, look up
+// again); GPU-thread backing reads, INDIRECT_BUFFER, branch and SET_*_REG_INDIRECT sources drain on
+// overlap. Dispatches whose writes the bindings do not describe (address writes, device addresses,
+// image heap, GDS, BDA page table, fault buffer) run on the GPU thread after a drain; indirect
+// dispatches still drain before their packet. Each record carries the guest sync epoch read on the
+// front. With KYTY_CP_PIPELINE=2 the pending set lives until the next drain point although the
+// records ran inline, and "PERF cppipe" counts verify_miss (a byte a dispatch really writes, from
+// its final bindings, that the front did not record) and verify_unchecked (a GPU-thread fault on a
+// pending range outside the record execution, i.e. a front read no check saw).
 namespace Libs::Graphics::CpPipeline {
 
+// A queued direct dispatch (DrawRecord::is_dispatch).
+struct DispatchRecord {
+	uint32_t                         groups[3] = {};
+	uint32_t                         mode      = 0;
+	HW::ComputeShaderInfo            cs;
+	ShaderComputeInputInfo           input;
+	ShaderRecompiler::IR::ResourceSnapshot snapshot;
+	uint64_t                         sync_epoch = 0;
+	// Guest ranges [begin, end) the front recorded as written (verify mode compares).
+	std::vector<std::pair<uint64_t, uint64_t>> writes;
+};
+
 struct DrawRecord {
+	bool             is_dispatch = false;
+	DispatchRecord   dispatch;
 	bool             indexed   = false;
 	uint64_t         submit_id = 0;
 	DrawIndexArgs    index_args;
@@ -59,6 +87,8 @@ using RelookupFn = void (*)(void* context, DrawRecord& record);
 using FeedbackFn = void (*)(void* context, const DrawRecord& record);
 
 [[nodiscard]] int Mode() noexcept;
+// KYTY_CP_PIPELINE_DISPATCH=1 with the pipeline on.
+[[nodiscard]] bool DispatchEnabled() noexcept;
 // KYTY_CP_PIPELINE_MIN_FRAME_MS=M (default 25, 0 = always): mode 1 queues draws only while presented
 // frames are at least M ms apart on average (PerfStats::RecentFrameUs), as the record thread does. At
 // the display rate the GPU thread has time to spare and each hand-off only delays the submission.
@@ -95,6 +125,18 @@ void               SetHeapHook(HeapFn hook) noexcept;
 void               NoteHeapAcquire() noexcept;
 [[nodiscard]] bool TakeHeapInline() noexcept;
 
+// Front, before Publish of a dispatch: guest bytes [address, address + size) the record may write.
+void NoteWrite(DrawRecord& record, uint64_t address, uint64_t size) noexcept;
+// Front: a read of guest memory. Overlapping a pending write drains (true) before the read.
+bool CheckRead(uint64_t address, uint64_t size) noexcept;
+// Front: an SRT walk's guest loads overlapped a pending write since the last call (the lookup must
+// be done again after a drain).
+[[nodiscard]] bool TakeWalkHazard() noexcept;
+// GPU-thread fault (verify mode): counts a fault on a pending range outside record execution.
+void VerifyFault(uint64_t address) noexcept;
+// Back (verify mode): a range the dispatch really writes, from its final bindings.
+void VerifyWrite(const DrawRecord& record, uint64_t address, uint64_t size, uint64_t shader) noexcept;
+
 // KYTY_PERF_STATS: what happened to the draws the front saw ("PERF cppipe" line).
 enum class Stat : uint32_t {
 	Queued,
@@ -104,6 +146,13 @@ enum class Stat : uint32_t {
 	FallbackTargets,  // metadata color operation, resolve or depth copy
 	FallbackShaders,  // no valid vertex shader or topology
 	FallbackFast,     // frames faster than KYTY_CP_PIPELINE_MIN_FRAME_MS
+	DispatchQueued,
+	DispatchInline,   // writes not described by bindings, or image heap
+	DispatchFast,     // not engaged
+	HazardWalk,       // SRT walk looked up again
+	HazardRead,       // backing read / PM4 source drained
+	VerifyMiss,
+	VerifyUnchecked,
 	Count
 };
 void Note(Stat stat) noexcept;

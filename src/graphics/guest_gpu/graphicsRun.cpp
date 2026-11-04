@@ -1037,6 +1037,7 @@ static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_UCONFIG_REG_INDIRECT: return true;
+		case Pm4::IT_DISPATCH_DIRECT: return CpPipeline::DispatchEnabled();
 		default: return false;
 	}
 }
@@ -1445,7 +1446,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
+		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, DrawBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode, IsAsyncComputeQueue());
 	}
 }

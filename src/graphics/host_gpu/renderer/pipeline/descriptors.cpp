@@ -572,6 +572,26 @@ static bool ResolveTextureDesc(const RenderContext& context,
                                const ShaderRecompiler::IR::ImageResource& resource,
                                const ShaderTextureResource& descriptor, ResolvedTextureDesc& out);
 
+bool RenderExecutor::StorageImageRanges(const ShaderRecompiler::IR::ImageResource&   resource,
+                                        const ShaderRecompiler::IR::DescriptorValue& value,
+                                        GuestRange& data, GuestRange& stencil) const {
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (descriptor.IsNull()) return false;
+	if (!resource.heap && TextureDescMemoMode() != 0 && t_texture_desc_memo) {
+		const auto& entry = (*t_texture_desc_memo)[TextureDescMemoSlot(resource, value)];
+		if (entry.valid && entry.value == value && entry.resource == resource) {
+			data    = entry.resolved.desc.info.data;
+			stencil = entry.resolved.desc.info.stencil;
+			return true;
+		}
+	}
+	ResolvedTextureDesc resolved;
+	if (!ResolveTextureDesc(m_context, resource, descriptor, resolved)) return false;
+	data    = resolved.desc.info.data;
+	stencil = resolved.desc.info.stencil;
+	return true;
+}
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {

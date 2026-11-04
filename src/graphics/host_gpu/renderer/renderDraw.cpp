@@ -1974,6 +1974,7 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 	(void)initialized;
 
 	auto& record          = CpPipeline::Acquire();
+	record.is_dispatch    = false;
 	record.state          = {};
 	record.state.topology = topology;
 	const bool guessed    = GuessSingleSample(buffer.GetShaders().GetPs().ps_regs.data_addr);
@@ -1982,8 +1983,19 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 		CpSplitProf::LookupScope lookup;
 		RefreshShaders(buffer, record.state, guessed);
 	}
+	bool heap_first = false;
+	if (CpPipeline::TakeWalkHazard()) {
+		// KYTY_CP_PIPELINE_DISPATCH: a walk read bytes a queued dispatch writes.
+		CpPipeline::Note(CpPipeline::Stat::HazardWalk);
+		CpPipeline::Drain();
+		heap_first            = CpPipeline::TakeHeapInline();
+		record.state          = {};
+		record.state.topology = topology;
+		CpSplitProf::LookupScope lookup;
+		RefreshShaders(buffer, record.state, guessed);
+	}
 	CpPipeline::SetInLookup(false);
-	const bool heap = CpPipeline::TakeHeapInline();
+	const bool heap = CpPipeline::TakeHeapInline() || heap_first;
 	// A draw without a compiled vertex program is skipped inline, like the unqueued path does.
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
 		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.
@@ -2019,7 +2031,9 @@ void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& reco
 	auto&                  scheduler = self->m_context.GetCommandScheduler();
 	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
 	auto&                  buffer = scheduler.Current();
-	if (record.indexed) {
+	if (record.is_dispatch) {
+		self->PipelineExecuteDispatch(record);
+	} else if (record.indexed) {
 		self->DrawIndexBody(record.submit_id, buffer, record.index_args, &record.state, &record,
 		                    DrawPrepared::LookedUp);
 	} else {
@@ -2048,6 +2062,7 @@ void RenderExecutor::PipelineRelookup(void* context, CpPipeline::DrawRecord& rec
 	}
 	CpPipeline::SetInLookup(false);
 	(void)CpPipeline::TakeHeapInline();
+	(void)CpPipeline::TakeWalkHazard(); // the record's own stream position: later writers do not apply
 	g_pipeline_relookup = false;
 	CopySnapshots(record);
 }

@@ -919,6 +919,8 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
+		// KYTY_CP_PIPELINE_DISPATCH: bytes a queued dispatch writes are not GPU-dirty yet.
+		Graphics::CpPipeline::CheckRead(vaddr, size);
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);

@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::CpPipeline {
 
@@ -48,6 +50,12 @@ struct State {
 	std::atomic<uint64_t> full_wait_ns {0};
 	std::atomic<uint64_t> relookups {0};
 	std::atomic<uint64_t> back_busy_ns {0};
+
+	// Front only (KYTY_CP_PIPELINE_DISPATCH): guest ranges [begin, end) queued dispatches may write,
+	// kept until the back is idle, and their bounds.
+	std::vector<std::pair<uint64_t, uint64_t>> pending;
+	uint64_t                                   pending_lo = UINT64_MAX;
+	uint64_t                                   pending_hi = 0;
 };
 
 uint64_t NowNs() noexcept {
@@ -64,6 +72,9 @@ State& S() noexcept {
 thread_local bool t_back        = false;
 thread_local bool t_in_lookup   = false;
 thread_local bool t_heap_inline = false;
+thread_local bool t_walk_hazard = false;
+// Verify mode: the GPU thread runs a record inline (its reads are back work, in order).
+thread_local bool t_executing   = false;
 HeapFn            g_heap_hook   = nullptr;
 
 DrawRecord& Slot(uint64_t index) noexcept {
@@ -120,6 +131,47 @@ void FrontWait(Done&& done) noexcept {
 	}
 }
 
+void ClearPending() noexcept {
+	auto& s = S();
+	s.pending.clear();
+	s.pending_lo = UINT64_MAX;
+	s.pending_hi = 0;
+}
+
+// Front: [begin, end) overlaps a pending write. Mode 1 forgets the set once the back is idle; verify
+// mode keeps it until a drain point, as if the records were still queued.
+bool PendingOverlap(uint64_t begin, uint64_t end) noexcept {
+	auto& s = S();
+	if (begin >= s.pending_hi || end <= s.pending_lo) return false;
+	if (Mode() == 1 && BackIdle()) {
+		ClearPending();
+		return false;
+	}
+	for (const auto& [b, e]: s.pending) {
+		if (begin < e && b < end) return true;
+	}
+	return false;
+}
+
+// Front reads that the pending set applies to: not while serving a re-lookup (that record's own
+// position in the stream, earlier writers done, later ones not yet) nor inside an inline record.
+bool CheckingReads() noexcept {
+	auto& s = S();
+	return !s.pending.empty() && !t_executing && FrontActive() &&
+	       s.request.load(std::memory_order_acquire) == nullptr;
+}
+
+void WalkLoads(const uint64_t* addresses, size_t count, size_t stride) {
+	if (t_walk_hazard || !CheckingReads()) return;
+	for (size_t i = 0; i < count; i++) {
+		const auto address = addresses[i * stride];
+		if (PendingOverlap(address, address + sizeof(uint32_t))) {
+			t_walk_hazard = true;
+			return;
+		}
+	}
+}
+
 void BackThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuBack");
 	t_back = true;
@@ -162,6 +214,14 @@ int Mode() noexcept {
 	return mode;
 }
 
+bool DispatchEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_PIPELINE_DISPATCH");
+		return Mode() != 0 && value != nullptr && std::atoi(value) == 1;
+	}();
+	return enabled;
+}
+
 bool Engaged() noexcept {
 	static const uint64_t min_frame_us = [] {
 		const char* value = std::getenv("KYTY_CP_PIPELINE_MIN_FRAME_MS");
@@ -178,6 +238,9 @@ void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feed
 	s.relookup = relookup;
 	s.feedback = feedback;
 	s.slots    = std::make_unique<std::array<DrawRecord, Slots>>();
+	if (DispatchEnabled()) {
+		ShaderRecompiler::IR::SetWalkLoadsHook(&WalkLoads);
+	}
 	if (Mode() == 1) {
 		// Detached: it only ever waits for work or runs a record, and dies with the process.
 		std::thread(BackThread).detach();
@@ -218,6 +281,9 @@ void Drain() noexcept {
 		// Parked on a request this lookup cannot serve: it touches nothing until served.
 		return t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr;
 	});
+	if (s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_relaxed)) {
+		ClearPending();
+	}
 	if (!t_in_lookup) ApplyFeedback();
 }
 
@@ -253,7 +319,9 @@ void Publish() noexcept {
 	auto&      s    = S();
 	const auto head = s.head.load(std::memory_order_relaxed);
 	if (Mode() == 2) {
+		t_executing = true;
 		s.execute(s.context, Slot(head));
+		t_executing = false;
 		s.head.store(head + 1, std::memory_order_release);
 		s.tail.store(head + 1, std::memory_order_release);
 		return;
@@ -294,6 +362,61 @@ bool TakeHeapInline() noexcept {
 	return std::exchange(t_heap_inline, false);
 }
 
+void NoteWrite(DrawRecord& record, uint64_t address, uint64_t size) noexcept {
+	if (size == 0 || address + size < address) return;
+	auto& s = S();
+	s.pending.emplace_back(address, address + size);
+	s.pending_lo = std::min(s.pending_lo, address);
+	s.pending_hi = std::max(s.pending_hi, address + size);
+	if (Mode() == 2) record.dispatch.writes.emplace_back(address, address + size);
+}
+
+bool CheckRead(uint64_t address, uint64_t size) noexcept {
+	if (!CheckingReads() || !PendingOverlap(address, address + std::max<uint64_t>(size, 1))) {
+		return false;
+	}
+	Note(Stat::HazardRead);
+	Drain();
+	return true;
+}
+
+bool TakeWalkHazard() noexcept {
+	return std::exchange(t_walk_hazard, false);
+}
+
+void VerifyFault(uint64_t address) noexcept {
+	if (Mode() != 2 || !CheckingReads() || !PendingOverlap(address, address + 1)) return;
+	Note(Stat::VerifyUnchecked);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("PERF cppipe unchecked: fault=0x%016" PRIx64 " on a pending write\n", address);
+	}
+}
+
+void VerifyWrite(const DrawRecord& record, uint64_t address, uint64_t size, uint64_t shader) noexcept {
+	if (Mode() != 2 || size == 0) return;
+	// Covered by the union of the recorded ranges.
+	const auto end    = address + size;
+	auto       cursor = address;
+	for (bool advanced = true; cursor < end && advanced;) {
+		advanced = false;
+		for (const auto& [b, e]: record.dispatch.writes) {
+			if (b <= cursor && cursor < e) {
+				cursor   = e;
+				advanced = true;
+			}
+		}
+	}
+	if (cursor >= end) return;
+	Note(Stat::VerifyMiss);
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("PERF cppipe miss: shader=0x%016" PRIx64 " writes 0x%" PRIx64 "-0x%" PRIx64
+		            ", not recorded from 0x%" PRIx64 "\n",
+		            shader, address, end, cursor);
+	}
+}
+
 void Note(Stat stat) noexcept {
 	S().stats[static_cast<size_t>(stat)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -312,9 +435,12 @@ void Report(double seconds) noexcept {
 	std::printf("PERF cppipe %.1fs: queued=%" PRIu64 " inline_heap=%" PRIu64 " inline_writes=%" PRIu64
 	            " fallback_args=%" PRIu64 " fallback_targets=%" PRIu64 " fallback_shaders=%" PRIu64 " fallback_fast=%" PRIu64
 	            " drain_waits=%" PRIu64 "(%.0fms) full_waits=%" PRIu64 "(%.0fms) relookups=%" PRIu64
-	            " back_busy=%.0fms\n",
+	            " back_busy=%.0fms dispatch_queued=%" PRIu64 " dispatch_inline=%" PRIu64
+	            " dispatch_fast=%" PRIu64 " hazard_walk=%" PRIu64 " hazard_read=%" PRIu64
+	            " verify_miss=%" PRIu64 " verify_unchecked=%" PRIu64 "\n",
 	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], drains, ms(drain), fulls, ms(full),
-	            take(s.relookups), ms(take(s.back_busy_ns)));
+	            take(s.relookups), ms(take(s.back_busy_ns)), st[7], st[8], st[9], st[10], st[11], st[12],
+	            st[13]);
 }
 
 } // namespace Libs::Graphics::CpPipeline

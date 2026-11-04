@@ -324,6 +324,28 @@ private:
 	static void PipelineFeedback(void* context, const CpPipeline::DrawRecord& record);
 	static void PipelineHeap(void* context);
 
+	// KYTY_CP_PIPELINE_DISPATCH (cpPipeline.h): direct dispatches queued on the back thread.
+	bool PipelineDispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                      uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                      bool async_compute);
+	void PipelineExecuteDispatch(CpPipeline::DrawRecord& record);
+	void NoteDispatchWrites(CpPipeline::DrawRecord& record);
+	// Guest memory a storage image binding covers, as ResolveTexture describes it, without the
+	// texture cache; false when it binds nothing.
+	bool StorageImageRanges(const ShaderRecompiler::IR::ImageResource&   resource,
+	                        const ShaderRecompiler::IR::DescriptorValue& value, GuestRange& data,
+	                        GuestRange& stencil) const;
+	static void LogZeroDispatch(const HW::ComputeShaderInfo& cs_regs, uint32_t thread_group_x,
+	                            uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	bool LookUpDispatch(const HW::ComputeShaderInfo& cs_regs, uint32_t thread_group_x,
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                    bool async_compute, bool begin_heap, ShaderComputeInputInfo& input_info);
+	void DispatchDirectBody(uint64_t submit_id, CommandBuffer& buffer,
+	                        const HW::ComputeShaderInfo& cs_regs, ShaderComputeInputInfo& input_info,
+	                        uint32_t thread_group_x, uint32_t thread_group_y,
+	                        uint32_t thread_group_z, uint32_t mode, uint64_t epoch,
+	                        const CpPipeline::DrawRecord* record);
+
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
 		std::optional<PreparedBindings> pixel;

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -427,12 +428,11 @@ static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& bu
                                  vk::CommandBuffer vk_buffer, const ShaderComputeInputInfo& input,
                                  const PreparedBindings& bindings, bool writes,
                                  DispatchChain::Accesses& accesses,
-                                 std::vector<DispatchChain::Access>& guest) {
+                                 std::vector<DispatchChain::Access>& guest, uint64_t epoch) {
 	using namespace DispatchChain;
 	const bool verify = DispatchChainMode() == 2;
 	CollectAccesses(context, input, bindings, writes, accesses, verify ? &guest : nullptr);
 	auto&      state    = buffer.DispatchChainState();
-	const auto epoch    = GuestSyncEpoch();
 	const auto decision = Decide(state, accesses, epoch);
 	if (verify) {
 		Add(Counter::Direct);
@@ -497,37 +497,73 @@ static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& bu
 	Commit(state, accesses, epoch, decision.barrier);
 }
 
+// Direct dispatches with KYTY_CP_PIPELINE_DISPATCH: what the bindings do not describe (writes
+// through addresses, device addresses, the image heap, GDS, the BDA page table, the fault buffer)
+// cannot enter the front's pending-write set, so such dispatches run on the GPU thread.
+static bool DispatchWritesUndescribed(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	using ShaderRecompiler::IR::DescriptorBindingKind;
+	const auto& counts = program.bindings.descriptor_counts;
+	return program.has_address_writes || program.info.uses_dma || program.info.uses_image_heap ||
+	       program.info.uses_gds || counts[static_cast<size_t>(DescriptorBindingKind::Gds)] != 0 ||
+	       counts[static_cast<size_t>(DescriptorBindingKind::BdaPagetable)] != 0 ||
+	       counts[static_cast<size_t>(DescriptorBindingKind::FaultBuffer)] != 0;
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
+	if (CpPipeline::DispatchEnabled() && CpPipeline::FrontActive() &&
+	    PipelineDispatch(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                     async_compute)) {
+		return;
+	}
+	CpPipeline::Drain();
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
-	auto& sh_ctx = buffer.GetShaders();
+	const auto& cs_regs = buffer.GetShaders().GetCs();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
-	                    sh_ctx.GetCs().cs_regs.data_addr);
+	                    cs_regs.cs_regs.data_addr);
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
-			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
-			     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
-			     thread_group_x, thread_group_y, thread_group_z, mode,
-			     sh_ctx.GetCs().cs_regs.data_addr);
-		}
+		LogZeroDispatch(cs_regs, thread_group_x, thread_group_y, thread_group_z, mode);
 		return;
 	}
+	Common::LockGuard  lock(m_context.GetMutex());
+	ShaderComputeInputInfo input_info {};
+	if (!LookUpDispatch(cs_regs, thread_group_x, thread_group_y, thread_group_z, mode, async_compute,
+	                    true, input_info)) {
+		return;
+	}
+	DispatchDirectBody(submit_id, buffer, cs_regs, input_info, thread_group_x, thread_group_y,
+	                   thread_group_z, mode, GuestSyncEpoch(), nullptr);
+}
 
-	Common::LockGuard lock(m_context.GetMutex());
-	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
+void RenderExecutor::LogZeroDispatch(const HW::ComputeShaderInfo& cs_regs, uint32_t thread_group_x,
+                                     uint32_t thread_group_y, uint32_t thread_group_z,
+                                     uint32_t mode) {
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
+		     "mode=0x%08" PRIx32 " shader=0x%016" PRIx64 "\n",
+		     thread_group_x, thread_group_y, thread_group_z, mode, cs_regs.cs_regs.data_addr);
+	}
+}
+
+// The part of a direct dispatch up to its program lookup; false when nothing is to be recorded.
+bool RenderExecutor::LookUpDispatch(const HW::ComputeShaderInfo& cs_regs, uint32_t thread_group_x,
+                                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                                    bool async_compute, bool begin_heap,
+                                    ShaderComputeInputInfo& input_info) {
+	if (cs_regs.cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
 		     thread_group_x, thread_group_y, thread_group_z, mode);
-		return;
+		return false;
 	}
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
@@ -543,14 +579,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			LOGF("GraphicsRenderDispatchDirect: unknown dispatch initiator bits "
 			     "mode=0x%08" PRIx32 " unknown=0x%08" PRIx32 " shader=0x%016" PRIx64
 			     " groups=%ux%ux%u\n",
-			     mode, unknown_mode_bits, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x,
+			     mode, unknown_mode_bits, cs_regs.cs_regs.data_addr, thread_group_x,
 			     thread_group_y, thread_group_z);
 		}
 	}
 
-	const auto& cs_regs = sh_ctx.GetCs();
-
-	ShaderComputeInputInfo input_info {};
+	input_info               = {};
 	input_info.async_compute = async_compute;
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
@@ -566,19 +600,154 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	m_context.GetImageHeap().BeginDraw();
+	if (begin_heap) {
+		m_context.GetImageHeap().BeginDraw();
+	}
 	bool found_program = false;
 	{
 		CpSplitProf::LookupScope lookup;
 		found_program = static_cast<bool>(m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info));
 	}
-	if (!found_program) return;
+	if (!found_program) return false;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
 		input_info.dispatch_threads_num[2]    = thread_group_z;
 	}
+	return true;
+}
 
+// The guest ranges a queued dispatch may write, from its snapshot: written V# as FindBuffers sizes
+// them (without the clamps that only shrink), and storage T# as ResolveTexture describes them.
+void RenderExecutor::NoteDispatchWrites(CpPipeline::DrawRecord& record) {
+	const auto& input     = record.dispatch.input;
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < resources.buffers.size(); i++) {
+		const auto& metadata = program.info.buffers[i];
+		if (!metadata.written || metadata.descriptor_index == UINT32_MAX) continue;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		auto       size       = descriptor.GetSize();
+		if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    !metadata.scalar) {
+			size = std::max(size, uint64_t {metadata.max_byte_extent});
+		}
+		if (descriptor.NumRecords() == UINT32_MAX) {
+			size = std::min(size, uint64_t {256} * 1024 * 1024);
+		}
+		if (descriptor.Base48() != 0) {
+			CpPipeline::NoteWrite(record, descriptor.Base48(), size);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size() && i < resources.images.size(); i++) {
+		GuestRange data;
+		GuestRange stencil;
+		if (program.info.images[i].written &&
+		    StorageImageRanges(program.info.images[i], resources.images[i], data, stencil)) {
+			CpPipeline::NoteWrite(record, data.address, data.size);
+			CpPipeline::NoteWrite(record, stencil.address, stencil.size);
+		}
+	}
+}
+
+// GPU thread, KYTY_CP_PIPELINE_DISPATCH: looks the dispatch's program up and queues it; false when
+// it must run here (pipeline not engaged).
+bool RenderExecutor::PipelineDispatch(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint32_t thread_group_x, uint32_t thread_group_y,
+                                      uint32_t thread_group_z, uint32_t mode, bool async_compute) {
+	if (!CpPipeline::Engaged()) {
+		CpPipeline::Note(CpPipeline::Stat::DispatchFast);
+		return false;
+	}
+	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+		LogZeroDispatch(buffer.GetShaders().GetCs(), thread_group_x, thread_group_y, thread_group_z,
+		                mode);
+		return true;
+	}
+	static const bool initialized = [this] {
+		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
+		CpPipeline::SetHeapHook(PipelineHeap);
+		return true;
+	}();
+	(void)initialized;
+
+	auto& record       = CpPipeline::Acquire();
+	auto& dispatch     = record.dispatch;
+	record.is_dispatch = true;
+	record.submit_id   = submit_id;
+	dispatch.cs        = buffer.GetShaders().GetCs();
+	dispatch.writes.clear();
+	CpPipeline::SetInLookup(true);
+	bool found = LookUpDispatch(dispatch.cs, thread_group_x, thread_group_y, thread_group_z, mode,
+	                            async_compute, false, dispatch.input);
+	bool heap = false;
+	if (CpPipeline::TakeWalkHazard()) {
+		// The walk read bytes a queued dispatch writes: look up again once they are written (an
+		// image heap use begins its draw again through the heap hook).
+		CpPipeline::Note(CpPipeline::Stat::HazardWalk);
+		CpPipeline::Drain();
+		heap  = CpPipeline::TakeHeapInline();
+		found = LookUpDispatch(dispatch.cs, thread_group_x, thread_group_y, thread_group_z, mode,
+		                       async_compute, false, dispatch.input);
+	}
+	CpPipeline::SetInLookup(false);
+	heap = CpPipeline::TakeHeapInline() || heap;
+	if (!found) {
+		return true;
+	}
+	if (heap || DispatchWritesUndescribed(*dispatch.input.stage.program)) {
+		CpPipeline::Note(CpPipeline::Stat::DispatchInline);
+		CpPipeline::Drain();
+		EXIT_IF(buffer.IsInvalid());
+		m_context.GetCommandScheduler().PopPendingOperations();
+		buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
+		                    thread_group_x, thread_group_y, thread_group_z, mode,
+		                    dispatch.cs.cs_regs.data_addr);
+		Common::LockGuard lock(m_context.GetMutex());
+		if (!heap) {
+			m_context.GetImageHeap().BeginDraw();
+		}
+		DispatchDirectBody(submit_id, buffer, dispatch.cs, dispatch.input, thread_group_x,
+		                   thread_group_y, thread_group_z, mode, GuestSyncEpoch(), nullptr);
+		return true;
+	}
+	dispatch.groups[0]      = thread_group_x;
+	dispatch.groups[1]      = thread_group_y;
+	dispatch.groups[2]      = thread_group_z;
+	dispatch.mode           = mode;
+	dispatch.sync_epoch     = GuestSyncEpoch();
+	dispatch.snapshot       = *dispatch.input.stage.resources;
+	dispatch.input.stage.resources = &dispatch.snapshot;
+	NoteDispatchWrites(record);
+	CpPipeline::Note(CpPipeline::Stat::DispatchQueued);
+	CpPipeline::Publish();
+	return true;
+}
+
+// Back thread (or GPU thread): a queued direct dispatch, from the packet's place in the stream.
+void RenderExecutor::PipelineExecuteDispatch(CpPipeline::DrawRecord& record) {
+	auto& dispatch = record.dispatch;
+	auto& buffer   = m_context.GetCommandScheduler().Current();
+	m_context.GetCommandScheduler().PopPendingOperations();
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect),
+	                    record.submit_id, dispatch.groups[0], dispatch.groups[1],
+	                    dispatch.groups[2], dispatch.mode, dispatch.cs.cs_regs.data_addr);
+	Common::LockGuard lock(m_context.GetMutex());
+	m_context.GetImageHeap().BeginDraw();
+	DispatchDirectBody(record.submit_id, buffer, dispatch.cs, dispatch.input, dispatch.groups[0],
+	                   dispatch.groups[1], dispatch.groups[2], dispatch.mode, dispatch.sync_epoch,
+	                   &record);
+}
+
+// Everything after the program lookup: consumed fills, bindings, barriers and the dispatch. The
+// caller holds the render mutex. `epoch` is the guest sync point the dispatch was decoded under.
+void RenderExecutor::DispatchDirectBody(uint64_t submit_id, CommandBuffer& buffer,
+                                        const HW::ComputeShaderInfo& cs_regs,
+                                        ShaderComputeInputInfo& input_info, uint32_t thread_group_x,
+                                        uint32_t thread_group_y, uint32_t thread_group_z,
+                                        uint32_t mode, uint64_t epoch,
+                                        const CpPipeline::DrawRecord* record) {
+	const bool use_thread_dimensions = (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty() &&
@@ -631,6 +800,26 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		RebindBuffers(bindings);
 	}
+	if (record != nullptr && CpPipeline::Mode() == 2) {
+		// Verify mode: every byte the final bindings let the dispatch write was recorded.
+		for (const auto& resource: program.info.buffers) {
+			const auto index = resource.descriptor_index;
+			if (resource.written && index < bindings.buffers.size() &&
+			    index < bindings.buffer_sources.size() && bindings.buffers[index].buffer) {
+				CpPipeline::VerifyWrite(*record, bindings.buffer_sources[index].address,
+				                        bindings.buffer_sources[index].size, program.shader_hash);
+			}
+		}
+		for (uint32_t i = 0; i < program.info.images.size() && i < bindings.images.size(); i++) {
+			if (program.info.images[i].written && bindings.images[i].image_id) {
+				const auto& info = bindings.images[i].desc.info;
+				CpPipeline::VerifyWrite(*record, info.data.address, info.data.size,
+				                        program.shader_hash);
+				CpPipeline::VerifyWrite(*record, info.stencil.address, info.stencil.size,
+				                        program.shader_hash);
+			}
+		}
+	}
 
 	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
 	// own tracked accesses), its barrier and the dispatch are recorded: a dispatch chain stays open.
@@ -655,7 +844,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    has_storage_writes;
 	if (chain_mode != 0) {
 		ChainDispatchBarrier(m_context, buffer, vk_buffer, input_info, bindings, has_storage_writes,
-		                     m_chain_accesses, m_chain_guest_accesses);
+		                     m_chain_accesses, m_chain_guest_accesses, epoch);
 	} else if (has_storage_writes) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
@@ -671,7 +860,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
+		     frame_num, cs_regs.cs_regs.data_addr, program.shader_hash,
 		     m_context.GetCommandScheduler().CurrentTick(),
 		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
 		     thread_group_x, thread_group_y, thread_group_z, mode,

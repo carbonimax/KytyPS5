@@ -70,6 +70,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// (it would otherwise publish GPU bytes as a read and report the fault handled).
 	constexpr uint64_t fault_size = 1;
 	// KYTY_CP_PIPELINE: a GPU-thread fault resolves through the caches the back thread uses.
+	CpPipeline::VerifyFault(fault_vaddr);
 	CpPipeline::Drain();
 	if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) || !IsMapped(fault_vaddr, fault_size)) {
 		return false;
