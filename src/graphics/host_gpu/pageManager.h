@@ -29,19 +29,27 @@ public:
 	// holds the address-space lock that concurrent watcher updates wait for before protecting.
 	void RestoreProtection(uint64_t vaddr, uint64_t size) noexcept;
 
-	// KYTY_PROTECT_COALESCE (BufferCache::BeginDeferredUploads). Between Begin and Flush, the
-	// protections this thread would add (read-only / no-access) inside a DeferCapture scope are
-	// recorded instead of applied; the watcher counts change at once. Flush applies them in
-	// merged runs: under each region's lock, every page of a recorded span (plus gaps of up to
+	// KYTY_PROTECT_COALESCE / KYTY_REPROTECT_BATCH (BufferCache::BeginDeferredUploads). After
+	// Begin, the protections this thread would add (read-only / no-access) inside a DeferCapture
+	// scope are recorded instead of applied; the watcher counts change at once. The recorded
+	// spans are shared by all deferring threads, and Flush (on any thread) applies all of them
+	// in merged runs: under each region's lock, every page of a recorded span (plus gaps of up to
 	// 16 pages between spans) whose current state still asks for that protection. A page whose
 	// state changed meanwhile (another thread made it writable again) is skipped: like every
 	// other protection change, the host protection is set to the page's state under the region
 	// lock, never to an older value. Until Flush, recorded pages stay writable, so their bytes
-	// must be read after Flush.
+	// must be read after Flush. Concurrent Flush calls must be serialized by the caller.
 	static void BeginDeferredProtect() noexcept;
 	static void FlushDeferredProtect() noexcept;
 	static void EndDeferredProtect() noexcept;
 	[[nodiscard]] static bool DeferringProtect() noexcept;
+	// KYTY_REPROTECT_BATCH=2: Flush reads back the host protection of the pages it applied.
+	struct DeferredVerifyStats {
+		uint64_t checked  = 0;
+		uint64_t mismatch = 0;
+	};
+	static void                              SetDeferredVerify(bool on) noexcept;
+	[[nodiscard]] static DeferredVerifyStats GetDeferredVerifyStats() noexcept;
 	// Only protections made inside a capture scope (upload re-protections of a read-only
 	// synchronization, MemoryTracker::ForEachUploadRange) are deferred; all others apply at once.
 	class DeferCapture final {

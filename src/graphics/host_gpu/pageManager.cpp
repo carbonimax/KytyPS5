@@ -92,14 +92,28 @@ struct DeferredSpan {
 	Common::VirtualMemory::Mode mode;
 };
 
+// Per thread: whether this thread defers the protections of its capture scopes, and the flush state.
 struct DeferredProtect {
-	bool                      active  = false;
-	bool                      capture = false;
-	std::vector<DeferredSpan> spans;
+	bool                      active   = false;
+	bool                      capture  = false;
+	bool                      applying = false; // inside FlushDeferredProtect: protect at once
 	std::vector<DeferredSpan> scratch;
 };
 
 thread_local DeferredProtect t_deferred;
+
+// Recorded spans, shared by the deferring threads (the GPU thread and the command-processor back
+// thread take turns; either may flush what the other recorded). Taken inside a region lock, never
+// the other way round.
+std::atomic_flag          g_deferred_lock = ATOMIC_FLAG_INIT;
+std::vector<DeferredSpan> g_deferred_spans;
+std::atomic<bool>         g_deferred_any {false};
+
+// KYTY_REPROTECT_BATCH=2: after a flush, the host protection of every page it was asked to protect
+// is read back (VirtualQuery) and compared with the page state.
+std::atomic<bool>     g_verify_deferred {false};
+std::atomic<uint64_t> g_verify_checked {0};
+std::atomic<uint64_t> g_verify_mismatch {0};
 
 void ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
@@ -220,15 +234,17 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		if (t_deferred.capture && t_deferred.active &&
+		if (t_deferred.capture && t_deferred.active && !t_deferred.applying &&
 		    mode != Common::VirtualMemory::Mode::ReadWrite) [[unlikely]] {
-			auto& spans = t_deferred.spans;
+			SpinGuard lock(g_deferred_lock);
+			auto&     spans = g_deferred_spans;
 			if (!spans.empty() && spans.back().impl == this && spans.back().mode == mode &&
 			    spans.back().end == vaddr) {
 				spans.back().end = vaddr + size;
 			} else {
 				spans.push_back({this, vaddr, vaddr + size, mode});
 			}
+			g_deferred_any.store(true, std::memory_order_relaxed);
 			return;
 		}
 		if (mode != Common::VirtualMemory::Mode::ReadWrite && GuestStacks::MaybeHit(vaddr, size)) [[unlikely]] {
@@ -311,9 +327,49 @@ struct PageManager::Impl {
 						run = last;
 					}
 				}
+				if (g_verify_deferred.load(std::memory_order_relaxed)) [[unlikely]] {
+					VerifyDeferred(*region, region_base, first, last);
+				}
 			}
 			chunk_begin = chunk_end;
 		}
+	}
+
+	// KYTY_REPROTECT_BATCH=2 (region lock held): every page of [first, last) whose state asks for a
+	// protection must not be writable on the host once the flush applied it.
+	static void VerifyDeferred(const Region& region, uint64_t region_base, size_t first,
+	                           size_t last) noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		for (size_t page = first; page < last; page++) {
+			const auto perms = region.pages[page].Perms();
+			if (perms == Common::VirtualMemory::Mode::ReadWrite) {
+				continue;
+			}
+			const auto               address = region_base + page * PAGE_SIZE;
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) == 0) {
+				continue;
+			}
+			g_verify_checked.fetch_add(1, std::memory_order_relaxed);
+			const auto protect  = info.Protect & 0xffu;
+			const bool writable = protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+			                      protect == PAGE_EXECUTE_READWRITE ||
+			                      protect == PAGE_EXECUTE_WRITECOPY;
+			const bool readable = protect != PAGE_NOACCESS;
+			const bool bad = writable || (perms == Common::VirtualMemory::Mode::NoAccess && readable);
+			if (bad && g_verify_mismatch.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "PageManager: deferred protection mismatch at 0x%016" PRIx64
+				             " (state %u, host 0x%08lx)\n",
+				             address, static_cast<unsigned>(perms), info.Protect);
+			}
+		}
+#else
+		(void)region;
+		(void)region_base;
+		(void)first;
+		(void)last;
+#endif
 	}
 
 	template <bool track, bool is_read>
@@ -410,15 +466,19 @@ bool PageManager::DeferringProtect() noexcept {
 }
 
 void PageManager::FlushDeferredProtect() noexcept {
-	if (!t_deferred.active || t_deferred.spans.empty()) {
+	if (!g_deferred_any.load(std::memory_order_acquire)) {
 		return;
 	}
 	constexpr uint64_t MaxGap = 16 * PAGE_SIZE;
 	auto&              spans  = t_deferred.scratch;
 	spans.clear();
-	std::swap(spans, t_deferred.spans);
-	// Inactive while applying: ApplyDeferred's protections are made at once.
-	t_deferred.active = false;
+	{
+		SpinGuard lock(g_deferred_lock);
+		std::swap(spans, g_deferred_spans);
+		g_deferred_any.store(false, std::memory_order_relaxed);
+	}
+	// ApplyDeferred's protections are made at once.
+	t_deferred.applying = true;
 	std::sort(spans.begin(), spans.end(), [](const DeferredSpan& a, const DeferredSpan& b) {
 		return a.impl != b.impl ? a.impl < b.impl : a.begin < b.begin;
 	});
@@ -437,7 +497,16 @@ void PageManager::FlushDeferredProtect() noexcept {
 		i = j;
 	}
 	spans.clear();
-	t_deferred.active = true;
+	t_deferred.applying = false;
+}
+
+void PageManager::SetDeferredVerify(bool on) noexcept {
+	g_verify_deferred.store(on, std::memory_order_relaxed);
+}
+
+PageManager::DeferredVerifyStats PageManager::GetDeferredVerifyStats() noexcept {
+	return {g_verify_checked.load(std::memory_order_relaxed),
+	        g_verify_mismatch.load(std::memory_order_relaxed)};
 }
 
 void PageManager::EndDeferredProtect() noexcept {

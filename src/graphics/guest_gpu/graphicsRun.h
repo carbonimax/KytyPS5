@@ -47,6 +47,8 @@ public:
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 	// KYTY_CP_PIPELINE back thread: runs GPU-thread code paths (never guest code).
 	static void MarkHostGpuThread() noexcept;
+	// GPU thread: KYTY_REPROTECT_BATCH flush at a guest sync point (see BufferCache).
+	void FlushBatchedUploads();
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
