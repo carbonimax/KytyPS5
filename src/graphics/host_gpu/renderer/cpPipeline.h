@@ -70,6 +70,13 @@ void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feed
 [[nodiscard]] bool FrontActive() noexcept;
 // No queued or running record (any thread; acquire).
 [[nodiscard]] bool BackIdle() noexcept;
+// Monotonic record counts: finished by the back (on the back thread, the index of the record it
+// runs) and published by the front.
+[[nodiscard]] uint64_t Finished() noexcept;
+[[nodiscard]] uint64_t Published() noexcept;
+// Back thread: a published record after the one it runs (Finished() < index < Published()); the
+// front leaves it alone until the back is done with it.
+[[nodiscard]] const DrawRecord& Queued(uint64_t index) noexcept;
 
 // Front: wait until the back thread is idle. Inside a program lookup a back thread parked on a
 // re-lookup request counts as idle (it touches nothing until the front serves it after the lookup).

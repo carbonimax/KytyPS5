@@ -304,6 +304,8 @@ private:
 	static void PipelineRelookup(void* context, CpPipeline::DrawRecord& record);
 	static void PipelineFeedback(void* context, const CpPipeline::DrawRecord& record);
 	static void PipelineHeap(void* context);
+	// KYTY_PIPELINE_PARALLEL (pipelineCache.h): predicts the pipelines of the queued draws.
+	static void PipelinePrefetch(void* context);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;

@@ -197,6 +197,18 @@ bool BackIdle() noexcept {
 	return s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_acquire);
 }
 
+uint64_t Finished() noexcept {
+	return S().tail.load(std::memory_order_acquire);
+}
+
+uint64_t Published() noexcept {
+	return S().head.load(std::memory_order_acquire);
+}
+
+const DrawRecord& Queued(uint64_t index) noexcept {
+	return Slot(index);
+}
+
 void Drain() noexcept {
 	if (!FrontActive() || S().slots == nullptr) return;
 	auto& s = S();
