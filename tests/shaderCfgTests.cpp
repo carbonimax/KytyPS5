@@ -6355,18 +6355,18 @@ void TestNewShaderRecompilerImageViewDimensions() {
         "1D image view did not survive into IR metadata");
   Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
         "1D-array image view did not survive into IR metadata");
-  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 1),
-        "SPIR-V binary does not contain sampled 1D image type");
-  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 1),
-        "SPIR-V binary does not contain sampled 1D-array image type");
+  // 1D views are hosted as 2D images one texel high.
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 0, 1),
+        "SPIR-V binary does not contain the sampled 2D host type of the 1D image");
+  Check(!SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 1) &&
+            !SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 1),
+        "SPIR-V binary still declares a sampled 1D image type");
   Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 1, 1),
         "SPIR-V binary does not contain sampled 2D-array image type");
   Check(SpirvContainsTypeImage(result.spirv, SpirvDim3D, 0, 1),
         "SPIR-V binary does not contain sampled 3D image type");
-  Check(SpirvContainsCapability(result.spirv, 43),
-        "SPIR-V binary does not request Sampled1D");
-  Check(SpirvContainsCapability(result.spirv, 44),
-        "SPIR-V binary does not request Image1D");
+  Check(!SpirvContainsCapability(result.spirv, 43) && !SpirvContainsCapability(result.spirv, 44),
+        "SPIR-V binary still requests Sampled1D or Image1D");
   Check(SpirvContainsOpcode(result.spirv, 95),
         "SPIR-V binary does not contain array image fetch");
   CheckSpirvBinaryValidates(result.spirv);
@@ -6383,6 +6383,7 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   constexpr uint32_t MimgDim1D = 0;
   constexpr uint32_t MimgDim1DArray = 4;
   constexpr uint32_t SpirvDim1D = 0;
+  constexpr uint32_t SpirvDim2D = 1;
 
   const uint32_t shader[] = {
       EncodeMimg0(0x08, 0xf, false, MimgDim1D),
@@ -6405,10 +6406,14 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
         "1D storage dimension did not survive into IR metadata");
   Check((result.ir_dump.find("image_dim=1d_array") != std::string::npos),
         "1D-array storage dimension did not survive into IR metadata");
-  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 2),
-        "SPIR-V binary does not contain storage 1D image type");
-  Check(SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 2),
-        "SPIR-V binary does not contain storage 1D-array image type");
+  // 1D views are hosted as 2D images one texel high.
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 0, 2),
+        "SPIR-V binary does not contain the storage 2D host type of the 1D image");
+  Check(SpirvContainsTypeImage(result.spirv, SpirvDim2D, 1, 2),
+        "SPIR-V binary does not contain the storage 2D-array host type of the 1D-array image");
+  Check(!SpirvContainsTypeImage(result.spirv, SpirvDim1D, 0, 2) &&
+            !SpirvContainsTypeImage(result.spirv, SpirvDim1D, 1, 2),
+        "SPIR-V binary still declares a storage 1D image type");
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
