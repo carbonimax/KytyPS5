@@ -204,6 +204,34 @@ endif()
 
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
+# The shader store key (src/shader_store_key.cmake): the translation sources, hashed at build time,
+# and what of the build can change their results. shortcut: multi-config generators share one key
+# for all configurations; give each its own once the store runs in more than Release.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" kyty_store_config)
+get_directory_property(kyty_store_options COMPILE_OPTIONS)
+get_directory_property(kyty_store_definitions COMPILE_DEFINITIONS)
+string(JOIN "\n" kyty_store_build
+	"${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}"
+	"${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_OSX_ARCHITECTURES}"
+	"${CMAKE_BUILD_TYPE} ${CMAKE_INTERPROCEDURAL_OPTIMIZATION}"
+	"${CMAKE_CXX_FLAGS}"
+	"${CMAKE_CXX_FLAGS_${kyty_store_config}}"
+	"${kyty_store_options}"
+	"${kyty_store_definitions}")
+file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/shaderStoreBuild.txt" CONTENT "@kyty_store_build@\n" @ONLY)
+include("${KYTY_SOURCE_DIR}/shader_store_key.cmake")
+kyty_shader_store_key_files("${CMAKE_CURRENT_SOURCE_DIR}" kyty_store_key_sources)
+list(TRANSFORM kyty_store_key_sources PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
+add_custom_command(
+	OUTPUT "${PROJECT_BINARY_DIR}/shaderStoreKey.h"
+	COMMAND ${CMAKE_COMMAND} "-DROOT=${CMAKE_CURRENT_SOURCE_DIR}"
+	        "-DBUILD_FILE=${PROJECT_BINARY_DIR}/shaderStoreBuild.txt"
+	        "-DOUTPUT=${PROJECT_BINARY_DIR}/shaderStoreKey.h" -P "${KYTY_SOURCE_DIR}/shader_store_key.cmake"
+	DEPENDS ${kyty_store_key_sources} "${PROJECT_BINARY_DIR}/shaderStoreBuild.txt"
+	COMMENT "Hash the shader store sources"
+	VERBATIM
+)
+
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/libs/*.cpp"
 	"${KYTY_SOURCE_DIR}/libs/*.h"
@@ -332,6 +360,7 @@ add_gpu_blit_shader(gpu_pssr_linear gpu_pssr_linear.comp)
 # At SPIR-V 1.6 glslang declares a task shader's workgroup size with LocalSizeId, which needs maintenance4.
 add_gpu_blit_shader(gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
+list(APPEND kyty_emulator_src "${PROJECT_BINARY_DIR}/shaderStoreKey.h")
 
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
@@ -829,6 +858,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME shader_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --shader-store-only)
+	add_test(NAME shader_store_key
+		COMMAND ${CMAKE_COMMAND} "-DSCRIPT=${KYTY_SOURCE_DIR}/shader_store_key.cmake"
+		        "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/shader_store_key_test" -P "${KYTY_TESTS_DIR}/ShaderStoreKeyTests.cmake")
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation

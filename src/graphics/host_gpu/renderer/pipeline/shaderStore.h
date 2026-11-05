@@ -21,11 +21,12 @@ struct ZSTD_CCtx_s;
 namespace Libs::Graphics {
 
 // The per-title shader store, _PipelineCache/<title>.shaders: a header naming everything the
-// records depend on besides their own fields (the build, the host and the switches that change
-// the SPIR-V), then checksummed zstd frames, one per record. Each frame names its record's kind,
-// id, the last launch that wrote or used it and how many launches did. A store cut short keeps
-// every complete record; the first damaged one ends it. Any header difference starts the store
-// over, so SPIR-V from another build or host is never loaded.
+// records depend on besides their own fields (the sources that translate shaders and the build
+// flags, hashed by shader_store_key.cmake; the host; the switches that change the SPIR-V), then
+// checksummed zstd frames, one per record. Each frame names its record's kind, id, the last
+// launch that wrote or used it and how many launches did. A store cut short keeps every complete
+// record; the first damaged one ends it. Any header difference starts the store
+// over, so SPIR-V from other translation sources or another host is never loaded.
 //
 // Records are appended while the title runs: programs (key and resource plan), modules (their
 // compiled info), the SPIR-V of each module in a frame of its own, graphics pipelines, and lists

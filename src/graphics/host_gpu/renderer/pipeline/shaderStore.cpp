@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "shaderStoreKey.h"
 
 #include <algorithm>
 #include <array>
@@ -16,15 +17,6 @@
 #include <unordered_map>
 #include <xxhash.h>
 #include <zstd.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#elif defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 namespace Libs::Graphics {
 
@@ -72,57 +64,6 @@ constexpr double   Megabytes     = 1'000'000.0;
 
 // Dead records start a compaction once they are this part of the file.
 constexpr uint64_t CompactDeadDivisor = 4;
-
-std::filesystem::path ExecutablePath() {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::vector<wchar_t> name(32768);
-	const auto           length =
-	    GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
-	if (length == 0 || length >= name.size()) {
-		return {};
-	}
-	return std::filesystem::path(name.data());
-#elif defined(__APPLE__)
-	std::array<char, 4096> name {};
-	auto                   size = static_cast<uint32_t>(name.size());
-	if (_NSGetExecutablePath(name.data(), &size) != 0) {
-		return {};
-	}
-	return std::filesystem::path(name.data());
-#else
-	return std::filesystem::path("/proc/self/exe");
-#endif
-}
-
-// The content of the running executable, so that any rebuild of the recompiler starts the store
-// over. Zero when the executable cannot be read.
-uint64_t BuildHash() {
-	const auto path = ExecutablePath();
-	if (path.empty()) {
-		return 0;
-	}
-	Common::File file;
-	if (!file.Open(path, Common::File::Mode::Read)) {
-		return 0;
-	}
-	XXH3_state_t* state = XXH3_createState();
-	XXH3_64bits_reset(state);
-	std::vector<uint8_t> chunk(4u << 20u);
-	uint64_t             total = 0;
-	for (;;) {
-		uint32_t read = 0;
-		file.Read(chunk.data(), static_cast<uint32_t>(chunk.size()), &read);
-		if (read == 0) {
-			break;
-		}
-		XXH3_64bits_update(state, chunk.data(), read);
-		total += read;
-	}
-	file.Close();
-	const auto hash = XXH3_64bits_digest(state);
-	XXH3_freeState(state);
-	return total != 0 && hash != 0 ? hash : 0;
-}
 
 // Switches read while translating or emitting shaders.
 constexpr std::array ShaderEnvironment {
@@ -508,12 +449,11 @@ ShaderStoreMode GetShaderStoreMode() {
 }
 
 std::vector<uint8_t> ShaderStoreHostKey(const GraphicContext& graphics) {
-	const auto build = BuildHash();
-	if (build == 0) {
-		return {};
-	}
-	const auto& properties = graphics.GetPhysicalDeviceProperties();
-	Writer      key;
+	// The translation sources and build flags (shader_store_key.cmake), not the executable, so that
+	// a rebuild that leaves them alone keeps the store.
+	const std::string build      = KYTY_SHADER_STORE_SOURCE_KEY;
+	const auto&       properties = graphics.GetPhysicalDeviceProperties();
+	Writer            key;
 	// The SPIR-V profile and host features of ProgramCache, then what selects compute variants.
 	IoAll(key, build, graphics.maintenance8_enabled, properties.vendorID,
 	      graphics.device_clock_period_ps, graphics.shader_buffer_int64_atomics_enabled,
