@@ -1040,6 +1040,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			});
 		}
 		PipelineCacheLog("Pipeline parallel: {} workers (KYTY_PIPELINE_PARALLEL)", workers);
+		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
+		m_async           = async != nullptr && async[0] == '1';
+		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
@@ -2245,23 +2248,68 @@ void PipelineCache::Prefetch(const HW::Context& ctx, const HW::UserConfig& ucfg,
 	    m_graphics_pipelines.contains(key) || m_pending.contains(key)) {
 		return;
 	}
+	StartPending(key, state, false);
+}
+
+PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer&   command,
+                                                             const DrawRenderState& state,
+                                                             std::span<const RenderColorInfo> colors,
+                                                             bool depth_feedback, bool may_skip,
+                                                             bool& missed) {
+	WaitWarmUp();
+	GraphicsPipelineKey key;
+	(void)MakeGraphicsKey(command.GetRegisters(), command.GetUserConfig(), state, colors,
+	                      depth_feedback, false, key);
+	if (const auto found = m_graphics_pipelines.find(key); found != m_graphics_pipelines.end()) {
+		missed = false;
+		if (found->second.store_id != 0 && m_store != nullptr) [[unlikely]] {
+			m_store->NoteUsedPipeline(std::exchange(found->second.store_id, 0));
+		}
+		return &found->second;
+	}
+	missed = true;
+	if (may_skip) {
+		const auto pending = m_pending.find(key);
+		if (pending == m_pending.end()) {
+			if (!StartPending(key, state, true)) return &GetGraphicsPipeline(command, state, colors, depth_feedback);
+			if (m_prefetch_hook != nullptr && CpPipeline::IsBackThread()) {
+				m_prefetch_hook(m_prefetch_context);
+			}
+			return nullptr;
+		}
+		// shortcut: a job still queued when the close-time Save() drops the queue stays skipped;
+		// only matters after the window closed.
+		if (pending->second->state.load(std::memory_order_acquire) != 2) {
+			return nullptr;
+		}
+	}
+	return &GetGraphicsPipeline(command, state, colors, depth_feedback);
+}
+
+bool PipelineCache::StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state,
+                                 bool first) {
 	auto       job         = std::make_shared<PendingPipeline>();
 	const auto vertex_info = state.VertexStages();
 	job->key               = key;
 	job->stage_count       = static_cast<uint32_t>(vertex_info.size());
 	for (uint32_t i = 0; i < job->stage_count; i++) {
 		job->stages[i] = vertex_info[i].stage.module;
-		if (job->stages[i] == nullptr) return;
+		if (job->stages[i] == nullptr) return false;
 	}
 	job->pixel = state.ps_active ? state.ps_input_info.stage.module : nullptr;
-	if (state.ps_active && job->pixel == nullptr) return;
+	if (state.ps_active && job->pixel == nullptr) return false;
 	m_pending.emplace(key, job);
 	{
 		std::scoped_lock lock(m_pool->mutex);
-		m_pool->queue.push_back(std::move(job));
+		if (first) {
+			m_pool->queue.push_front(std::move(job));
+		} else {
+			m_pool->queue.push_back(std::move(job));
+			m_pool->prefetched++;
+		}
 	}
 	m_pool->work.notify_one();
-	m_pool->prefetched++;
+	return true;
 }
 
 void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {

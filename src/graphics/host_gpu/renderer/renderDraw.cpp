@@ -1418,6 +1418,19 @@ static void ColorAttachmentPassBarrier(vk::CommandBuffer vk_buffer) {
 	vk_buffer.pipelineBarrier2(dependency);
 }
 
+// KYTY_ASYNC_PIPELINE: buffer, image or by-address writes, whose effects outlive this frame's colors.
+static bool DrawWritesAnything(const DrawRenderState& state) {
+	const auto writes = [](const ShaderStageRuntime& stage) {
+		// Conservative: a written buffer counts even when its descriptor is empty.
+		const auto& info    = stage.program->info;
+		const auto  written = [](const auto& resource) { return resource.written || resource.atomic; };
+		return stage.program->has_address_writes || std::ranges::any_of(info.buffers, written) ||
+		       std::ranges::any_of(info.images, written);
+	};
+	return std::ranges::any_of(state.VertexStages(), [&](const auto& vs) { return writes(vs.stage); }) ||
+	       (state.ps_active && writes(state.ps_input_info.stage));
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1551,14 +1564,48 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::array<PipelineCache::Pipeline*, RENDER_COLOR_ATTACHMENTS_MAX> pipelines {};
 	std::array<RenderState, RENDER_COLOR_ATTACHMENTS_MAX>              renderings {};
 	std::array<vk::ImageAspectFlags, RENDER_COLOR_ATTACHMENTS_MAX>     feedback {};
+	auto& pipeline_cache = m_context.GetPipelineCache();
+	if (pipeline_cache.AsyncEnabled()) {
+		// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
+		// its pipeline is created; any other miss waits, counted by reason.
+		auto block = PerfStats::Counter::AsyncSkipped;
+		if (passes) {
+			block = PerfStats::Counter::AsyncBlockPasses;
+		} else if (DrawWritesAnything(state)) {
+			block = PerfStats::Counter::AsyncBlockWrites;
+		} else if (state.color_count == 0) {
+			block = PerfStats::Counter::AsyncBlockDepthOnly;
+		} else if (m_context.GetOcclusionQueries().Counting()) {
+			block = PerfStats::Counter::AsyncBlockQuery;
+		}
+		const bool may_skip = block == PerfStats::Counter::AsyncSkipped;
+		bool       missed   = false;
+		pipelines[0]        = pipeline_cache.FindGraphicsPipeline(
+            buffer, state, std::span {state.color_info, passes ? 1u : state.color_count},
+            depth_feedback, may_skip, missed);
+		if (missed && !may_skip) {
+			PerfStats::Add(block, 1);
+		}
+		if (pipelines[0] == nullptr) {
+			PerfStats::Add(PerfStats::Counter::AsyncSkipped, 1);
+			static uint64_t last_frame = UINT64_MAX;
+			if (const auto frame = PerfStats::Frame(); frame != last_frame) {
+				last_frame = frame;
+				PerfStats::Add(PerfStats::Counter::AsyncSkipFrames, 1);
+			}
+			return;
+		}
+	}
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto* colors = passes ? state.color_info + pass : state.color_info;
 		const auto count = passes ? 1u : state.color_count;
 		if (draw.IsIndexed()) {
 			LogDrawPhase(draw.Name(), "CreatePipeline");
 		}
-		pipelines[pass] = &m_context.GetPipelineCache().GetGraphicsPipeline(
-		    buffer, state, std::span {colors, count}, depth_feedback);
+		if (pipelines[pass] == nullptr) {
+			pipelines[pass] = &pipeline_cache.GetGraphicsPipeline(buffer, state, std::span {colors, count},
+			                                                      depth_feedback);
+		}
 		renderings[pass] = AcquireRenderTargets(buffer, colors, count, state.depth_info, feedback[pass], stages);
 	}
 	vk::DeviceAddress task_params = 0;
