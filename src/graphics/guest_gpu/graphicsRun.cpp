@@ -383,7 +383,7 @@ bool GuestGpu::IsStopping() {
 	return m_stopping;
 }
 
-void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command, GpuCommandKind kind) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
@@ -392,6 +392,7 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_commands.push_back(std::move(command));
+	m_command_kinds.push_back(kind);
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 }
@@ -409,31 +410,38 @@ void GuestGpu::ProcessCommands() {
 	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		// Per command: one may arrive after the check above (it records and submits like the back).
-		CpPipeline::Drain(CpPipeline::Reason::Command);
-		FlushBatchedUploads();
 		Common::UniqueFunction<void> command;
+		auto                         kind = GpuCommandKind::Other;
 		{
 			Common::LockGuard lock(m_queue_mutex);
 			EXIT_IF(m_commands.empty());
 			command = std::move(m_commands.front());
 			m_commands.pop_front();
+			kind = m_command_kinds.front();
+			m_command_kinds.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		const auto reason = CpPipeline::CommandReason(static_cast<uint32_t>(kind));
+		CpPipeline::Drain(reason);
+		FlushBatchedUploads();
+		const CpPipeline::FrontScope front(CpPipeline::Front::Command, static_cast<uint32_t>(reason));
 		command();
 	}
 }
 
-void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
+void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command, GpuCommandKind kind) {
 	EXIT_IF(!command);
 	if (IsGpuThread()) {
 		command();
 		return;
 	}
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
-		operation();
-		done.release();
-	});
+	SendCommand(
+	    [operation = std::move(command), &done]() mutable {
+		    operation();
+		    done.release();
+	    },
+	    kind);
 	done.acquire();
 }
 
@@ -793,6 +801,7 @@ void GuestGpu::ThreadRun(void* data) {
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
+		auto                         command_kind   = GpuCommandKind::Other;
 		bool                         has_submission = false;
 		bool                         should_stop    = false;
 		{
@@ -809,6 +818,8 @@ void GuestGpu::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
+				command_kind = gpu->m_command_kinds.front();
+				gpu->m_command_kinds.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
@@ -854,7 +865,9 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
 				CpSplitProf::BusyBegin();
-				CpPipeline::Drain(CpPipeline::Reason::GpuCommand);
+				const auto reason = CpPipeline::CommandReason(static_cast<uint32_t>(command_kind));
+				CpPipeline::Drain(reason);
+				const CpPipeline::FrontScope front(CpPipeline::Front::Command, static_cast<uint32_t>(reason));
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -1149,13 +1162,15 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
-		if (!IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
-			CpPipeline::Drain(CpPipeline::DrainProfEnabled()
-			                      ? CpPipeline::PacketReason(opcode,
-			                                                 DrainSubReason(opcode, KYTY_PM4_R(packet_header), packet,
-			                                                                std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw)),
-			                                                 IsAsyncComputeQueue())
-			                      : CpPipeline::Reason::Other);
+		const bool pipelined    = IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header));
+		const auto drain_reason = !pipelined && CpPipeline::DrainProfEnabled()
+		                              ? CpPipeline::PacketReason(opcode,
+		                                                         DrainSubReason(opcode, KYTY_PM4_R(packet_header), packet,
+		                                                                        std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw)),
+		                                                         IsAsyncComputeQueue())
+		                              : CpPipeline::Reason::Other;
+		if (!pipelined) {
+			CpPipeline::Drain(drain_reason);
 			if (reprotect_batch && IsSyncPointPacket(opcode) && g_gpu_state != nullptr) {
 				g_gpu_state->FlushBatchedUploads();
 			}
@@ -1177,8 +1192,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		uint32_t packet_dw = 0;
+		{
+			const CpPipeline::FrontScope front(CpPipeline::Front::Packet, static_cast<uint32_t>(drain_reason), !pipelined);
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1395,6 +1413,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	// while they are zero. With KYTY_MESH_INDIRECT_GPU, a mesh-emulated draw's task shader also
 	// writes the records' bases to the patched vertex/instance user-data slots.
 	DrawIndirectArgs records {args_addr, draw_count, stride_in_bytes};
+	const uint64_t   front_start = CpPipeline::FrontProfEnabled() ? CpPipeline::NowNs() : 0;
+	const auto       note_front  = [&](CpPipeline::IndirectPath path, uint64_t draws) {
+		if (front_start != 0) {
+			CpPipeline::NoteFront(CpPipeline::Front::Indirect, static_cast<uint32_t>(path) | (indexed ? 0x10u : 0u),
+			                      CpPipeline::NowNs() - front_start, draws);
+		}
+	};
 	const bool       patched = registers.vertex_offset != Pm4::SH_NOP ||
 	                     registers.instance_offset != Pm4::SH_NOP ||
 	                     registers.index_offset != Pm4::SH_NOP || registers.draw_index != Pm4::SH_NOP;
@@ -1408,6 +1433,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                                   .index_type_and_size = m_index_type_and_size,
 	                                   .indirect            = records})
 	             : executor.DrawAuto(m_submit_id, CurrentBuffer(), {.indirect = records}))) {
+		note_front(front_start != 0 && ShaderVertexStageIsMesh(m_sh_ctx.GetVs(), m_ctx) ? CpPipeline::IndirectPath::GpuMesh
+		                                                                                 : CpPipeline::IndirectPath::GpuRecords,
+		           1);
 		return;
 	}
 
@@ -1438,6 +1466,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                    .first_instance      = args.firstInstance,
 		                    .offset_source       = DrawOffsetSource::IndirectArgs});
 	}
+	note_front(CpPipeline::IndirectPath::CpuRecords, draw_count);
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,

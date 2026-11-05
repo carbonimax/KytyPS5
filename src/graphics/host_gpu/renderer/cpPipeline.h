@@ -98,8 +98,16 @@ enum class Reason : uint32_t {
 	FallbackShaders,
 	FallbackFast,
 	QueueFull,     // Acquire waited for a free slot
+	// Commands from other threads by GpuCommandKind (Command = Other): CPU read of GPU-written
+	// bytes, fault window published asynchronously / synchronously, label repair, unmap.
+	CommandReadMemory,
+	CommandFaultAsync,
+	CommandFaultSync,
+	CommandLabelRepair,
+	CommandUnmap,
 	Count
 };
+[[nodiscard]] Reason CommandReason(uint32_t gpu_command_kind) noexcept;
 // Packet key: opcode, a sub-reason byte (IT_NOP's R, the event type of EVENT_WRITE/RELEASE_MEM) and
 // the queue (async compute or graphics).
 [[nodiscard]] constexpr Reason PacketReason(uint32_t opcode, uint32_t sub, bool compute) noexcept {
@@ -110,6 +118,38 @@ enum class Reason : uint32_t {
 // KYTY_CP_DRAIN_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): every front drain per
 // reason, whether it waited for a busy back thread and how long ("PERF cpdrain" line).
 [[nodiscard]] bool DrainProfEnabled() noexcept;
+// KYTY_CP_DRAIN_PROF=2: also the GPU thread time of the work it runs itself ("PERF cpfront" line):
+// handlers of draining packets, the indirect draw paths, draws run on the GPU thread outside an
+// indirect packet (no-ES draws by their stages and primitive type) and commands from other threads.
+// Packet times include the indirect paths of their packet, which include their draws.
+[[nodiscard]] bool FrontProfEnabled() noexcept;
+enum class Front : uint32_t {
+	Packet = 1,  // value: the packet's Reason
+	Indirect,    // value: IndirectPath | indexed << 4
+	Inline,      // value: Reason (fallback or inline draw)
+	NoEs,        // value: ls | hs << 1 | gs << 2 | ps << 3 | primitive type << 4
+	Command,     // value: Reason (CommandReason)
+};
+enum class IndirectPath : uint32_t { GpuRecords, GpuMesh, CpuRecords };
+void NoteFront(Front family, uint32_t value, uint64_t ns, uint64_t count = 1) noexcept;
+[[nodiscard]] uint64_t NowNs() noexcept;
+// Times its scope when FrontProfEnabled() (one flag test otherwise).
+class FrontScope {
+public:
+	FrontScope(Front family, uint32_t value, bool on = true) noexcept: m_family(family), m_value(value) {
+		if (on && FrontProfEnabled()) m_start = NowNs();
+	}
+	~FrontScope() {
+		if (m_start != 0) NoteFront(m_family, m_value, NowNs() - m_start);
+	}
+	FrontScope(const FrontScope&)            = delete;
+	FrontScope& operator=(const FrontScope&) = delete;
+
+private:
+	Front    m_family;
+	uint32_t m_value;
+	uint64_t m_start = 0;
+};
 
 // Front: wait until the back thread is idle. Inside a program lookup a back thread parked on a
 // re-lookup request counts as idle (it touches nothing until the front serves it after the lookup).

@@ -846,7 +846,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			QueueBdaSync(vaddr, size);
 		}
-	});
+	}, GpuCommandKind::ReadMemory);
 }
 
 bool BufferCache::AsyncFaultReadbacks() {
@@ -969,7 +969,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 				// No GPU-written byte left in the window: nothing to publish.
 				m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 			}
-		});
+		}, GpuCommandKind::FaultAsync);
 		if (own_side) {
 			// Copied on the readback queue: this thread publishes once the copy completed.
 			m_readback_queue->Wait(wait_for->side_tick);
@@ -1012,7 +1012,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, 1);
 			QueueBdaSync(vaddr, 1);
 		}
-	});
+	}, GpuCommandKind::FaultSync);
 }
 
 bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {

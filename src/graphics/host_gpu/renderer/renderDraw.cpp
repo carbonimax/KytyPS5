@@ -453,6 +453,22 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
+// KYTY_CP_DRAIN_PROF=2: front-time category of a direct draw that PipelineDraw did not queue.
+static std::pair<CpPipeline::Front, uint32_t> InlineDrawFront(CommandBuffer& buffer) {
+	const auto reason = CpPipeline::FallbackReason();
+	if (!CpPipeline::FrontProfEnabled() || reason != CpPipeline::Reason::FallbackShaders ||
+	    DrawHasValidVertexShader(buffer.GetShaders())) {
+		return {CpPipeline::Front::Inline, static_cast<uint32_t>(reason)};
+	}
+	const auto& vs = buffer.GetShaders().GetVs();
+	const auto  ps = buffer.GetShaders().GetPs().ps_regs.data_addr != 0;
+	return {CpPipeline::Front::NoEs, static_cast<uint32_t>(vs.ls_regs.data_addr != 0) |
+	                                     (static_cast<uint32_t>(vs.hs_regs.data_addr != 0) << 1u) |
+	                                     (static_cast<uint32_t>(vs.gs_regs.data_addr != 0) << 2u) |
+	                                     (static_cast<uint32_t>(ps) << 3u) |
+	                                     (static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()) << 4u)};
+}
+
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
@@ -1675,6 +1691,9 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return true;
 	}
 	CpPipeline::Drain(CpPipeline::FallbackReason());
+	const auto [front_family, front_value] = InlineDrawFront(buffer);
+	const CpPipeline::FrontScope front(front_family, front_value,
+	                                   args.offset_source != DrawOffsetSource::IndirectArgs && args.indirect.address == 0);
 	return DrawIndexBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
 }
 
@@ -1801,6 +1820,9 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return true;
 	}
 	CpPipeline::Drain(CpPipeline::FallbackReason());
+	const auto [front_family, front_value] = InlineDrawFront(buffer);
+	const CpPipeline::FrontScope front(front_family, front_value,
+	                                   args.offset_source != DrawOffsetSource::IndirectArgs && args.indirect.address == 0);
 	return DrawAutoBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
 }
 
@@ -1989,6 +2011,8 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.
 		CpPipeline::Note(heap ? CpPipeline::Stat::InlineHeap : CpPipeline::Stat::InlineWrites);
 		CpPipeline::Drain(heap ? CpPipeline::Reason::InlineHeap : CpPipeline::Reason::InlineWrites);
+		const CpPipeline::FrontScope front(CpPipeline::Front::Inline, static_cast<uint32_t>(heap ? CpPipeline::Reason::InlineHeap
+		                                                                                         : CpPipeline::Reason::InlineWrites));
 		const auto stage = heap ? DrawPrepared::LookedUpHeapBegun : DrawPrepared::LookedUp;
 		if (indexed) {
 			DrawIndexBody(submit_id, buffer, *index_args, &record.state, nullptr, stage);

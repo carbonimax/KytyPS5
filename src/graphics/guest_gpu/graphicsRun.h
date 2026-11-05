@@ -21,6 +21,9 @@ namespace Libs::Graphics {
 
 class RenderContext;
 
+// KYTY_CP_DRAIN_PROF: what a command sent by another thread does (CpPipeline::CommandReason).
+enum class GpuCommandKind : uint8_t { Other, ReadMemory, FaultAsync, FaultSync, LabelRepair, Unmap };
+
 class GuestGpu final {
 public:
 	explicit GuestGpu(RenderContext& renderer);
@@ -29,8 +32,9 @@ public:
 
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
-	void               SendCommand(Common::UniqueFunction<void>&& command);
-	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+	void               SendCommand(Common::UniqueFunction<void>&& command, GpuCommandKind kind = GpuCommandKind::Other);
+	void               SendCommandSync(Common::UniqueFunction<void>&& command,
+	                                   GpuCommandKind              kind = GpuCommandKind::Other);
 	// Retries blocked submissions now instead of after the 100 ms stall timeout.
 	void               Wake();
 
@@ -85,6 +89,7 @@ private:
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
+	std::deque<GpuCommandKind>                     m_command_kinds;  // in step with m_commands
 	std::atomic_uint32_t                           m_pending_commands {0};
 	std::atomic_uint64_t                           m_compute_enqueued {0};
 	uint32_t                                       m_next_queue        = 0;

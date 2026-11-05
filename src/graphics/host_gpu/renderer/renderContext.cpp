@@ -114,7 +114,8 @@ RenderContext::CompletedWrite RenderContext::WriteCompletedLabel(uint64_t vaddr,
 
 void RenderContext::TrySendGpuCommand(Common::UniqueFunction<void>&& command) {
 	if (m_gpu != nullptr && !m_gpu->IsStopping()) {
-		m_gpu->SendCommand(std::move(command));
+		// Its only caller repairs labels (KYTY_CP_DRAIN_PROF command kind).
+		m_gpu->SendCommand(std::move(command), GpuCommandKind::LabelRepair);
 	}
 }
 
@@ -165,7 +166,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		unmap();
 		return;
 	}
-	m_gpu->SendCommandSync(unmap);
+	m_gpu->SendCommandSync(unmap, GpuCommandKind::Unmap);
 }
 
 void RenderContext::PrepareBda() {

@@ -55,12 +55,6 @@ struct State {
 	std::atomic<uint64_t> back_busy_ns {0};
 };
 
-uint64_t NowNs() noexcept {
-	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-	                                 std::chrono::steady_clock::now().time_since_epoch())
-	                                 .count());
-}
-
 State& S() noexcept {
 	static State state;
 	return state;
@@ -73,11 +67,19 @@ struct DrainEntry {
 	uint64_t wait_ns = 0;
 	uint64_t depth   = 0;  // records still queued at the waited drains
 };
-const bool                               g_drain_prof = [] {
+const int                                g_drain_level = [] {
 	const char* value = std::getenv("KYTY_CP_DRAIN_PROF");
-	return value != nullptr && std::atoi(value) == 1;
+	const int   level = value != nullptr ? std::atoi(value) : 0;
+	return level == 1 || level == 2 ? level : 0;
 }();
+const bool                               g_drain_prof = g_drain_level != 0;
+const bool                               g_front_prof = g_drain_level == 2;
 std::unordered_map<uint32_t, DrainEntry> g_drains;
+struct FrontEntry {
+	uint64_t count = 0;
+	uint64_t ns    = 0;
+};
+std::unordered_map<uint64_t, FrontEntry> g_front;  // GPU thread only
 thread_local Stat                        t_last_stat = Stat::FallbackArgs;
 
 void NoteDrain(Reason reason, uint64_t depth, uint64_t wait_ns) noexcept {
@@ -96,7 +98,8 @@ std::string ReasonName(uint32_t key) {
 	    "end_rendering", "flush",          "flush_wait",    "finish",          "sched_wait",
 	    "submit",        "timeline_wait",  "fault",         "readback",        "image_heap",
 	    "inline_heap",   "inline_writes",  "fallback_args", "fallback_targets", "fallback_shaders",
-	    "fallback_fast", "queue_full"};
+	    "fallback_fast", "queue_full",    "cmd_read_memory", "cmd_fault_async", "cmd_fault_sync",
+	    "cmd_label_repair", "cmd_unmap"};
 	static_assert(std::size(Names) == static_cast<size_t>(Reason::Count) - static_cast<size_t>(Reason::PacketReasons));
 	const auto base = static_cast<uint32_t>(Reason::PacketReasons);
 	if (key >= base) return Names[key - base];
@@ -254,6 +257,29 @@ bool BackIdle() noexcept {
 	return s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_acquire);
 }
 
+uint64_t NowNs() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+Reason CommandReason(uint32_t gpu_command_kind) noexcept {
+	return gpu_command_kind == 0
+	           ? Reason::Command
+	           : static_cast<Reason>(static_cast<uint32_t>(Reason::CommandReadMemory) + gpu_command_kind - 1);
+}
+
+bool FrontProfEnabled() noexcept {
+	return g_front_prof;
+}
+
+void NoteFront(Front family, uint32_t value, uint64_t ns, uint64_t count) noexcept {
+	if (!GuestGpu::IsGpuThread() || t_back) return;
+	auto& e = g_front[(static_cast<uint64_t>(family) << 32u) | value];
+	e.count += count;
+	e.ns += ns;
+}
+
 Reason FallbackReason() noexcept {
 	return static_cast<Reason>(static_cast<uint32_t>(Reason::FallbackArgs) + static_cast<uint32_t>(t_last_stat) -
 	                           static_cast<uint32_t>(Stat::FallbackArgs));
@@ -400,11 +426,47 @@ void ReportDrains(double seconds, uint64_t frames) {
 	std::printf("\n");
 }
 
+std::string FrontName(uint64_t key) {
+	const auto value   = static_cast<uint32_t>(key);
+	char       buf[96] = {};
+	switch (static_cast<Front>(key >> 32u)) {
+		case Front::Packet: return "pkt:" + ReasonName(value);
+		case Front::Indirect: {
+			static constexpr const char* Paths[] = {"gpu", "gpu_mesh", "cpu"};
+			std::snprintf(buf, sizeof(buf), "indirect:%s:%s", (value & 0x10u) != 0 ? "index" : "auto",
+			              Paths[(value & 0xfu) % 3u]);
+			return buf;
+		}
+		case Front::Inline: return "inline:" + ReasonName(value);
+		case Front::NoEs:
+			std::snprintf(buf, sizeof(buf), "noes:ls%u.hs%u.gs%u.ps%u.prim%u", value & 1u, (value >> 1u) & 1u,
+			              (value >> 2u) & 1u, (value >> 3u) & 1u, value >> 4u);
+			return buf;
+		case Front::Command: return "cmd:" + ReasonName(value);
+		default: return "?";
+	}
+}
+
+void ReportFront(double seconds, uint64_t frames) {
+	std::vector<std::pair<uint64_t, FrontEntry>> rows(g_front.begin(), g_front.end());
+	g_front.clear();
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+	// Per category: count and GPU thread time (nested: pkt > indirect > its draws).
+	std::printf("PERF cpfront %.1fs: frames=%" PRIu64, seconds, frames);
+	constexpr size_t Top = 32;
+	for (size_t i = 0; i < rows.size() && i < Top; i++) {
+		std::printf(" | %s n=%" PRIu64 " t=%.2fms", FrontName(rows[i].first).c_str(), rows[i].second.count,
+		            static_cast<double>(rows[i].second.ns) / 1e6);
+	}
+	std::printf("\n");
+}
+
 } // namespace
 
 void Report(double seconds, uint64_t frames) noexcept {
 	if (Mode() == 0) return;
 	if (g_drain_prof) ReportDrains(seconds, frames);
+	if (g_front_prof) ReportFront(seconds, frames);
 	auto&      s    = S();
 	const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
 	const auto ms   = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
