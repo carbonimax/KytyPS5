@@ -4,6 +4,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/graphicsRun.h" // Fork: EopAtGpu front reads (WAIT_REG_MEM)
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/agc.h"

@@ -45,6 +45,8 @@
 namespace Libs::Graphics {
 
 static thread_local Pm4Execution* g_current_execution = nullptr;
+// Fork: also set on the CP pipeline's back thread (MarkHostGpuThread), which has no g_gpu_state.
+static thread_local bool          g_gpu_thread        = false;
 static thread_local GuestGpu*     g_gpu_state         = nullptr;
 
 static bool GraphicsRunDebugDumpEnabled() {
@@ -762,7 +764,8 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
-	g_gpu_state = gpu;
+	g_gpu_thread = true;
+	g_gpu_state  = gpu;
 	PerfStats::MarkGpuThread();
 
 	for (;;) {
@@ -819,7 +822,8 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
-			g_gpu_state = nullptr;
+			g_gpu_state  = nullptr;
+			g_gpu_thread = false;
 			return;
 		}
 
@@ -1803,7 +1807,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
-	return g_gpu_state != nullptr;
+	return g_gpu_thread;
 }
 
 void GuestGpu::FlushBatchedUploads() {
