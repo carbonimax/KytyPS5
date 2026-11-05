@@ -582,10 +582,10 @@ void TestGpuReacquisitionAfterInvalidation() {
 void TestHostReadIntoUnownedGpuPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 64;
   const auto size = page_size * pages;
-  auto *memory = Allocate(harness.page_manager, pages);
+  auto *memory = Allocate(pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto orphan = address + page_size * 16;
 
@@ -1234,11 +1234,11 @@ bool HandleTrackedWriteFault(const Common::HostException::ExceptionInfo &info) {
 void TestHostReadIntoCleanTrackedPage() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  const auto page_size = harness.page_manager.GetPageSize();
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr uint64_t pages = 800;
   const auto size = page_size * pages;
   constexpr uint64_t offset = 17;
-  auto *memory = Allocate(harness.page_manager, pages);
+  auto *memory = Allocate(pages);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(

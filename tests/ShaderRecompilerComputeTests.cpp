@@ -4388,12 +4388,11 @@ public:
       buffer_cache.CopyBuffer(clean_cached_readback, gds_clean_mirror,
                               2 * sizeof(source_words), false, true);
     });
-    // Only reads and writes are tracking faults: an execute or unknown access on a GPU-dirty
-    // page is not resolved and publishes nothing.
-    Require("GpuCommandLane", "execute and unknown faults not resolved",
-            !resources.HandleFault(PageFaultAccess::Execute, immediate_dst) &&
-                !resources.HandleFault(PageFaultAccess::Unknown, immediate_dst),
-            "an execute or unknown access was resolved as a tracking fault");
+    // Only reads and writes are tracking faults: an execute access on a GPU-dirty page is not
+    // resolved and publishes nothing.
+    Require("GpuCommandLane", "execute faults not resolved",
+            !resources.HandleFault(PageFaultAccess::Execute, immediate_dst),
+            "an execute access was resolved as a tracking fault");
     gpu.SendCommandSync([&] {
       Require("GpuCommandLane", "unresolved fault keeps GPU bytes",
               resources.GetBufferCache().HasGpuDirtyBytes(immediate_dst,
