@@ -20623,8 +20623,6 @@ public:
         set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
         set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
       }
-      const vk::Bool32 write = true;
-      cmd.setColorWriteEnableEXT(1, &write);
       if (m_feedback_loop_dynamic) {
         cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
       }
@@ -24426,10 +24424,8 @@ private:
     available_depth_clip.pNext = &available_derivatives;
     vk::PhysicalDeviceDepthClipControlFeaturesEXT available_clip_control{};
     available_clip_control.pNext = &available_depth_clip;
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT available_color_write{};
-    available_color_write.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT available_feedback_layout{};
-    available_feedback_layout.pNext = &available_color_write;
+    available_feedback_layout.pNext = &available_clip_control;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT available_feedback_dynamic{};
     available_feedback_dynamic.pNext = &available_feedback_layout;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT available_provoking_vertex{};
@@ -24548,7 +24544,6 @@ private:
         {"fragmentStoresAndAtomics", available_features.fragmentStoresAndAtomics},
         {"depthClipEnable", available_depth_clip.depthClipEnable},
         {"depthClipControl", available_clip_control.depthClipControl},
-        {"colorWriteEnable", available_color_write.colorWriteEnable},
         {"attachmentFeedbackLoopLayout", available_feedback_layout.attachmentFeedbackLoopLayout},
         {"provokingVertexLast", available_provoking_vertex.provokingVertexLast}};
     std::string missing_rasterization;
@@ -24615,7 +24610,6 @@ private:
     derivatives.computeDerivativeGroupQuads = full;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
@@ -24624,9 +24618,7 @@ private:
       depth_clip.depthClipEnable = true;
       clip_control.pNext = &depth_clip;
       clip_control.depthClipControl = true;
-      color_write.pNext = &clip_control;
-      color_write.colorWriteEnable = true;
-      feedback_layout.pNext = &color_write;
+      feedback_layout.pNext = &clip_control;
       feedback_layout.attachmentFeedbackLoopLayout = true;
       feedback_dynamic.pNext = &feedback_layout;
       feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
@@ -24662,22 +24654,6 @@ private:
                                   : m_conditional_rendering_enabled
                                         ? static_cast<const void *>(&conditional_rendering)
                                         : static_cast<const void *>(&robustness2);
-    // Outside Apple the production renderer always records vkCmdSetColorWriteEnableEXT
-    // (VK_EXT_color_write_enable is a hard device requirement there), so the portable graphics
-    // fixtures, which draw through it, need the extension too.
-    vk::PhysicalDeviceColorWriteEnableFeaturesEXT portable_color_write{};
-#if !defined(__APPLE__)
-    const bool portable_color_write_needed = portable_graphics;
-#else
-    const bool portable_color_write_needed = false;
-#endif
-    if (portable_color_write_needed) {
-      Require("VulkanHarness", "graphics", available_color_write.colorWriteEnable == true,
-              "prerequisite missing: colorWriteEnable (VK_EXT_color_write_enable) is not supported");
-      portable_color_write.colorWriteEnable = true;
-      portable_color_write.pNext = const_cast<void *>(device_info.pNext);
-      device_info.pNext = &portable_color_write;
-    }
     m_mesh_task_enabled = m_mesh_task_enabled && m_rasterization_supported;
     vk::PhysicalDeviceMeshShaderFeaturesEXT mesh{};
     if (m_mesh_task_enabled) {
@@ -24726,14 +24702,10 @@ private:
       if (portable_graphics || min_lod_fallback) {
         device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
       }
-      if (portable_color_write_needed) {
-        device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-      }
     }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
-      device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
       if (m_feedback_loop_dynamic) {
         device_extensions.push_back(
