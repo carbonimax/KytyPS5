@@ -161,6 +161,7 @@ struct ImageResource {
 	uint32_t                      mip_count         = 1;
 	Prospero::BufferFormat        conversion_format = Prospero::BufferFormat::kInvalid;
 	uint32_t                      shader_swizzle    = ShaderImageIdentitySwizzle;
+	Prospero::BufferFormat        srgb_decode       = Prospero::BufferFormat::kInvalid;
 	bool                          read              = false;
 	bool                          written           = false;
 	bool                          atomic            = false;
@@ -171,6 +172,7 @@ struct ImageResource {
 	uint32_t                      sample_min_lod = 0;
 	uint32_t                      view_min_level = 0;
 	bool                          depth_compare     = false;
+	bool                          skip_degamma      = false; // A sampler reads sRGB as stored.
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
