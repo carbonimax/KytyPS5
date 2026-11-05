@@ -57109,6 +57109,68 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+namespace Libs::Graphics {
+struct PipelineCacheTestAccess {
+  // Gives the cache an empty driver cache saved to `path`.
+  static void UseDriverCache(PipelineCache &cache, const std::filesystem::path &path) {
+    const vk::PipelineCacheCreateInfo create{};
+    EXIT_IF(cache.m_driver_cache != nullptr ||
+            cache.m_graphics.device.createPipelineCache(&create, nullptr, &cache.m_driver_cache) !=
+                vk::Result::eSuccess);
+    cache.m_driver_cache_path = path;
+  }
+  // A pipeline the driver cache did not have; `due` makes the periodic write due now. The next
+  // write then rewrites the file even though the empty cache serializes to the same bytes.
+  static void Checkpoint(PipelineCache &cache, bool due) {
+    if (due) cache.m_next_driver_cache_save = {};
+    cache.m_saved_payload_hash = 0;
+    cache.CheckpointDriverCache({});
+  }
+};
+
+// 1b7ea368: a due driver cache is written on the writer thread; Save() finishes a queued write
+// and writes what changed after it; once Save() stopped the writer, the next Save() writes.
+void CheckDriverCacheWriter(VulkanHarness &vulkan) {
+  constexpr const char *name = "DriverCacheWriter";
+  const auto path = std::filesystem::temp_directory_path() / "kyty_driver_cache_writer_test.bin";
+  std::filesystem::remove(path);
+  const auto exists_within = [&path](std::chrono::milliseconds wait) {
+    const auto deadline = std::chrono::steady_clock::now() + wait;
+    while (!std::filesystem::exists(path) && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    return std::filesystem::exists(path);
+  };
+  {
+    RenderContext context(vulkan.RuntimeContext());
+    auto &cache = context.GetPipelineCache();
+    PipelineCacheTestAccess::UseDriverCache(cache, path);
+    PipelineCacheTestAccess::Checkpoint(cache, /*due=*/false);
+    Require(name, "not due", !exists_within(std::chrono::milliseconds(200)),
+            "a driver cache checkpoint before the interval wrote the file");
+    PipelineCacheTestAccess::Checkpoint(cache, /*due=*/true);
+    Require(name, "writer thread", exists_within(std::chrono::seconds(5)),
+            "a due driver cache was not written by the writer thread");
+    // The writer records the saved hash just after the rename: let it finish before Checkpoint
+    // clears it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::filesystem::remove(path);
+    PipelineCacheTestAccess::Checkpoint(cache, /*due=*/true);
+    cache.Save();
+    Require(name, "queued write", std::filesystem::exists(path),
+            "Save() returned before a queued driver cache write ran");
+    std::filesystem::remove(path);
+    PipelineCacheTestAccess::Checkpoint(cache, /*due=*/true);
+    Require(name, "writer stopped", !exists_within(std::chrono::milliseconds(200)),
+            "the driver cache was written after Save() stopped the writer");
+    cache.Save();
+    Require(name, "write at exit", std::filesystem::exists(path),
+            "Save() did not write a driver cache changed after the writer stopped");
+  }
+  std::filesystem::remove(path);
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+} // namespace Libs::Graphics
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
@@ -58529,6 +58591,7 @@ int main(int argc, char **argv) {
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
   vulkan.CheckSamplerFilterMode();
+  CheckDriverCacheWriter(vulkan);
   if (rasterization) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckOneDimensionalDepthAlias();

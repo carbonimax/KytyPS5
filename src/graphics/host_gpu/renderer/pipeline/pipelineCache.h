@@ -14,11 +14,13 @@
 #include "graphics/shader/shader.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stop_token>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -168,10 +170,14 @@ struct PipelineCacheFeedback {
 
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
+	friend struct PipelineCacheTestAccess;
+
 public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
+	// Waits for the pipeline workers, stops the driver cache writer, then writes the driver cache if
+	// it changed.
 	void Save();
 
 	struct Pipeline {
@@ -269,7 +275,13 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;
-	uint64_t                      m_saved_payload_hash = 0; // payload of the file on disk
+	uint64_t                      m_saved_payload_hash = 0; // payload of the file on disk, writer only
+	// 1b7ea368: the periodic driver cache write (~40 ms for 20 MB) runs here, not on the thread that
+	// creates pipelines. Save() stops it.
+	std::mutex                    m_cache_write_mutex;
+	std::condition_variable_any   m_cache_write_ready;
+	bool                          m_cache_write_queued = false;
+	std::jthread                  m_cache_writer;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	// KYTY_PIPELINE_PARALLEL: pipelines handed to the workers and not looked up yet (the thread that
@@ -283,7 +295,10 @@ private:
 	std::mutex                    m_module_mutex;
 
 	void InitializeDriverCache();
+	// Marks the driver cache changed and, once per interval, has the writer thread write it.
 	void CheckpointDriverCache(PipelineCacheFeedback feedback);
+	// The writer thread, or Save() once the writer has stopped.
+	void WriteDriverCache();
 	// Worker or the thread that needs it: creates a pending pipeline.
 	void CreatePending(PendingPipeline& job, bool worker);
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
