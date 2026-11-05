@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -32,6 +33,7 @@
 #include <bit>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,6 +46,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -500,6 +503,39 @@ struct PipelineCache::ProgramCache {
 		};
 		permutation.handle.id = ModuleId(key, permutation.program.bindings.push_data_start_dword,
 		                                 permutation.specialization, function_code);
+		if (diag_log) {
+			// M time module_id stage hash push_start function_words static=<words> B=<buffers>
+			//   I=<images> S=<samplers>: what the module id hashes, to diff variants across launches.
+			const auto& spec = permutation.specialization;
+			std::string line = fmt::format("M {} {:016x} {} {:016x} {} {} static=", PerfStats::SteadyUs(),
+			                               permutation.handle.id, static_cast<int>(key.stage), key.hash,
+			                               permutation.program.bindings.push_data_start_dword,
+			                               function_code.size());
+			for (const auto word: key.static_state) line += fmt::format("{:x},", word);
+			line += " B=";
+			for (const auto& b: spec.buffers) {
+				line += fmt::format("{:x}/{}/{:x}/{}{}/{:x}/{:x}/{}/{};", b.packed_stride,
+				                    static_cast<int>(b.descriptor_format), b.descriptor_swizzle,
+				                    b.zero_stride_oob ? 1 : 0, b.scalar_empty ? 1 : 0, b.indirect_root,
+				                    b.indirect_mapping_offset, b.indirect_search_iterations,
+				                    b.null_fallback ? 1 : 0);
+			}
+			line += " I=";
+			for (const auto& i: spec.images) {
+				line += fmt::format("{}/{}/{}/{}/{:x}/{:x}/{:x}/{}/{}{}/{}/{}/{}{};",
+				                    static_cast<int>(i.numeric_class), static_cast<int>(i.dimension),
+				                    i.mip_count, static_cast<int>(i.conversion_format), i.shader_swizzle,
+				                    i.indirect_root, i.indirect_mapping_offset, i.indirect_search_iterations,
+				                    i.cube ? 1 : 0, i.fmask ? 1 : 0, i.sample_min_lod, i.view_min_level,
+				                    i.null_fallback ? 1 : 0, i.heap ? 1 : 0);
+			}
+			line += " S=";
+			for (const auto& s: spec.samplers) {
+				line += fmt::format("{:x}/{:x}/{};", s.indirect_root, s.indirect_mapping_offset,
+				                    s.indirect_search_iterations);
+			}
+			PerfStats::CompileLogLine("%s", line.c_str());
+		}
 		// The inputs of these come from the stage's static key.
 		if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 		    options.input_info.vertex != nullptr) {
@@ -936,12 +972,77 @@ struct PipelineCache::ProgramCache {
 	uint64_t              last_spirv_hash   = 0;
 };
 
+// KYTY_PIPELINE_PARALLEL (pipelineCache.h).
+struct PipelineCache::PendingPipeline {
+	GraphicsPipelineKey                key;
+	std::array<const ShaderModule*, 3> stages {};
+	uint32_t                           stage_count = 0;
+	const ShaderModule*                pixel       = nullptr;
+	Pipeline                           pipeline;
+	PipelineCacheFeedback              feedback;
+	// 0 queued, 1 being created, 2 created (set under the pool mutex by the workers).
+	std::atomic<uint32_t>              state {0};
+};
+
+struct PipelineCache::ParallelPool {
+	std::mutex                                   mutex;
+	std::condition_variable                      work;
+	std::condition_variable                      done;
+	std::deque<std::shared_ptr<PendingPipeline>> queue;
+	uint32_t                                     running = 0;
+	bool                                         stop    = false;
+	std::vector<std::thread>                     threads;
+	// The thread that creates pipelines: handed out, then found created / being created / still queued.
+	uint64_t prefetched = 0;
+	uint64_t ready      = 0;
+	uint64_t waited     = 0;
+	uint64_t taken      = 0;
+
+	[[nodiscard]] bool Busy() {
+		std::scoped_lock lock(mutex);
+		return running != 0 || !queue.empty();
+	}
+};
+
+static uint32_t ParallelWorkers() {
+	const char* value = std::getenv("KYTY_PIPELINE_PARALLEL");
+	if (value != nullptr) return static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
+	// Default: half the hardware threads, 1..8, as the warm-up (8 from 16 threads up).
+	return std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
+}
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (const auto workers = ParallelWorkers(); workers != 0) {
+		m_pool = std::make_unique<ParallelPool>();
+		for (uint32_t i = 0; i < workers; i++) {
+			m_pool->threads.emplace_back([this] {
+				SetPipelineCreationQuiet(true);
+				auto&             pool = *m_pool;
+				std::unique_lock lock(pool.mutex);
+				for (;;) {
+					pool.work.wait(lock, [&pool] { return pool.stop || !pool.queue.empty(); });
+					if (pool.stop) return;
+					auto job = std::move(pool.queue.front());
+					pool.queue.pop_front();
+					uint32_t queued = 0;
+					if (!job->state.compare_exchange_strong(queued, 1)) continue; // taken inline
+					pool.running++;
+					lock.unlock();
+					CreatePending(*job, true);
+					lock.lock();
+					pool.running--;
+					job->state.store(2, std::memory_order_release);
+					pool.done.notify_all();
+				}
+			});
+		}
+		PipelineCacheLog("Pipeline parallel: {} workers (KYTY_PIPELINE_PARALLEL)", workers);
+	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
 		PipelineCacheLog("Shader store: disabled (KYTY_BOUNDS_MODE=2)");
@@ -957,6 +1058,26 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 PipelineCache::~PipelineCache() {
 	WaitWarmUp();
 	Save();
+	if (m_pool != nullptr) {
+		{
+			std::scoped_lock lock(m_pool->mutex);
+			m_pool->stop = true;
+		}
+		m_pool->work.notify_all();
+		for (auto& thread: m_pool->threads) {
+			thread.join();
+		}
+		for (const auto& [key, job]: m_pending) {
+			(void)key;
+			if (job->state.load(std::memory_order_acquire) == 2) {
+				m_graphics.device.destroyPipeline(job->pipeline.pipeline, nullptr);
+				m_graphics.device.destroyPipelineLayout(job->pipeline.pipeline_layout, nullptr);
+				m_graphics.device.destroyDescriptorSetLayout(job->pipeline.descriptor_set_layout, nullptr);
+			}
+		}
+		m_pending.clear();
+		m_pool.reset();
+	}
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -1271,6 +1392,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 }
 
 void PipelineCache::LoadStoredModule(const ShaderModule* stage) {
+	std::scoped_lock lock(m_module_mutex);
 	if (stage == nullptr || stage->handle.module != nullptr || stage->store_spirv == 0) {
 		return;
 	}
@@ -1370,7 +1492,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::CheckpointDriverCache() {
+void PipelineCache::CheckpointDriverCache(PipelineCacheFeedback feedback) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -1381,18 +1503,38 @@ void PipelineCache::CheckpointDriverCache() {
 		const char* value = std::getenv("KYTY_PIPELINE_CACHE_SAVE_HITS");
 		return value != nullptr && value[0] == '1';
 	}();
-	if (const auto feedback = LastPipelineCacheFeedback();
-	    !save_hits && feedback.valid && feedback.hit) {
+	if (!save_hits && feedback.valid && feedback.hit) {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save) {
+	// Not while workers create pipelines with it: the next creation saves.
+	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save &&
+	    (m_pool == nullptr || !m_pool->Busy())) {
 		Save();
 	}
 }
 
 void PipelineCache::Save() {
 	WaitWarmUp();
+	if (m_pool != nullptr) {
+		// The window saves at close, outside the thread that creates pipelines (render mutex held):
+		// queued jobs stay pending (a lookup creates them inline) and running ones finish first.
+		std::unique_lock lock(m_pool->mutex);
+		m_pool->queue.clear();
+		m_pool->done.wait(lock, [this] { return m_pool->running == 0; });
+		size_t unused = 0;
+		for (const auto& [key, job]: m_pending) {
+			(void)key;
+			if (job->state.load(std::memory_order_acquire) == 2) {
+				unused++;
+				m_driver_cache_dirty = m_driver_cache_dirty || !job->feedback.valid || !job->feedback.hit;
+			}
+		}
+		PipelineCacheLog("Pipeline parallel: {} handed to workers, used {} (created {}, being created {}, "
+		                 "still queued {}), {} created and not used yet",
+		                 m_pool->prefetched, m_pool->ready + m_pool->waited + m_pool->taken,
+		                 m_pool->ready, m_pool->waited, m_pool->taken, unused);
+	}
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
@@ -1740,26 +1882,33 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
-                                                            const DrawRenderState& state,
-                                                            std::span<const RenderColorInfo> colors,
-                                                            bool depth_feedback) {
-	WaitWarmUp();
+// The key of a draw's pipeline. `predict`: a draw queued behind the current one, with predicted
+// targets; returns false wherever the real lookup would stop the emulator, and logs nothing.
+#define KYTY_KEY_CHECK(cond)                       \
+	do {                                           \
+		if (cond) {                                \
+			if (predict) return false;             \
+			EXIT_IF(cond);                         \
+		}                                          \
+	} while (false)
+bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig& ucfg,
+                                    const DrawRenderState&           state,
+                                    std::span<const RenderColorInfo> colors, bool depth_feedback,
+                                    bool predict, GraphicsPipelineKey& key) const {
+	key = {};
 	const auto& depth          = state.depth_info;
 	const auto  vertex_info    = state.VertexStages();
 	const auto& ps_input_info  = state.ps_input_info;
 	const auto& vs_input_info  = vertex_info.front();
 	const auto* vertex_program = vs_input_info.stage.handle;
 	const auto* pixel_program  = state.ps_input_info.stage.handle;
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
-	EXIT_IF(vertex_program == nullptr);
+	KYTY_KEY_CHECK(vertex_program == nullptr);
 	const bool ps_active = state.ps_active;
-	EXIT_IF(ps_active && pixel_program == nullptr);
-	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
+	KYTY_KEY_CHECK(ps_active && pixel_program == nullptr);
+	KYTY_KEY_CHECK(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
-	auto&             ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -1778,21 +1927,24 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 	}
 	if (aliased_targets != 0) {
+		// A prediction skips aliased targets (merged when the pixel shader was selected).
+		if (predict) return false;
 		const auto reason = PlanAliasedColorTargets(ctx, aliased_targets, aliased);
 		if (!reason.empty() ||
 		    !std::equal(std::begin(aliased.component_mask), std::end(aliased.component_mask),
 		                component_mask.begin()) ||
 		    aliased.alpha_source != ps_input_info.target_merge_alpha_source) {
+			if (predict) return false;
 			EXIT("aliased color targets changed after shader selection:%s\n", reason.c_str());
 		}
 		if (aliased.alpha_source && color_count != 1) {
+			if (predict) return false;
 			EXIT("aliased color targets: E6 the second blend source needs a single attachment, "
 			     "got %u\n",
 			     color_count);
 		}
 	}
 
-	GraphicsPipelineKey key {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
 		key.vertex_shader_ids[i] = vertex_info[i].stage.handle->id;
 	}
@@ -1803,9 +1955,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
-		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
+		KYTY_KEY_CHECK(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
-		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
+		KYTY_KEY_CHECK(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		const bool merged = aliased.component_mask[slot] != 0;
 		static_params.color_mask[slot] = merged ? aliased.write_mask[slot] : colors[i].export_mapping.ApplyMask(render_target_mask_slot(ctx.GetRenderTargetMask(), slot));
 		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
@@ -1815,6 +1967,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (attachment_samples == 0) {
 			attachment_samples = colors[i].desc.info.samples;
 		} else if (attachment_samples != colors[i].desc.info.samples) {
+			if (predict) return false;
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
@@ -1829,7 +1982,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
-			if (!warned.exchange(true, std::memory_order_relaxed)) {
+			if (!predict && !warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "Warning: blending disabled for unsupported color mapping "
 				    "(slot={} mapping=0x{:02x} color={}/{} alpha={}/{} separate={}).\n",
@@ -1887,20 +2040,21 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {
+			if (predict) return false;
 			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
 			     depth.desc.info.samples);
 		}
 	}
 	if (color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
-		EXIT_IF(!static_cast<bool>(
+		KYTY_KEY_CHECK(!static_cast<bool>(
 		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &
 		    vulkan_sample_count(attachment_samples)));
 	}
-	EXIT_IF(attachment_samples == 0 ||
+	KYTY_KEY_CHECK(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
-	if (ps_active && depth.depth_test_enable && ps_input_info.ps_execute_on_noop) {
+	if (!predict && ps_active && depth.depth_test_enable && ps_input_info.ps_execute_on_noop) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
 			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
@@ -1916,16 +2070,17 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
+		if (predict) return false;
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 	const bool mesh = vs_input_info.stage.program->stage == ShaderType::Mesh;
 	if (vertex_info.size() == 3) {
-		EXIT_IF(vs_input_info.tess.input_control_points == 0 ||
+		KYTY_KEY_CHECK(vs_input_info.tess.input_control_points == 0 ||
 		        vs_input_info.tess.input_control_points > 32);
 		static_params.patch_control_points =
 		    static_cast<uint8_t>(vs_input_info.tess.input_control_points);
@@ -1935,7 +2090,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	if (!mesh) {
-		EXIT_IF(vs_input_info.buffers_num < 0 ||
+		KYTY_KEY_CHECK(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
 		        vs_input_info.resources_num < 0 ||
 		        vs_input_info.resources_num > ShaderVertexInputInfo::RES_MAX);
@@ -1948,7 +2103,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
-			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
+			KYTY_KEY_CHECK(binding < 0 || binding >= vs_input_info.buffers_num);
 			key.vertex_input.attributes[attribute] = {
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
@@ -1956,6 +2111,30 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			};
 		}
 	}
+	return true;
+}
+#undef KYTY_KEY_CHECK
+
+PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
+                                                            const DrawRenderState& state,
+                                                            std::span<const RenderColorInfo> colors,
+                                                            bool depth_feedback) {
+	WaitWarmUp();
+	const auto  vertex_info    = state.VertexStages();
+	const auto& ps_input_info  = state.ps_input_info;
+	const auto& vs_input_info  = vertex_info.front();
+	const auto* vertex_program = vs_input_info.stage.handle;
+	const auto* pixel_program  = state.ps_input_info.stage.handle;
+	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+
+	GraphicsPipelineKey key;
+	(void)MakeGraphicsKey(command.GetRegisters(), command.GetUserConfig(), state, colors,
+	                      depth_feedback, false, key);
+	const bool  ps_active     = state.ps_active;
+	const auto  vs_id         = vertex_program->id;
+	const auto  ps_id         = key.ps_shader_id;
+	const auto& rendering     = key.rendering;
+	const auto& static_params = key.static_params;
 
 	auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
 	auto& pipeline        = iter->second;
@@ -1964,6 +2143,16 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			m_store->NoteUsedPipeline(std::exchange(pipeline.store_id, 0));
 		}
 		return pipeline;
+	}
+	// KYTY_PIPELINE_PARALLEL: a worker may have it already; meanwhile the queued draws behind this
+	// one get theirs started (the key is in the map now, so it is not handed out again).
+	std::shared_ptr<PendingPipeline> pending;
+	if (const auto found = m_pending.find(key); found != m_pending.end()) {
+		pending = std::move(found->second);
+		m_pending.erase(found);
+	}
+	if (m_pool != nullptr && m_prefetch_hook != nullptr && CpPipeline::IsBackThread()) {
+		m_prefetch_hook(m_prefetch_context);
 	}
 	for (const auto& stage: vertex_info) {
 		LoadStoredModule(stage.stage.module);
@@ -1990,21 +2179,51 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::GfxPipelineNs,
 		                                  PerfStats::Counter::GfxPipelineCount);
-		std::array<const ShaderModule*, 3> vertex_stages {};
-		for (uint32_t i = 0; i < vertex_info.size(); i++) {
-			vertex_stages[i] = vertex_info[i].stage.module;
+		if (pending != nullptr) {
+			TakePending(*pending);
+			pipeline = pending->pipeline;
+		} else {
+			std::array<const ShaderModule*, 3> vertex_stages {};
+			for (uint32_t i = 0; i < vertex_info.size(); i++) {
+				vertex_stages[i] = vertex_info[i].stage.module;
+			}
+			CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, static_params,
+			                       std::span(vertex_stages).first(vertex_info.size()),
+			                       ps_active ? ps_input_info.stage.module : nullptr, m_driver_cache);
 		}
-		CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, static_params,
-		                       std::span(vertex_stages).first(vertex_info.size()),
-		                       ps_active ? ps_input_info.stage.module : nullptr, m_driver_cache);
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	const auto feedback = pending != nullptr ? pending->feedback : LastPipelineCacheFeedback();
 	if (PerfStats::CompileLogEnabled()) {
-		// P time driver_hit(1/0, -1 unknown) us vs_id ps_id
-		const auto feedback = LastPipelineCacheFeedback();
+		// P time driver_hit(1/0, -1 unknown) us vs_id ps_id (a pending one: us = the wait, W line)
 		PerfStats::CompileLogLine("P %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64, diag_begin,
 		                          feedback.valid ? (feedback.hit ? 1 : 0) : -1,
 		                          PerfStats::SteadyUs() - diag_begin, vs_id, ps_id);
+		if (pending != nullptr) {
+			PerfStats::CompileLogLine("W %" PRIu64, diag_begin);
+		}
+		// K time hit vs0 vs1 vs2 ps | color_count formats depth stencil feedback | bindings
+		//   (stride:instance) attributes (offset:binding) | static parameters (packed bytes):
+		//   the whole key, to diff variants across launches.
+		std::string line = fmt::format("K {} {} {:x} {:x} {:x} {:x} | {}", diag_begin,
+		                               feedback.valid ? (feedback.hit ? 1 : 0) : -1,
+		                               key.vertex_shader_ids[0], key.vertex_shader_ids[1],
+		                               key.vertex_shader_ids[2], key.ps_shader_id, rendering.color_count);
+		for (const auto format: rendering.color_formats) line += fmt::format(",{}", static_cast<int>(format));
+		line += fmt::format(" {} {} {} |", static_cast<int>(rendering.depth_format),
+		                    static_cast<int>(rendering.stencil_format), rendering.depth_feedback ? 1 : 0);
+		const auto& vi = key.vertex_input;
+		for (uint32_t i = 0; i < vi.binding_count; i++) {
+			line += fmt::format(" {}:{}", vi.bindings[i].stride, vi.bindings[i].instance ? 1 : 0);
+		}
+		line += " /";
+		for (uint32_t i = 0; i < vi.attribute_count; i++) {
+			line += fmt::format(" {}:{}", vi.attributes[i].offset, vi.attributes[i].binding);
+		}
+		line += " | ";
+		const auto* sp = reinterpret_cast<const uint8_t*>(&static_params);
+		for (size_t i = 0; i < sizeof(static_params); i++) line += fmt::format("{:02x}", sp[i]);
+		PerfStats::CompileLogLine("%s", line.c_str());
 	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
@@ -2016,9 +2235,72 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                       .vertex_input  = key.vertex_input,
 		                       .static_params = static_params});
 	}
-	CheckpointDriverCache();
+	CheckpointDriverCache(feedback);
 
 	return pipeline;
+}
+
+void PipelineCache::Prefetch(const HW::Context& ctx, const HW::UserConfig& ucfg,
+                             const DrawRenderState& state, std::span<const RenderColorInfo> colors) {
+	GraphicsPipelineKey key;
+	if (m_pool == nullptr || !MakeGraphicsKey(ctx, ucfg, state, colors, false, true, key) ||
+	    m_graphics_pipelines.contains(key) || m_pending.contains(key)) {
+		return;
+	}
+	auto       job         = std::make_shared<PendingPipeline>();
+	const auto vertex_info = state.VertexStages();
+	job->key               = key;
+	job->stage_count       = static_cast<uint32_t>(vertex_info.size());
+	for (uint32_t i = 0; i < job->stage_count; i++) {
+		job->stages[i] = vertex_info[i].stage.module;
+		if (job->stages[i] == nullptr) return;
+	}
+	job->pixel = state.ps_active ? state.ps_input_info.stage.module : nullptr;
+	if (state.ps_active && job->pixel == nullptr) return;
+	m_pending.emplace(key, job);
+	{
+		std::scoped_lock lock(m_pool->mutex);
+		m_pool->queue.push_back(std::move(job));
+	}
+	m_pool->work.notify_one();
+	m_pool->prefetched++;
+}
+
+void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
+	for (uint32_t i = 0; i < job.stage_count; i++) {
+		LoadStoredModule(job.stages[i]);
+	}
+	LoadStoredModule(job.pixel);
+	const auto begin = PerfStats::CompileLogEnabled() ? PerfStats::SteadyUs() : 0;
+	CreatePipelineInternal(m_graphics, job.pipeline, job.key.rendering, job.key.vertex_input,
+	                       job.key.static_params, std::span(job.stages).first(job.stage_count),
+	                       job.pixel, m_driver_cache);
+	job.feedback = LastPipelineCacheFeedback();
+	EXIT_NOT_IMPLEMENTED(job.pipeline.pipeline == nullptr || job.pipeline.pipeline_layout == nullptr);
+	if (PerfStats::CompileLogEnabled()) {
+		// J time driver_hit us vs_id ps_id worker(1/0): a pipeline handed out ahead of its draw.
+		PerfStats::CompileLogLine("J %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %d", begin,
+		                          job.feedback.valid ? (job.feedback.hit ? 1 : 0) : -1,
+		                          PerfStats::SteadyUs() - begin, job.key.vertex_shader_ids[0],
+		                          job.key.ps_shader_id, worker ? 1 : 0);
+	}
+}
+
+void PipelineCache::TakePending(PendingPipeline& job) {
+	uint32_t state = 0;
+	if (job.state.compare_exchange_strong(state, 1)) {
+		m_pool->taken++;
+		CreatePending(job, false);
+		job.state.store(2, std::memory_order_release);
+		return;
+	}
+	if (state == 2) {
+		m_pool->ready++;
+		return;
+	}
+	m_pool->waited++;
+	std::unique_lock lock(m_pool->mutex);
+	m_pool->done.wait(lock, [&job] { return job.state.load(std::memory_order_acquire) == 2; });
 }
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info) {
@@ -2057,7 +2339,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
-	CheckpointDriverCache();
+	CheckpointDriverCache(LastPipelineCacheFeedback());
 
 	return pipeline;
 }
