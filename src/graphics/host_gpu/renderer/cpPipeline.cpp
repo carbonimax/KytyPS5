@@ -3,16 +3,21 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::CpPipeline {
 
@@ -59,6 +64,58 @@ uint64_t NowNs() noexcept {
 State& S() noexcept {
 	static State state;
 	return state;
+}
+
+// KYTY_CP_DRAIN_PROF: per-reason drains, GPU thread (front) only, like their report.
+struct DrainEntry {
+	uint64_t count   = 0;
+	uint64_t waited  = 0;
+	uint64_t wait_ns = 0;
+	uint64_t depth   = 0;  // records still queued at the waited drains
+};
+const bool                               g_drain_prof = [] {
+	const char* value = std::getenv("KYTY_CP_DRAIN_PROF");
+	return value != nullptr && std::atoi(value) == 1;
+}();
+std::unordered_map<uint32_t, DrainEntry> g_drains;
+thread_local Stat                        t_last_stat = Stat::FallbackArgs;
+
+void NoteDrain(Reason reason, uint64_t depth, uint64_t wait_ns) noexcept {
+	auto& e = g_drains[static_cast<uint32_t>(reason)];
+	e.count++;
+	if (depth != 0) {
+		e.waited++;
+		e.wait_ns += wait_ns;
+		e.depth += depth;
+	}
+}
+
+std::string ReasonName(uint32_t key) {
+	static constexpr const char* Names[] = {
+	    "other",         "command",        "gpu_command",   "submit_begin",    "sched_begin",
+	    "end_rendering", "flush",          "flush_wait",    "finish",          "sched_wait",
+	    "submit",        "timeline_wait",  "fault",         "readback",        "image_heap",
+	    "inline_heap",   "inline_writes",  "fallback_args", "fallback_targets", "fallback_shaders",
+	    "fallback_fast", "queue_full"};
+	static_assert(std::size(Names) == static_cast<size_t>(Reason::Count) - static_cast<size_t>(Reason::PacketReasons));
+	const auto base = static_cast<uint32_t>(Reason::PacketReasons);
+	if (key >= base) return Names[key - base];
+	const uint32_t op   = key & 0xffu;
+	const uint32_t sub  = (key >> 8u) & 0xffu;
+	std::string    name = Pm4::OpcodeName(op);
+	if (name.rfind("IT_", 0) == 0) name.erase(0, 3);
+	char buf[32] = {};
+	switch (op) {
+		case Pm4::IT_NOP: std::snprintf(buf, sizeof(buf), ":%s", Pm4::RegisterName(sub)); break;
+		case Pm4::IT_EVENT_WRITE: std::snprintf(buf, sizeof(buf), ":ev%02" PRIx32, sub); break;
+		case Pm4::IT_RELEASE_MEM: std::snprintf(buf, sizeof(buf), ":data%" PRIu32 ".int%" PRIu32, sub & 7u, sub >> 3u); break;
+		case Pm4::IT_WRITE_DATA: std::snprintf(buf, sizeof(buf), ":dst%" PRIu32, sub); break;
+		case Pm4::IT_DMA_DATA: std::snprintf(buf, sizeof(buf), ":src%" PRIu32 ".dst%" PRIu32, sub & 3u, sub >> 2u); break;
+		default: break;
+	}
+	name += buf;
+	if ((key & 0x10000u) != 0) name += "@acb";
+	return name;
 }
 
 thread_local bool t_back        = false;
@@ -197,10 +254,21 @@ bool BackIdle() noexcept {
 	return s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_acquire);
 }
 
-void Drain() noexcept {
+Reason FallbackReason() noexcept {
+	return static_cast<Reason>(static_cast<uint32_t>(Reason::FallbackArgs) + static_cast<uint32_t>(t_last_stat) -
+	                           static_cast<uint32_t>(Stat::FallbackArgs));
+}
+
+bool DrainProfEnabled() noexcept {
+	return g_drain_prof;
+}
+
+void Drain(Reason reason) noexcept {
 	if (!FrontActive() || S().slots == nullptr) return;
-	auto& s = S();
-	if (s.tail.load(std::memory_order_acquire) != s.head.load(std::memory_order_relaxed)) {
+	auto&          s       = S();
+	const uint64_t depth   = s.head.load(std::memory_order_relaxed) - s.tail.load(std::memory_order_acquire);
+	uint64_t       wait_ns = 0;
+	if (depth != 0) {
 		const auto start = NowNs();
 		FrontWait([&] {
 			if (s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_relaxed)) {
@@ -208,9 +276,11 @@ void Drain() noexcept {
 			}
 			return t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr;
 		});
+		wait_ns = NowNs() - start;
 		s.drains_waited.fetch_add(1, std::memory_order_relaxed);
-		s.drain_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		s.drain_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
 	}
+	if (g_drain_prof) NoteDrain(reason, depth, wait_ns);
 	FrontWait([&] {
 		if (s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_relaxed)) {
 			return true;
@@ -240,8 +310,10 @@ DrawRecord& Acquire() noexcept {
 	if (head - s.tail.load(std::memory_order_acquire) >= Slots) {
 		const auto start = NowNs();
 		FrontWait([&] { return head - s.tail.load(std::memory_order_acquire) < Slots; });
+		const auto wait_ns = NowNs() - start;
 		s.full_waits.fetch_add(1, std::memory_order_relaxed);
-		s.full_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		s.full_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+		if (g_drain_prof) NoteDrain(Reason::QueueFull, Slots, wait_ns);
 	}
 	ApplyFeedback();
 	auto& rec          = Slot(head);
@@ -285,7 +357,7 @@ void SetHeapHook(HeapFn hook) noexcept {
 
 void NoteHeapAcquire() noexcept {
 	if (!t_in_lookup || t_heap_inline || S().slots == nullptr || !FrontActive()) return;
-	Drain();
+	Drain(Reason::ImageHeap);
 	g_heap_hook(S().context);
 	t_heap_inline = true;
 }
@@ -295,11 +367,44 @@ bool TakeHeapInline() noexcept {
 }
 
 void Note(Stat stat) noexcept {
+	if (stat >= Stat::FallbackArgs && stat <= Stat::FallbackFast) t_last_stat = stat;
 	S().stats[static_cast<size_t>(stat)].fetch_add(1, std::memory_order_relaxed);
 }
 
-void Report(double seconds) noexcept {
+namespace {
+
+void ReportDrains(double seconds, uint64_t frames) {
+	std::vector<std::pair<uint32_t, DrainEntry>> rows(g_drains.begin(), g_drains.end());
+	g_drains.clear();
+	DrainEntry total;
+	for (const auto& [key, e]: rows) {
+		total.count += e.count;
+		total.waited += e.waited;
+		total.wait_ns += e.wait_ns;
+	}
+	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+		return a.second.wait_ns != b.second.wait_ns ? a.second.wait_ns > b.second.wait_ns
+		                                            : a.second.count > b.second.count;
+	});
+	// Per reason: drains/waited, total wait, mean wait of a waited drain, mean records still queued.
+	std::printf("PERF cpdrain %.1fs: frames=%" PRIu64 " drains=%" PRIu64 " waited=%" PRIu64 " wait=%.1fms", seconds,
+	            frames, total.count, total.waited, static_cast<double>(total.wait_ns) / 1e6);
+	constexpr size_t Top = 16;
+	for (size_t i = 0; i < rows.size() && i < Top; i++) {
+		const auto& e = rows[i].second;
+		std::printf(" | %s n=%" PRIu64 "/%" PRIu64 " wait=%.1fms mean=%.0fus depth=%.1f", ReasonName(rows[i].first).c_str(),
+		            e.count, e.waited, static_cast<double>(e.wait_ns) / 1e6,
+		            e.waited != 0 ? static_cast<double>(e.wait_ns) / 1e3 / static_cast<double>(e.waited) : 0.0,
+		            e.waited != 0 ? static_cast<double>(e.depth) / static_cast<double>(e.waited) : 0.0);
+	}
+	std::printf("\n");
+}
+
+} // namespace
+
+void Report(double seconds, uint64_t frames) noexcept {
 	if (Mode() == 0) return;
+	if (g_drain_prof) ReportDrains(seconds, frames);
 	auto&      s    = S();
 	const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
 	const auto ms   = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };

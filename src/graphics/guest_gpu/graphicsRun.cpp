@@ -409,7 +409,7 @@ void GuestGpu::ProcessCommands() {
 	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		// Per command: one may arrive after the check above (it records and submits like the back).
-		CpPipeline::Drain();
+		CpPipeline::Drain(CpPipeline::Reason::Command);
 		FlushBatchedUploads();
 		Common::UniqueFunction<void> command;
 		{
@@ -854,7 +854,7 @@ void GuestGpu::ThreadRun(void* data) {
 			{
 				PerfStats::ScopedTimer busy(PerfStats::Counter::GpuBusyNs);
 				CpSplitProf::BusyBegin();
-				CpPipeline::Drain();
+				CpPipeline::Drain(CpPipeline::Reason::GpuCommand);
 				command();
 				CpSplitProf::BusyEnd();
 			}
@@ -909,7 +909,7 @@ bool GuestGpu::Process(Submission& submission) {
 	}
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::SubmitBegin);
 	FlushBatchedUploads();
 	cp.BufferInit();
 	bool complete = true;
@@ -1065,6 +1065,22 @@ static bool IsSyncPointPacket(uint32_t opcode) {
 	}
 }
 
+// KYTY_CP_DRAIN_PROF: the sub-reason byte of a draining packet (see CpPipeline::PacketReason).
+static uint32_t DrainSubReason(uint32_t opcode, uint32_t custom, const uint32_t* packet, uint32_t packet_dw) {
+	const uint32_t* body    = packet + 1;
+	const uint32_t  body_dw = packet_dw > 1 ? packet_dw - 1 : 0;
+	switch (opcode) {
+		case Pm4::IT_NOP: return custom;
+		case Pm4::IT_EVENT_WRITE: return body_dw >= 1 ? body[0] & 0x3fu : 0;
+		case Pm4::IT_RELEASE_MEM:  // data_sel | int_sel << 3
+			return body_dw >= 2 ? ((body[1] >> 29u) & 0x7u) | (((body[1] >> 24u) & 0x7u) << 3u) : 0;
+		case Pm4::IT_WRITE_DATA: return body_dw >= 1 ? (body[0] >> 8u) & 0xfu : 0;
+		case Pm4::IT_DMA_DATA:  // src_sel | dst_sel << 2
+			return body_dw >= 1 ? ((body[0] >> 29u) & 0x3u) | (((body[0] >> 20u) & 0x3u) << 2u) : 0;
+		default: return 0;
+	}
+}
+
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	static const bool idle_submit     = CommandScheduler::IdleSubmitEnabled();
 	static const bool reprotect_batch = BufferCache::ReprotectBatchEnabled();
@@ -1134,7 +1150,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		auto handler = g_cp_op_func[opcode];
 		CpSplitProf::Packet(opcode, KYTY_PM4_R(packet_header));
 		if (!IsPipelinedPacket(opcode, KYTY_PM4_R(packet_header))) {
-			CpPipeline::Drain();
+			CpPipeline::Drain(CpPipeline::DrainProfEnabled()
+			                      ? CpPipeline::PacketReason(opcode,
+			                                                 DrainSubReason(opcode, KYTY_PM4_R(packet_header), packet,
+			                                                                std::min<uint32_t>(KYTY_PM4_LEN(packet_header), remaining_dw)),
+			                                                 IsAsyncComputeQueue())
+			                      : CpPipeline::Reason::Other);
 			if (reprotect_batch && IsSyncPointPacket(opcode) && g_gpu_state != nullptr) {
 				g_gpu_state->FlushBatchedUploads();
 			}

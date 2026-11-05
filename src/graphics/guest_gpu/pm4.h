@@ -1006,6 +1006,9 @@ constexpr uint32_t UC_NUM = 0x3FFF + 1;
 
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw);
+[[nodiscard]] const char* OpcodeName(uint32_t opcode);
+// IT_NOP's R field.
+[[nodiscard]] const char* RegisterName(uint32_t r);
 
 } // namespace Libs::Graphics::Pm4
 

@@ -208,7 +208,7 @@ void CommandScheduler::Shutdown() {
 void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config,
                              HW::Shader& shaders) {
 	// KYTY_CP_PIPELINE: the GPU thread reads the command buffer state only once the back is idle.
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::SchedBegin);
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
@@ -225,7 +225,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 }
 
 void CommandScheduler::EndRendering() {
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::EndRendering);
 	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
@@ -237,20 +237,20 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::Flush);
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::FlushAndWait);
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::Finish);
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -261,7 +261,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::SchedWait);
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -545,7 +545,7 @@ bool CommandScheduler::IdleSubmitDue() {
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	CpSplitProf::NoteSubmitOrWait();
 	// KYTY_CP_PIPELINE: the GPU thread reads the command buffer state only once the back is idle.
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::Reason::Submit);
 	EXIT_IF(m_command.IsInvalid());
 	if (m_pre_submit != nullptr) [[unlikely]] {
 		m_pre_submit(m_pre_submit_context);
