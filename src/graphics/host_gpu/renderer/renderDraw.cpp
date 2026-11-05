@@ -1156,7 +1156,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
-	const bool remember = m_context.GetPipelineCache().ParallelEnabled();
+	const bool remember = m_context.GetPipelineCache().ParallelEnabled() && CpPipeline::Mode() != 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],

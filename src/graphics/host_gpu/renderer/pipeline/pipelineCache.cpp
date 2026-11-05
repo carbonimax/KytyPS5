@@ -1004,7 +1004,9 @@ struct PipelineCache::ParallelPool {
 
 static uint32_t ParallelWorkers() {
 	const char* value = std::getenv("KYTY_PIPELINE_PARALLEL");
-	return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16)) : 0u;
+	if (value != nullptr) return static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
+	// Default: half the hardware threads, 1..8, as the warm-up (8 from 16 threads up).
+	return std::clamp(std::thread::hardware_concurrency() / 2u, 1u, 8u);
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,

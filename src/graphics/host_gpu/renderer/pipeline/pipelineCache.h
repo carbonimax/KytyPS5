@@ -203,11 +203,12 @@ public:
 	                              bool                             depth_feedback = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
-	// KYTY_PIPELINE_PARALLEL=N (default 0 = off): N worker threads create the graphics pipelines
-	// of draws queued behind a missing one (KYTY_CP_PIPELINE back thread). At a miss, and while it
-	// waits for a pipeline a worker is creating, the back calls the hook, which predicts the keys of
-	// the queued draws and calls Prefetch. A draw still waits for its own pipeline; a wrong
-	// prediction only costs a compilation (the lookup stays the only source of truth).
+	// KYTY_PIPELINE_PARALLEL=N (default half the hardware threads, 1..8; 0 = off): N worker threads
+	// create the graphics pipelines of draws queued behind a missing one (KYTY_CP_PIPELINE back
+	// thread). At a miss, and while it waits for a pipeline a worker is creating, the back calls the
+	// hook, which predicts the keys of the queued draws and calls Prefetch. A draw still waits for its
+	// own pipeline; a wrong prediction only costs a compilation (the lookup stays the only source of
+	// truth).
 	using PrefetchHook = void (*)(void* context);
 	void SetPrefetchHook(PrefetchHook hook, void* context) {
 		m_prefetch_hook    = hook;
