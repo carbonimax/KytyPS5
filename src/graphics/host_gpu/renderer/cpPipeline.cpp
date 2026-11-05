@@ -443,6 +443,18 @@ std::string FrontName(uint64_t key) {
 			              (value >> 2u) & 1u, (value >> 3u) & 1u, value >> 4u);
 			return buf;
 		case Front::Command: return "cmd:" + ReasonName(value);
+		case Front::Dispatch: {
+			static constexpr const char* Phases[] = {"pop", "lock", "lookup", "meta", "end_rendering", "pipeline",
+			                                         "bindings", "heap_bda", "rebind", "commit", "barrier", "record"};
+			static constexpr const char* Attrs[]  = {"n_heap", "n_dma", "n_writes", "n_chained", "sum_buffers",
+			                                         "sum_images", "n_meta"};
+			const uint32_t phase = value & 0xffu;
+			const char*    name  = phase < 12u                       ? Phases[phase]
+			                       : phase >= 0x20u && phase < 0x27u ? Attrs[phase - 0x20u]
+			                                                         : "?";
+			std::snprintf(buf, sizeof(buf), "disp%s:%s", (value & 0x100u) != 0 ? "@acb" : "", name);
+			return buf;
+		}
 		default: return "?";
 	}
 }
@@ -453,7 +465,7 @@ void ReportFront(double seconds, uint64_t frames) {
 	std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
 	// Per category: count and GPU thread time (nested: pkt > indirect > its draws).
 	std::printf("PERF cpfront %.1fs: frames=%" PRIu64, seconds, frames);
-	constexpr size_t Top = 32;
+	constexpr size_t Top = 64;
 	for (size_t i = 0; i < rows.size() && i < Top; i++) {
 		std::printf(" | %s n=%" PRIu64 " t=%.2fms", FrontName(rows[i].first).c_str(), rows[i].second.count,
 		            static_cast<double>(rows[i].second.ns) / 1e6);

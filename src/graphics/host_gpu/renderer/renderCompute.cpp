@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -497,6 +498,29 @@ static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& bu
 	Commit(state, accesses, epoch, decision.barrier);
 }
 
+namespace {
+// KYTY_CP_DRAIN_PROF=2: GPU thread time of each phase since the previous mark, per ring ("disp" rows).
+class DispatchPhases {
+public:
+	explicit DispatchPhases(bool async_compute) noexcept
+	    : m_ring(async_compute ? 0x100u : 0u), m_t(CpPipeline::FrontProfEnabled() ? CpPipeline::NowNs() : 0) {}
+	void Mark(CpPipeline::DispatchPhase phase) noexcept {
+		if (m_t == 0) return;
+		const uint64_t now = CpPipeline::NowNs();
+		CpPipeline::NoteFront(CpPipeline::Front::Dispatch, static_cast<uint32_t>(phase) | m_ring, now - m_t);
+		m_t = now;
+	}
+	void Count(CpPipeline::DispatchPhase attr, uint64_t n = 1) const noexcept {
+		if (m_t != 0) CpPipeline::NoteFront(CpPipeline::Front::Dispatch, static_cast<uint32_t>(attr) | m_ring, 0, n);
+	}
+
+private:
+	uint32_t m_ring;
+	uint64_t m_t;
+};
+using Phase = CpPipeline::DispatchPhase;
+} // namespace
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
@@ -504,7 +528,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PerfStats::NoteWork();
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
+	DispatchPhases phases(async_compute);
 	m_context.GetCommandScheduler().PopPendingOperations();
+	phases.Mark(Phase::Pop);
 	auto& sh_ctx = buffer.GetShaders();
 
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchDirect), submit_id,
@@ -523,6 +549,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	Common::LockGuard lock(m_context.GetMutex());
+	phases.Mark(Phase::Lock);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -572,6 +599,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		CpSplitProf::LookupScope lookup;
 		found_program = static_cast<bool>(m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info));
 	}
+	phases.Mark(Phase::Lookup);
 	if (!found_program) return;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
@@ -586,8 +614,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
 		ResetBindings();
+		phases.Mark(Phase::Meta);
+		phases.Count(Phase::AttrMeta);
 		return;
 	}
+	phases.Mark(Phase::Meta);
 
 	if (use_thread_dimensions) {
 		const uint32_t old_x = thread_group_x;
@@ -609,7 +640,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
+	phases.Mark(Phase::EndRendering);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	phases.Mark(Phase::Pipeline);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -618,6 +651,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	phases.Mark(Phase::Bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -625,12 +659,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		PerfStats::ScopedTimer heap_timer(PerfStats::Counter::BindHeapNs, PerfStats::BindProfEnabled());
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	phases.Mark(Phase::HeapBda);
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	{
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		RebindBuffers(bindings);
 	}
+	phases.Mark(Phase::Rebind);
 
 	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
 	// own tracked accesses), its barrier and the dispatch are recorded: a dispatch chain stays open.
@@ -640,6 +676,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+	phases.Mark(Phase::Commit);
 	if (HasShaderBufferWrites(input_info.stage)) {
 		CpSplitProf::NoteItemWrites();
 	}
@@ -661,6 +698,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	phases.Mark(Phase::Barrier);
+	if (program.info.uses_image_heap) phases.Count(Phase::AttrHeap);
+	if (program.info.uses_dma) phases.Count(Phase::AttrDma);
+	if (has_storage_writes) phases.Count(Phase::AttrWrites);
+	if (chain_mode != 0 && !program.info.uses_image_heap) phases.Count(Phase::AttrChained);
+	phases.Count(Phase::AttrBuffers, program.info.buffers.size());
+	phases.Count(Phase::AttrImages, program.info.images.size());
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -752,6 +796,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	ResetBindings();
+	phases.Mark(Phase::Record);
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,

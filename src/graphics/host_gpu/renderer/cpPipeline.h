@@ -129,8 +129,14 @@ enum class Front : uint32_t {
 	Inline,      // value: Reason (fallback or inline draw)
 	NoEs,        // value: ls | hs << 1 | gs << 2 | ps << 3 | primitive type << 4
 	Command,     // value: Reason (CommandReason)
+	Dispatch,    // value: DispatchPhase | async compute ring << 8 (attribute rows: count only, no time)
 };
 enum class IndirectPath : uint32_t { GpuRecords, GpuMesh, CpuRecords };
+// RenderExecutor::DispatchDirect, in order. Attributes count dispatches (buffers/images: their sum).
+enum class DispatchPhase : uint32_t {
+	Pop, Lock, Lookup, Meta, EndRendering, Pipeline, Bindings, HeapBda, Rebind, Commit, Barrier, Record,
+	AttrHeap = 0x20, AttrDma, AttrWrites, AttrChained, AttrBuffers, AttrImages, AttrMeta,
+};
 void NoteFront(Front family, uint32_t value, uint64_t ns, uint64_t count = 1) noexcept;
 [[nodiscard]] uint64_t NowNs() noexcept;
 // Times its scope when FrontProfEnabled() (one flag test otherwise).
