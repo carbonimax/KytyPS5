@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -33,6 +34,11 @@ class ShaderStore;
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
 } // namespace ShaderRecompiler::IR
+
+namespace HW {
+class Context;
+class UserConfig;
+} // namespace HW
 
 #pragma pack(push, 1)
 
@@ -155,6 +161,11 @@ struct DrawRenderState {
 	}
 };
 
+struct PipelineCacheFeedback {
+	bool valid = false;
+	bool hit   = false;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -192,8 +203,25 @@ public:
 	                              bool                             depth_feedback = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
+	// KYTY_PIPELINE_PARALLEL=N (default 0 = off): N worker threads create the graphics pipelines
+	// of draws queued behind a missing one (KYTY_CP_PIPELINE back thread). At a miss, and while it
+	// waits for a pipeline a worker is creating, the back calls the hook, which predicts the keys of
+	// the queued draws and calls Prefetch. A draw still waits for its own pipeline; a wrong
+	// prediction only costs a compilation (the lookup stays the only source of truth).
+	using PrefetchHook = void (*)(void* context);
+	void SetPrefetchHook(PrefetchHook hook, void* context) {
+		m_prefetch_hook    = hook;
+		m_prefetch_context = context;
+	}
+	[[nodiscard]] bool ParallelEnabled() const { return m_pool != nullptr; }
+	// Starts creating the pipeline of a queued draw (predicted targets) if it is missing.
+	void Prefetch(const HW::Context& ctx, const HW::UserConfig& ucfg, const DrawRenderState& state,
+	              std::span<const RenderColorInfo> colors);
+
 private:
 	struct ProgramCache;
+	struct PendingPipeline;
+	struct ParallelPool;
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
@@ -220,6 +248,13 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
+	// The key of a draw's pipeline. `predict`: a queued draw with predicted targets; false wherever
+	// the real lookup would stop the emulator.
+	[[nodiscard]] bool MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig& ucfg,
+	                                   const DrawRenderState&           state,
+	                                   std::span<const RenderColorInfo> colors, bool depth_feedback,
+	                                   bool predict, GraphicsPipelineKey& key) const;
+
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	// The shader store (KYTY_SHADER_STORE, --shader-cache), loaded by m_warm_up. Every other member
@@ -236,9 +271,22 @@ private:
 	uint64_t                      m_saved_payload_hash = 0; // payload of the file on disk
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
+	// KYTY_PIPELINE_PARALLEL: pipelines handed to the workers and not looked up yet (the thread that
+	// creates pipelines owns the map; the workers only fill the entries).
+	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>, GraphicsPipelineKeyHash>
+	                              m_pending;
+	std::unique_ptr<ParallelPool> m_pool;
+	PrefetchHook                  m_prefetch_hook    = nullptr;
+	void*                         m_prefetch_context = nullptr;
+	// LoadStoredModule runs on the workers too.
+	std::mutex                    m_module_mutex;
 
 	void InitializeDriverCache();
-	void CheckpointDriverCache();
+	void CheckpointDriverCache(PipelineCacheFeedback feedback);
+	// Worker or the thread that needs it: creates a pending pipeline.
+	void CreatePending(PendingPipeline& job, bool worker);
+	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
+	void TakePending(PendingPipeline& job);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
 	void WarmUp(const std::filesystem::path& path);
 	void WaitWarmUp() {
@@ -254,10 +302,6 @@ private:
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 // Driver pipeline-cache outcome of the latest CreatePipelineInternal call on this thread, from
 // pipeline creation feedback (core in Vulkan 1.3). `valid` is false when the driver did not report.
-struct PipelineCacheFeedback {
-	bool valid = false;
-	bool hit   = false;
-};
 [[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
 // Pipelines created by this thread are left out of the performance counters (shader store warm-up).
 void SetPipelineCreationQuiet(bool quiet) noexcept;

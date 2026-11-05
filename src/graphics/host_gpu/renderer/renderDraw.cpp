@@ -37,6 +37,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <xxhash.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1069,6 +1070,69 @@ static bool GuessSingleSample(uint64_t ps_address) {
 	return guess.last;
 }
 
+// KYTY_PIPELINE_PARALLEL: the targets that draws resolved, by the registers that select them, so the
+// back thread can predict the pipeline keys of queued draws (under the render mutex).
+// shortcut: a stale entry only mispredicts (one wasted compilation); cleared past 4096 entries.
+static std::unordered_map<uint64_t, RenderColorInfo> g_color_targets;
+static std::unordered_map<uint64_t, RenderDepthInfo> g_depth_targets;
+
+static uint64_t ColorTargetKey(const HW::Context& hw, uint32_t slot, uint32_t slice_offset) {
+	const auto&    rt       = hw.GetRenderTarget(slot);
+	const uint32_t extra[3] = {slot, render_target_mask_slot(hw.GetRenderTargetMask(), slot),
+	                           slice_offset};
+	return XXH3_64bits_withSeed(&rt, sizeof(rt), XXH3_64bits(extra, sizeof(extra)));
+}
+
+// The registers ResolveRenderDepthTarget decides the attachment from.
+static uint64_t DepthTargetKey(const HW::Context& hw) {
+	const auto&    z           = hw.GetDepthRenderTarget();
+	const auto&    rc          = hw.GetRenderControl();
+	const auto&    dc          = hw.GetDepthControl();
+	const bool     has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const uint32_t active[2]   = {
+        dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color ? 1u : 0u,
+        has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color) ? 1u : 0u};
+	return XXH3_64bits_withSeed(&z, sizeof(z), XXH3_64bits(active, sizeof(active)));
+}
+
+template <typename Info>
+static void RememberTarget(std::unordered_map<uint64_t, Info>& targets, uint64_t key, const Info& info) {
+	if (targets.size() >= 4096) targets.clear();
+	targets[key] = info;
+}
+
+// The targets of a queued draw from the remembered ones; false when one is unknown or the draw would
+// take another path (aliased targets, mixed sample counts, nothing to draw, another pixel permutation).
+static bool PredictTargets(const CpPipeline::DrawRecord& record, DrawRenderState& state) {
+	const auto& hw     = record.registers;
+	const auto  offset = record.indexed ? record.index_args.render_target_slice_offset
+	                                    : record.auto_args.render_target_slice_offset;
+	if (std::ranges::any_of(state.ps_input_info.target_merge_mask, [](auto mask) { return mask != 0; })) {
+		return false;
+	}
+	state.color_count = 0;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((state.mrt_mask & (1u << slot)) == 0) continue;
+		const auto found = g_color_targets.find(ColorTargetKey(hw, slot, offset));
+		if (found == g_color_targets.end()) return false;
+		if (found->second.image_id) state.color_info[state.color_count++] = found->second;
+	}
+	const auto depth = g_depth_targets.find(DepthTargetKey(hw));
+	if (depth == g_depth_targets.end()) return false;
+	state.depth_info = depth->second;
+	const auto colors       = std::span {state.color_info, state.color_count};
+	const auto pass_samples = state.depth_info.image_id ? state.depth_info.desc.info.samples
+	                                                    : state.color_info[0].desc.info.samples;
+	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+		    return color.desc.info.samples != pass_samples;
+	    })) {
+		return false;
+	}
+	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) return false;
+	return !state.ps_active || state.ps_input_info.ps_single_sample ==
+	                               DrawUsesSingleSample(colors, state.depth_info, hw.GetAaConfig());
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state, CpPipeline::DrawRecord* record,
@@ -1092,10 +1156,16 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
+	const bool remember = m_context.GetPipelineCache().ParallelEnabled();
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
+			if (remember) {
+				RememberTarget(g_color_targets,
+				               ColorTargetKey(buffer.GetRegisters(), slot, render_target_slice_offset),
+				               state.color_info[state.color_count]);
+			}
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
 			}
@@ -1117,6 +1187,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (remember) {
+		RememberTarget(g_depth_targets, DepthTargetKey(buffer.GetRegisters()), state.depth_info);
+	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
 	const auto colors       = std::span {state.color_info, state.color_count};
@@ -1967,6 +2040,7 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 		return false;
 	}
 	static const bool initialized = [this] {
+		m_context.GetPipelineCache().SetPrefetchHook(PipelinePrefetch, this);
 		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
 		CpPipeline::SetHeapHook(PipelineHeap);
 		return true;
@@ -2059,6 +2133,23 @@ void RenderExecutor::PipelineFeedback(void* /*context*/, const CpPipeline::DrawR
 	auto& guess                                 = GetSingleSampleGuess();
 	guess.last                                  = record.feedback_single_sample;
 	guess.by_shader[record.feedback_ps_address] = record.feedback_single_sample;
+}
+
+void RenderExecutor::PipelinePrefetch(void* context) {
+	auto& cache = static_cast<RenderExecutor*>(context)->m_context.GetPipelineCache();
+	// Back thread only: each queued record is looked at once.
+	static uint64_t        scanned = 0;
+	static DrawRenderState state;
+	const auto             end = CpPipeline::Published();
+	for (auto index = std::max(scanned, CpPipeline::Finished() + 1); index < end; index++) {
+		const auto& record = CpPipeline::Queued(index);
+		state              = record.state;
+		if (state.vertex_info[0].stage && PredictTargets(record, state)) {
+			cache.Prefetch(record.registers, record.user_config, state,
+			               {state.color_info, state.color_count});
+		}
+	}
+	scanned = std::max(scanned, end);
 }
 
 void RenderExecutor::PipelineHeap(void* context) {
