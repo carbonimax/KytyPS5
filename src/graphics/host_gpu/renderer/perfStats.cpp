@@ -81,10 +81,17 @@ bool SrtProfEnabled() noexcept {
 	return enabled;
 }
 
+static std::atomic<uint64_t> g_frame {0};
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
+		if (counter == Counter::Frames) g_frame.fetch_add(value, std::memory_order_relaxed);
 	}
+}
+
+uint64_t Frame() noexcept {
+	return g_frame.load(std::memory_order_relaxed);
 }
 
 void MarkGpuThread() noexcept {
@@ -285,6 +292,15 @@ void MaybeReport() noexcept {
 		            walk.fault_reads, walk.protected_calls, static_cast<double>(walk.protected_ns) / 1e6,
 		            walk.protected_synced, walk.protected_evictions, walk.reuse_hits, walk.reuse_checks,
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
+	}
+	if (n(Counter::AsyncSkipped) + n(Counter::AsyncBlockWrites) + n(Counter::AsyncBlockDepthOnly) +
+	        n(Counter::AsyncBlockQuery) + n(Counter::AsyncBlockPasses) != 0) {
+		std::printf("PERF async %.1fs: skipped=%" PRIu64 " skip_frames=%" PRIu64 "/%" PRIu64
+		            " blocked_writes=%" PRIu64 " blocked_depth_only=%" PRIu64 " blocked_query=%" PRIu64
+		            " blocked_passes=%" PRIu64 "\n",
+		            seconds, n(Counter::AsyncSkipped), n(Counter::AsyncSkipFrames), n(Counter::Frames),
+		            n(Counter::AsyncBlockWrites), n(Counter::AsyncBlockDepthOnly), n(Counter::AsyncBlockQuery),
+		            n(Counter::AsyncBlockPasses));
 	}
 	if (const auto* bounds = g_bounds_counters.load(std::memory_order_relaxed); bounds != nullptr) {
 		// Totals since launch; nonzero_loads must stay 0.

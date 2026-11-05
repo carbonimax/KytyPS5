@@ -89,6 +89,14 @@ enum class Counter : uint32_t {
 	BindObtainNs,      // of buffers: NativeStorageBuffer (buffer cache, uploads)
 	BindUploadNs,      // of buffers: flattened SRT + shader data stream uploads
 	BindViewNs,        // of images: TextureCache::FindTexture (views)
+	// KYTY_ASYNC_PIPELINE=1: draws skipped while their pipeline is created, guest frames with a
+	// skipped draw, and the misses that waited, by why the draw could not be skipped.
+	AsyncSkipped,
+	AsyncSkipFrames,
+	AsyncBlockWrites,    // writes buffers, images or memory by address
+	AsyncBlockDepthOnly, // no color attachment (depth-only: later passes test or sample it)
+	AsyncBlockQuery,     // an occlusion query counts its samples
+	AsyncBlockPasses,    // aliased-target passes
 	Count
 };
 
@@ -100,6 +108,8 @@ enum class Counter : uint32_t {
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
+// Guest frames counted so far (Counter::Frames, without the report resets).
+[[nodiscard]] uint64_t Frame() noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
 [[nodiscard]] bool IsGpuThread() noexcept;

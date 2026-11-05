@@ -208,6 +208,14 @@ public:
 	                              std::span<const RenderColorInfo> colors,
 	                              bool                             depth_feedback = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	// KYTY_ASYNC_PIPELINE=1 (default 0, experiment; needs the KYTY_PIPELINE_PARALLEL workers): with
+	// `may_skip`, a missing pipeline is handed to the workers (first in line) and nullptr returned:
+	// the caller skips the draw until a later lookup finds it created. Without `may_skip` it is
+	// GetGraphicsPipeline. `missed`: the pipeline was not created yet.
+	[[nodiscard]] bool AsyncEnabled() const { return m_async; }
+	Pipeline* FindGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                               std::span<const RenderColorInfo> colors, bool depth_feedback,
+	                               bool may_skip, bool& missed);
 
 	// KYTY_PIPELINE_PARALLEL=N (default half the hardware threads, 1..8; 0 = off): N worker threads
 	// create the graphics pipelines of draws queued behind a missing one (KYTY_CP_PIPELINE back
@@ -289,7 +297,8 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<PendingPipeline>, GraphicsPipelineKeyHash>
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
-	PrefetchHook                  m_prefetch_hook    = nullptr;
+	bool                          m_async = false;
+	PrefetchHook                 m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
 	// LoadStoredModule runs on the workers too.
 	std::mutex                    m_module_mutex;
@@ -301,6 +310,8 @@ private:
 	void WriteDriverCache();
 	// Worker or the thread that needs it: creates a pending pipeline.
 	void CreatePending(PendingPipeline& job, bool worker);
+	// Hands a missing key to the workers (`first`: ahead of the predicted ones).
+	bool StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state, bool first);
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
 	void TakePending(PendingPipeline& job);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
