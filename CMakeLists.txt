@@ -900,6 +900,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
+	add_test(NAME gpu_capture_replay
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
