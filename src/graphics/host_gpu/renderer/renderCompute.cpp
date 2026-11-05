@@ -226,7 +226,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
 	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
 	const auto&        flat = stage.resources->flattened_srt;
-	for (const auto [low, high]: stage.module->info.info.address_bases) {
+	for (const auto [low, high]: stage.program->info.address_bases) {
 		const auto base = flat[low] | uint64_t {flat[high]} << 32u;
 		for (uint64_t index = 0; index <= 2; ++index) {
 			const auto page = base + index * Page;
