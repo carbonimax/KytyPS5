@@ -44,6 +44,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_dynamic      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// Stencil image -> image copies into attachment images are lost (ResolveStencilCopyViaBuffer).
+	bool                               stencil_copy_via_buffer               = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;

@@ -24055,6 +24055,8 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = m_mode == Mode::Full;
     m_runtime_context.null_descriptor_enabled = m_mode == Mode::Full;
     m_runtime_context.maintenance8_enabled = m_maintenance8_enabled;
+    m_runtime_context.stencil_copy_via_buffer =
+        ResolveStencilCopyViaBuffer(m_runtime_context);
     // Only the full mode requires and enables minLod, together with maintenance8.
     m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
     m_runtime_context.shader_resource_min_lod_enabled = m_resource_min_lod_enabled;
@@ -47732,6 +47734,7 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   // Lane L selects ordinal L - 1, so lane 0 selects 0xffffffff.
   auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
   auto &ordinal = block->AppendNewInst(ValueOpcode::ISub32, {Value(&lane), Value(1u)});
+  auto &sampler_key = block->AppendNewInst(ValueOpcode::IMul32, {Value(&ordinal), Value(4u)});
   auto &image = block->AppendNewInst(
       ValueOpcode::GetImageResource,
       {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -47799,7 +47802,21 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
   // A table consecutive from ordinal 1 selects without a switch; a single candidate and a table
   // with a gap keep it.
   const std::array<std::vector<u32>, 3> tables{{{3u, 0u, 1u}, {2u}, {0u, 2u, 1u}}};
-  for (const auto &table : tables) {
+  for (size_t case_index = 0; case_index < 2u * tables.size(); ++case_index) {
+    const auto &table = tables[case_index % tables.size()];
+    const bool mapped = case_index >= tables.size();
+    sampler.SetArg(0, mapped ? Value(&sampler_key) : Value(&ordinal));
+    auto &root = program.info.samplers[0];
+    root.indirect_root = mapped ? 0u : SamplerResource::NoIndirectSampler;
+    root.indirect_mapping_offset = 0u;
+    root.indirect_search_iterations = 0u;
+    compiled.resources.flattened_srt.clear();
+    if (mapped) {
+      // Only the sampler needs a lookup buffer: reverse its keys to distinct sampler ordinals.
+      compiled.resources.flattened_srt.push_back(static_cast<u32>(table.size()));
+      for (size_t index = table.size(); index != 0; --index)
+        compiled.resources.flattened_srt.push_back(static_cast<u32>(index - 1u));
+    }
     program.info.samplers[0].indirect_resources = table;
     program.shader_info_complete = false;
     CollectShaderInfo(program, {.compute = &compute});
@@ -47816,8 +47833,11 @@ void CheckSamplerCandidateTables(VulkanHarness &vulkan) {
     test.expected.resize(wave_size);
     for (u32 lane_index = 0; lane_index < wave_size; ++lane_index) {
       const auto selected = lane_index - 1u;
+      const auto index = selected < table.size()
+                             ? (mapped ? table.size() - 1u - selected : selected)
+                             : 0u;
       test.expected[lane_index] =
-          std::bit_cast<u32>(float(10u + table[selected < table.size() ? selected : 0u]));
+          std::bit_cast<u32>(float(10u + table[index]));
     }
     auto buffer = vulkan.CreateStorageBuffer(name, test.initial, test.initial.size());
     vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures,
@@ -52203,7 +52223,30 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
-  destination.CopyMip(source, 1, 0);
+  // Two bytes hold one stencil row of the 2x2 image: the buffer path copies in two chunks.
+  Buffer stencil_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0,
+                         AllFlags, 2);
+  destination.CopyMip(source, 1, 0, stencil_scratch);
+  // The DB depth/stencil copy shape: stencil alone into mip 0, through the buffer path on any
+  // driver.
+  Image stencil_destination(context, scheduler, source_info);
+  {
+    const bool probed = context.stencil_copy_via_buffer;
+    context.stencil_copy_via_buffer = true;
+    auto command = scheduler.Current().Handle();
+    source.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                   vk::AccessFlagBits2::eTransferRead, {}, command);
+    stencil_destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                vk::AccessFlagBits2::eTransferWrite, {},
+                                command);
+    vk::ImageCopy region{};
+    region.srcSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = vk::Extent3D{2, 2, 1};
+    stencil_destination.CopyRegions(source, std::span{&region, 1},
+                                    stencil_scratch, command);
+    context.stencil_copy_via_buffer = probed;
+  }
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -52216,6 +52259,14 @@ void CheckImageTransitionState(RenderContext &renderer) {
   destination_copies[1].imageSubresource.mipLevel = 1;
   destination.Download(destination_copies, download.Handle(), download_offset,
                        128);
+  const auto [stencil_download_data, stencil_download_offset] = download.Map(4, 4);
+  Require(name, "stencil-only download map", stencil_download_data != nullptr,
+          "stencil-only download allocation failed");
+  download.Commit();
+  auto stencil_copy = source_copies[1];
+  stencil_copy.bufferOffset = stencil_download_offset;
+  stencil_destination.Download(std::span{&stencil_copy, 1}, download.Handle(),
+                               stencil_download_offset, 4);
 
   auto buffered_info = MakeInfo(vk::Format::eR8Unorm, 1, 1);
   buffered_info.extent = {8, 4, 1};
@@ -52258,6 +52309,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                 buffered_expected.size());
   scheduler.Finish();
   download.Invalidate(download_offset, 128);
+  download.Invalidate(stencil_download_offset, 4);
   download.Invalidate(buffered_download_offset, buffered_expected.size());
   {
     std::array<uint32_t, 4> depth_words{};
@@ -52271,6 +52323,10 @@ void CheckImageTransitionState(RenderContext &renderer) {
     Require(name, "depth/stencil mip contents",
             depth_words == expected_depth && stencil_bytes == expected_stencil, detail);
   }
+  Require(name, "stencil-only copy via buffer",
+          std::memcmp(stencil_download_data, expected_stencil.data(),
+                      expected_stencil.size()) == 0,
+          "stencil-only copy through the scratch buffer lost texels");
   Require(name, "buffered-copy chunk contents",
           std::memcmp(buffered_download_data, buffered_expected.data(),
                       buffered_expected.size()) == 0,

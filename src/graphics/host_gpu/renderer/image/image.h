@@ -24,6 +24,11 @@ struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
 
+// Device init: whether stencil image -> image copies into depth/stencil attachments must go
+// through a buffer. KYTY_STENCIL_COPY_VIA_BUFFER=0/1 forces it; otherwise (auto) a probe runs the
+// copies the AMD proprietary driver drops. Logs the result.
+[[nodiscard]] bool ResolveStencilCopyViaBuffer(GraphicContext& graphics);
+
 struct CachedImageView {
 	ImageViewInfo info;
 	vk::ImageView view = nullptr;
@@ -67,7 +72,12 @@ public:
 	void Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
-	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	void CopyMip(Image& source, uint32_t mip, uint32_t layer, Buffer& scratch);
+	// vkCmdCopyImage of `regions` with source in eTransferSrcOptimal and this image in
+	// eTransferDstOptimal. With GraphicContext::stencil_copy_via_buffer, stencil regions the driver
+	// would drop go image -> scratch -> image instead.
+	void CopyRegions(Image& source, std::span<const vk::ImageCopy> regions, Buffer& scratch,
+	                 vk::CommandBuffer command);
 
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
@@ -177,6 +187,8 @@ private:
 	friend struct ImageTestAccess;
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
+	void CopyStencilWithBuffer(Image& source, const vk::ImageCopy& region, Buffer& scratch,
+	                           vk::CommandBuffer command);
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>

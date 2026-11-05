@@ -649,7 +649,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
-	destination.CopyMip(source, mip, layer);
+	destination.CopyMip(source, mip, layer,
+	                    m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal));
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
