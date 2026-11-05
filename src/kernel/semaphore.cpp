@@ -51,12 +51,14 @@ public:
 private:
 	enum class Status { Set, Deleted };
 
+	// Each waiter sleeps on its own condition variable, so a signal wakes only the waiters it
+	// gives counts to.
 	struct WaitingThread {
-		int    id         = 0;
-		int    priority   = 700;
-		int    need_count = 0;
-		Result result     = Result::TimedOut;
-		bool   ready      = false;
+		int             priority   = 700;
+		int             need_count = 0;
+		Result          result     = Result::TimedOut;
+		bool            ready      = false;
+		Common::CondVar cond_var;
 	};
 
 	void AddWaiter(WaitingThread* waiter);
@@ -64,7 +66,6 @@ private:
 	void WakeWaiters();
 
 	Common::Mutex               m_mutex;
-	Common::CondVar             m_cond_var;
 	std::string                 m_name;
 	Status                      m_status = Status::Set;
 	std::vector<WaitingThread*> m_waiting_threads;
@@ -89,10 +90,9 @@ KernelSemaPrivate::~KernelSemaPrivate() {
 		if (!waiter->ready) {
 			waiter->result = Result::Deleted;
 			waiter->ready  = true;
+			waiter->cond_var.Signal();
 		}
 	}
-
-	m_cond_var.SignalAll();
 
 	while (!m_waiting_threads.empty()) {
 		m_mutex.Unlock();
@@ -124,10 +124,9 @@ KernelSemaPrivate::Result KernelSemaPrivate::Cancel(int set_count, int* num_wait
 		if (!waiter->ready) {
 			waiter->result = Result::Canceled;
 			waiter->ready  = true;
+			waiter->cond_var.Signal();
 		}
 	}
-
-	m_cond_var.SignalAll();
 
 	return Result::Ok;
 }
@@ -148,8 +147,6 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 	SyncTrace::Wake(SyncTrace::Kind::Sema, this, m_name.c_str(), signal_count,
 	                static_cast<int>(m_waiting_threads.size()));
 	WakeWaiters();
-
-	m_cond_var.SignalAll();
 
 	return Result::Ok;
 }
@@ -180,6 +177,7 @@ void KernelSemaPrivate::WakeWaiters() {
 			m_count -= waiter->need_count;
 			waiter->result = Result::Ok;
 			waiter->ready  = true;
+			waiter->cond_var.Signal();
 		}
 	}
 }
@@ -217,10 +215,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	uint32_t      elapsed = 0;
 	Common::Timer t;
 
-	int id = Common::Thread::GetThreadIdUnique();
-
 	WaitingThread waiter {};
-	waiter.id         = id;
 	waiter.priority   = (m_fifo_order ? 0 : Libs::LibKernel::PthreadGetCurrentPriorityForKernel());
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
@@ -235,11 +230,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 			return Result::TimedOut;
 		}
 
-		if (infinitely) {
-			m_cond_var.WaitFor(&m_mutex, SIGNAL_APC_POLL_MICROS);
-		} else {
-			m_cond_var.WaitFor(&m_mutex, micros - elapsed);
-		}
+		waiter.cond_var.WaitFor(&m_mutex, infinitely ? SIGNAL_APC_POLL_MICROS : micros - elapsed);
 
 		m_mutex.Unlock();
 		LibKernel::KernelDispatchPendingSignalForCurrentThread();
