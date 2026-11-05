@@ -1674,7 +1674,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	if (CpPipeline::FrontActive() && PipelineDraw(submit_id, buffer, &args, nullptr)) {
 		return true;
 	}
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::FallbackReason());
 	return DrawIndexBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
 }
 
@@ -1800,7 +1800,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	if (CpPipeline::FrontActive() && PipelineDraw(submit_id, buffer, nullptr, &args)) {
 		return true;
 	}
-	CpPipeline::Drain();
+	CpPipeline::Drain(CpPipeline::FallbackReason());
 	return DrawAutoBody(submit_id, buffer, args, nullptr, nullptr, DrawPrepared::No);
 }
 
@@ -1988,7 +1988,7 @@ bool RenderExecutor::PipelineDraw(uint64_t submit_id, CommandBuffer& buffer,
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
 		// Later lookups may read what this draw writes, and the image heap is per draw: run it here.
 		CpPipeline::Note(heap ? CpPipeline::Stat::InlineHeap : CpPipeline::Stat::InlineWrites);
-		CpPipeline::Drain();
+		CpPipeline::Drain(heap ? CpPipeline::Reason::InlineHeap : CpPipeline::Reason::InlineWrites);
 		const auto stage = heap ? DrawPrepared::LookedUpHeapBegun : DrawPrepared::LookedUp;
 		if (indexed) {
 			DrawIndexBody(submit_id, buffer, *index_args, &record.state, nullptr, stage);

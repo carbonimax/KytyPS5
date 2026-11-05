@@ -294,7 +294,7 @@ void MaybeReport() noexcept {
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
 	CpSplitProf::Report(seconds);
-	CpPipeline::Report(seconds);
+	CpPipeline::Report(seconds, n(Counter::Frames));
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();

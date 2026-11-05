@@ -72,9 +72,48 @@ void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feed
 // No queued or running record (any thread; acquire).
 [[nodiscard]] bool BackIdle() noexcept;
 
+// Why the front drains (KYTY_CP_DRAIN_PROF). Values below PacketReasons are PM4 packets, built by
+// PacketReason(); the named reasons follow.
+enum class Reason : uint32_t {
+	PacketReasons = 0x20000,
+	Other         = PacketReasons,
+	Command,       // command sent by another thread, run between packets
+	GpuCommand,    // command run by the GPU thread loop
+	SubmitBegin,   // start of a guest submission slice
+	SchedBegin,    // scheduler Begin
+	EndRendering,
+	Flush,
+	FlushAndWait,
+	Finish,
+	SchedWait,     // scheduler Wait(tick)
+	Submit,
+	TimelineWait,  // host timeline semaphore wait on the GPU thread
+	Fault,         // GPU-thread page fault
+	Readback,      // front read of GPU-written memory
+	ImageHeap,     // image heap acquired inside a pipelined lookup
+	InlineHeap,    // looked-up draw run inline: image heap
+	InlineWrites,  // looked-up draw run inline: writes memory from shaders (or no vertex program)
+	FallbackArgs,  // the Stat::Fallback* draws, in the same order
+	FallbackTargets,
+	FallbackShaders,
+	FallbackFast,
+	QueueFull,     // Acquire waited for a free slot
+	Count
+};
+// Packet key: opcode, a sub-reason byte (IT_NOP's R, the event type of EVENT_WRITE/RELEASE_MEM) and
+// the queue (async compute or graphics).
+[[nodiscard]] constexpr Reason PacketReason(uint32_t opcode, uint32_t sub, bool compute) noexcept {
+	return static_cast<Reason>((opcode & 0xffu) | ((sub & 0xffu) << 8u) | (compute ? 0x10000u : 0u));
+}
+// The drain reason of a draw that PipelineDraw did not queue (its last Fallback* stat).
+[[nodiscard]] Reason FallbackReason() noexcept;
+// KYTY_CP_DRAIN_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): every front drain per
+// reason, whether it waited for a busy back thread and how long ("PERF cpdrain" line).
+[[nodiscard]] bool DrainProfEnabled() noexcept;
+
 // Front: wait until the back thread is idle. Inside a program lookup a back thread parked on a
 // re-lookup request counts as idle (it touches nothing until the front serves it after the lookup).
-void Drain() noexcept;
+void Drain(Reason reason = Reason::Other) noexcept;
 // Front: serves a pending re-lookup request (between packets, outside lookups).
 void Poll() noexcept;
 // Front: program lookups of pipelined draws (re-lookup requests are not served inside).
@@ -107,7 +146,7 @@ enum class Stat : uint32_t {
 	Count
 };
 void Note(Stat stat) noexcept;
-void Report(double seconds) noexcept;
+void Report(double seconds, uint64_t frames) noexcept;
 
 } // namespace Libs::Graphics::CpPipeline
 

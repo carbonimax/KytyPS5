@@ -89,6 +89,14 @@ constexpr auto g_opcode_names   = MakeOpcodeNames();
 
 } // namespace
 
+const char* OpcodeName(uint32_t opcode) {
+	return opcode < g_opcode_names.size() ? g_opcode_names[opcode] : "<unknown>";
+}
+
+const char* RegisterName(uint32_t r) {
+	return r < g_register_names.size() ? g_register_names[r] : "<unknown>";
+}
+
 void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_t start_dw,
                          uint32_t num_dw) {
 	// db_dump();

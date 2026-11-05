@@ -58,7 +58,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const bool             gpu_thread = PerfStats::IsGpuThread();
 	if (gpu_thread) {
 		CpSplitProf::NoteSubmitOrWait();
-		CpPipeline::Drain();
+		CpPipeline::Drain(CpPipeline::Reason::TimelineWait);
 	}
 	PerfStats::ScopedTimer perf_timer(
 	    gpu_thread ? PerfStats::Counter::WaitGpuThreadNs : PerfStats::Counter::WaitOtherNs,
