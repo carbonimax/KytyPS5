@@ -46,6 +46,8 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	// Stencil image -> image copies into attachment images are lost (ResolveStencilCopyViaBuffer).
 	bool                               stencil_copy_via_buffer               = false;
+	bool                               r8_srgb_views                         = false;
+	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
@@ -97,6 +99,14 @@ struct GraphicContext {
 			physical_device.getFormatProperties(format, &it->second);
 		}
 		return it->second;
+	}
+
+	// Sampled views of format filter linearly, as guest samplers may.
+	[[nodiscard]] bool SamplesFiltered(vk::Format format) const {
+		constexpr vk::FormatFeatureFlags features =
+		    vk::FormatFeatureFlagBits::eSampledImage |
+		    vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+		return (GetFormatProperties(format).optimalTilingFeatures & features) == features;
 	}
 
 	[[nodiscard]] vk::Result GetImageFormatProperties(vk::Format format, vk::ImageType type,

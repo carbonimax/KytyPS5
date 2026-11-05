@@ -40,6 +40,9 @@ struct Profile {
 	uint32_t storage_bounds_alignment = 4;
 	// KYTY_BOUNDS_MODE=2: device address of the StorageBoundsCounter words, 0 otherwise.
 	uint64_t storage_bounds_verify_address = 0;
+	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
+	bool r8_srgb_views   = false;
+	bool r8g8_srgb_views = false;
 };
 
 // Descriptor range of a storage binding of `range` bytes whose shader leaves loads and plain stores

@@ -894,7 +894,9 @@ struct PipelineCache::ProgramCache {
 		           .storage_bounds = static_cast<ShaderRecompiler::Spirv::StorageBounds>(graphics.storage_bounds),
 		           .storage_bounds_alignment = graphics.storage_bounds_alignment,
 		           .storage_bounds_verify_address =
-		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u} {
+		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u,
+		           .r8_srgb_views   = graphics.r8_srgb_views,
+		           .r8g8_srgb_views = graphics.r8g8_srgb_views} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
