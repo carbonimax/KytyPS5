@@ -503,6 +503,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
+	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -742,7 +743,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
-	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	Common::LockGuard lock(m_context.GetMutex());

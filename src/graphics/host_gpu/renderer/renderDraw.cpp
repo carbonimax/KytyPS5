@@ -1630,6 +1630,7 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
 
+	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
@@ -1740,6 +1741,7 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
 
+	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ucfg   = buffer.GetUserConfig();
