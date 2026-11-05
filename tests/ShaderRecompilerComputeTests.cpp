@@ -24042,6 +24042,8 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = m_mode == Mode::Full;
     m_runtime_context.null_descriptor_enabled = m_mode == Mode::Full;
     m_runtime_context.maintenance8_enabled = m_maintenance8_enabled;
+    m_runtime_context.stencil_copy_via_buffer =
+        ResolveStencilCopyViaBuffer(m_runtime_context);
     // Only the full mode requires and enables minLod, together with maintenance8.
     m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
     m_runtime_context.shader_resource_min_lod_enabled = m_resource_min_lod_enabled;
@@ -52145,7 +52147,30 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
-  destination.CopyMip(source, 1, 0);
+  // Two bytes hold one stencil row of the 2x2 image: the buffer path copies in two chunks.
+  Buffer stencil_scratch(context, scheduler, MemoryUsage::DeviceLocal, 0,
+                         AllFlags, 2);
+  destination.CopyMip(source, 1, 0, stencil_scratch);
+  // The DB depth/stencil copy shape: stencil alone into mip 0, through the buffer path on any
+  // driver.
+  Image stencil_destination(context, scheduler, source_info);
+  {
+    const bool probed = context.stencil_copy_via_buffer;
+    context.stencil_copy_via_buffer = true;
+    auto command = scheduler.Current().Handle();
+    source.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                   vk::AccessFlagBits2::eTransferRead, {}, command);
+    stencil_destination.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                vk::AccessFlagBits2::eTransferWrite, {},
+                                command);
+    vk::ImageCopy region{};
+    region.srcSubresource = {vk::ImageAspectFlagBits::eStencil, 0, 0, 1};
+    region.dstSubresource = region.srcSubresource;
+    region.extent = vk::Extent3D{2, 2, 1};
+    stencil_destination.CopyRegions(source, std::span{&region, 1},
+                                    stencil_scratch, command);
+    context.stencil_copy_via_buffer = probed;
+  }
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -52158,6 +52183,14 @@ void CheckImageTransitionState(RenderContext &renderer) {
   destination_copies[1].imageSubresource.mipLevel = 1;
   destination.Download(destination_copies, download.Handle(), download_offset,
                        128);
+  const auto [stencil_download_data, stencil_download_offset] = download.Map(4, 4);
+  Require(name, "stencil-only download map", stencil_download_data != nullptr,
+          "stencil-only download allocation failed");
+  download.Commit();
+  auto stencil_copy = source_copies[1];
+  stencil_copy.bufferOffset = stencil_download_offset;
+  stencil_destination.Download(std::span{&stencil_copy, 1}, download.Handle(),
+                               stencil_download_offset, 4);
 
   auto buffered_info = MakeInfo(vk::Format::eR8Unorm, 1, 1);
   buffered_info.extent = {8, 4, 1};
@@ -52200,6 +52233,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                 buffered_expected.size());
   scheduler.Finish();
   download.Invalidate(download_offset, 128);
+  download.Invalidate(stencil_download_offset, 4);
   download.Invalidate(buffered_download_offset, buffered_expected.size());
   {
     std::array<uint32_t, 4> depth_words{};
@@ -52213,6 +52247,10 @@ void CheckImageTransitionState(RenderContext &renderer) {
     Require(name, "depth/stencil mip contents",
             depth_words == expected_depth && stencil_bytes == expected_stencil, detail);
   }
+  Require(name, "stencil-only copy via buffer",
+          std::memcmp(stencil_download_data, expected_stencil.data(),
+                      expected_stencil.size()) == 0,
+          "stencil-only copy through the scratch buffer lost texels");
   Require(name, "buffered-copy chunk contents",
           std::memcmp(buffered_download_data, buffered_expected.data(),
                       buffered_expected.size()) == 0,

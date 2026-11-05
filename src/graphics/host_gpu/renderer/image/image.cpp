@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -22,6 +23,186 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// The copies of the D32S8 stencil repro: depth and stencil in one call into mip 1 of a two-mip
+// attachment image, and stencil alone into a single-mip one. Returns whether a stencil was lost,
+// or nullopt when D32S8 cannot be a transfer attachment image.
+[[nodiscard]] std::optional<bool> ProbeStencilCopyLost(GraphicContext& graphics) {
+	constexpr auto format = vk::Format::eD32SfloatS8Uint;
+	constexpr auto needed = vk::FormatFeatureFlagBits::eDepthStencilAttachment |
+	                        vk::FormatFeatureFlagBits::eTransferSrc |
+	                        vk::FormatFeatureFlagBits::eTransferDst;
+	if ((graphics.physical_device.getFormatProperties(format).optimalTilingFeatures & needed) !=
+	    needed) {
+		return std::nullopt;
+	}
+	const auto device      = graphics.device;
+	const auto memory_type = [&](uint32_t bits, vk::MemoryPropertyFlags flags) {
+		const auto& properties = graphics.physical_device_memory_properties;
+		for (uint32_t i = 0; i < properties.memoryTypeCount; i++) {
+			if ((bits & (1u << i)) != 0 && (properties.memoryTypes[i].propertyFlags & flags) == flags) {
+				return i;
+			}
+		}
+		EXIT("stencil copy probe: no memory type\n");
+	};
+	std::array<vk::DeviceMemory, 4> memories {};
+	const auto                      allocate = [&](uint32_t index, vk::MemoryRequirements req,
+                                  vk::MemoryPropertyFlags flags) {
+		vk::MemoryAllocateInfo info {};
+		info.allocationSize  = req.size;
+		info.memoryTypeIndex = memory_type(req.memoryTypeBits, flags);
+		EXIT_IF(device.allocateMemory(&info, nullptr, &memories[index]) != vk::Result::eSuccess);
+		return memories[index];
+	};
+	// source 2x2, destination 4x4 with two mips, destination 2x2 with one mip.
+	std::array<vk::Image, 3> images {};
+	for (uint32_t i = 0; i < images.size(); i++) {
+		vk::ImageCreateInfo info {};
+		info.imageType   = vk::ImageType::e2D;
+		info.format      = format;
+		info.extent      = vk::Extent3D {i == 1 ? 4u : 2u, i == 1 ? 4u : 2u, 1};
+		info.mipLevels   = i == 1 ? 2 : 1;
+		info.arrayLayers = 1;
+		info.samples     = vk::SampleCountFlagBits::e1;
+		info.tiling      = vk::ImageTiling::eOptimal;
+		info.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+		             vk::ImageUsageFlagBits::eDepthStencilAttachment |
+		             vk::ImageUsageFlagBits::eSampled;
+		EXIT_IF(device.createImage(&info, nullptr, &images[i]) != vk::Result::eSuccess);
+		vk::MemoryRequirements req {};
+		device.getImageMemoryRequirements(images[i], &req);
+		EXIT_IF(device.bindImageMemory(
+		            images[i], allocate(i, req, vk::MemoryPropertyFlagBits::eDeviceLocal), 0) !=
+		        vk::Result::eSuccess);
+	}
+	vk::Buffer           buffer = nullptr;
+	vk::BufferCreateInfo buffer_info {};
+	buffer_info.size  = 256;
+	buffer_info.usage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+	EXIT_IF(device.createBuffer(&buffer_info, nullptr, &buffer) != vk::Result::eSuccess);
+	vk::MemoryRequirements buffer_req {};
+	device.getBufferMemoryRequirements(buffer, &buffer_req);
+	const auto buffer_memory = allocate(3, buffer_req,
+	                                    vk::MemoryPropertyFlagBits::eHostVisible |
+	                                        vk::MemoryPropertyFlagBits::eHostCoherent);
+	EXIT_IF(device.bindBufferMemory(buffer, buffer_memory, 0) != vk::Result::eSuccess);
+	void* mapped = nullptr;
+	EXIT_IF(device.mapMemory(buffer_memory, 0, 256, {}, &mapped) != vk::Result::eSuccess);
+	auto*                             bytes   = static_cast<uint8_t*>(mapped);
+	constexpr std::array<float, 4>    depth   = {0.25f, 0.5f, 0.75f, 1.0f};
+	constexpr std::array<uint8_t, 4>  stencil = {0x12, 0x34, 0x56, 0x78};
+	std::memset(bytes, 0xEE, 256);
+	std::memcpy(bytes, depth.data(), sizeof(depth));
+	std::memcpy(bytes + 64, stencil.data(), sizeof(stencil));
+
+	vk::CommandPool           pool = nullptr;
+	vk::CommandPoolCreateInfo pool_info {};
+	pool_info.queueFamilyIndex = graphics.queue_family;
+	EXIT_IF(device.createCommandPool(&pool_info, nullptr, &pool) != vk::Result::eSuccess);
+	vk::CommandBufferAllocateInfo command_info {};
+	command_info.commandPool        = pool;
+	command_info.level              = vk::CommandBufferLevel::ePrimary;
+	command_info.commandBufferCount = 1;
+	vk::CommandBuffer command       = nullptr;
+	EXIT_IF(device.allocateCommandBuffers(&command_info, &command) != vk::Result::eSuccess);
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_IF(command.begin(&begin) != vk::Result::eSuccess);
+
+	constexpr auto aspects = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+	const auto     barrier = [&](uint32_t first, uint32_t count, vk::ImageLayout from,
+                             vk::ImageLayout to) {
+		std::array<vk::ImageMemoryBarrier2, 3> barriers {};
+		for (uint32_t i = 0; i < count; i++) {
+			auto& b               = barriers[i];
+			b.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+			b.srcAccessMask       = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+			b.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+			b.dstAccessMask       = b.srcAccessMask;
+			b.oldLayout           = from;
+			b.newLayout           = to;
+			b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			b.image               = images[first + i];
+			b.subresourceRange    = {aspects, 0, VK_REMAINING_MIP_LEVELS, 0, 1};
+		}
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = count;
+		dependency.pImageMemoryBarriers    = barriers.data();
+		command.pipelineBarrier2(dependency);
+	};
+	const auto buffer_copy = [](uint64_t offset, vk::ImageAspectFlagBits aspect, uint32_t mip) {
+		vk::BufferImageCopy copy {};
+		copy.bufferOffset     = offset;
+		copy.imageSubresource = {aspect, mip, 0, 1};
+		copy.imageExtent      = vk::Extent3D {2, 2, 1};
+		return copy;
+	};
+	barrier(0, 3, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+	const std::array uploads = {buffer_copy(0, vk::ImageAspectFlagBits::eDepth, 0),
+	                            buffer_copy(64, vk::ImageAspectFlagBits::eStencil, 0)};
+	command.copyBufferToImage(buffer, images[0], vk::ImageLayout::eTransferDstOptimal, 2,
+	                          uploads.data());
+	const vk::ClearDepthStencilValue     clear {0.0f, 0xAA};
+	const vk::ImageSubresourceRange all {aspects, 0, VK_REMAINING_MIP_LEVELS, 0, 1};
+	command.clearDepthStencilImage(images[1], vk::ImageLayout::eTransferDstOptimal, &clear, 1, &all);
+	command.clearDepthStencilImage(images[2], vk::ImageLayout::eTransferDstOptimal, &clear, 1, &all);
+	barrier(0, 1, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
+	barrier(1, 2, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferDstOptimal);
+	std::array<vk::ImageCopy, 2> copies {};
+	for (uint32_t i = 0; i < 2; i++) {
+		const auto aspect        = i == 0 ? vk::ImageAspectFlagBits::eDepth
+		                                  : vk::ImageAspectFlagBits::eStencil;
+		copies[i].srcSubresource = {aspect, 0, 0, 1};
+		copies[i].dstSubresource = {aspect, 1, 0, 1};
+		copies[i].extent         = vk::Extent3D {2, 2, 1};
+	}
+	command.copyImage(images[0], vk::ImageLayout::eTransferSrcOptimal, images[1],
+	                  vk::ImageLayout::eTransferDstOptimal, 2, copies.data());
+	copies[1].dstSubresource.mipLevel = 0;
+	command.copyImage(images[0], vk::ImageLayout::eTransferSrcOptimal, images[2],
+	                  vk::ImageLayout::eTransferDstOptimal, 1, &copies[1]);
+	barrier(1, 2, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
+	const auto mip1 = buffer_copy(128, vk::ImageAspectFlagBits::eStencil, 1);
+	const auto mip0 = buffer_copy(192, vk::ImageAspectFlagBits::eStencil, 0);
+	command.copyImageToBuffer(images[1], vk::ImageLayout::eTransferSrcOptimal, buffer, 1, &mip1);
+	command.copyImageToBuffer(images[2], vk::ImageLayout::eTransferSrcOptimal, buffer, 1, &mip0);
+	vk::MemoryBarrier2 host {};
+	host.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	host.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo host_dependency {};
+	host_dependency.memoryBarrierCount = 1;
+	host_dependency.pMemoryBarriers    = &host;
+	command.pipelineBarrier2(host_dependency);
+	EXIT_IF(command.end() != vk::Result::eSuccess);
+
+	vk::Fence           fence = nullptr;
+	vk::FenceCreateInfo fence_info {};
+	EXIT_IF(device.createFence(&fence_info, nullptr, &fence) != vk::Result::eSuccess);
+	vk::SubmitInfo submit {};
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	{
+		Common::LockGuard lock(graphics.queue_mutex);
+		EXIT_IF(graphics.queue.submit(1, &submit, fence) != vk::Result::eSuccess);
+	}
+	EXIT_IF(device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+	const bool lost = std::memcmp(bytes + 128, stencil.data(), stencil.size()) != 0 ||
+	                  std::memcmp(bytes + 192, stencil.data(), stencil.size()) != 0;
+	device.destroyFence(fence, nullptr);
+	device.destroyCommandPool(pool, nullptr);
+	device.destroyBuffer(buffer, nullptr);
+	for (const auto image: images) {
+		device.destroyImage(image, nullptr);
+	}
+	for (const auto memory: memories) {
+		device.freeMemory(memory, nullptr);
+	}
+	return lost;
+}
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -130,6 +311,20 @@ bool ElideReadOnlyDepthBarrier(const VulkanImageState& state, vk::ImageLayout de
 }
 
 } // namespace
+
+bool ResolveStencilCopyViaBuffer(GraphicContext& graphics) {
+	const char* env = std::getenv("KYTY_STENCIL_COPY_VIA_BUFFER");
+	if (env != nullptr && (std::strcmp(env, "0") == 0 || std::strcmp(env, "1") == 0)) {
+		std::printf("Stencil copy via buffer: %s (KYTY_STENCIL_COPY_VIA_BUFFER)\n",
+		            env[0] == '1' ? "on" : "off");
+		return env[0] == '1';
+	}
+	const auto lost = ProbeStencilCopyLost(graphics);
+	std::printf("Stencil copy probe: %s, stencil copies via buffer %s\n",
+	            !lost ? "no D32S8 attachment copies" : *lost ? "stencil lost" : "ok",
+	            lost.value_or(false) ? "on" : "off");
+	return lost.value_or(false);
+}
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	switch (format) {
@@ -609,7 +804,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer, Buffer& scratch) {
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -636,10 +831,107 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	CopyRegions(source, std::span {copies.data(), copy_count}, scratch, command);
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
+void Image::CopyRegions(Image& source, std::span<const vk::ImageCopy> regions, Buffer& scratch,
+                        vk::CommandBuffer command) {
+	std::array<vk::ImageCopy, 3> direct {};
+	uint32_t                     direct_count = 0;
+	EXIT_IF(regions.size() > direct.size());
+	// On the affected driver only depth and stencil copied in one call into a single-mip image
+	// keep the stencil.
+	const bool stencil_lost =
+	    m_graphics.stencil_copy_via_buffer &&
+	    static_cast<bool>(backing.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) &&
+	    (backing.mip_levels != 1 || std::ranges::none_of(regions, [](const vk::ImageCopy& r) {
+		     return static_cast<bool>(r.dstSubresource.aspectMask & vk::ImageAspectFlagBits::eDepth);
+	     }));
+	for (const auto& region: regions) {
+		if (!stencil_lost || region.dstSubresource.aspectMask != vk::ImageAspectFlagBits::eStencil) {
+			direct[direct_count++] = region;
+		}
+	}
+	if (direct_count != 0) {
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+		                  vk::ImageLayout::eTransferDstOptimal, direct_count, direct.data());
+	}
+	if (direct_count == regions.size()) {
+		return;
+	}
+	for (const auto& region: regions) {
+		if (region.dstSubresource.aspectMask == vk::ImageAspectFlagBits::eStencil) {
+			CopyStencilWithBuffer(source, region, scratch, command);
+		}
+	}
+}
+
+void Image::CopyStencilWithBuffer(Image& source, const vk::ImageCopy& region, Buffer& scratch,
+                                  vk::CommandBuffer command) {
+	static std::atomic<uint64_t> copies {0};
+	const auto                   count = copies.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((count & (count - 1)) == 0) {
+		std::printf("Stencil copy via buffer #%llu (mip %u, %ux%u, %u layers)\n",
+		            static_cast<unsigned long long>(count), region.dstSubresource.mipLevel,
+		            region.extent.width, region.extent.height, region.dstSubresource.layerCount);
+	}
+	EXIT_IF(region.srcSubresource.aspectMask != vk::ImageAspectFlagBits::eStencil ||
+	        region.extent.depth != 1 ||
+	        region.srcSubresource.layerCount != region.dstSubresource.layerCount);
+	// The stencil aspect is tightly packed at one byte per texel.
+	const auto rows_per_copy = CopyRows(region.extent.width, region.extent.height, scratch.Size());
+	EXIT_IF(rows_per_copy == 0);
+	vk::BufferMemoryBarrier2 barrier {};
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = scratch.Handle();
+	barrier.size                = VK_WHOLE_SIZE;
+	vk::DependencyInfo dependency {};
+	dependency.bufferMemoryBarrierCount = 1;
+	dependency.pBufferMemoryBarriers    = &barrier;
+	const auto sync = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+	                      vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+		barrier.srcStageMask  = src_stage;
+		barrier.srcAccessMask = src_access;
+		barrier.dstStageMask  = dst_stage;
+		barrier.dstAccessMask = dst_access;
+		command.pipelineBarrier2(dependency);
+	};
+	for (uint32_t layer = 0; layer < region.dstSubresource.layerCount; layer++) {
+		for (uint32_t row = 0; row < region.extent.height; row += rows_per_copy) {
+			vk::BufferImageCopy read {};
+			read.imageSubresource = {vk::ImageAspectFlagBits::eStencil,
+			                         region.srcSubresource.mipLevel,
+			                         region.srcSubresource.baseArrayLayer + layer, 1};
+			read.imageOffset      = {region.srcOffset.x,
+			                         region.srcOffset.y + static_cast<int32_t>(row),
+			                         region.srcOffset.z};
+			read.imageExtent      = {region.extent.width,
+			                         std::min(rows_per_copy, region.extent.height - row), 1};
+			auto write            = read;
+			write.imageSubresource = {vk::ImageAspectFlagBits::eStencil,
+			                          region.dstSubresource.mipLevel,
+			                          region.dstSubresource.baseArrayLayer + layer, 1};
+			write.imageOffset      = {region.dstOffset.x,
+			                          region.dstOffset.y + static_cast<int32_t>(row),
+			                          region.dstOffset.z};
+			// The scratch buffer is shared with other GPU users (compute LDS, buffered copies).
+			sync(vk::PipelineStageFlagBits2::eAllCommands,
+			     vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+			     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+			command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+			                          scratch.Handle(), read);
+			sync(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+			     vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+			command.copyBufferToImage(scratch.Handle(), backing.image,
+			                          vk::ImageLayout::eTransferDstOptimal, write);
+		}
+	}
+	sync(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+	     vk::PipelineStageFlagBits2::eAllCommands,
+	     vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 }
 
 namespace ImageOps {
