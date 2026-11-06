@@ -831,8 +831,7 @@ static vk::Sampler NativeSampler(RenderContext& context, const ShaderRecompiler:
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto& command_buffer = context.GetCommandScheduler().Current();
-	EXIT_IF(command_buffer.IsInvalid());
+	EXIT_IF(context.GetCommandScheduler().Current().IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
@@ -923,10 +922,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	BufferCache::UploadBatch upload_batch(cache);
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
-		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
-		const auto& layout = program.bindings;
+		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
 			continue;
@@ -998,14 +996,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindBuffersNs, PerfStats::BindProfEnabled());
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 
 	prepared.buffers.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -1037,11 +1032,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer bind_timer(PerfStats::Counter::BindImagesNs, PerfStats::BindProfEnabled());
-	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
-	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -1133,13 +1126,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	const auto check_start = bind_prof ? BindClock::now() : BindClock::time_point {};
 	auto   vk_buffer        = buffer.Handle();
 	size_t image_descriptor_count = 0;
-	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	for (const auto* prepared: prepared_bindings) {
-		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
-		write_count += std::popcount(program.bindings.descriptor_mask);
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
 			const auto count = program.bindings.descriptor_counts[index];
@@ -1159,18 +1149,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
-	m_descriptor_writes.reserve(write_count);
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
 		auto&       descriptors   = *prepared;
-		const auto  shader_stage  = NativeShaderStage(program.stage);
-		const auto  shader_stages = ShaderPipelineStages(shader_stage);
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
-			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
+			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
+			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));
 			vk_buffer.pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |
@@ -1239,11 +1227,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:
-						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
-						for (const auto& view: descriptors.buffers) {
-							// Null views (StorageBounds::Device) have a whole-size range.
-							EXIT_IF(view.range == 0 || (view.buffer == nullptr && view.range != vk::WholeSize));
-						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;
 					case BindingKind::BdaPagetable:
@@ -1275,7 +1258,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					}
 					case BindingKind::Samplers:
 						for (const auto sampler: descriptors.samplers) {
-							EXIT_IF(sampler == nullptr);
 							m_descriptor_images[image_cursor++] = {sampler, nullptr, vk::ImageLayout::eUndefined};
 						}
 						break;
@@ -1295,8 +1277,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			const auto& texture = descriptors.images[i];
 			if (resource.heap) continue;
-			EXIT_IF(texture.image_id &&
-			        resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()));
 			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
 			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
 			                   resource.descriptor_index;
@@ -1306,8 +1286,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 
-		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-		EXIT_IF(prepared->shader_data.size() != shader_data_dwords);
 		if (program.bindings.UsesPushData()) {
 			std::ranges::copy(prepared->shader_data,
 			                  push_data.dwords.begin() + program.bindings.push_data_start_dword);
@@ -1330,7 +1308,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		PerfStats::Add(PerfStats::Counter::BindDescriptorCount, descriptors);
 	}
 	if (!m_descriptor_writes.empty()) {
-		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),

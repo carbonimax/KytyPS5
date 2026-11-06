@@ -35,8 +35,7 @@
 namespace Libs::Graphics::CpPipeline {
 
 struct DrawRecord {
-	bool             indexed   = false;
-	uint64_t         submit_id = 0;
+	bool             indexed = false;
 	DrawIndexArgs    index_args;
 	DrawAutoArgs     auto_args;
 	HW::Context      registers;

@@ -164,6 +164,13 @@ static_assert(!HasObtainBufferForImageCopy<BufferCache>);
 static_assert(!HasObtainBufferForImageWrite<BufferCache>);
 static_assert(!HasDiscardGpuDirtyBytes<BufferCache>);
 
+// A render-target view covers slices base..last of last + 1 image layers.
+static_assert(ResolveTargetViewInfo(3, 3).base_layer == 3 &&
+              ResolveTargetViewInfo(3, 3).layer_count == 1 &&
+              ResolveTargetViewInfo(3, 3).image_layers == 4);
+static_assert(ResolveTargetViewInfo(0, 5).layer_count == 6 &&
+              ResolveTargetViewInfo(0, 5).image_layers == 6);
+
 template <typename Backing>
 concept HasLegacyImageLayout = requires(Backing &backing) { backing.layout; };
 static_assert(!HasLegacyImageLayout<VulkanImage>);
@@ -409,12 +416,12 @@ struct TextureCacheTestAccess {
 struct RenderExecutorTestAccess {
   static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
                         const DrawIndexArgs &args) {
-    return executor.DrawIndex(0, command, args);
+    return executor.DrawIndex(command, args);
   }
 
   static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
-    return executor.DrawAuto(0, command, args);
+    return executor.DrawAuto(command, args);
   }
 
   static bool TryConsumeComputeFill(RenderExecutor &executor,
@@ -442,11 +449,9 @@ struct RenderExecutorTestAccess {
                                       bool pixel_active) {
     RenderExecutor::GraphicsBindings result;
     executor.PrepareBindings(vertex, result.vertex[0]);
-    std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
+    std::array<PreparedBindings *, 2> stages{&result.vertex[0], &result.pixel};
     if (pixel_active) {
-      result.pixel.emplace();
-      executor.PrepareBindings(pixel, *result.pixel);
-      stages[1] = &*result.pixel;
+      executor.PrepareBindings(pixel, result.pixel);
     }
     executor.PrepareGraphicsBindings(
         std::span{stages.data(), pixel_active ? 2u : 1u}, {});
@@ -567,7 +572,7 @@ struct RenderExecutorTestAccess {
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
-    executor.ResolveRenderColorTarget(buffer, color, 0, slot);
+    executor.ResolveRenderColorTarget(buffer, color, slot);
   }
 
   static void BindRenderTarget(RenderExecutor &executor, ImageId id) {
@@ -595,7 +600,7 @@ struct RenderExecutorTestAccess {
   }
 
   static bool ResolveColorTargets(RenderExecutor &executor, CommandBuffer &buffer) {
-    return executor.ResolveColorTargets(buffer, 0);
+    return executor.ResolveColorTargets(buffer);
   }
 
   static bool BoundImagesInOrder(const RenderExecutor &executor, ImageId first,
@@ -2984,7 +2989,7 @@ public:
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
             "rebinding guest state replaced the active command recording");
-    scheduler.FlushAndWait();
+    scheduler.Finish();
     Require("SchedulerTimeline", "guest context after recording restart",
             scheduler.Active() && &scheduler.Current() == command &&
                 &command->GetRegisters() == &next_registers &&
@@ -4301,7 +4306,7 @@ public:
     std::memcpy(reinterpret_cast<void *>(clean_cached_source),
                 clean_copy_words.data(), sizeof(clean_copy_words));
 
-    std::array<uint32_t, 56> dma_commands{};
+    std::array<uint32_t, 63> dma_commands{};
     size_t dma_cursor = 0;
     const auto append_dma = [&](uint8_t dst_sel, uint64_t dst, uint8_t src_sel,
                                 uint64_t src, uint32_t bytes,
@@ -4331,6 +4336,8 @@ public:
     append_dma(3, l2_copy_dst, 3, memory_src, sizeof(source_words));
     append_dma(2, nowhere_dst, 3, nowhere_dst, sizeof(nowhere_words),
                1u << 31u);
+    // A 2 MiB register-space DMA_DATA to 0x3022c is dropped without a copy.
+    append_dma(0, 0x3022c, 3, 0, 1u << 21u, 0x5u << 27u);
     Require("GpuCommandLane", "DMA_DATA packet assembly",
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
@@ -6329,7 +6336,7 @@ public:
     for (const auto mode : {0x41u, 0x61u}) {
       for (const auto &groups : empty_dispatches) {
         context.GetRenderExecutor().DispatchDirect(
-            0, scheduler.Current(), groups[0], groups[1], groups[2], mode, false);
+            scheduler.Current(), groups[0], groups[1], groups[2], mode, false);
       }
     }
     Require(name, "HTile fixture",
@@ -12472,7 +12479,7 @@ public:
     constexpr u32 side = 64, last = 6;
     EnsureRuntimeContext();
     Require(name, "enabled features", !m_runtime_context.image_view_min_lod_enabled && m_runtime_context.shader_resource_min_lod_enabled &&
-        !m_runtime_context.maintenance8_enabled && !m_runtime_context.null_descriptor_enabled && m_runtime_context.sample_rate_shading_enabled &&
+        !m_runtime_context.maintenance8_enabled && !m_runtime_context.null_descriptor_enabled &&
         !m_runtime_context.shader_buffer_int64_atomics_enabled && !m_runtime_context.shader_image_int64_atomics_enabled, "fixture must exercise the unsupported-native path with truthful renderer features");
     std::array<std::vector<u32>, 3> codes;
     for (u32 sample_mode = 0; sample_mode < codes.size(); ++sample_mode) {
@@ -14401,7 +14408,7 @@ public:
           for (uint32_t i = 0; i < (goat ? 4u : user_data.size()); i++) {
             shaders.SetCsUserSgpr(i, user_data[i]);
           }
-          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
+          executor.DispatchDirect(scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
         if (fill_case.goat) {
@@ -17346,8 +17353,7 @@ public:
                                                  &ordered_snapshot};
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
-      const auto ordered_sampled_id =
-          ordered_bindings.pixel->images[0].image_id;
+      const auto ordered_sampled_id = ordered_bindings.pixel.images[0].image_id;
       Require(
           name, "VS-before-PS retained-owner order",
           ordered_bindings.vertex[0].images[0].image_id == storage_id &&
@@ -17363,8 +17369,7 @@ public:
               executor, storage_runtime, sampled_runtime, true);
       const auto &storage_binding =
           graphics_bindings.vertex[0].images[0];
-      const auto &sampled_binding =
-          graphics_bindings.pixel->images[0];
+      const auto &sampled_binding = graphics_bindings.pixel.images[0];
       Require(name, "storage final acquisition",
               storage_binding.image_view != nullptr &&
                   texture_cache.GetImage(storage_id).usage.storage &&
@@ -17384,7 +17389,7 @@ public:
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), graphics_bindings.vertex[0],
-          *graphics_bindings.pixel));
+          graphics_bindings.pixel));
       Require(name, "early writable alias retention",
               texture_cache.GetImage(storage_id).backing.state.access_mask ==
                   (vk::AccessFlagBits2::eShaderRead |
@@ -17424,16 +17429,16 @@ public:
               "storage alias bound the same backing");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), writable_alias_bindings.vertex[0],
-          *writable_alias_bindings.pixel));
+          writable_alias_bindings.pixel));
       Require(
           name, "forced-general descriptor capture",
           writable_alias_bindings.vertex[0].images[0].layout ==
                   vk::ImageLayout::eGeneral &&
-              writable_alias_bindings.pixel->images[0].layout ==
+              writable_alias_bindings.pixel.images[0].layout ==
                   vk::ImageLayout::eGeneral &&
               MakeImageInfo(writable_alias_bindings.vertex[0].images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
-              MakeImageInfo(writable_alias_bindings.pixel->images[0])
+              MakeImageInfo(writable_alias_bindings.pixel.images[0])
                       .imageLayout == vk::ImageLayout::eGeneral &&
               texture_cache.GetImage(storage_id).backing.state.layout ==
                   vk::ImageLayout::eGeneral &&
@@ -17990,15 +17995,16 @@ public:
         auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, bounds_vertex, bounds_pixel, true);
         std::array<PreparedBindings *, 2> bounds_stages{
-            &bounds_bindings.vertex[0], &*bounds_bindings.pixel};
+            &bounds_bindings.vertex[0], &bounds_bindings.pixel};
         vk::ImageAspectFlags bounds_feedback;
         const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &no_color, 0, bounds_depth,
             bounds_stages, &bounds_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
-            executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
+            executor, scheduler.Current(), bounds_bindings.vertex[0],
+            bounds_bindings.pixel));
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
-        const auto &pixel_depth = bounds_bindings.pixel->images[0];
+        const auto &pixel_depth = bounds_bindings.pixel.images[0];
         const auto expected_layout = pass == 0
             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
             : vk::ImageLayout::eDepthReadOnlyOptimal;
@@ -18018,7 +18024,7 @@ public:
                     MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
                     MakeImageInfo(pixel_depth).imageLayout == expected_layout,
                 "a deferred clear sampled by vertex and pixel stages missed depth feedback");
-        scheduler.BeginRendering(bounds_rendering);
+        scheduler.Current().BeginRendering(bounds_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         const vk::BufferImageCopy copy{pass * depth_bytes, 0, 0,
@@ -18090,7 +18096,7 @@ public:
                     !texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 86) &&
                     texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 85),
                 "high slice was cleared repeatedly or consumed its neighbor's state");
-        scheduler.BeginRendering(rendering);
+        scheduler.Current().BeginRendering(rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         const vk::BufferImageCopy copy{pass * 2 * sizeof(uint32_t), 0, 0,
@@ -18405,11 +18411,11 @@ public:
         stencil_view_info.aspect = vk::ImageAspectFlagBits::eStencil;
         stencil_view_info.usage = vk::ImageUsageFlagBits::eSampled;
         const auto stencil_view = shared_image.FindView(stencil_view_info);
-        auto& pixel_image = shared_bindings.pixel->images[0];
+        auto &pixel_image = shared_bindings.pixel.images[0];
         pixel_image.image_view = stencil_view;
         pixel_image.desc.view_info = stencil_view_info;
         std::array<PreparedBindings *, 2> shared_stages{
-            &shared_bindings.vertex[0], &*shared_bindings.pixel};
+            &shared_bindings.vertex[0], &shared_bindings.pixel};
         vk::ImageAspectFlags shared_feedback;
         const auto shared_rendering =
             RenderExecutorTestAccess::AcquireRenderTargets(
@@ -18417,7 +18423,7 @@ public:
                 shared_stages, &shared_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), shared_bindings.vertex[0],
-            *shared_bindings.pixel));
+            shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
                 ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
@@ -18444,7 +18450,7 @@ public:
                     shared_image.backing.state.access_mask == expected_access,
                 "stencil sampling and writes lost the feedback aspect, shared "
                 "layout, or attachment access");
-        scheduler.BeginRendering(shared_rendering);
+        scheduler.Current().BeginRendering(shared_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
         Require(name, "attachment binding reset",
@@ -18705,7 +18711,7 @@ public:
         clear_attachment.colorAttachment = 0;
         clear_attachment.clearValue.color.uint32[0] = after;
         const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
-        scheduler.BeginRendering(rendering);
+        scheduler.Current().BeginRendering(rendering);
         scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
@@ -19032,7 +19038,7 @@ public:
               texture_cache.GetImage(stencil_proxy_id).depth_id == depth_id,
           "the final target pass did not acquire color before depth and "
           "build the dynamic render state");
-      scheduler.BeginRendering(rebound_rendering);
+      scheduler.Current().BeginRendering(rebound_rendering);
       scheduler.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
       Require(name, "draw-scoped target reset",
@@ -19255,7 +19261,7 @@ public:
         plane_depth.info.data = {base + 0x900000, plane_size};
         plane_depth.info.stencil = {plane_address, plane_size};
         plane_depth.info.extent = {3, 2, 1};
-        plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
+        plane_depth.info.pitch = TileGetRenderTargetPitch(3, sizeof(uint32_t));
         plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
         plane_depth.info.UpdateSize();
         const auto plane_depth_id = texture_cache.FindImage(plane_depth);
@@ -19267,7 +19273,7 @@ public:
         sampled_plane.info.pixel_format = vk::Format::eR8Uint;
         sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
         sampled_plane.info.bytes_per_block = 1;
-        sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
+        sampled_plane.info.pitch = TileGetRenderTargetPitch(3, 1);
         sampled_plane.info.UpdateSize();
         sampled_plane.view_info.format = vk::Format::eR8Uint;
         sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -19283,9 +19289,11 @@ public:
             stencil_initial);
 
         TileBlockLayout stencil_block{};
-        Require(name, "independent stencil tile pitch",
+        Require(
+            name, "independent stencil tile pitch",
             TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block) &&
-                plane_depth.info.pitch == 128 && TileGetDepthPitch(3, 1) == 256,
+                plane_depth.info.pitch == 128 &&
+                TileGetRenderTargetPitch(3, 1) == 256,
             "stencil must use its own one-byte tile layout");
         std::vector<uint32_t> plane_words(plane_size / sizeof(uint32_t), 0);
         auto *plane_bytes = reinterpret_cast<uint8_t *>(plane_words.data());
@@ -20445,8 +20453,41 @@ public:
           scheduler.Current(), state, {state.color_info, state.color_count}, baked_feedback);
     };
     auto &filled = pipeline(true, 2, 2);
-    const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+    if (!depth_feedback && !packed_vertex_color) {
+      auto msaa = color;
+      auto &info = msaa.desc.info;
+      info.data = {depth_address + 0x14000, 8 * 8 * 16 * 4};
+      info.mip_layout[0] = {0, info.data.size, 8, 8, 0, info.data.size, 8};
+      info.linear_slice_stride = info.data.size;
+      info.extent = {8, 8, 1};
+      info.pitch = 8;
+      info.samples = 4;
+      msaa.image_id = cache.FindImage(msaa.desc);
+      auto per_sample = pixel;
+      per_sample.ps_sample_shading = true;
+      DrawRenderState state{.color_info = {msaa}, .color_count = 1,
+                            .topology = vk::PrimitiveTopology::eTriangleList,
+                            .ps_active = true, .vertex_info = {vertex},
+                            .ps_input_info = per_sample};
+      // Fork: the pipeline cache reads the stage handles (as in the pipeline lambda above).
+      state.vertex_info[0].stage.handle = &vertex_shader.handle;
+      state.vertex_info[0].stage.module = &vertex_shader;
+      state.ps_input_info.stage.handle = &pixel_shader.handle;
+      state.ps_input_info.stage.module = &pixel_shader;
+      Require(name, "per-sample shading",
+              static_cast<bool>(context.GetPipelineCache()
+                                    .GetGraphicsPipeline(scheduler.Current(), state)
+                                    .pipeline),
+              "a 4x per-sample-shaded pipeline was not built");
+    }
+    const auto draw = [&](const PipelineCache::Pipeline &selected,
+                          uint32_t vertex_count = 3,
                           std::array<u32, 4> clear_value = {}) {
+      vk::ClearValue clear{};
+      clear.color.uint32 = clear_value;
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
         RenderExecutorTestAccess::BindRenderTarget(executor, depth.image_id);
@@ -20454,12 +20495,13 @@ public:
       auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, vertex.stage, pixel.stage, true);
       Require(name, "sampled attachment identity",
-              !depth_feedback || bindings.pixel->images[0].image_id == depth.image_id,
+              !depth_feedback ||
+                  bindings.pixel.images[0].image_id == depth.image_id,
               "the fragment must sample the depth attachment's native image");
       auto &command = scheduler.Current();
       vk::ImageAspectFlags feedback_aspects;
-      std::array<PreparedBindings *, 2> stages{
-          &bindings.vertex[0], &*bindings.pixel};
+      std::array<PreparedBindings *, 2> stages{&bindings.vertex[0],
+                                               &bindings.pixel};
       auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
           executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
@@ -20471,9 +20513,7 @@ public:
                                           : vk::ImageAspectFlags{}),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
-          executor, command, selected, bindings.vertex[0], *bindings.pixel);
-      rendering.color_attachments[0].is_clear = true;
-      rendering.color_attachments[0].clear_value = clear_value;
+          executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
       auto cmd = command.Handle();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
@@ -21161,7 +21201,6 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
       registers.SetRenderTargetMask(0xf00f);
       registers.SetShaderMask(0xf00f);
       registers.SetPsInControl(0x8000);
@@ -21452,11 +21491,11 @@ public:
                       native_vertex.end());
           return code;
         }();
-        static std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+        static std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1>
             fetch_offsets;
-        fetch_offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        fetch_offsets.fill(ILLEGAL_DIRECT_OFFSET);
+        fetch_offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+        fetch_offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
         static ShaderUserData fetch_user_data{
             .direct_resource_offset = fetch_offsets.data(),
             .direct_resource_count = static_cast<uint16_t>(fetch_offsets.size())};
@@ -21768,7 +21807,6 @@ public:
         registers.SetScreenScissor(0, 0, extent, extent);
         registers.SetWindowScissor(0, 0, extent, extent, false);
         registers.SetGenericScissor(0, 0, extent, extent, false);
-        registers.SetViewportScissor(0, 0, 0, extent, extent, false);
         registers.SetRenderTargetMask((7u << (4u * test.slot)) | (0xfu << (4u * float_slot)));
         registers.SetShaderMask(test.slot == 2 ? 0x0fffffffu : 0xfffff0ffu);
         registers.SetPsInControl(test.wave == 32 ? 0x8000 : 0);
@@ -23748,7 +23786,8 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetViewportScissorTL(0, 0, 0, false);
+      registers.SetViewportScissorBR(0, extent, extent);
       registers.SetRenderTargetMask(slots[0].mask | (slots[1].mask << 4u));
       registers.SetShaderMask(0xff);
       registers.SetPsInControl(0x8000);
@@ -23988,7 +24027,8 @@ public:
       registers.SetScreenScissor(0, 0, extent, extent);
       registers.SetWindowScissor(0, 0, extent, extent, false);
       registers.SetGenericScissor(0, 0, extent, extent, false);
-      registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+      registers.SetViewportScissorTL(0, 0, 0, false);
+      registers.SetViewportScissorBR(0, extent, extent);
       registers.SetRenderTargetMask(0xc3);
       registers.SetShaderMask(0xff);
       registers.SetPsInControl(per_vertex ? 0x8001 : 0x8000);
@@ -24150,7 +24190,6 @@ private:
       m_runtime_context.subgroup_size = SubgroupSize();
     }
     if (m_mode == Mode::MinLodFallback) {
-      m_runtime_context.sample_rate_shading_enabled = true;
       m_runtime_context.subgroup_size = SubgroupSize();
       Require("ImageMinLodFallback", "subgroup", m_runtime_context.subgroup_size == 32 || m_runtime_context.subgroup_size == 64, "missing GPU qualification: production bindings require a 32- or 64-lane subgroup");
     }
@@ -53319,6 +53358,18 @@ void CheckStorageTextureDepthTileUploadLayout() {
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == pitch,
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
+  auto stencil_layout = layout;
+  stencil_layout.pixel_format = vk::Format::eS8Uint;
+  auto depth_layout = layout;
+  depth_layout.pixel_format = vk::Format::eD16Unorm;
+  Require("StorageTextureDepthTileUpload", "copy aspects",
+          regions[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eColor &&
+              stencil_layout.BufferCopies()[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eStencil &&
+              depth_layout.BufferCopies()[0].imageSubresource.aspectMask ==
+                  vk::ImageAspectFlagBits::eDepth,
+          "depth-plane copies lost their color, stencil or depth aspect");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
 
@@ -53989,8 +54040,8 @@ void CheckNativeMsaaState() {
   TileSizeAlign stencil{};
   TileSizeAlign htile{};
   Require("NativeMsaaState", "8x depth/stencil footprint",
-          TileGetDepthPitch(1920, 4, 3) == 1920 &&
-              TileGetDepthSize(1920, 1080, 0, Prospero::DepthFormat::kZ32F,
+          TileGetRenderTargetPitch(1920, 4, 3) == 1920 &&
+              TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ32F,
                                Prospero::StencilFormat::k8UInt, true, stencil,
                                htile, depth, 3) &&
               depth.align == 0x10000 && depth.size == 0x03fc0000 &&
@@ -54172,12 +54223,11 @@ void CheckDynamicRenderingState() {
   first.num_color_attachments = 1;
   first.color_attachments[0].image_layout =
       vk::ImageLayout::eColorAttachmentOptimal;
-  first.color_attachments[0].clear_value = {1, 2, 3, 4};
-  first.color_attachments[0].is_clear = true;
+  first.depth_stencil_attachment.depth_clear = true;
   auto changed = first;
   Require("DynamicRenderingState", "identical state", first == changed,
           "fieldwise RenderState identity rejected an identical scope");
-  changed.color_attachments[0].is_clear = false;
+  changed.depth_stencil_attachment.depth_clear = false;
   Require("DynamicRenderingState", "clear identity", first != changed,
           "clear/load state did not participate in rendering identity");
   changed = first;
@@ -54267,7 +54317,7 @@ void CheckDepthTargetFootprints() {
             "PS5 depth/stencil attachment mapping changed");
   }
   Require("DepthTargetFootprints", "1920x1080 Z16S8 without HTile",
-          TileGetDepthSize(1920, 1080, 0, Prospero::DepthFormat::kZ16,
+          TileGetDepthSize(1920, 1080, Prospero::DepthFormat::kZ16,
                            Prospero::StencilFormat::k8UInt, false, stencil,
                            htile, depth) &&
               depth.size == 0x480000 && depth.align == 0x10000 &&
@@ -54369,7 +54419,7 @@ void CheckDepthTargetFootprints() {
             "D16 host promotion changed the represented depth value");
   }
   Require("DepthTargetFootprints", "640x360 Z32S8 without HTile",
-          TileGetDepthSize(640, 360, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(640, 360, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, false, stencil,
                            htile, depth),
           "valid non-HTile depth/stencil footprint was rejected");
@@ -54392,7 +54442,7 @@ void CheckDepthTargetFootprints() {
 
   Require(
       "DepthTargetFootprints", "960x540 Z32S8 with HTile",
-      TileGetDepthSize(960, 540, 0, Prospero::DepthFormat::kZ32F,
+      TileGetDepthSize(960, 540, Prospero::DepthFormat::kZ32F,
                        Prospero::StencilFormat::k8UInt, true, stencil, htile,
                        depth) &&
           depth.size == 0x280000 && depth.align == 0x10000 &&
@@ -54400,14 +54450,14 @@ void CheckDepthTargetFootprints() {
           htile.size == 0x10000 && htile.align == 0x8000,
       "generic Prospero HTile block calculation rejected the title footprint");
   Require("DepthTargetFootprints", "known HTile extent",
-          TileGetDepthSize(1280, 720, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(1280, 720, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, true, stencil,
                            htile, depth) &&
               depth.size == 0x3c0000 && stencil.size == 0xf0000 &&
               htile.size == 0x20000,
           "validated 1280x720 HTile footprint regressed");
   Require("DepthTargetFootprints", "PPSA06228 3840x2160 Z32S8 with HTile",
-          TileGetDepthSize(3840, 2160, 0, Prospero::DepthFormat::kZ32F,
+          TileGetDepthSize(3840, 2160, Prospero::DepthFormat::kZ32F,
                            Prospero::StencilFormat::k8UInt, true, stencil,
                            htile, depth) &&
               depth.size == 0x1fe0000 && depth.align == 0x10000 &&
@@ -54416,20 +54466,20 @@ void CheckDepthTargetFootprints() {
           "captured 3840x2160 depth/stencil/HTile footprint disagrees with "
           "Prospero rules");
   Require("DepthTargetFootprints", "invalid depth format",
-          !TileGetDepthSize(960, 540, 0, static_cast<Prospero::DepthFormat>(2u),
+          !TileGetDepthSize(960, 540, static_cast<Prospero::DepthFormat>(2u),
                             Prospero::StencilFormat::k8UInt, true, stencil,
                             htile, depth),
           "unsupported depth format was silently admitted");
   Require("DepthTargetFootprints", "invalid stencil format",
-          !TileGetDepthSize(960, 540, 0, Prospero::DepthFormat::kZ32F,
+          !TileGetDepthSize(960, 540, Prospero::DepthFormat::kZ32F,
                             static_cast<Prospero::StencilFormat>(2u), true,
                             stencil, htile, depth),
           "unsupported stencil format was silently admitted");
   Require("DepthTargetFootprints", "invalid extent",
-          !TileGetDepthSize(0, 540, 0, Prospero::DepthFormat::kZ32F,
+          !TileGetDepthSize(0, 540, Prospero::DepthFormat::kZ32F,
                             Prospero::StencilFormat::k8UInt, true, stencil,
                             htile, depth) &&
-              !TileGetDepthSize(16385, 540, 0, Prospero::DepthFormat::kZ32F,
+              !TileGetDepthSize(16385, 540, Prospero::DepthFormat::kZ32F,
                                 Prospero::StencilFormat::k8UInt, true, stencil,
                                 htile, depth),
           "invalid HTile extent was silently admitted");
@@ -54545,7 +54595,6 @@ void CheckVulkan13FeatureRequirements() {
 }
 
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
@@ -54588,7 +54637,6 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
 void CheckPm4Predication(RenderContext &renderer) {
   constexpr const char *name = "Pm4Predication";
   constexpr uint64_t ready = 1ull << 63u;
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.BufferInit();
   alignas(16) std::array<uint64_t, 32> query{};
@@ -54655,7 +54703,7 @@ void CheckPm4Predication(RenderContext &renderer) {
     query[missing] &= ~ready;
     for (uint32_t condition : {0u, 1u}) {
       boolean = 0;
-      processor.SetPredication(1, 3, 0, &boolean, 0);
+      processor.SetPredication(1, 3, 0, &boolean);
       check("unavailable no-wait", 1, condition, 1, query.data(), false);
     }
   }
@@ -54666,7 +54714,7 @@ void CheckPm4Predication(RenderContext &renderer) {
     query[31]++;
     query[missing] &= ~ready;
     boolean = 0;
-    processor.SetPredication(1, 3, 0, &boolean, 0);
+    processor.SetPredication(1, 3, 0, &boolean);
     predicated = unconditional = 0;
     const auto packet = commands(1, 1, 0, query.data());
     Pm4Execution execution;
@@ -54690,12 +54738,15 @@ void CheckPm4Predication(RenderContext &renderer) {
 
 void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
-  constexpr std::array<uint32_t, 2> payload{0x00100801u, 0x28000000u};
-  const auto consumed = HwCtxSetStencilInfo(
-      processor, 0xC0016900u, Pm4::DB_STENCIL_INFO, payload.data(), 1);
-  const auto &stencil = processor.GetCtx().GetDepthStencilInfo();
+  const std::array<uint32_t, 3> packet{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::DB_STENCIL_INFO,
+      0x00100801u};
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
+  const auto &stencil = processor.GetCtx().GetDepthRenderTarget().stencil_info;
   Require("Pm4StencilInfoValueLane", "standalone register value",
-          consumed == 1 && stencil.format == Prospero::StencilFormat::k8UInt &&
+          result == Pm4ProcessResult::Complete &&
+              stencil.format == Prospero::StencilFormat::k8UInt &&
               stencil.texture_compatibility ==
                   Prospero::TextureCompatibleStencil::kEnable &&
               !stencil.expclear_enabled && !stencil.htile_stencil_disabled,
@@ -54704,7 +54755,6 @@ void CheckPm4StencilInfoValueLane(RenderContext &renderer) {
 }
 
 void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor packet(renderer, 0);
   CommandProcessor indirect(renderer, 0);
 
@@ -54780,8 +54830,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
         Pm4::CB_COLOR0_FMASK + stride + 1u,
     };
     for (const auto offset : legacy_color_slots) {
-      legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                    g_hw_ctx_indirect_func[offset] == nullptr;
+      legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
     }
   }
   // These offsets are the removed GCN DB_DEPTH_INFO, DB_DEPTH_SIZE, and
@@ -54790,12 +54839,10 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   constexpr std::array<uint32_t, 3> legacy_depth_slots{0x000fu, 0x0016u,
                                                        0x0017u};
   for (const auto offset : legacy_depth_slots) {
-    legacy_slots_are_unhandled &= g_hw_ctx_func[offset] == nullptr &&
-                                  g_hw_ctx_indirect_func[offset] == nullptr;
+    legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[offset] == nullptr;
   }
   // Removed GCN PA_SC_NGG_MODE_CNTL.
-  legacy_slots_are_unhandled &= g_hw_ctx_func[0x0314u] == nullptr &&
-                                g_hw_ctx_indirect_func[0x0314u] == nullptr;
+  legacy_slots_are_unhandled &= g_hw_ctx_indirect_func[0x0314u] == nullptr;
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
@@ -54830,14 +54877,22 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
   const bool native_index_size_packet_complete =
       packet.Process(index_size_execution, index_size_packet) ==
           Pm4ProcessResult::Complete &&
-      g_hw_uc_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
       g_hw_uc_indirect_func[Pm4::VGT_INDEX_TYPE] != nullptr &&
-      g_hw_uc_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr &&
       g_hw_uc_indirect_func[Pm4::IA_MULTI_VGT_PARAM] != nullptr;
 
+  // Every value of a register range lands in its own register.
+  std::array<uint32_t, 4> index_range_packet{
+      KYTY_PM4(4, Pm4::IT_SET_UCONFIG_REG, Pm4::R_ZERO), Pm4::GE_INDX_OFFSET,
+      7u, 0x80000000u};
+  Pm4Execution index_range_execution;
+  Require("Pm4NativeTargetGeometry", "uconfig register range",
+          packet.Process(index_range_execution, index_range_packet) ==
+                  Pm4ProcessResult::Complete &&
+              packet.GetUcfg().GetIndexOffset() == 7u &&
+              packet.GetUcfg().GetPrimitiveResetControl() == 0x80000000u,
+          "a SET_UCONFIG_REG range dropped a register value");
+
   const bool native_ps_address_slots_are_handled =
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
-      g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] != nullptr &&
       g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] != nullptr;
   const bool native_pace_slots_are_handled =
@@ -54853,7 +54908,6 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   std::array<uint32_t, 24> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
@@ -54899,7 +54953,6 @@ void CheckPm4IndirectShaderRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   std::array<uint32_t, 2> registers{
       Pm4::UC_PARAMETER_OVERSUBSCRIPTION, 0x12345678u,
@@ -54924,7 +54977,6 @@ void CheckPm4IndirectUconfigRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t shader_address = 0x0000123456789a00ull;
   std::array<uint32_t, 4> packet{
@@ -54939,11 +54991,29 @@ void CheckPm4DirectShaderRegisterFallback(RenderContext &renderer) {
               processor.GetShCtx().GetVs().es_regs.data_addr == shader_address,
           "direct SET_SH_REG did not route its ES base pair through the "
           "register handlers");
+  std::array<uint32_t, 8> user_data{
+      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+      Pm4::SPI_SHADER_USER_DATA_PS_0 + 30,
+      1u,
+      2u,
+      KYTY_PM4(4, Pm4::IT_SET_SH_REG, Pm4::R_ZERO),
+      Pm4::COMPUTE_USER_DATA_0 + 14,
+      3u,
+      4u,
+  };
+  Pm4Execution user_data_execution;
+  const auto &ps_sgpr = processor.GetShCtx().GetPs().ps_user_sgpr.value;
+  const auto &cs_sgpr = processor.GetShCtx().GetCs().cs_user_sgpr.value;
+  Require("Pm4DirectShaderRegisterFallback", "last user-data slots",
+          processor.Process(user_data_execution, user_data) ==
+                  Pm4ProcessResult::Complete &&
+              ps_sgpr[30] == 1u && ps_sgpr[31] == 2u && cs_sgpr[14] == 3u &&
+              cs_sgpr[15] == 4u,
+          "direct SET_SH_REG user data missed the last slots of a stage");
   std::printf("[host]    %-32s ok\n", "Pm4DirectShaderRegisterFallback");
 }
 
 void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
 
@@ -54984,8 +55054,137 @@ void CheckPm4GuardBandRegisterRanges(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4GuardBandRegisterRanges");
 }
 
+void CheckPm4IgnoredContextRegisters(RenderContext &renderer) {
+  CommandProcessor processor(renderer, 0);
+  for (const uint32_t offset : {Pm4::CB_DCC_CONTROL,
+                                Pm4::DB_COUNT_CONTROL,
+                                Pm4::DB_SRESULTS_COMPARE_STATE0,
+                                Pm4::DB_SRESULTS_COMPARE_STATE1,
+                                Pm4::DB_RENDER_OVERRIDE2,
+                                Pm4::DB_DFSM_CONTROL,
+                                Pm4::DB_RMI_L2_CACHE_CONTROL,
+                                Pm4::CB_RMI_GL2_CACHE_CONTROL,
+                                Pm4::TA_BC_BASE_ADDR,
+                                Pm4::TA_BC_BASE_ADDR_HI,
+                                Pm4::PA_SU_POINT_SIZE,
+                                Pm4::PA_SU_POINT_MINMAX,
+                                Pm4::SPI_VS_OUT_CONFIG,
+                                Pm4::SPI_SHADER_POS_FORMAT,
+                                Pm4::SPI_SHADER_IDX_FORMAT,
+                                Pm4::VGT_GS_INSTANCE_CNT,
+                                Pm4::VGT_GS_ONCHIP_CNTL,
+                                Pm4::VGT_HOS_MAX_TESS_LEVEL,
+                                Pm4::VGT_HOS_MIN_TESS_LEVEL,
+                                Pm4::VGT_ESGS_RING_ITEMSIZE,
+                                Pm4::VGT_PRIMITIVEID_EN,
+                                Pm4::VGT_REUSE_OFF,
+                                Pm4::VGT_TESS_DISTRIBUTION,
+                                Pm4::VGT_PRIMITIVEID_RESET,
+                                Pm4::SPI_SHADER_Z_FORMAT,
+                                Pm4::PA_SC_FOV_WINDOW_LR,
+                                Pm4::PA_SC_FOV_WINDOW_TB,
+                                Pm4::PA_SC_FSR_ENABLE,
+                                Pm4::FSR_RECURSIONS0,
+                                Pm4::FSR_RECURSIONS1,
+                                Pm4::PA_SC_MODE_CNTL_1,
+                                Pm4::PA_SC_AA_MASK_X0Y0_X1Y0,
+                                Pm4::PA_SC_AA_MASK_X0Y1_X1Y1,
+                                Pm4::PA_SU_VTX_CNTL,
+                                Pm4::PS_SHADER_SAMPLE_EXCLUSION_MASK,
+                                Pm4::PA_SC_BINNER_CNTL_0,
+                                Pm4::PA_SC_BINNER_CNTL_1,
+                                Pm4::PA_SC_CONSERVATIVE_RASTERIZATION_CNTL,
+                                Pm4::PA_SC_SHADER_CONTROL,
+                                Pm4::CX_NOP}) {
+    std::array<uint32_t, 3> command{
+        KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), offset, ~0u};
+    Pm4Execution execution;
+    Require("Pm4IgnoredContextRegisters", "accepted register",
+            processor.Process(execution, command) ==
+                    Pm4ProcessResult::Complete &&
+                (offset == Pm4::CX_NOP ||
+                 g_hw_ctx_indirect_func[offset] != nullptr),
+            "an ignored context register write did not complete");
+  }
+  std::printf("[host]    %-32s ok\n", "Pm4IgnoredContextRegisters");
+}
+
+void CheckPm4IndirectShaderAndUconfigTables(RenderContext &renderer) {
+  CommandProcessor processor(renderer, 0);
+  bool handled = true;
+  for (const uint32_t offset : {Pm4::SPI_SHADER_PGM_RSRC1_HS,
+                                Pm4::SPI_SHADER_PGM_RSRC4_HS,
+                                Pm4::SPI_SHADER_PGM_CHKSUM_HS,
+                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_HS,
+                                Pm4::SPI_SHADER_PGM_RSRC4_GS,
+                                Pm4::SPI_SHADER_PACE_ID_GS,
+                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS,
+                                Pm4::SPI_SHADER_PGM_RSRC1_PS,
+                                Pm4::SPI_SHADER_PACE_ID_PS,
+                                Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS,
+                                0x0cau,
+                                Pm4::COMPUTE_PGM_LO,
+                                Pm4::COMPUTE_PGM_HI,
+                                Pm4::COMPUTE_PGM_RSRC1,
+                                Pm4::COMPUTE_PGM_RSRC2,
+                                Pm4::COMPUTE_START_X,
+                                Pm4::COMPUTE_START_Y,
+                                Pm4::COMPUTE_START_Z,
+                                Pm4::COMPUTE_RESOURCE_LIMITS,
+                                Pm4::COMPUTE_TMPRING_SIZE,
+                                Pm4::COMPUTE_PGM_RSRC3,
+                                Pm4::COMPUTE_PACE_ID}) {
+    handled = handled && g_hw_sh_indirect_func[offset] != nullptr;
+  }
+  for (const uint32_t offset :
+       {Pm4::TEXTURE_GRADIENT_FACTORS, Pm4::TEXTURE_GRADIENT_CONTROL,
+        Pm4::IA_MULTI_VGT_PARAM, Pm4::TA_CS_BC_BASE_ADDR,
+        Pm4::TA_CS_BC_BASE_ADDR_HI, Pm4::UC_PARAMETER_OVERSUBSCRIPTION,
+        Pm4::GDS_OA_CNTL, Pm4::GDS_OA_COUNTER, Pm4::GDS_OA_ADDRESS,
+        Pm4::FSR_WINDOW_LEFT + 1u, Pm4::FSR_CONTROL_POINTS_LEFT_X,
+        Pm4::FSR_CONTROL_POINTS_LEFT_Y + 3u, Pm4::FSR_ALPHA_LEFT_X,
+        Pm4::FSR_ALPHA_LEFT_Y + 1u, Pm4::GE_STEREO_CNTL}) {
+    handled = handled && g_hw_uc_indirect_func[offset] != nullptr;
+  }
+  handled = handled &&
+            g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MIN] != nullptr &&
+            g_hw_ctx_indirect_func[Pm4::DB_DEPTH_BOUNDS_MAX] != nullptr;
+  for (const uint32_t offset :
+       {Pm4::COMPUTE_NUM_THREAD_X, Pm4::COMPUTE_NUM_THREAD_Y,
+        Pm4::COMPUTE_NUM_THREAD_Z}) {
+    const auto handler = g_hw_sh_indirect_func[offset];
+    handled = handled && handler != nullptr;
+    if (handler != nullptr) {
+      handler(processor, offset, offset);
+    }
+  }
+  const auto &cs = processor.GetShCtx().GetCs().cs_regs;
+  Require("Pm4IndirectShaderAndUconfigTables", "indirect handlers",
+          handled && cs.num_thread_x == Pm4::COMPUTE_NUM_THREAD_X &&
+              cs.num_thread_y == Pm4::COMPUTE_NUM_THREAD_Y &&
+              cs.num_thread_z == Pm4::COMPUTE_NUM_THREAD_Z,
+          "an indirect SH or UCONFIG register lost its handler");
+  std::printf("[host]    %-32s ok\n", "Pm4IndirectShaderAndUconfigTables");
+}
+
+void CheckPm4LineWidth(RenderContext &renderer) {
+  CommandProcessor processor(renderer, 0);
+  std::array<uint32_t, 3> command{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::PA_SU_LINE_CNTL,
+      8u};
+  Pm4Execution execution;
+  const bool direct =
+      processor.Process(execution, command) == Pm4ProcessResult::Complete &&
+      processor.GetCtx().GetLineWidth() == 1.0f;
+  g_hw_ctx_indirect_func[Pm4::PA_SU_LINE_CNTL](processor, Pm4::PA_SU_LINE_CNTL,
+                                               12u);
+  Require("Pm4LineWidth", "width in eighths",
+          direct && processor.GetCtx().GetLineWidth() == 1.5f,
+          "PA_SU_LINE_CNTL width was not decoded in eighths of a pixel");
+  std::printf("[host]    %-32s ok\n", "Pm4LineWidth");
+}
+
 void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   processor.GetCtx().SetBlendColor({1.0f, 2.0f, 3.0f, 4.0f});
 
@@ -55048,7 +55247,6 @@ void CheckPm4BlendColorRegisterRanges(RenderContext &renderer) {
 }
 
 void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   const auto &defaults = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "format defaults",
@@ -55061,15 +55259,19 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
                                             std::bit_cast<uint32_t>(-3.25f),
                                             std::bit_cast<uint32_t>(32.0f),
                                             std::bit_cast<uint32_t>(4.5f)};
-  const auto consumed = HwCtxSetPolyOffsetRegisters(
-      processor, KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
-      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL, payload.data(), 0);
+  std::array<uint32_t, 2 + payload.size()> packet{
+      KYTY_PM4(8, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL};
+  std::copy(payload.begin(), payload.end(), packet.begin() + 2);
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
   const auto &direct = processor.GetCtx().GetPolyOffset();
   Require("Pm4PolygonOffset", "direct registers",
-          consumed == payload.size() && direct.neg_num_db_bits == -16 &&
-              !direct.db_is_float_fmt && direct.clamp == 2.5f &&
-              direct.front_scale == 16.0f && direct.front_offset == -3.25f &&
-              direct.back_scale == 32.0f && direct.back_offset == 4.5f,
+          result == Pm4ProcessResult::Complete &&
+              direct.neg_num_db_bits == -16 && !direct.db_is_float_fmt &&
+              direct.clamp == 2.5f && direct.front_scale == 16.0f &&
+              direct.front_offset == -3.25f && direct.back_scale == 32.0f &&
+              direct.back_offset == 4.5f,
           "direct polygon offset register packet was decoded incorrectly");
 
   g_hw_ctx_indirect_func[Pm4::PA_SU_POLY_OFFSET_DB_FMT_CNTL](
@@ -55086,7 +55288,6 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
 }
 
 void CheckPm4DepthControlHighBits(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
 
   std::array<uint32_t, 3> direct{
@@ -55135,7 +55336,6 @@ void CheckPm4DepthControlHighBits(RenderContext &renderer) {
 
 void CheckPm4DepthRenderOverride(RenderContext &renderer) {
   constexpr const char *name = "Pm4DepthRenderOverride";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   struct Case {
     uint32_t value;
@@ -55173,6 +55373,37 @@ void CheckPm4DepthRenderOverride(RenderContext &renderer) {
           "DB_RENDER_OVERRIDE lost, exchanged, or retained force flags");
     }
   }
+  // A range through DB_HTILE_DATA_BASE writes every register it covers.
+  const std::array<uint32_t, 5> range_packet{
+      KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::DB_RENDER_OVERRIDE, 0x28000000u, 0u, 0x00001234u};
+  Pm4Execution range_execution;
+  const auto range_result = processor.Process(range_execution, range_packet);
+  const auto &range_override = processor.GetCtx().GetDepthRenderOverride();
+  Require(name, "register range",
+          range_result == Pm4ProcessResult::Complete &&
+              range_override.force_z_valid && range_override.force_z_dirty &&
+              processor.GetCtx().GetDepthRenderTarget().htile_data_base_addr ==
+                  0x123400u,
+          "a SET_CONTEXT_REG range dropped DB_HTILE_DATA_BASE");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+void CheckPm4DepthShaderControl(RenderContext &renderer) {
+  constexpr const char *name = "Pm4DepthShaderControl";
+  CommandProcessor processor(renderer, 0);
+  const std::array<uint32_t, 3> packet{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO), Pm4::DB_SHADER_CONTROL,
+      0x00006a61u};
+  Pm4Execution execution;
+  const auto result = processor.Process(execution, packet);
+  const auto &db = processor.GetCtx().GetShaderRegisters().db_shader_control;
+  Require(name, "fields",
+          result == Pm4ProcessResult::Complete && db.shader_z_export_enable &&
+              db.shader_z_behavior == 2 && db.shader_kill_enable &&
+              !db.shader_mask_export_enable && db.shader_dual_export_enable &&
+              !db.shader_execute_on_noop && db.alpha_to_mask_disable,
+          "DB_SHADER_CONTROL fields decoded into the wrong state");
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -55322,7 +55553,6 @@ static_assert(offsetof(CommandBufferLayout, reserved_dw) == 0x30);
 
 void CheckPm4AcquireMemPackets(RenderContext &renderer) {
   constexpr const char *name = "Pm4AcquireMemPackets";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   // Byte ranges cover every touched 256-byte block, including partial first and last blocks.
   struct Case {
@@ -55379,7 +55609,6 @@ void CheckPm4AcquireMemPackets(RenderContext &renderer) {
 }
 
 void CheckPm4WaitPackets(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr auto packet_mismatch = static_cast<int>(0x8a6c000cu);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
@@ -55514,7 +55743,6 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
 }
 
 void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
     Pm4Execution execution;
@@ -55696,7 +55924,6 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
 }
 
 void CheckPm4ContextStateOperations(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   constexpr auto primitive_type = static_cast<Prospero::PrimitiveType>(0x35u);
 
@@ -55893,7 +56120,6 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
 
 void CheckPm4IndirectControlFlow(RenderContext &renderer) {
   constexpr const char *name = "Pm4IndirectControlFlow";
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   uint32_t selected = 0;
   uint32_t returned = 0;
@@ -55965,6 +56191,16 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
                 commands[1] == value,
             "a NOP payload executed or blocked the following packet");
   }
+  // Debug markers carry an opaque string; the packet after a push/pop pair must run.
+  std::array<uint32_t, 10> markers{KYTY_PM4(3, Pm4::IT_NOP, Pm4::R_PUSH_MARKER), 0x00636261u, 0u,
+                                   KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_POP_MARKER), 0u};
+  std::copy(completion.begin(), completion.end(), markers.begin() + 5);
+  selected = 0;
+  Pm4Execution marker_execution;
+  Require(name, "debug markers",
+          processor.Process(marker_execution, markers) == Pm4ProcessResult::Complete &&
+              selected == 7,
+          "a debug marker consumed the wrong length or hid the packet after it");
   alignas(8) uint64_t released = 0;
   std::array<uint32_t, 20> disabled_commands{};
   const auto disabled_write = write(&returned, 99);
@@ -56242,7 +56478,6 @@ void CheckPm4Flip() {
           handle > 0 && EventQueue::KernelCreateEqueue(&flips, "flips") == 0 &&
               VideoOut::VideoOutAddFlipEvent(flips, handle, &udata) == 0,
           "video-out or flip event registration failed");
-  GraphicsInitJmpTables();
 
   alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
   constexpr int64_t flip_arg = 0x777;
@@ -56299,7 +56534,6 @@ void CheckPm4Flip() {
 }
 
 void CheckPm4WaitResume(RenderContext &renderer) {
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
 
   uint32_t label = 0;
@@ -56375,7 +56609,6 @@ void CheckPm4MemSemaphore(RenderContext &renderer) {
               symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbMemSemaphore),
           "async semaphore import did not resolve to the emitter");
 
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0x20);
   const auto execute = [&](std::span<const uint32_t> commands) {
     Pm4Execution execution;
@@ -56489,7 +56722,6 @@ void CheckPm4RewindResume(RenderContext &renderer) {
               command == invalid,
           "rewind patch accepted or modified a packet with the wrong opcode");
 
-  GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
   for (const bool async : {false, true}) {
     for (const uint8_t offload : {0, 1}) {
@@ -57648,12 +57880,17 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckShaderFusion();
     CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
+    CheckPm4IgnoredContextRegisters(vulkan.RuntimeRenderer());
+    CheckPm4IndirectShaderAndUconfigTables(vulkan.RuntimeRenderer());
+    CheckPm4LineWidth(vulkan.RuntimeRenderer());
     CheckPm4IndirectShaderRegisters(vulkan.RuntimeRenderer());
+    CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
     CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
     CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+    CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -57989,10 +58226,14 @@ int main(int argc, char **argv) {
   CheckPm4IndirectUconfigRegisters(vulkan.RuntimeRenderer());
   CheckPm4DirectShaderRegisterFallback(vulkan.RuntimeRenderer());
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
+  CheckPm4IgnoredContextRegisters(vulkan.RuntimeRenderer());
+  CheckPm4IndirectShaderAndUconfigTables(vulkan.RuntimeRenderer());
+  CheckPm4LineWidth(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
+  CheckPm4DepthShaderControl(vulkan.RuntimeRenderer());
   CheckShaderFusion();
   CheckAgcSystemTable(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());

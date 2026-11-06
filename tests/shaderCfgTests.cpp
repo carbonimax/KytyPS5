@@ -1170,8 +1170,6 @@ void TestNativeShaderResourceDependencies() {
       .shader_hash = program.shader_hash,
       .wave_size = program.wave_size,
       .user_data_base = program.user_data_base,
-      .user_data_count = program.user_data_count,
-      .scratch_dwords = program.scratch_dwords,
       .info = program.info,
       .bindings = program.bindings,
   };
@@ -1890,10 +1888,10 @@ void TestShaderStageBarriers() {
 
 void TestVertexBufferGrouping() {
   const uint32_t shader[] = {EncodeSopp(0x01)};
-  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
-  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1> offsets;
+  offsets.fill(ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
   ShaderUserData user_data{};
   user_data.direct_resource_count = offsets.size();
   user_data.direct_resource_offset = offsets.data();
@@ -12187,10 +12185,10 @@ void TestEmbeddedVertexFormatSwizzle() {
        {0x3e800000, 0x3f000000, 0x3f400000, 0x40000000},
        Prospero::VertexAttribFormat::k32_32_32_32Float},
   };
-  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
-  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
-  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  std::array<uint16_t, static_cast<size_t>(DirectResourceType::Last) + 1> offsets;
+  offsets.fill(ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(DirectResourceType::PtrVertexAttribDescTable)] = 2;
   ShaderUserData user_data{};
   user_data.direct_resource_offset = offsets.data();
   user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
@@ -15600,29 +15598,6 @@ void TestNewShaderRecompilerNativeBindingPlan() {
             result.program.bindings == bindings &&
             result.program.info.buffers[0].descriptor_index == 0,
         "repeated emission did not rebuild descriptor slots deterministically");
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ShaderRecompiler::IR::Inst *buffer_handle = nullptr;
-  for (auto *block : result.program.blocks) {
-    const auto found = std::ranges::find_if(*block, [](const auto &inst) {
-      return inst.GetOpcode() ==
-             ShaderRecompiler::IR::ValueOpcode::GetBufferResource;
-    });
-    if (found != block->end()) {
-      buffer_handle = &*found;
-      break;
-    }
-  }
-  Check(buffer_handle != nullptr,
-        "native validation fixture lacks a buffer handle");
-  ExpectFatal(
-      [&] {
-        buffer_handle->SetFlags(UINT32_MAX);
-        (void)ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                   options.input_info);
-      },
-      "invalid dense buffer resource did not terminate SPIR-V emission");
-#endif
 }
 
 void BuildTypedPlan(const uint32_t *code, uint32_t words,
@@ -17096,7 +17071,7 @@ void TestComputeLdsAllocationIdentity() {
   ShaderComputeInputInfo scratch_info{};
   const auto scratch_params = PrepareProgram(regs, scratch_info);
   Check(scratch_info.scratch_size_dwords == 7,
-        "AGC per-thread scratch size was not propagated");
+        "per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
   scratch_options.shader_hash = scratch_params.hash;
   scratch_options.user_data = std::span(scratch_params.user_data).first(scratch_params.user_data_count);
@@ -17106,7 +17081,7 @@ void TestComputeLdsAllocationIdentity() {
   auto scratch_result =
       RecompileForTest(scratch_params.code, scratch_options);
   Check(scratch_result.program.scratch_dwords == 7,
-        "AGC per-thread scratch size did not reach the compiler program");
+        "per-thread scratch size did not reach the compiler program");
   Check(MakeStageStaticKey(scratch_info) != MakeStageStaticKey(lds_896),
         "compute pipeline identity omitted the scratch allocation");
 

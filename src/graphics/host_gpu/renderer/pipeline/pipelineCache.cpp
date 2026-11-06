@@ -79,7 +79,7 @@ uint8_t RemapSourceAlphaToSrc1Color(uint8_t factor) {
 }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
-	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
+	// PA_SU_SC_MODE_CNTL.POLY_MODE disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
 		return vk::PolygonMode::eFill;
 	}
@@ -1088,9 +1088,7 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
-	if (m_driver_cache != nullptr) {
-		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	}
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 
 void PipelineCache::JoinWarmUp() {
@@ -1647,7 +1645,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (object_primitive_id) {
-		// CxObjectIdMode: register source plus a 32-bit pipelined primitive-ID addition.
+		// PA_CL_OBJPRIM_ID_CNTL = 2: VGT_OBJECT_ID plus the pipelined 32-bit primitive ID.
 		EXIT_NOT_IMPLEMENTED(sh.m_paClObjprimIdCntl != 2u || mesh_active || tess_active ||
 		                     !pixel_active || (sh.m_vgtDrawPayloadCntl & 8u) == 0 ||
 		                     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList);
@@ -1951,7 +1949,6 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 	key.ps_shader_id            = ps_id;
 	auto& static_params         = key.static_params;
 	auto& rendering             = key.rendering;
-	rendering.color_count       = 0;
 	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
@@ -2054,13 +2051,6 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 	KYTY_KEY_CHECK(attachment_samples == 0 ||
 	        vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {});
 
-	if (!predict && ps_active && depth.depth_test_enable && ps_input_info.ps_execute_on_noop) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
-			LOGF("Pipeline: temporary: accepting EXEC_ON_NOOP with depth test enabled\n");
-		}
-	}
-
 	const auto& clip_control               = ctx.GetClipControl();
 	static_params.negative_one_to_one      = !clip_control.dx_clip_space;
 	static_params.depth_clip_enable        = clip_control.IsZClipEnabled();
@@ -2069,10 +2059,6 @@ bool PipelineCache::MakeGraphicsKey(const HW::Context& ctx, const HW::UserConfig
 	static_params.samples                  = attachment_samples;
 	static_params.sample_shading_enable =
 	    ps_active && attachment_samples > 1 && ps_input_info.ps_sample_shading;
-	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
-		if (predict) return false;
-		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
-	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
@@ -2166,9 +2152,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (ps_active) {
 			ShaderDbgDumpInputInfo(ps_input_info);
 		}
-		LOGF("PipelineTrace: shader modules VS=%" PRIu64 " module=%p PS=%" PRIu64 " module=%p\n",
-		     vs_id, static_cast<void*>(vertex_program->module), ps_id,
-		     ps_active ? static_cast<void*>(pixel_program->module) : nullptr);
 	}
 
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
@@ -2307,7 +2290,6 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	WaitWarmUp();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(input_info.stage.module == nullptr);
 	const auto& compute_program = input_info.stage.module->handle;
 
 	auto [iter, inserted] = m_compute_pipelines.try_emplace(compute_program.id);

@@ -170,7 +170,7 @@ KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
 KYTY_IO_FIELDS(Bindings, a, b, c, d, e)
-KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j)
+KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h)
 KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS
 
