@@ -129,6 +129,7 @@ constexpr std::array ShaderEnvironment {
     "KYTY_MAD_SEPARATE_ROUNDING", "KYTY_PS_UNLAUNCHED_LANES",       "KYTY_PS_PACKED_WAVE32",
     "KYTY_VS_PACKED_WAVE32",      "KYTY_VERTEX_TABLE_BACKING_READS", "KYTY_SRT_PROTECTED_LOADS",
     "KYTY_PERVERTEX_EXPERIMENTAL", "KYTY_SHADER_OPT",                "KYTY_SHADER_OPT_LANES",
+    "KYTY_MED3_NATIVE_MINMAX",
 };
 
 uint64_t FrameChecksum(Frame frame, std::span<const uint8_t> compressed) {

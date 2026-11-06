@@ -32674,7 +32674,9 @@ TestCase VectorMinMaxF32RuntimeEdges(u32 wave, bool signaling_nan = true) {
   return test;
 }
 
-TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
+// signaling_nan = false drops the rows with a signaling NaN operand, denormals = false those
+// with a denormal operand.
+TestCase VectorMed3F32NanUsesMin3Path(u32 wave, bool signaling_nan = true, bool denormals = true) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
   constexpr u32 cases[][4] = {
@@ -32700,33 +32702,49 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
       {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
       {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
       {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
-      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
+      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u},
+      // Quiet NaN pairs and triples (kept on the native path, unlike the rows with a sNaN).
+      {0x7fc01234u, 0xffc05678u, 0x3f800000u, 0x3f800000u},
+      {0x7fc01234u, 0x3f800000u, 0xffc05678u, 0x3f800000u},
+      {0x3f800000u, 0x7fc01234u, 0xffc05678u, 0x3f800000u},
+      {0x7fc01234u, 0xffc05678u, 0x7fc0abcdu, 0x7fc0abcdu}};
   TestCase test;
   test.name = "VectorMed3F32NanUsesMin3Path";
   test.has_compute_info = true;
   test.compute_info.wave_size = wave;
   test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
   test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
-  for (const auto &values : cases)
-    test.initial.insert(test.initial.end(), values, values + 3);
+  const auto signaling = [](u32 v) {
+    return (v & 0x7fffffffu) > 0x7f800000u && (v & 0x00400000u) == 0u;
+  };
+  const auto denormal = [](u32 v) { return (v & 0x7f800000u) == 0u && (v & 0x007fffffu) != 0u; };
+  std::vector<std::array<u32, 4>> rows;
+  for (const auto &values : cases) {
+    if ((signaling_nan || std::none_of(values, values + 3, signaling)) &&
+        (denormals || std::none_of(values, values + 3, denormal)))
+      rows.push_back({values[0], values[1], values[2], values[3]});
+  }
+  for (const auto &values : rows)
+    test.initial.insert(test.initial.end(), values.begin(), values.begin() + 3);
   test.expected = test.initial;
   auto &code = test.code;
-  for (u32 index = 0; index < std::size(cases); ++index) {
+  for (u32 index = 0; index < static_cast<u32>(rows.size()); ++index) {
     for (u32 operand = 0; operand < 3; ++operand) {
       AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
       AppendBufferLoadDword(&code, operand, 30);
     }
     AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
     AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
-    test.expected.push_back(cases[index][3]);
+    test.expected.push_back(rows[index][3]);
   }
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
+  test.ir_counts = {{"FPMedTri32", rows.size()}};
+  // Measured 16,140/33,705 words for 24 rows; every row costs the same, so the limit scales with
+  // the rows. Keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = (wave == 32u ? 16150u : 33720u) * rows.size() / 24u;
   return test;
 }
 
@@ -57325,7 +57343,9 @@ int main(int argc, char **argv) {
       for (auto test :
            {VectorMinMaxF32NanAndSignedZeroEdges(literal_snan),
             VectorMinMaxF32RuntimeEdges(32, runtime_snan),
-            VectorMinMaxF32RuntimeEdges(64, runtime_snan)}) {
+            VectorMinMaxF32RuntimeEdges(64, runtime_snan),
+            VectorMed3F32NanUsesMin3Path(32, runtime_snan, false),
+            VectorMed3F32NanUsesMin3Path(64, runtime_snan, false)}) {
         auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
         test.profile = native ? &native_profile : &Maintenance8Profile;

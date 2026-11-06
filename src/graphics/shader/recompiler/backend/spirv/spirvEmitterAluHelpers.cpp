@@ -1,5 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -123,17 +126,32 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	                     EmitBitcastF32ToU32(state, rhs), max_value);
 }
 
+// KYTY_MED3_NATIVE_MINMAX=0 keeps the emulated min/max inside MED3 on native_float_min_max hosts.
+static bool NativeMed3MinMaxEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MED3_NATIVE_MINMAX");
+		return value == nullptr || *value == '\0' || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	const auto a_bits = EmitBitcastF32ToU32(state, a);
-	const auto b_bits = EmitBitcastF32ToU32(state, b);
-	const auto c_bits = EmitBitcastF32ToU32(state, c);
 	// The NaN path is RDNA2 MIN3, which keeps the later source when two are NaN.
-	const auto min_ba = EmitMinMaxF32(state, b, a, b_bits, a_bits, false);
-	const auto min3 =
-	    EmitMinMaxF32(state, c, min_ba, c_bits, EmitBitcastF32ToU32(state, min_ba), false);
-	const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
-	const auto max3 =
-	    EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);
+	uint32_t min3 = 0;
+	uint32_t max3 = 0;
+	if (state.profile.native_float_min_max && NativeMed3MinMaxEnabled()) {
+		// NMin/NMax already give the V_MIN/V_MAX_F32 results here: 12 selects fewer per MED3.
+		min3 = EmitMinMaxF32Value(state, c, EmitMinMaxF32Value(state, b, a, false), false);
+		max3 = EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, true), c, true);
+	} else {
+		const auto a_bits = EmitBitcastF32ToU32(state, a);
+		const auto b_bits = EmitBitcastF32ToU32(state, b);
+		const auto c_bits = EmitBitcastF32ToU32(state, c);
+		const auto min_ba = EmitMinMaxF32(state, b, a, b_bits, a_bits, false);
+		min3 = EmitMinMaxF32(state, c, min_ba, c_bits, EmitBitcastF32ToU32(state, min_ba), false);
+		const auto max_ab = EmitMinMaxF32(state, a, b, a_bits, b_bits, true);
+		max3 = EmitMinMaxF32(state, max_ab, c, EmitBitcastF32ToU32(state, max_ab), c_bits, true);
+	}
 	// RDNA2 compares numerically against MAX3, including ties between signed zeros, then takes
 	// V_MAX_F32 of the other two sources in their original order.
 	const auto a_is_max = Binary(state, spv::OpFOrdEqual, TypeBool(state), max3, a);
