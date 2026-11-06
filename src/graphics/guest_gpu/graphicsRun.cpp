@@ -976,9 +976,12 @@ static bool IsYieldPoint(uint32_t opcode) {
 
 // KYTY_CP_PIPELINE: packets the front runs while draws are queued (register writes, fetcher,
 // direct draws). Every other packet drains the queue first.
+// Debug markers are skipped by their handlers, so they keep the queue (AnyPS5 keepsDrawPipeline).
 static bool IsPipelinedPacket(uint32_t opcode, uint32_t custom) {
 	switch (opcode) {
-		case Pm4::IT_NOP: return custom == Pm4::R_ZERO || custom == Pm4::R_CONTEXT_STATE;
+		case Pm4::IT_NOP:
+			return custom == Pm4::R_ZERO || custom == Pm4::R_CONTEXT_STATE || custom == Pm4::R_PUSH_MARKER ||
+			       custom == Pm4::R_POP_MARKER;
 		case Pm4::IT_SET_BASE:
 		case Pm4::IT_CLEAR_STATE:
 		case Pm4::IT_INDEX_BASE:
