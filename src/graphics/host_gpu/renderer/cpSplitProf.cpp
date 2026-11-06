@@ -177,7 +177,7 @@ void Packet(uint32_t opcode, uint32_t custom) noexcept {
 		case Pm4::IT_NUM_INSTANCES:
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_DRAW_INDEX_MULTI_INST:
 		case Pm4::IT_DRAW_INDEX_AUTO:
 		case Pm4::IT_PFP_SYNC_ME:
 		case Pm4::IT_INDIRECT_BUFFER:
