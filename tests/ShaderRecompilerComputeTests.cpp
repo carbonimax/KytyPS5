@@ -57,6 +57,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -66,6 +67,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
+#include "loader/x64InstructionEmulator.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
 
@@ -15083,6 +15085,10 @@ public:
     }
 
     EnsureRuntimeContext();
+    // Game shaders may use the int64 buffer atomics the device enables, as in the emulator; the
+    // other fixtures keep the emulated path.
+    const bool int64_atomics = std::exchange(m_runtime_context.shader_buffer_int64_atomics_enabled,
+                                             m_buffer_int64_atomics);
     RenderContext context(m_runtime_context);
     context.InitializeGpu(nullptr);
     Memory::InstallGpuResources(&context);
@@ -15157,6 +15163,7 @@ public:
     });
     context.ShutdownGpu();
     Memory::InstallGpuResources(nullptr);
+    m_runtime_context.shader_buffer_int64_atomics_enabled = int64_atomics;
     for (size_t i = 0; i < merged.size(); i++) {
       const auto size = merged[i].second - merged[i].first;
       Require(name, "unmap memory",
@@ -24552,6 +24559,7 @@ private:
   // the depth feedback loop is a pipeline property instead of per-draw state.
   bool m_feedback_loop_dynamic = false;
   bool m_sampler_filter_minmax = false;
+  bool m_buffer_int64_atomics = false; // enabled on the device (fixtures still declare it off)
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
@@ -24581,7 +24589,14 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              if (LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr)) return true;
+              // As in the emulator: an SRT walker load of an unmapped address (unused null
+              // descriptor pointer) reads zero.
+              if (const auto length = ShaderRecompiler::IR::SrtWalkerLoadLength(info.exception_address)) {
+                Loader::X64InstructionEmulator::SkipLoad(info.native_context, length);
+                return true;
+              }
+              return false;
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
@@ -24944,6 +24959,7 @@ private:
       device_features12.bufferDeviceAddress = true;
       device_features12.timelineSemaphore = min_lod_fallback || portable_graphics;
     }
+    m_buffer_int64_atomics = device_features12.shaderBufferInt64Atomics == VK_TRUE;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
