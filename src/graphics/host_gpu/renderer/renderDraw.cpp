@@ -1515,34 +1515,28 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	std::array<vk::ImageAspectFlags, RENDER_COLOR_ATTACHMENTS_MAX>     feedback {};
 	auto& pipeline_cache = m_context.GetPipelineCache();
 	if (pipeline_cache.AsyncEnabled()) {
-		// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
-		// its pipeline is created; any other miss waits, counted by reason.
-		auto block = PerfStats::Counter::AsyncSkipped;
-		if (passes) {
-			block = PerfStats::Counter::AsyncBlockPasses;
-		} else if (DrawWritesAnything(state)) {
-			block = PerfStats::Counter::AsyncBlockWrites;
-		} else if (state.color_count == 0) {
-			block = PerfStats::Counter::AsyncBlockDepthOnly;
-		} else if (m_context.GetOcclusionQueries().Counting()) {
-			block = PerfStats::Counter::AsyncBlockQuery;
-		}
-		const bool may_skip = block == PerfStats::Counter::AsyncSkipped;
-		bool       missed   = false;
-		pipelines[0]        = pipeline_cache.FindGraphicsPipeline(
-            buffer, state, std::span {state.color_info, passes ? 1u : state.color_count},
-            depth_feedback, may_skip, missed);
-		if (missed && !may_skip) {
-			PerfStats::Add(block, 1);
-		}
+		const auto colors = std::span {state.color_info, passes ? 1u : state.color_count};
+		pipelines[0]      = pipeline_cache.FindGraphicsPipeline(buffer, state, colors, depth_feedback);
 		if (pipelines[0] == nullptr) {
-			PerfStats::Add(PerfStats::Counter::AsyncSkipped, 1);
-			static uint64_t last_frame = UINT64_MAX;
-			if (const auto frame = PerfStats::Frame(); frame != last_frame) {
-				last_frame = frame;
-				PerfStats::Add(PerfStats::Counter::AsyncSkipFrames, 1);
+			// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
+			// its pipeline is created; any other miss waits (below), counted by reason.
+			using PerfStats::Counter;
+			const auto block = passes                                       ? Counter::AsyncBlockPasses
+			                   : DrawWritesAnything(state)                  ? Counter::AsyncBlockWrites
+			                   : state.color_count == 0                     ? Counter::AsyncBlockDepthOnly
+			                   : m_context.GetOcclusionQueries().Counting() ? Counter::AsyncBlockQuery
+			                                                                : Counter::Count;
+			if (block != Counter::Count) {
+				PerfStats::Add(block, 1);
+			} else if (pipeline_cache.SkipMissing(buffer, state, colors, depth_feedback)) {
+				PerfStats::Add(Counter::AsyncSkipped, 1);
+				static uint64_t last_frame = UINT64_MAX;
+				if (const auto frame = pipeline_cache.Frame(); frame != last_frame) {
+					last_frame = frame;
+					PerfStats::Add(Counter::AsyncSkipFrames, 1);
+				}
+				return;
 			}
-			return;
 		}
 	}
 	for (uint32_t pass = 0; pass < pass_count; pass++) {

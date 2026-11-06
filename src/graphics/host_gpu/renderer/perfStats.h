@@ -97,6 +97,7 @@ enum class Counter : uint32_t {
 	AsyncBlockDepthOnly, // no color attachment (depth-only: later passes test or sample it)
 	AsyncBlockQuery,     // an occlusion query counts its samples
 	AsyncBlockPasses,    // aliased-target passes
+	AsyncBlockCap,       // skipped for ASYNC_PIPELINE_SKIP_FRAMES guest frames already
 	Count
 };
 
@@ -108,8 +109,6 @@ enum class Counter : uint32_t {
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
-// Guest frames counted so far (Counter::Frames, without the report resets).
-[[nodiscard]] uint64_t Frame() noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
 [[nodiscard]] bool IsGpuThread() noexcept;
