@@ -1414,7 +1414,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	// Stall only this command processor, not the host command lane or other queues.
-	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	if (m_renderer.HasVideoOut() && !m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
 	                                                 static_cast<int>(display_buffer_index))) {
 		SuspendPm4();
 	}
@@ -1771,6 +1771,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	if (!m_renderer.HasVideoOut()) return;
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);

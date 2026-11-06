@@ -15020,9 +15020,14 @@ public:
     for (const auto &record : capture.records) {
       const auto *memory = std::get_if<GpuCapture::Memory>(&record);
       const auto *zero = std::get_if<GpuCapture::Zero>(&record);
-      if (memory != nullptr || zero != nullptr) {
-        const auto address = memory != nullptr ? memory->address : zero->address;
-        const auto size = memory != nullptr ? memory->bytes.size() : zero->size;
+      const auto *update = std::get_if<GpuCapture::Update>(&record);
+      if (memory != nullptr || zero != nullptr || update != nullptr) {
+        const auto address = memory != nullptr ? memory->address
+                             : zero != nullptr ? zero->address
+                                               : update->address;
+        const auto size = memory != nullptr ? memory->bytes.size()
+                          : zero != nullptr ? zero->size
+                                            : update->bytes.size();
         const auto begin = address & ~(block - 1);
         const auto end = (address + size + block - 1) & ~(block - 1);
         Require(name, "memory range", GuestRange{begin, end - begin}.Valid(),
@@ -15057,7 +15062,11 @@ public:
       if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
         std::memcpy(reinterpret_cast<void *>(memory->address), memory->bytes.data(),
                     memory->bytes.size());
-      } else if (const auto *shader = std::get_if<GpuCapture::Shader>(&record)) {
+      }
+    }
+    // Registration reads the shader code and user data, so it follows the memory.
+    for (const auto &record : capture.records) {
+      if (const auto *shader = std::get_if<GpuCapture::Shader>(&record)) {
         static_assert(sizeof(GpuCapture::Shader::Register) == sizeof(ShaderRegister));
         ShaderMapUserData(shader->address,
             {.type = static_cast<Prospero::ShaderBinaryType>(shader->type),
@@ -15090,6 +15099,10 @@ public:
         } else {
           gpu.SubmitCompute(submit->queue, commands);
         }
+      } else if (const auto *update = std::get_if<GpuCapture::Update>(&record)) {
+        gpu.WaitForIdle();
+        std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                    update->bytes.size());
       } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
         gpu.SuspendPoint();
       }
@@ -15200,7 +15213,8 @@ public:
     auto &records = capture.records;
     records.emplace_back(GpuCapture::Memory{dcb, bytes_of(graphics)});
     records.emplace_back(GpuCapture::Memory{ib, bytes_of(indirect)});
-    records.emplace_back(GpuCapture::Memory{acb, bytes_of(compute)});
+    // The compute list is rewritten between the submissions (reused command memory).
+    records.emplace_back(GpuCapture::Memory{acb, bytes_of(write_data(labels + 12, 0x55555555u))});
     records.emplace_back(GpuCapture::Memory{code_address, bytes_of(shader)});
     records.emplace_back(GpuCapture::Memory{dma_src, dma_bytes});
     // A zero page in its own 64 KiB block: mapped and zero-filled by the replay.
@@ -15210,6 +15224,7 @@ public:
         .address = code_address, .type = static_cast<u32>(Prospero::ShaderBinaryType::kCs),
         .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
     records.emplace_back(GpuCapture::Submit{dcb, 0, static_cast<u32>(graphics.size())});
+    records.emplace_back(GpuCapture::Update{acb, bytes_of(compute)});
     records.emplace_back(GpuCapture::Submit{acb, 0x20, static_cast<u32>(compute.size())});
     records.emplace_back(GpuCapture::FrameEnd{});
     records.emplace_back(GpuCapture::Expect{labels, sizeof(label_values),

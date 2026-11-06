@@ -1167,6 +1167,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
 		uint8_t code = 0;
+		GpuCapture::Touch(address, sizeof(code));
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
@@ -1522,6 +1523,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (GpuCapture::Recording()) {
 		GpuCapture::Touch(image.info.data.address, image.info.data.size);
 		GpuCapture::Touch(image.info.stencil.address, image.info.stencil.size);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
 	}
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1559,6 +1561,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	if (GpuCapture::Recording()) {
 		GpuCapture::Touch(image.info.data.address, image.info.data.size, true);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
 	}
 	TouchImage(image);
 	image.usage.render_target = true;
@@ -1577,6 +1580,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (GpuCapture::Recording()) {
 		GpuCapture::Touch(image.info.data.address, image.info.data.size);
 		GpuCapture::Touch(desc.info.stencil.address, desc.info.stencil.size);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
 	}
 	TouchImage(image);
 	if (desc.info.HasStencil()) {

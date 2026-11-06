@@ -93,6 +93,7 @@ void PutPayload(Writer& w, const Submit& s) {
 	w.Put(s.dword_count);
 }
 void PutPayload(Writer& /*w*/, const FrameEnd& /*f*/) {}
+void PutPayload(Writer& w, const Update& u) { PutPayload(w, Memory {u.address, u.bytes}); }
 void PutPayload(Writer& w, const Zero& z) {
 	w.Put(z.address);
 	w.Put(z.size);
@@ -128,6 +129,12 @@ bool GetPayload(Reader& r, Submit& s) {
 	return r.Get(s.address) && r.Get(s.queue) && r.Get(s.dword_count) && s.address != 0 && s.dword_count != 0;
 }
 bool GetPayload(Reader& /*r*/, FrameEnd& /*f*/) { return true; }
+bool GetPayload(Reader& r, Update& u) {
+	Memory m;
+	if (!GetPayload(r, m)) return false;
+	u = {m.address, std::move(m.bytes)};
+	return true;
+}
 bool GetPayload(Reader& r, Zero& z) {
 	return r.Get(z.address) && r.Get(z.size) && z.size != 0 && z.address + z.size > z.address;
 }
@@ -230,9 +237,10 @@ struct Recorder {
 	std::unordered_set<uint64_t>               pages;   // recorded this frame
 	std::unordered_set<uint64_t>               shaders; // recorded this frame
 	std::unordered_map<uint64_t, Shader>       kept;    // every registered shader
+	std::unordered_map<uint64_t, uint64_t>     command_hashes; // command page -> XXH3 when submitted
 	std::vector<std::pair<uint64_t, uint64_t>> outputs;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
-	uint64_t          missing_shaders = 0, written = 0;
+	uint64_t          missing_shaders = 0, written = 0, updates = 0;
 	Clock::duration   touch_time {}, publish_time {};
 	Clock::time_point start;
 };
@@ -290,11 +298,8 @@ void RecordRun(Recorder& r, uint64_t begin, uint64_t end) {
 	}
 }
 
-} // namespace
-
-void TouchSlow(uint64_t address, uint64_t size, bool output) {
-	auto&            r = GetRecorder();
-	std::scoped_lock lock(r.mutex);
+// Caller holds the mutex.
+void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
 	if (!Recording() || size == 0 || address == 0) return;
 	// shortcut: ranges over 1 GiB are not recorded (bad descriptors); raise it if a game needs them.
 	if (size > (uint64_t {1} << 30u) || address + size < address) {
@@ -319,12 +324,34 @@ void TouchSlow(uint64_t address, uint64_t size, bool output) {
 	r.touch_time += Clock::now() - start;
 }
 
-void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
-	const auto address = reinterpret_cast<uint64_t>(commands.data());
-	TouchSlow(address, commands.size_bytes(), false);
+} // namespace
+
+void TouchSlow(uint64_t address, uint64_t size, bool output) {
 	auto&            r = GetRecorder();
 	std::scoped_lock lock(r.mutex);
+	TouchLocked(r, address, size, output);
+}
+
+void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
+	const auto       address = reinterpret_cast<uint64_t>(commands.data());
+	auto&            r       = GetRecorder();
+	std::scoped_lock lock(r.mutex);
 	if (!Recording()) return;
+	// Command memory reused in the frame (rings): pages changed since an earlier submission.
+	// shortcut: indirect buffers and other CPU-written ranges get no Update; add them when a replay needs it.
+	std::vector<uint8_t> page(PageSize);
+	const uint64_t       end = address + commands.size_bytes();
+	for (uint64_t p = address & ~(PageSize - 1); p < end; p += PageSize) {
+		if (!LibKernel::Memory::CopySparseMemory(p, page.data(), PageSize)) continue;
+		const auto hash          = XXH3_64bits(page.data(), PageSize);
+		const auto [it, fresh]   = r.command_hashes.try_emplace(p, hash);
+		if (!fresh && it->second != hash && r.pages.contains(p)) {
+			Write(r, Update {p, page});
+			r.updates++;
+		}
+		it->second = hash;
+	}
+	TouchLocked(r, address, commands.size_bytes(), false);
 	Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
 	r.submits++;
 }
@@ -399,10 +426,10 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 		const bool complete = r.file != nullptr && std::fclose(r.file) == 0;
 		r.file          = nullptr;
 		const auto line = fmt::format(
-		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} "
+		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} updates={} "
 		    "shaders={} missing_shaders={} expects={} publish_start_ms={:.1f} record_ms={:.1f} "
 		    "end_ms={:.1f} frame_ms={:.1f}",
-		    r.path, frame - 1, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, r.submits,
+		    r.path, frame - 1, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, r.submits, r.updates,
 		    r.shaders.size(), r.missing_shaders, expects, Ms(r.publish_time), Ms(r.touch_time),
 		    Ms(Clock::now() - end_start), Ms(end_start - r.start));
 		LOGF("%s\n", line.c_str());
@@ -430,7 +457,8 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	r.pages.clear();
 	r.shaders.clear();
 	r.outputs.clear();
-	r.stored = r.zero = r.unreadable = r.skipped = r.submits = r.missing_shaders = 0;
+	r.command_hashes.clear();
+	r.stored = r.zero = r.unreadable = r.skipped = r.submits = r.missing_shaders = r.updates = 0;
 	r.touch_time   = {};
 	r.publish_time = Clock::now() - publish_start;
 	r.start        = Clock::now();

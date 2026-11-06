@@ -59,6 +59,13 @@ struct Zero {
 	uint64_t size    = 0;
 };
 
+// Guest bytes the CPU rewrote during the frame (reused command memory), written once the GPU
+// is idle, before the next Submit.
+struct Update {
+	uint64_t             address = 0;
+	std::vector<uint8_t> bytes;
+};
+
 // XXH3-64 of guest memory after the replay.
 struct Expect {
 	uint64_t address = 0;
@@ -66,7 +73,7 @@ struct Expect {
 	uint64_t hash    = 0;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero>;
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update>;
 
 struct Capture {
 	std::vector<Record> records;
