@@ -32730,6 +32730,52 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   return test;
 }
 
+// KYTY_SPV_NONWRITABLE: v2 = buffer[0], then LDS[0] = v2, so the buffers are only read unless
+// store_result also writes v2 back to buffer[0].
+TestCase NonWritableBufferCase(bool store_result, bool enabled) {
+  using O = ShaderOpcode;
+  static constexpr ShaderProfile nonwritable_profile{.maintenance8 = true,
+                                                     .nonwritable_buffers = true};
+  TestCase test;
+  test.name = store_result ? "NonWritableSkipsWrittenBuffers"
+              : enabled    ? "NonWritableReadOnlyBuffers"
+                           : "NonWritableOffByDefault";
+  AppendVMovU32(&test.code, 1, 0);
+  AppendBufferLoadDword(&test.code, 2, 1);
+  test.code.push_back(EncodeDs0(0x0d, 0));
+  test.code.push_back(EncodeDs1(0, 2, 1));
+  if (store_result) AppendStoreVgpr(&test.code, 2, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::DS_WRITE_B32, O::S_ENDPGM};
+  test.profile = enabled ? &nonwritable_profile : &Maintenance8Profile;
+  auto &spirv = enabled && !store_result ? test.required_spirv : test.forbidden_spirv;
+  spirv = {"OpDecorate %buffers NonWritable"};
+  test.compile_only = true;
+  return test;
+}
+
+// Any written or atomic buffer or image, or a GLC/DLC access, keeps the buffer arrays writable.
+void CheckStorageBuffersReadOnly() {
+  using ShaderRecompiler::Spirv::StorageBuffersReadOnly;
+  const auto check = [](const char *what, bool expected, auto &&edit) {
+    ShaderRecompiler::IR::ShaderInfo info;
+    info.buffers.resize(2);
+    info.images.resize(2);
+    info.buffers[0].read = info.images[0].read = true;
+    edit(info);
+    Require("StorageBuffersReadOnly", what, StorageBuffersReadOnly(info) == expected,
+            expected ? "read-only program kept writable buffers"
+                     : "program with a write got NonWritable buffers");
+  };
+  check("reads only", true, [](auto &) {});
+  check("buffer store", false, [](auto &info) { info.buffers[1].written = true; });
+  check("buffer atomic", false, [](auto &info) { info.buffers[1].atomic = true; });
+  check("image store", false, [](auto &info) { info.images[1].written = true; });
+  check("image atomic", false, [](auto &info) { info.images[1].atomic = true; });
+  check("coherent access", false, [](auto &info) { info.coherent_buffers = true; });
+  std::printf("[compute] %-32s ok\n", "StorageBuffersReadOnly");
+}
+
 TestCase Vop3FloatConversions(u32 wave_size) {
   using O = ShaderOpcode;
   struct ConversionCase {
@@ -57294,6 +57340,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--nonwritable-only") == 0) {
+    CheckStorageBuffersReadOnly();
+    for (const auto [store_result, enabled] :
+         {std::pair {false, true}, std::pair {true, true}, std::pair {false, false}})
+      RunCase(nullptr, NonWritableBufferCase(store_result, enabled));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {

@@ -934,7 +934,11 @@ struct PipelineCache::ProgramCache {
 		           .storage_bounds_verify_address =
 		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u,
 		           .r8_srgb_views   = graphics.r8_srgb_views,
-		           .r8g8_srgb_views = graphics.r8g8_srgb_views} {
+		           .r8g8_srgb_views = graphics.r8g8_srgb_views,
+		           .nonwritable_buffers = [] {
+			           const char* value = std::getenv("KYTY_SPV_NONWRITABLE");
+			           return value != nullptr && std::strcmp(value, "1") == 0;
+		           }()} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {

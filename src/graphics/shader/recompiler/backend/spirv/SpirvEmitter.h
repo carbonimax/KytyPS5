@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -43,7 +44,20 @@ struct Profile {
 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;
+	// KYTY_SPV_NONWRITABLE=1: NonWritable on the storage buffers a program only reads, so the
+	// driver can load them through the scalar cache.
+	bool nonwritable_buffers = false;
 };
+
+// True when no buffer or image of `info` is written or atomically updated and no access asks for
+// GLC/DLC coherence: then a guest-memory read cannot alias a write of this shader, nor poll for one
+// from another agent, and the buffer arrays can be NonWritable. Writes by other draws or dispatches
+// are ordered by the barriers between them, which also invalidate the scalar cache.
+[[nodiscard]] inline bool StorageBuffersReadOnly(const IR::ShaderInfo& info) {
+	const auto writes = [](const auto& resource) { return resource.written || resource.atomic; };
+	return !info.coherent_buffers && std::ranges::none_of(info.buffers, writes) &&
+	       std::ranges::none_of(info.images, writes);
+}
 
 // Descriptor range of a storage binding of `range` bytes whose shader leaves loads and plain stores
 // to the device. Without 8/16-bit views every access is a whole dword, so cutting the range to

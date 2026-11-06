@@ -288,6 +288,12 @@ void DefineDescriptors(EmitterState& state) {
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
 		};
+		// Host-written tables: the shader only loads from them.
+		const auto ReadOnlyTable = [&](uint32_t variable) {
+			if (state.profile.nonwritable_buffers) {
+				state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			}
+		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
@@ -310,12 +316,16 @@ void DefineDescriptors(EmitterState& state) {
 					if (info.coherent_buffers) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 					}
+					if (state.profile.nonwritable_buffers && StorageBuffersReadOnly(info)) {
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationNonWritable);
+					}
 				}
 				break;
 			}
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
+				ReadOnlyTable(state.bda_pagetable_variable);
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
@@ -324,10 +334,12 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				ReadOnlyTable(state.shader_data_storage_variable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+				ReadOnlyTable(state.flattened_srt_variable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_type = state.builder.Type(spv::OpTypeSampler);
