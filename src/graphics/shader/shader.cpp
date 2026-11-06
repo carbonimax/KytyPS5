@@ -409,6 +409,10 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		for (const auto& in: metadata.input_semantics) {
 			attrib_count = std::max<uint32_t>(attrib_count, static_cast<uint32_t>(in.semantic) + 1u);
 		}
+		if (GpuCapture::Recording()) {
+			GpuCapture::Touch(reinterpret_cast<uint64_t>(attrib), uint64_t {attrib_count} * sizeof(uint32_t));
+			GpuCapture::Touch(reinterpret_cast<uint64_t>(buffer), sizeof(buffer_copy));
+		}
 		if (backing_reads && GuestGpu::IsGpuThread() && attrib_count <= attrib_copy.size()) {
 			const auto read_table = [](const uint32_t* table, uint32_t* out, uint32_t dwords) {
 				const auto address = reinterpret_cast<uint64_t>(table);

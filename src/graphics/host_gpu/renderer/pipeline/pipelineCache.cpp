@@ -151,6 +151,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	GpuCapture::Touch(address, values.size_bytes());
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
