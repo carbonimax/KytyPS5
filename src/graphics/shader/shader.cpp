@@ -33,6 +33,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -80,6 +81,29 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
 	return static_cast<uint32_t>(end);
 }
 
+// KYTY_SHADER_DUMP=<dir> (diagnostic, default off): each binary registered with a new hash is
+// written once as <dir>/<hash>_<type>_<hashed words>.bin, whole (footer included).
+static void DumpRegisteredShader(const uint32_t* binary, const ShaderMappedData& data, uint32_t hashed_words,
+                                 uint64_t hash) {
+	static const char* dir = std::getenv("KYTY_SHADER_DUMP");
+	if (dir == nullptr || dir[0] == 0) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> written;
+	std::scoped_lock                    lock(mutex);
+	if (!written.insert(hash).second) {
+		return;
+	}
+	char path[1024];
+	std::snprintf(path, sizeof(path), "%s/%016" PRIx64 "_%u_%u.bin", dir, hash,
+	              static_cast<uint32_t>(data.type), hashed_words);
+	if (std::FILE* file = std::fopen(path, "wb"); file != nullptr) {
+		std::fwrite(binary, 1, data.code_size_bytes, file);
+		std::fclose(file);
+	}
+}
+
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 
@@ -97,6 +121,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		                          static_cast<uint32_t>(data.type), mapped.code_size_bytes / 4u);
 	}
 	// Pretranslation keys on the same code size as translation.
+	DumpRegisteredShader(binary, data, mapped.code_size_bytes / 4u, hash);
 	ShaderPretranslate::OnShaderRegistered(addr, hash, mapped);
 	// The register pointers are only valid during this call.
 	mapped.cx_registers = mapped.sh_registers = nullptr;
