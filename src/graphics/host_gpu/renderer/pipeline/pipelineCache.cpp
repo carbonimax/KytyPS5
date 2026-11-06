@@ -56,6 +56,8 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Upstream uses 1 minute; here each vkGetPipelineCacheData stalls rendering 0.3-1 s in the driver,
+// even off the creating thread, so keep the previous 5 minutes.
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
@@ -997,11 +999,6 @@ struct PipelineCache::ParallelPool {
 	uint64_t ready      = 0;
 	uint64_t waited     = 0;
 	uint64_t taken      = 0;
-
-	[[nodiscard]] bool Busy() {
-		std::scoped_lock lock(mutex);
-		return running != 0 || !queue.empty();
-	}
 };
 
 static uint32_t ParallelWorkers() {
@@ -1017,6 +1014,16 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	m_cache_writer = std::jthread([this](std::stop_token stop) {
+		std::unique_lock lock(m_cache_write_mutex);
+		// Once stop is requested, a queued write still runs, then the wait returns false.
+		while (m_cache_write_ready.wait(lock, stop, [this] { return m_cache_write_queued; })) {
+			m_cache_write_queued = false;
+			lock.unlock();
+			WriteDriverCache();
+			lock.lock();
+		}
+	});
 	if (const auto workers = ParallelWorkers(); workers != 0) {
 		m_pool = std::make_unique<ParallelPool>();
 		for (uint32_t i = 0; i < workers; i++) {
@@ -1505,10 +1512,19 @@ void PipelineCache::CheckpointDriverCache(PipelineCacheFeedback feedback) {
 		return;
 	}
 	m_driver_cache_dirty = true;
-	// Not while workers create pipelines with it: the next creation saves.
-	if (std::chrono::steady_clock::now() >= m_next_driver_cache_save &&
-	    (m_pool == nullptr || !m_pool->Busy())) {
-		Save();
+	if (!m_cache_writer.joinable()) {
+		return; // stopped by Save(): the next Save() writes it
+	}
+	// The driver cache is internally synchronized (not EXTERNALLY_SYNCHRONIZED): the writer may
+	// serialize it while workers and this thread create pipelines.
+	if (const auto now = std::chrono::steady_clock::now(); now >= m_next_driver_cache_save) {
+		m_driver_cache_dirty     = false;
+		m_next_driver_cache_save = now + DriverCacheSaveInterval;
+		{
+			std::scoped_lock lock(m_cache_write_mutex);
+			m_cache_write_queued = true;
+		}
+		m_cache_write_ready.notify_one();
 	}
 }
 
@@ -1533,11 +1549,20 @@ void PipelineCache::Save() {
 		                 m_pool->prefetched, m_pool->ready + m_pool->waited + m_pool->taken,
 		                 m_pool->ready, m_pool->waited, m_pool->taken, unused);
 	}
+	// Then the writer: a write it runs finishes first, so the write below is the newest.
+	if (m_cache_writer.joinable()) {
+		m_cache_writer.request_stop();
+		m_cache_writer.join();
+	}
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
-	m_next_driver_cache_save = std::chrono::steady_clock::now() + DriverCacheSaveInterval;
-	const auto save_start    = std::chrono::steady_clock::now();
+	m_driver_cache_dirty = false;
+	WriteDriverCache();
+}
+
+void PipelineCache::WriteDriverCache() {
+	const auto save_start = std::chrono::steady_clock::now();
 	const auto elapsed_ms    = [&save_start] {
 		return std::chrono::duration_cast<std::chrono::milliseconds>(
 		           std::chrono::steady_clock::now() - save_start)
@@ -1572,7 +1597,6 @@ void PipelineCache::Save() {
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	if (payload_hash == m_saved_payload_hash) {
 		// Pipelines that hit the driver cache do not change its data: skip rewriting an identical file.
-		m_driver_cache_dirty = false;
 		PipelineCacheLog("Vulkan pipeline cache: unchanged {:.2f} MB (get {} ms, total {} ms)",
 		                 static_cast<double>(payload.size()) / 1'000'000.0, get_ms, elapsed_ms());
 		return;
@@ -1603,7 +1627,6 @@ void PipelineCache::Save() {
 	                 static_cast<double>(payload.size()) / 1'000'000.0,
 	                 Common::PathToString(m_driver_cache_path), get_ms, elapsed_ms());
 	m_saved_payload_hash = payload_hash;
-	m_driver_cache_dirty = false;
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state,

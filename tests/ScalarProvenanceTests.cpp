@@ -960,6 +960,21 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestSignedMinMaxFolding() {
+  Fixture fixture;
+  const auto low =
+      fixture.Emit(ValueOpcode::SMin32, {Value(0xfffffffeu), Value(3u)});
+  const auto high =
+      fixture.Emit(ValueOpcode::SMax32, {low, Value(0xffffffffu)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {high});
+
+  ConstantPropagationPass(fixture.program.blocks);
+
+  Check(fixture.BlockAt().Instructions().back().Arg(0).Resolve() ==
+            Value(0xffffffffu),
+        "signed min/max constant folding regressed");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -1046,17 +1061,11 @@ void TestUndefinedRuntimeValueFails() {
 
 namespace Common {
 
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
+void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
-int DbgExitHandler(const char *, int, std::string_view text) {
+void DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
-
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
-  throw std::runtime_error(std::string(text));
-}
-
-void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
@@ -1082,6 +1091,7 @@ int main() {
     TestReadLaneElimination();
     TestCompleteWaveReduction();
     TestOptimizationPipeline();
+    TestSignedMinMaxFolding();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();

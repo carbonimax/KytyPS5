@@ -115,7 +115,6 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 
 	uint32_t      elapsed = 0;
 	Common::Timer t;
-	t.Start();
 
 	auto update_timeout = [&]() {
 		if (ptr_micros != nullptr) {

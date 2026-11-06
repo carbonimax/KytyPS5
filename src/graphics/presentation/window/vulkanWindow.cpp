@@ -6,7 +6,6 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -39,8 +38,6 @@
 #include <vulkan/vk_platform.h>
 
 // IWYU pragma: no_include <intrin.h>
-
-#define KYTY_ENABLE_DEBUG_PRINTF
 
 namespace Libs::Graphics {
 
@@ -133,14 +130,9 @@ static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::Surfa
 	EXIT_NOT_IMPLEMENTED(r.present_modes.empty());
 }
 
-static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
+static bool CheckFormat(vk::PhysicalDevice device, vk::Format format,
                         vk::FormatFeatureFlags features) {
-	vk::FormatProperties format_props {};
-	device.getFormatProperties(format, &format_props);
-
-	const auto supported_features =
-	    (tile ? format_props.optimalTilingFeatures : format_props.linearTilingFeatures);
-	return (supported_features & features) == features;
+	return (device.getFormatProperties(format).optimalTilingFeatures & features) == features;
 }
 
 static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR surface) {
@@ -175,7 +167,6 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
                                      const std::vector<const char*>& device_extensions,
-                                     SurfaceCapabilities&            out_capabilities,
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
                                      std::string& out_rejections) {
 	EXIT_IF(instance == nullptr);
@@ -198,9 +189,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		devices = {headset}; // The headset runtime renders on this GPU.
 	}
 
-	vk::PhysicalDevice  best_device       = nullptr;
-	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
-	SurfaceCapabilities best_capabilities;
+	vk::PhysicalDevice best_device       = nullptr;
+	uint32_t           best_queue_family = static_cast<uint32_t>(-1);
 
 	for (const auto& device: devices) {
 		bool skip_device = false;
@@ -235,15 +225,13 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		vk::PhysicalDeviceVulkan13Features features13 {};
 
-		vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 		vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
 		const bool min_lod_requested = HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
-		if (min_lod_requested) {
-			color_write_ext.pNext = &image_view_min_lod;
-		}
 
 		vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
-		depth_clip_enable.pNext = &color_write_ext;
+		if (min_lod_requested) {
+			depth_clip_enable.pNext = &image_view_min_lod;
+		}
 
 		vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 		depth_clip_control.pNext = &depth_clip_enable;
@@ -280,13 +268,6 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
-#if defined(__APPLE__)
-		if (color_write_ext.colorWriteEnable != VK_TRUE) {
-			LOGF("colorWriteEnable is not supported\n");
-		}
-#else
-		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
-#endif
 #if !defined(__APPLE__)
 		if (min_lod_requested) {
 			check_feature(image_view_min_lod.minLod, "image view minLod");
@@ -405,7 +386,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		const auto check_format = [&](vk::Format format, vk::FormatFeatureFlags features,
 		                              const char* usage) {
-			if (!skip_device && !CheckFormat(device, format, true, features)) {
+			if (!skip_device && !CheckFormat(device, format, features)) {
 				reject(fmt::format("Format vk::Format::e{} cannot be used as {}",
 				                   vk::to_string(format), usage));
 			}
@@ -425,16 +406,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_format(vk::Format::eR8Unorm, texture_features, "texture");
 		check_format(vk::Format::eR8G8Unorm, texture_features, "texture");
 
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eR8G8B8A8Unorm, storage_features, "storage image");
-		}
-
-		if (!skip_device &&
-		    !CheckFormat(device, vk::Format::eB8G8R8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as storage image\n");
-			check_format(vk::Format::eB8G8R8A8Unorm, storage_features, "storage image");
+		for (const auto [srgb, unorm]:
+		     {std::pair {vk::Format::eR8G8B8A8Srgb, vk::Format::eR8G8B8A8Unorm},
+		      std::pair {vk::Format::eB8G8R8A8Srgb, vk::Format::eB8G8R8A8Unorm}}) {
+			if (!skip_device && !CheckFormat(device, srgb, storage_features)) {
+				LOGF("Format vk::Format::e%s cannot be used as storage image\n",
+				     vk::to_string(srgb).c_str());
+				check_format(unorm, storage_features, "storage image");
+			}
 		}
 
 		if (!skip_device && device_properties.limits.maxSamplerAnisotropy < 16.0f) {
@@ -449,15 +428,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
 			best_device       = device;
 			best_queue_family = queue_family;
-			best_capabilities = std::move(candidate_capabilities);
 		}
 	}
 
 	out_device       = best_device;
 	out_queue_family = best_queue_family;
-	if (best_device != nullptr) {
-		out_capabilities = std::move(best_capabilities);
-	}
 }
 
 // KYTY_BOUNDS_MODE: 0 = shader checks (branch around every storage buffer access), 1 (default) =
@@ -535,11 +510,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		LOGF("Vulkan readback queue: family %d\n", static_cast<int>(chosen));
 	}
 
-	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
-	color_write_ext.colorWriteEnable = VK_TRUE;
-
 	vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip_enable {};
-	depth_clip_enable.pNext = &color_write_ext;
 	depth_clip_enable.depthClipEnable = VK_TRUE;
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
@@ -555,9 +526,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		graphics.image_view_min_lod_enabled = supported_min_lod.minLod == VK_TRUE;
 		depth_clip_control.pNext = &image_view_min_lod;
 	}
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
-	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
+	// MoltenVK lacks VK_EXT_depth_clip_enable, so drop its feature struct from the chain on
+	// macOS (the renderer falls back to default depth clipping).
 #if !defined(__APPLE__)
 	image_view_min_lod.pNext = &depth_clip_enable;
 #endif
@@ -649,6 +619,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.sampler_filter_minmax_enabled      = supported_features12.samplerFilterMinmax;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -658,6 +629,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	workgroup_layout.pNext = &depth_clip_control;
 	features12.pNext = workgroup_layout_extension ? static_cast<void*>(&workgroup_layout)
 	                                             : static_cast<void*>(&depth_clip_control);
+	features12.samplerFilterMinmax = supported_features12.samplerFilterMinmax;
 	auto features11 = WindowContext::RequiredVulkan11Features();
 	features11.pNext = features12.pNext;
 	features12.pNext = &features11;
@@ -1025,8 +997,8 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	}
 
 	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		EXIT("[Vulkan][%s][%u]: %s\n", severity_str, static_cast<uint32_t>(message_types),
+		     callback_data->pMessage);
 	}
 
 	if (!skip) {
@@ -1107,16 +1079,11 @@ void WindowContext::CreateVulkan() {
 		EXIT("--spirv-debug-printf and --gpu-assisted-validation are mutually exclusive\n");
 	}
 
-	vk::ValidationFeatureEnableEXT enabled_features[3]    = {};
+	vk::ValidationFeatureEnableEXT enabled_features[2]    = {};
 	uint32_t                       enabled_features_count = 0;
-#ifdef KYTY_ENABLE_BEST_PRACTICES
-	enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eBestPractices;
-#endif
-#ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eDebugPrintf;
 	}
-#endif
 	if (Config::GpuAssistedValidationEnabled()) {
 		enabled_features[enabled_features_count++] = vk::ValidationFeatureEnableEXT::eGpuAssisted;
 		LOGF("Vulkan GPU-assisted validation is enabled; expect a large slowdown\n");
@@ -1207,23 +1174,19 @@ void WindowContext::CreateVulkan() {
 #endif
 
 #if defined(__APPLE__)
-	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
-	// falls back to default depth clipping and static color-write masks on macOS. It also
-	// requires VK_KHR_portability_subset per the Vulkan portability spec.
+	// MoltenVK lacks VK_EXT_depth_clip_enable; the renderer falls back to default depth clipping
+	// on macOS. It also requires VK_KHR_portability_subset per the Vulkan portability spec.
 	device_extensions.push_back("VK_KHR_portability_subset");
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 #endif
 
-#ifdef KYTY_ENABLE_DEBUG_PRINTF
 	if (Config::SpirvDebugPrintfEnabled()) {
 		device_extensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
 	}
-#endif
 
 	std::string rejected_devices;
-	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
+	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions,
 	                         graphic_ctx.physical_device, graphic_ctx.queue_family,
 	                         rejected_devices);
 

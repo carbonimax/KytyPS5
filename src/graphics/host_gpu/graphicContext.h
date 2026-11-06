@@ -48,6 +48,7 @@ struct GraphicContext {
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
 	bool                               conditional_rendering_enabled         = false;
+	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
@@ -84,11 +85,6 @@ struct GraphicContext {
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
-	}
-
-	[[nodiscard]] const vk::PhysicalDeviceMemoryProperties&
-	GetPhysicalDeviceMemoryProperties() const {
-		return physical_device_memory_properties;
 	}
 
 	[[nodiscard]] vk::FormatProperties GetFormatProperties(vk::Format format) const {

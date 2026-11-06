@@ -487,6 +487,10 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	// REPORT_AND_RESET or FORCE_RESET: the counting starts anew after this report.
 	const bool reset = (buffer[3] & 0x000c0000u) != 0;
 
+	if (Config::LodStatsEnabled()) {
+		cp.GetLodStats(static_cast<volatile uint32_t*>(dst), buffer_size, reset);
+		return 4;
+	}
 	if (dst != nullptr && buffer_size != 0) {
 		MipStats::Report(dst, buffer_size, reset);
 	}
@@ -2161,8 +2165,9 @@ static constexpr auto MakeShaderIndirectTable() {
 	                             Pm4::SPI_SHADER_PACE_ID_PS, Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS}) {
 		table[cmd_offset] = IgnoreRegister;
 	}
-	// GS-front allocation metadata; the native GS resource registers already carry it.
+	// GS- and HS-front allocation metadata; the fused GS and HS resource registers carry it.
 	table[0x0ca] = IgnoreRegister;
+	table[0x14a] = IgnoreRegister;
 
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		table[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_REG_ARGS) {
