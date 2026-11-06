@@ -64,6 +64,7 @@ private:
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
+		bool                      started         = false;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;

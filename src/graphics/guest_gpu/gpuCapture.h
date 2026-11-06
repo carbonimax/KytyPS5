@@ -1,7 +1,9 @@
 #ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_GPUCAPTURE_H_
 #define EMULATOR_SRC_GRAPHICS_GUEST_GPU_GPUCAPTURE_H_
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -51,6 +53,12 @@ struct Submit {
 // Frame boundary (GuestGpu::SuspendPoint).
 struct FrameEnd {};
 
+// Zero-filled guest bytes (zero pages are not stored as Memory).
+struct Zero {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
 // XXH3-64 of guest memory after the replay.
 struct Expect {
 	uint64_t address = 0;
@@ -58,15 +66,41 @@ struct Expect {
 	uint64_t hash    = 0;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect>;
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero>;
 
 struct Capture {
 	std::vector<Record> records;
 };
 
 [[nodiscard]] std::vector<uint8_t> Serialize(const Capture& capture);
+// Streaming form of Serialize: the header, then each record appended to `out`.
+void SerializeHeader(std::vector<uint8_t>& out);
+void SerializeRecord(std::vector<uint8_t>& out, const Record& record);
 // nullopt and an error message on a malformed or unsupported file.
 [[nodiscard]] std::optional<Capture> Parse(std::span<const uint8_t> file, std::string* error);
+
+// Recording in the emulator. KYTY_GPU_CAPTURE=<dir> enables it (off by default); it records GPU
+// frame KYTY_GPU_CAPTURE_FRAME=N (suspend points processed before it) and the frame after each
+// <dir>/trigger file appears, to <dir>/frame_<N>.kygpucap. Guest bytes are recorded at their first use
+// in the frame; GPU-resident data is published to guest memory when recording starts.
+extern const bool       g_enabled;
+extern std::atomic_bool g_recording;
+inline bool             Enabled() noexcept { return g_enabled; }
+inline bool             Recording() noexcept { return g_recording.load(std::memory_order_relaxed); }
+void                    TouchSlow(uint64_t address, uint64_t size, bool output);
+// Guest bytes the GPU side is about to use; `output` ranges are hashed at the frame end (Expect).
+inline void Touch(uint64_t address, uint64_t size, bool output = false) {
+	if (Recording()) TouchSlow(address, size, output);
+}
+// While Recording(): a submission's first slice (queue as in Submit).
+void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue);
+// While Enabled(): ShaderMapUserData keeps the register defaults, only valid during that call.
+void KeepShader(Shader shader);
+// While Recording(): a shader-map lookup; records the shader and its guest data once per frame.
+void UseShader(uint64_t address);
+// GPU thread, at each processed suspend point while Enabled(). `publish_gpu_data` writes
+// GPU-resident data back to guest memory.
+void FrameBoundary(const std::function<void()>& publish_gpu_data);
 
 } // namespace Libs::Graphics::GpuCapture
 

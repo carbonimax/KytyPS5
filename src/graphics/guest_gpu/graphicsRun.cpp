@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
@@ -893,6 +894,15 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
 
+	if (!submission.started) {
+		submission.started = true;
+		if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
+			GpuCapture::RecordSubmit(submission.commands, submission.queue_id == 0
+			                                                  ? 0
+			                                                  : ComputeQueueBase + submission.queue_id - 1);
+		}
+	}
+
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
 	FlushBatchedUploads();
@@ -920,6 +930,12 @@ bool GuestGpu::Process(Submission& submission) {
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
+			if (GpuCapture::Enabled()) {
+				GpuCapture::FrameBoundary([this] {
+					m_renderer.GetTextureCache().DownloadGpuModified();
+					m_renderer.GetBufferCache().ReadGpuModified();
+				});
+			}
 			break;
 	}
 
@@ -953,6 +969,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }
@@ -1293,6 +1310,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
@@ -1303,6 +1321,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	auto&      executor  = m_renderer.GetRenderExecutor();
 	const auto args_addr = m_draw_indirect_args_base_addr + data_offset;
+	GpuCapture::Touch(args_addr, uint64_t {draw_count} * stride_in_bytes);
 	struct IndirectScope {
 		IndirectScope() { CpSplitProf::SetIndirect(true); }
 		~IndirectScope() { CpSplitProf::SetIndirect(false); }
@@ -1372,6 +1391,7 @@ void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
+	GpuCapture::Touch(args_addr, sizeof(vk::DispatchIndirectCommand));
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		DispatchDirect(args->x, args->y, args->z, mode);

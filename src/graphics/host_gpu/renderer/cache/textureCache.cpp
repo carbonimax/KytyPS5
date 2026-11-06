@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -1518,6 +1519,10 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size);
+		GpuCapture::Touch(image.info.stencil.address, image.info.stencil.size);
+	}
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -1552,6 +1557,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size, true);
+	}
 	TouchImage(image);
 	image.usage.render_target = true;
 	RefreshImage(id);
@@ -1565,6 +1573,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	}
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size);
+		GpuCapture::Touch(desc.info.stencil.address, desc.info.stencil.size);
 	}
 	TouchImage(image);
 	if (desc.info.HasStencil()) {
@@ -2116,6 +2128,31 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+}
+
+void TextureCache::DownloadGpuModified() {
+	std::vector<ImageId> ids;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto limit = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size();
+		m_slot_images.ForEach([&](ImageId id, Image& image) {
+			if (image.registered && image.IsGpuModified() && image.info.data.size <= limit) {
+				ids.push_back(id);
+			}
+		});
+	}
+	// One image at a time: the download buffer is reused.
+	for (const auto id: ids) {
+		bool downloaded = false;
+		{
+			std::scoped_lock lock {m_lock};
+			downloaded = DownloadImageMemory(id);
+		}
+		if (downloaded) {
+			m_scheduler.Finish();
+			m_scheduler.WaitPriorityOperations(m_scheduler.CurrentTick() - 1);
+		}
 	}
 }
 

@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/host_gpu/renderer/mipStats.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -575,6 +576,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
+	GpuCapture::Touch(addr, sizeof(uint32_t));
 	if (EopAtGpu::ReadFront32(reinterpret_cast<const volatile uint32_t*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
@@ -605,6 +607,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
 	if (TestWaitRegMemValue(EopAtGpu::ReadFront64(compare_addr), reference, mask, function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
@@ -981,6 +984,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1050,6 +1054,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1103,6 +1108,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	    reinterpret_cast<uint32_t*>((static_cast<uint64_t>(buffer[0]) & 0xfffffffcu) |
 	                                (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t indirect_num_dw = buffer[3] & 0x3fffu;
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(indirect_buffer), uint64_t {indirect_num_dw} * 8u);
 
 	if (indirect_num_dw == 0) {
 		return KYTY_PM4_LEN(cmd_id) - 1u;
@@ -1345,6 +1351,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);
 
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(addr), sizeof(T));
 	cp.WaitRegMem(ctrl & 0x7u, addr, ref, mask, CpOpWaitRegMemWaitOp<T>(ctrl));
 
 	return payload_dw;

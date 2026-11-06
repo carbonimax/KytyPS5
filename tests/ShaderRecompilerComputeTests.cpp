@@ -15018,9 +15018,13 @@ public:
     constexpr uint64_t block = 0x10000;
     std::vector<std::pair<uint64_t, uint64_t>> blocks;
     for (const auto &record : capture.records) {
-      if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
-        const auto begin = memory->address & ~(block - 1);
-        const auto end = (memory->address + memory->bytes.size() + block - 1) & ~(block - 1);
+      const auto *memory = std::get_if<GpuCapture::Memory>(&record);
+      const auto *zero = std::get_if<GpuCapture::Zero>(&record);
+      if (memory != nullptr || zero != nullptr) {
+        const auto address = memory != nullptr ? memory->address : zero->address;
+        const auto size = memory != nullptr ? memory->bytes.size() : zero->size;
+        const auto begin = address & ~(block - 1);
+        const auto end = (address + size + block - 1) & ~(block - 1);
         Require(name, "memory range", GuestRange{begin, end - begin}.Valid(),
                 "capture memory is outside the guest address space");
         blocks.emplace_back(begin, end);
@@ -15095,6 +15099,11 @@ public:
     gpu.SendCommandSync([&] {
       scheduler.Finish();
       scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    // Outputs are published as the capture published them.
+    gpu.SendCommandSync([&] {
+      context.GetTextureCache().DownloadGpuModified();
+      context.GetBufferCache().ReadGpuModified();
     });
     uint32_t mismatches = 0;
     for (const auto &record : capture.records) {
@@ -15194,6 +15203,9 @@ public:
     records.emplace_back(GpuCapture::Memory{acb, bytes_of(compute)});
     records.emplace_back(GpuCapture::Memory{code_address, bytes_of(shader)});
     records.emplace_back(GpuCapture::Memory{dma_src, dma_bytes});
+    // A zero page in its own 64 KiB block: mapped and zero-filled by the replay.
+    constexpr uint64_t zero_page = base + 0x20000;
+    records.emplace_back(GpuCapture::Zero{zero_page, 0x1000});
     records.emplace_back(GpuCapture::Shader{
         .address = code_address, .type = static_cast<u32>(Prospero::ShaderBinaryType::kCs),
         .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
@@ -15204,6 +15216,8 @@ public:
                                             XXH3_64bits(label_values.data(), sizeof(label_values))});
     records.emplace_back(GpuCapture::Expect{dma_dst, dma_bytes.size(),
                                             XXH3_64bits(dma_bytes.data(), dma_bytes.size())});
+    const std::vector<uint8_t> zeros(0x1000);
+    records.emplace_back(GpuCapture::Expect{zero_page, zeros.size(), XXH3_64bits(zeros.data(), zeros.size())});
     records.emplace_back(GpuCapture::Expect{output, sizeof(stored), XXH3_64bits(&stored, sizeof(stored))});
 
     // The file format round-trips and rejects damaged or unknown files.
@@ -15227,6 +15241,35 @@ public:
     Require(name, "mismatch detected", ReplayGpuCapture(name, wrong) == 1,
             "a wrong expected hash was not reported");
     std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // --gpu-replay <file>: replays a local capture (KYTY_GPU_CAPTURE); 0 when every Expect matches.
+  int ReplayGpuCaptureFile(const char *path) {
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> file;
+    if (FILE *f = std::fopen(path, "rb")) {
+      std::vector<uint8_t> chunk(64u << 20u);
+      for (size_t n; (n = std::fread(chunk.data(), 1, chunk.size(), f)) != 0;) {
+        file.insert(file.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
+      }
+      std::fclose(f);
+    }
+    std::string error;
+    auto capture = GpuCapture::Parse(file, &error);
+    Require("GpuReplay", "parse", capture.has_value(), std::string(path) + ": " + error);
+    file = {};
+    uint64_t memory = 0, expects = 0, submits = 0;
+    for (const auto &record : capture->records) {
+      if (const auto *m = std::get_if<GpuCapture::Memory>(&record)) memory += m->bytes.size();
+      expects += std::holds_alternative<GpuCapture::Expect>(record) ? 1 : 0;
+      submits += std::holds_alternative<GpuCapture::Submit>(record) ? 1 : 0;
+    }
+    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture);
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
+                " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
+                path, capture->records.size(), memory, submits, expects, mismatches, ms);
+    return mismatches == 0 ? 0 : 1;
   }
 
   void CheckSampledDccClear() {
@@ -57864,6 +57907,10 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCaptureReplay();
     return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--gpu-replay") == 0) {
+    VulkanHarness vulkan;
+    return vulkan.ReplayGpuCaptureFile(argv[2]);
   }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
     VulkanHarness vulkan;

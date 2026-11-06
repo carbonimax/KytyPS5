@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -1068,6 +1069,7 @@ void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	GpuCapture::Touch(vaddr, size);
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -1446,6 +1448,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	GpuCapture::Touch(vaddr, size, is_written);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -1607,6 +1610,19 @@ void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 			checked.Subtract(vaddr, size);
 			m_color_metadata_epoch.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+}
+
+void BufferCache::ReadGpuModified() {
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	for (const auto& [vaddr, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		if (IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			dirty.emplace_back(buffer.CpuAddress(), buffer.Size());
+		}
+	}
+	for (const auto& [vaddr, size]: dirty) {
+		ReadMemory(vaddr, size);
 	}
 }
 
