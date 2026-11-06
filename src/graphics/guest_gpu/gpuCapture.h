@@ -18,7 +18,7 @@
 // 8 bytes}. A reader rejects an unknown version, record type or flag.
 namespace Libs::Graphics::GpuCapture {
 
-constexpr uint32_t Version = 1;
+constexpr uint32_t Version = 2;
 
 // Guest bytes at an address, restored before the first submission.
 struct Memory {
@@ -59,10 +59,12 @@ struct Zero {
 	uint64_t size    = 0;
 };
 
-// Guest bytes the CPU rewrote during the frame (reused rings). The Update records that follow a
-// Submit are written once the GPU is idle, before that Submit.
+// Guest bytes the CPU rewrote during the frame (reused rings), seen while the GPU processed
+// submission `submit` (0-based index of its Submit record in the frame). Replay writes them, GPU
+// idle, right before that Submit.
 struct Update {
 	uint64_t             address = 0;
+	uint32_t             submit  = 0;
 	std::vector<uint8_t> bytes;
 };
 
@@ -99,8 +101,12 @@ void                    TouchSlow(uint64_t address, uint64_t size, bool output);
 inline void Touch(uint64_t address, uint64_t size, bool output = false) {
 	if (Recording()) TouchSlow(address, size, output);
 }
-// While Recording(): a submission's first slice (queue as in Submit).
-void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue);
+// While Recording(): a submission's first slice (queue as in Submit); returns its Submit index
+// (UINT32_MAX when recording stopped meanwhile).
+uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue);
+// While Recording(): a later slice of the submission RecordSubmit numbered `index`; the Updates seen
+// until the next slice belong to it.
+void ResumeSubmit(uint32_t index);
 // While Enabled(): ShaderMapUserData keeps the register defaults, only valid during that call.
 void KeepShader(Shader shader);
 // While Recording(): a shader-map lookup; records the shader and its guest data once per frame.

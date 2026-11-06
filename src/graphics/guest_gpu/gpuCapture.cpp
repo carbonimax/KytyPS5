@@ -93,7 +93,11 @@ void PutPayload(Writer& w, const Submit& s) {
 	w.Put(s.dword_count);
 }
 void PutPayload(Writer& /*w*/, const FrameEnd& /*f*/) {}
-void PutPayload(Writer& w, const Update& u) { PutPayload(w, Memory {u.address, u.bytes}); }
+void PutPayload(Writer& w, const Update& u) {
+	w.Put(u.submit);
+	w.Put<uint32_t>(0);
+	PutPayload(w, Memory {u.address, u.bytes});
+}
 void PutPayload(Writer& w, const Zero& z) {
 	w.Put(z.address);
 	w.Put(z.size);
@@ -130,9 +134,11 @@ bool GetPayload(Reader& r, Submit& s) {
 }
 bool GetPayload(Reader& /*r*/, FrameEnd& /*f*/) { return true; }
 bool GetPayload(Reader& r, Update& u) {
-	Memory m;
-	if (!GetPayload(r, m)) return false;
-	u = {m.address, std::move(m.bytes)};
+	uint32_t reserved = 0;
+	Memory   m;
+	if (!r.Get(u.submit) || !r.Get(reserved) || reserved != 0 || !GetPayload(r, m)) return false;
+	u.address = m.address;
+	u.bytes   = std::move(m.bytes);
 	return true;
 }
 bool GetPayload(Reader& r, Zero& z) {
@@ -240,6 +246,7 @@ struct Recorder {
 	std::vector<std::pair<uint64_t, uint64_t>> outputs;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
 	uint64_t          missing_shaders = 0, written = 0, updates = 0;
+	uint32_t          current = 0; // Submit index of the slice being processed
 	Clock::duration   touch_time {}, publish_time {};
 	Clock::time_point start;
 };
@@ -328,7 +335,7 @@ void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
 					const auto hash = XXH3_64bits(bytes.data(), PageSize);
 					if (hash != it->second) {
 						it->second = hash;
-						Write(r, Update {page, bytes});
+						Write(r, Update {page, r.current, bytes});
 						r.updates++;
 					}
 				}
@@ -353,15 +360,24 @@ void TouchSlow(uint64_t address, uint64_t size, bool output) {
 	TouchLocked(r, address, size, output);
 }
 
-void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
+uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
 	const auto       address = reinterpret_cast<uint64_t>(commands.data());
 	auto&            r       = GetRecorder();
 	std::scoped_lock lock(r.mutex);
-	if (!Recording()) return;
+	if (!Recording()) return UINT32_MAX;
 	Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
-	r.submits++;
-	// After the Submit: Updates of reused command memory are written before it.
+	r.current = static_cast<uint32_t>(r.submits++);
+	// Updates of reused command memory belong to this Submit.
 	TouchLocked(r, address, commands.size_bytes(), false);
+	return r.current;
+}
+
+void ResumeSubmit(uint32_t index) {
+	auto&            r = GetRecorder();
+	std::scoped_lock lock(r.mutex);
+	// shortcut: an index from an earlier recorded frame is taken as this frame's when it is in range;
+	// only back-to-back captured frames can hit it, tag indices with the frame if they are needed.
+	if (index < r.submits) r.current = index;
 }
 
 void KeepShader(Shader shader) {
@@ -466,6 +482,7 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	r.shaders.clear();
 	r.outputs.clear();
 	r.stored = r.zero = r.unreadable = r.skipped = r.submits = r.missing_shaders = r.updates = 0;
+	r.current = 0;
 	r.touch_time   = {};
 	r.publish_time = Clock::now() - publish_start;
 	r.start        = Clock::now();

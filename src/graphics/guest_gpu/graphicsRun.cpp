@@ -912,17 +912,18 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	auto& cp = GetProcessor(submission.queue_id);
 
-	if (!submission.started) {
-		submission.started = true;
-		if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
-			GpuCapture::RecordSubmit(submission.commands, submission.queue_id == 0
-			                                                  ? 0
-			                                                  : ComputeQueueBase + submission.queue_id - 1);
-		}
-	}
-
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
+	// After the drain: the previous slice's guest reads are attributed to its own submission.
+	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
+		if (!submission.started) {
+			submission.capture_submit = GpuCapture::RecordSubmit(
+			    submission.commands, submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1);
+		} else if (submission.capture_submit != UINT32_MAX) {
+			GpuCapture::ResumeSubmit(submission.capture_submit);
+		}
+	}
+	submission.started = true;
 	FlushBatchedUploads();
 	cp.BufferInit();
 	bool complete = true;

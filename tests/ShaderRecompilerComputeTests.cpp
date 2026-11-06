@@ -15090,26 +15090,29 @@ public:
       context.MapMemory(begin, end - begin);
     }
     auto &gpu = context.GetGpu();
-    const auto &records = capture.records;
+    // Updates by the submission that saw them (Submit index; a file holds one frame), in file order.
+    std::vector<std::vector<const GpuCapture::Update *>> updates;
+    for (const auto &record : capture.records) {
+      if (std::holds_alternative<GpuCapture::Submit>(record)) {
+        updates.emplace_back();
+      } else if (const auto *update = std::get_if<GpuCapture::Update>(&record)) {
+        Require(name, "update submission", update->submit < updates.size(),
+                "an update names a submission not recorded before it");
+        updates[update->submit].push_back(update);
+      }
+    }
     // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle.
-    // shortcut: Updates are then written while earlier work may still run; order them per queue if that corrupts a replay.
+    // shortcut: Updates are then written while earlier work may still run (no WaitValue breaker yet).
     constexpr uint32_t idle_timeout_ms = 1000;
     uint32_t busy = 0;
-    for (size_t i = 0; i < records.size(); i++) {
-      const auto &record = records[i];
+    size_t submit_index = 0;
+    for (const auto &record : capture.records) {
       if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
-        // The Updates up to the next submission or frame end are written before this one.
-        bool idle = false;
-        for (size_t j = i + 1; j < records.size() &&
-                               !std::holds_alternative<GpuCapture::Submit>(records[j]) &&
-                               !std::holds_alternative<GpuCapture::FrameEnd>(records[j]);
-             j++) {
-          if (const auto *update = std::get_if<GpuCapture::Update>(&records[j])) {
-            if (!idle && !gpu.WaitForIdle(idle_timeout_ms)) busy++;
-            idle = true;
-            std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
-                        update->bytes.size());
-          }
+        const auto &pending = updates[submit_index++];
+        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms)) busy++;
+        for (const auto *update : pending) {
+          std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                      update->bytes.size());
         }
         const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
                                  submit->dword_count};
@@ -15228,8 +15231,9 @@ public:
     GpuCapture::Capture capture;
     auto &records = capture.records;
     records.emplace_back(GpuCapture::Memory{dcb, bytes_of(graphics)});
-    records.emplace_back(GpuCapture::Memory{ib, bytes_of(indirect)});
-    // The compute list is rewritten between the submissions (reused command memory).
+    // The indirect buffer and the compute list are rewritten during the frame (reused command
+    // memory): each Update names the submission that saw it, whatever queue was recorded last.
+    records.emplace_back(GpuCapture::Memory{ib, bytes_of(write_data(labels + 4, 0x99999999u))});
     records.emplace_back(GpuCapture::Memory{acb, bytes_of(write_data(labels + 12, 0x55555555u))});
     records.emplace_back(GpuCapture::Memory{code_address, bytes_of(shader)});
     records.emplace_back(GpuCapture::Memory{dma_src, dma_bytes});
@@ -15241,7 +15245,8 @@ public:
         .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
     records.emplace_back(GpuCapture::Submit{dcb, 0, static_cast<u32>(graphics.size())});
     records.emplace_back(GpuCapture::Submit{acb, 0x20, static_cast<u32>(compute.size())});
-    records.emplace_back(GpuCapture::Update{acb, bytes_of(compute)});
+    records.emplace_back(GpuCapture::Update{acb, 1, bytes_of(compute)});
+    records.emplace_back(GpuCapture::Update{ib, 0, bytes_of(indirect)});
     records.emplace_back(GpuCapture::FrameEnd{});
     records.emplace_back(GpuCapture::Expect{labels, sizeof(label_values),
                                             XXH3_64bits(label_values.data(), sizeof(label_values))});
@@ -15262,7 +15267,7 @@ public:
     Require(name, "truncated", !GpuCapture::Parse(std::span{file}.first(file.size() - 9), &error),
             "a truncated capture was accepted");
     auto future = file;
-    future[8] = 2;
+    future[8] = static_cast<uint8_t>(GpuCapture::Version + 1);
     Require(name, "version", !GpuCapture::Parse(future, &error), "an unknown version was accepted");
 
     Require(name, "replay", ReplayGpuCapture(name, *parsed) == 0, "replayed output differs");

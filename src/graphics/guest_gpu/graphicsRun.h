@@ -67,6 +67,7 @@ private:
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
 		bool                      started         = false;
+		uint32_t                  capture_submit  = UINT32_MAX; // GpuCapture::RecordSubmit index
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
