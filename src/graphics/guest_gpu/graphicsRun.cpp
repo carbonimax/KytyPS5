@@ -628,6 +628,7 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
                                                      uint32_t);
 
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(counter), sizeof(uint64_t));
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -659,6 +660,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		const auto address = reinterpret_cast<uint64_t>(dst);
 		const auto bytes   = write_one_address ? uint64_t {sizeof(uint32_t)}
 		                                       : uint64_t {dw_num} * sizeof(uint32_t);
+		GpuCapture::Touch(address, bytes);
 		if (m_renderer.GetBufferCache().WriteGpuOwned(
 		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
 			m_renderer.GetTextureCache().InvalidateMemory(address, bytes);
@@ -680,6 +682,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		EXIT("invalid reference-clock copy, dst=0x%016" PRIx64 " size=%u\n", dst_address,
 		     num_bytes);
 	}
+	GpuCapture::Touch(dst_address, num_bytes);
 	const auto value = Sync::ReadReferenceClock();
 	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
@@ -1442,6 +1445,7 @@ void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size)
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id) {
+	GpuCapture::Touch(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1684,6 +1688,8 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
                                     uint64_t event_address) {
+	// Occlusion results: one begin/end pair of u64 per DB, 16 DBs.
+	GpuCapture::Touch(event_address, 16u * 2u * sizeof(uint64_t));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"

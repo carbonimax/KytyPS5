@@ -262,10 +262,11 @@ bool IsZeroPage(const uint8_t* p) {
 	return std::all_of(p, p + PageSize, [](uint8_t b) { return b == 0; });
 }
 
-// Page-aligned [begin, end): zero pages become Zero records, unreadable pages are left out.
+// Page-aligned [begin, end), read as the buffer cache uploads it (backing, private mappings, zero
+// holes): zero pages become Zero records, pages outside guest memory are left out.
 void RecordRun(Recorder& r, uint64_t begin, uint64_t end) {
 	std::vector<uint8_t> bytes(end - begin);
-	if (!LibKernel::Memory::TryReadBacking(begin, bytes.data(), bytes.size())) {
+	if (!LibKernel::Memory::CopySparseMemory(begin, bytes.data(), bytes.size())) {
 		if (end - begin == PageSize) {
 			r.unreadable += PageSize;
 			return;
@@ -390,7 +391,7 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 		uint64_t             expects = 0;
 		for (const auto& [begin, end]: merged) {
 			bytes.resize(end - begin);
-			if (LibKernel::Memory::TryReadBacking(begin, bytes.data(), bytes.size())) {
+			if (LibKernel::Memory::CopySparseMemory(begin, bytes.data(), bytes.size())) {
 				Write(r, Expect {begin, end - begin, XXH3_64bits(bytes.data(), bytes.size())});
 				expects++;
 			}
@@ -405,7 +406,10 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 		    r.shaders.size(), r.missing_shaders, expects, Ms(r.publish_time), Ms(r.touch_time),
 		    Ms(Clock::now() - end_start), Ms(end_start - r.start));
 		LOGF("%s\n", line.c_str());
-		std::fprintf(stderr, "%s\n", line.c_str());
+		if (FILE* log = std::fopen((dir / "capture.log").string().c_str(), "a")) {
+			std::fprintf(log, "%s\n", line.c_str());
+			std::fclose(log);
+		}
 	}
 	std::error_code error;
 	const bool      triggered = std::filesystem::remove(dir / "trigger", error);
