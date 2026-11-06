@@ -59,8 +59,8 @@ struct Zero {
 	uint64_t size    = 0;
 };
 
-// Guest bytes the CPU rewrote during the frame (reused command memory), written once the GPU
-// is idle, before the next Submit.
+// Guest bytes the CPU rewrote during the frame (reused rings). The Update records that follow a
+// Submit are written once the GPU is idle, before that Submit.
 struct Update {
 	uint64_t             address = 0;
 	std::vector<uint8_t> bytes;

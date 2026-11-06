@@ -234,10 +234,9 @@ struct Recorder {
 	FILE*                                      file = nullptr;
 	std::string                                path;
 	std::vector<uint8_t>                       out;
-	std::unordered_set<uint64_t>               pages;   // recorded this frame
+	std::unordered_map<uint64_t, uint64_t>     pages;   // recorded this frame -> XXH3 of the last bytes
 	std::unordered_set<uint64_t>               shaders; // recorded this frame
 	std::unordered_map<uint64_t, Shader>       kept;    // every registered shader
-	std::unordered_map<uint64_t, uint64_t>     command_hashes; // command page -> XXH3 when submitted
 	std::vector<std::pair<uint64_t, uint64_t>> outputs;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
 	uint64_t          missing_shaders = 0, written = 0, updates = 0;
@@ -282,6 +281,9 @@ void RecordRun(Recorder& r, uint64_t begin, uint64_t end) {
 		for (uint64_t page = begin; page < end; page += PageSize) RecordRun(r, page, page + PageSize);
 		return;
 	}
+	for (uint64_t i = 0; i < bytes.size(); i += PageSize) {
+		r.pages[begin + i] = XXH3_64bits(bytes.data() + i, PageSize);
+	}
 	for (uint64_t i = 0; i < bytes.size();) {
 		const bool zero = IsZeroPage(bytes.data() + i);
 		uint64_t   j    = i + PageSize;
@@ -308,11 +310,30 @@ void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
 	}
 	const auto start = Clock::now();
 	if (output) r.outputs.emplace_back(address, size);
-	const uint64_t end    = (address + size + PageSize - 1) & ~(PageSize - 1);
-	uint64_t       run    = 0;
-	bool           in_run = false;
+	// Pages recorded earlier in the frame and changed since (CPU rings) become Updates.
+	// shortcut: only accesses up to 1 MiB are compared; raise it if a replay misses larger rewrites.
+	const bool           compare = size <= (uint64_t {1} << 20u);
+	std::vector<uint8_t> bytes;
+	const uint64_t       end    = (address + size + PageSize - 1) & ~(PageSize - 1);
+	uint64_t             run    = 0;
+	bool                 in_run = false;
 	for (uint64_t page = address & ~(PageSize - 1); page <= end; page += PageSize) {
-		const bool fresh = page < end && r.pages.insert(page).second;
+		bool fresh = false;
+		if (page < end) {
+			const auto [it, inserted] = r.pages.try_emplace(page, 0);
+			fresh                     = inserted;
+			if (!inserted && compare) {
+				bytes.resize(PageSize);
+				if (LibKernel::Memory::CopySparseMemory(page, bytes.data(), PageSize)) {
+					const auto hash = XXH3_64bits(bytes.data(), PageSize);
+					if (hash != it->second) {
+						it->second = hash;
+						Write(r, Update {page, bytes});
+						r.updates++;
+					}
+				}
+			}
+		}
 		if (fresh && !in_run) {
 			run    = page;
 			in_run = true;
@@ -337,23 +358,10 @@ void RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
 	auto&            r       = GetRecorder();
 	std::scoped_lock lock(r.mutex);
 	if (!Recording()) return;
-	// Command memory reused in the frame (rings): pages changed since an earlier submission.
-	// shortcut: indirect buffers and other CPU-written ranges get no Update; add them when a replay needs it.
-	std::vector<uint8_t> page(PageSize);
-	const uint64_t       end = address + commands.size_bytes();
-	for (uint64_t p = address & ~(PageSize - 1); p < end; p += PageSize) {
-		if (!LibKernel::Memory::CopySparseMemory(p, page.data(), PageSize)) continue;
-		const auto hash          = XXH3_64bits(page.data(), PageSize);
-		const auto [it, fresh]   = r.command_hashes.try_emplace(p, hash);
-		if (!fresh && it->second != hash && r.pages.contains(p)) {
-			Write(r, Update {p, page});
-			r.updates++;
-		}
-		it->second = hash;
-	}
-	TouchLocked(r, address, commands.size_bytes(), false);
 	Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
 	r.submits++;
+	// After the Submit: Updates of reused command memory are written before it.
+	TouchLocked(r, address, commands.size_bytes(), false);
 }
 
 void KeepShader(Shader shader) {
@@ -457,7 +465,6 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	r.pages.clear();
 	r.shaders.clear();
 	r.outputs.clear();
-	r.command_hashes.clear();
 	r.stored = r.zero = r.unreadable = r.skipped = r.submits = r.missing_shaders = r.updates = 0;
 	r.touch_time   = {};
 	r.publish_time = Clock::now() - publish_start;

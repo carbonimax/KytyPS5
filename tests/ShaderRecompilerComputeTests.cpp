@@ -15090,8 +15090,23 @@ public:
       context.MapMemory(begin, end - begin);
     }
     auto &gpu = context.GetGpu();
-    for (const auto &record : capture.records) {
+    const auto &records = capture.records;
+    for (size_t i = 0; i < records.size(); i++) {
+      const auto &record = records[i];
       if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
+        // The Updates up to the next submission or frame end are written before this one.
+        bool idle = false;
+        for (size_t j = i + 1; j < records.size() &&
+                               !std::holds_alternative<GpuCapture::Submit>(records[j]) &&
+                               !std::holds_alternative<GpuCapture::FrameEnd>(records[j]);
+             j++) {
+          if (const auto *update = std::get_if<GpuCapture::Update>(&records[j])) {
+            if (!idle) gpu.WaitForIdle();
+            idle = true;
+            std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                        update->bytes.size());
+          }
+        }
         const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
                                  submit->dword_count};
         if (submit->queue == 0) {
@@ -15099,10 +15114,6 @@ public:
         } else {
           gpu.SubmitCompute(submit->queue, commands);
         }
-      } else if (const auto *update = std::get_if<GpuCapture::Update>(&record)) {
-        gpu.WaitForIdle();
-        std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
-                    update->bytes.size());
       } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
         gpu.SuspendPoint();
       }
@@ -15224,8 +15235,8 @@ public:
         .address = code_address, .type = static_cast<u32>(Prospero::ShaderBinaryType::kCs),
         .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
     records.emplace_back(GpuCapture::Submit{dcb, 0, static_cast<u32>(graphics.size())});
-    records.emplace_back(GpuCapture::Update{acb, bytes_of(compute)});
     records.emplace_back(GpuCapture::Submit{acb, 0x20, static_cast<u32>(compute.size())});
+    records.emplace_back(GpuCapture::Update{acb, bytes_of(compute)});
     records.emplace_back(GpuCapture::FrameEnd{});
     records.emplace_back(GpuCapture::Expect{labels, sizeof(label_values),
                                             XXH3_64bits(label_values.data(), sizeof(label_values))});
