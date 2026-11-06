@@ -286,6 +286,15 @@ void MaybeReport() noexcept {
 		            walk.protected_synced, walk.protected_evictions, walk.reuse_hits, walk.reuse_checks,
 		            static_cast<double>(walk.reuse_ns) / 1e6, walk.reuse_diffs);
 	}
+	if (n(Counter::AsyncSkipped) + n(Counter::AsyncBlockWrites) + n(Counter::AsyncBlockDepthOnly) +
+	        n(Counter::AsyncBlockQuery) + n(Counter::AsyncBlockPasses) + n(Counter::AsyncBlockCap) != 0) {
+		std::printf("PERF async %.1fs: skipped=%" PRIu64 " skip_frames=%" PRIu64 "/%" PRIu64
+		            " blocked_writes=%" PRIu64 " blocked_depth_only=%" PRIu64 " blocked_query=%" PRIu64
+		            " blocked_passes=%" PRIu64 " blocked_cap=%" PRIu64 "\n",
+		            seconds, n(Counter::AsyncSkipped), n(Counter::AsyncSkipFrames), n(Counter::Frames),
+		            n(Counter::AsyncBlockWrites), n(Counter::AsyncBlockDepthOnly), n(Counter::AsyncBlockQuery),
+		            n(Counter::AsyncBlockPasses), n(Counter::AsyncBlockCap));
+	}
 	if (const auto* bounds = g_bounds_counters.load(std::memory_order_relaxed); bounds != nullptr) {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
