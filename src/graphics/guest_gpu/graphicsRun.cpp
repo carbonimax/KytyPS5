@@ -752,6 +752,8 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
+	if (!src_gds) GpuCapture::Touch(src_address_or_offset_or_immediate, num_bytes);
+	if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, true);
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
 }
@@ -775,6 +777,19 @@ void GuestGpu::WaitForIdle() {
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
+}
+
+bool GuestGpu::WaitForIdle(uint32_t timeout_ms) {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	const auto        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		const auto left = deadline - std::chrono::steady_clock::now();
+		if (left <= std::chrono::steady_clock::duration::zero()) return false;
+		m_idle.WaitFor(&m_queue_mutex,
+		               static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(left).count()));
+	}
+	return true;
 }
 
 void GuestGpu::ThreadRun(void* data) {

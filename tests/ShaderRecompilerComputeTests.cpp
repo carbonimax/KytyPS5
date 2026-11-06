@@ -15091,6 +15091,10 @@ public:
     }
     auto &gpu = context.GetGpu();
     const auto &records = capture.records;
+    // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle.
+    // shortcut: Updates are then written while earlier work may still run; order them per queue if that corrupts a replay.
+    constexpr uint32_t idle_timeout_ms = 1000;
+    uint32_t busy = 0;
     for (size_t i = 0; i < records.size(); i++) {
       const auto &record = records[i];
       if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
@@ -15101,7 +15105,7 @@ public:
                                !std::holds_alternative<GpuCapture::FrameEnd>(records[j]);
              j++) {
           if (const auto *update = std::get_if<GpuCapture::Update>(&records[j])) {
-            if (!idle) gpu.WaitForIdle();
+            if (!idle && !gpu.WaitForIdle(idle_timeout_ms)) busy++;
             idle = true;
             std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
                         update->bytes.size());
@@ -15118,7 +15122,8 @@ public:
         gpu.SuspendPoint();
       }
     }
-    gpu.WaitForIdle();
+    if (!gpu.WaitForIdle(10 * idle_timeout_ms)) busy++;
+    if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
     auto &scheduler = context.GetCommandScheduler();
     gpu.SendCommandSync([&] {
       scheduler.Finish();

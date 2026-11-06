@@ -42,6 +42,8 @@ public:
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
+	// Same, giving up after timeout_ms: false while a queue still waits (on memory nobody writes).
+	bool              WaitForIdle(uint32_t timeout_ms);
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
