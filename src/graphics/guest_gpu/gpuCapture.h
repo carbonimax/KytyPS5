@@ -151,6 +151,13 @@ void UseShader(uint64_t address);
 // recording starts now).
 void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight,
                    uint32_t started_before);
+// Scoped captures: KYTY_GPU_CAPTURE_SUBMITS=a-b (or a trigger file holding "a-b") records only the
+// frame's submissions a..b (in processing order, from 0), as Submits 0..b-a, and the ranges they use.
+// While Recording(), before the first slice of a new submission: true when it is submission a > 0
+// (GPU-resident data is published first) or b + 1 (the recording ends there, Expects included).
+bool AtScopeBoundary();
+// GPU thread, when AtScopeBoundary(); same arguments as FrameBoundary.
+void ScopeBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight);
 
 } // namespace Libs::Graphics::GpuCapture
 

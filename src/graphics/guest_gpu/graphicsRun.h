@@ -83,6 +83,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// GPU capture: the frame boundary (`frame_end`) or a scope boundary (GpuCapture::ScopeBoundary).
+	void              CaptureBoundary(bool frame_end);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 	// Graphics processing yields at a packet boundary when compute work was queued since `seen`.

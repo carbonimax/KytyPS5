@@ -962,7 +962,12 @@ bool GuestGpu::Process(Submission& submission) {
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
 		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;
-		if (!submission.started) {
+		if ((!submission.started || submission.capture_submit == UINT32_MAX) && GpuCapture::AtScopeBoundary()) {
+			CaptureBoundary(false);
+		}
+		if (!GpuCapture::Recording()) {
+			// The scope ended before this submission.
+		} else if (!submission.started) {
 			submission.capture_submit = GpuCapture::RecordSubmit(submission.commands, queue);
 		} else {
 			if (submission.capture_submit == UINT32_MAX) {
@@ -1004,31 +1009,36 @@ bool GuestGpu::Process(Submission& submission) {
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
-			if (GpuCapture::Enabled()) {
-				std::vector<uint32_t> in_flight;
-				uint32_t              started_before = 0;
-				{
-					Common::LockGuard lock(m_queue_mutex);
-					for (const auto& queue: m_queues) {
-						for (const auto& queued: queue) {
-							if (queued.capture_submit != UINT32_MAX) in_flight.push_back(queued.capture_submit);
-							started_before += queued.started ? 1 : 0;
-						}
-					}
-				}
-				GpuCapture::FrameBoundary(
-				    [this](std::vector<GpuCapture::Unpublished>& skipped) {
-					    m_renderer.GetTextureCache().DownloadGpuModified(&skipped);
-					    m_renderer.GetBufferCache().ReadGpuModified();
-				    },
-				    in_flight, started_before);
-			}
+			if (GpuCapture::Enabled()) CaptureBoundary(true);
 			break;
 	}
 
 	// KYTY_REPROTECT_BATCH: nothing batched outlives a slice (the guest may resume at its end).
 	FlushBatchedUploads();
 	return complete;
+}
+
+void GuestGpu::CaptureBoundary(bool frame_end) {
+	std::vector<uint32_t> in_flight;
+	uint32_t              started_before = 0;
+	{
+		Common::LockGuard lock(m_queue_mutex);
+		for (const auto& queue: m_queues) {
+			for (const auto& queued: queue) {
+				if (queued.capture_submit != UINT32_MAX) in_flight.push_back(queued.capture_submit);
+				started_before += queued.started ? 1 : 0;
+			}
+		}
+	}
+	const auto publish = [this](std::vector<GpuCapture::Unpublished>& skipped) {
+		m_renderer.GetTextureCache().DownloadGpuModified(&skipped);
+		m_renderer.GetBufferCache().ReadGpuModified();
+	};
+	if (frame_end) {
+		GpuCapture::FrameBoundary(publish, in_flight, started_before);
+	} else {
+		GpuCapture::ScopeBoundary(publish, in_flight);
+	}
 }
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
