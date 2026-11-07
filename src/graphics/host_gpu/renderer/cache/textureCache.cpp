@@ -928,7 +928,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
-bool TextureCache::CanDownload(const Image& image) const {
+bool TextureCache::CanDownload(const Image& image, bool dcc_as_plain) const {
 	const auto& info = image.info;
 	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
 	    info.data.size % info.resources.layers != 0) {
@@ -938,7 +938,7 @@ bool TextureCache::CanDownload(const Image& image) const {
 		return IsSupportedDepthPlaneReadback(info) &&
 		       Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
 	}
-	return info.metadata.compression == VideoOutCompression::Uncompressed &&
+	return (dcc_as_plain || info.metadata.compression == VideoOutCompression::Uncompressed) &&
 	       (!info.IsTiled() || !Prospero::IsFmaskTextureFormat(info.guest_format)) &&
 	       info.LinearSize() != 0;
 }
@@ -1856,6 +1856,32 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
+bool TextureCache::CanDownloadStencil(const Image& plane) const {
+	const auto& depth = m_slot_images[plane.depth_id];
+	// Multisampled or compressed stencil is never uploaded either (RefreshImage).
+	return depth.info.samples == 1 && !depth.info.metadata.stencil_compressed &&
+	       depth.backing.image != nullptr && plane.info.resources.layers != 0 &&
+	       plane.info.data.size % plane.info.resources.layers == 0 && plane.info.LinearSize() != 0;
+}
+
+void TextureCache::DownloadStencil(Image& plane, Buffer& destination, uint64_t destination_offset) {
+	// Reverse of UploadImage for a stencil association: the depth owner holds the aspect.
+	const auto& info  = plane.info;
+	auto&       depth = m_slot_images[plane.depth_id];
+	auto        copies = info.BufferCopies(info.IsTiled() ? 0 : destination_offset);
+	for (auto& copy: copies) {
+		copy.imageSubresource.baseArrayLayer += plane.stencil_subresources.base_layer;
+	}
+	if (!info.IsTiled()) {
+		depth.Download(copies, destination.Handle(), destination_offset, info.data.size);
+		return;
+	}
+	const auto linear = m_tiler.GetScratchBuffer(info.LinearSize());
+	depth.Download(copies, linear.buffer, 0, linear.size);
+	m_tiler.Tile(linear.buffer, 0, linear.size, destination.Handle(), destination_offset,
+	             info.data.size, info);
+}
+
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
 	if (UploadBinding(image) == BindingType::DepthTarget) {
@@ -1929,12 +1955,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging) {
+bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture) {
 	auto& image = m_slot_images[id];
-	if (image.depth_id) {
+	if (image.depth_id ? !capture || !CanDownloadStencil(image) : !CanDownload(image, capture)) {
 		return false;
 	}
-	if (!image.SafeToDownload() || !CanDownload(image)) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1951,7 +1977,11 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging) {
 	}
 	download.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	if (image.depth_id) {
+		DownloadStencil(image, download, offset);
+	} else {
+		DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
@@ -2143,13 +2173,15 @@ void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* ski
 		std::scoped_lock lock {m_lock};
 		m_slot_images.ForEach([&](ImageId id, Image& image) {
 			if (!image.registered || !image.IsGpuModified()) return;
-			const char* reason = image.depth_id                ? "depth_alias"
+			const auto* owner  = image.depth_id ? &m_slot_images[image.depth_id] : nullptr;
+			const char* reason = owner != nullptr && owner->info.samples != 1 ? "stencil_msaa"
+			                     : owner != nullptr && owner->info.metadata.stencil_compressed ? "stencil_compressed"
 			                     : !image.SafeToDownload()    ? "cpu_or_buffer_modified"
-			                     : CanDownload(image)         ? nullptr
+			                     : owner != nullptr           ? (CanDownloadStencil(image) ? nullptr : "stencil_format")
+			                     : CanDownload(image, true)   ? nullptr
 			                     : image.info.samples != 1    ? "msaa"
 			                     : UploadBinding(image) == BindingType::DepthTarget ? "depth_format"
-			                     : image.info.metadata.compression != VideoOutCompression::Uncompressed ? "compressed"
-			                                                                                             : "format";
+			                                                                        : "format";
 			if (reason == nullptr) {
 				ids.push_back(id);
 			} else if (skipped != nullptr) {
@@ -2168,7 +2200,11 @@ void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* ski
 				staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 				                                   vk::BufferUsageFlagBits::eTransferDst, size);
 			}
-			downloaded = DownloadImageMemory(id, staging.get());
+			downloaded = DownloadImageMemory(id, staging.get(), true);
+			if (!downloaded && skipped != nullptr) {
+				const auto& info = m_slot_images[id].info;
+				skipped->push_back({info.data.address, info.data.size, "backing"});
+			}
 		}
 		if (downloaded) {
 			m_scheduler.Finish();

@@ -151,11 +151,16 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
+	// `dcc_as_plain` (GPU capture): a compressed video-out image is written as if every DCC block
+	// were uncompressed, the layout the cache itself uploads for DCC targets.
+	[[nodiscard]] bool          CanDownload(const Image& image, bool dcc_as_plain = false) const;
+	[[nodiscard]] bool          CanDownloadStencil(const Image& plane) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	// The stencil aspect of a stencil association (`depth_id`), in its guest plane layout.
+	void DownloadStencil(Image& plane, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
@@ -176,7 +181,8 @@ private:
 	                        FindImageMemo* memo);
 
 	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
-	[[nodiscard]] bool DownloadImageMemory(ImageId id, Buffer* staging = nullptr);
+	// `capture` (GPU capture publish): also stencil associations and compressed video-out images.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, Buffer* staging = nullptr, bool capture = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

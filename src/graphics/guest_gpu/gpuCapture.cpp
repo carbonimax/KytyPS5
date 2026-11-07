@@ -155,6 +155,13 @@ bool GetPayload(Reader& r, Zero& z) {
 bool GetPayload(Reader& r, Expect& e) {
 	return r.Get(e.address) && r.Get(e.size) && r.Get(e.hash) && e.size != 0 && e.address + e.size > e.address;
 }
+void PutPayload(Writer& w, const Unordered& e) { PutPayload(w, Expect {e.address, e.size, e.hash}); }
+bool GetPayload(Reader& r, Unordered& u) {
+	Expect e;
+	if (!GetPayload(r, e)) return false;
+	u = {e.address, e.size, e.hash};
+	return true;
+}
 
 template <size_t I = 0>
 bool ParseRecord(uint32_t type, Reader& payload, Record& record) {
@@ -169,6 +176,19 @@ bool ParseRecord(uint32_t type, Reader& payload, Record& record) {
 }
 
 } // namespace
+
+uint64_t UnorderedHash(std::span<const uint8_t> bytes) {
+	uint64_t sum = 0;
+	for (size_t i = 0; i < bytes.size(); i += 4) {
+		uint32_t dword = 0;
+		std::memcpy(&dword, bytes.data() + i, std::min<size_t>(4, bytes.size() - i));
+		uint64_t x = dword + 0x9e3779b97f4a7c15ull; // splitmix64 finalizer
+		x          = (x ^ (x >> 30u)) * 0xbf58476d1ce4e5b9ull;
+		x          = (x ^ (x >> 27u)) * 0x94d049bb133111ebull;
+		sum += x ^ (x >> 31u);
+	}
+	return sum;
+}
 
 void SerializeHeader(std::vector<uint8_t>& out) {
 	Writer w;
@@ -369,6 +389,23 @@ void TouchSlow(uint64_t address, uint64_t size, Out output) {
 	TouchLocked(r, address, size, output);
 }
 
+void GpuWriteSlow(uint64_t address, uint64_t size, bool after) {
+	auto&            r = GetRecorder();
+	std::scoped_lock lock(r.mutex);
+	if (!Recording() || size == 0 || address + size < address) return;
+	std::vector<uint8_t> bytes(PageSize);
+	for (uint64_t page = address & ~(PageSize - 1); page < address + size; page += PageSize) {
+		const auto it = r.pages.find(page);
+		if (it == r.pages.end() || !LibKernel::Memory::CopySparseMemory(page, bytes.data(), PageSize)) continue;
+		const auto hash = XXH3_64bits(bytes.data(), PageSize);
+		if (hash != it->second && !after) {
+			Write(r, Update {page, r.current, bytes});
+			r.updates++;
+		}
+		it->second = hash;
+	}
+}
+
 uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
 	const auto       address = reinterpret_cast<uint64_t>(commands.data());
 	auto&            r       = GetRecorder();
@@ -434,6 +471,28 @@ void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish
 	if (r.file != nullptr) {
 		const auto end_start = Clock::now();
 		g_recording.store(false, std::memory_order_relaxed);
+		// Diagnostics: recorded pages whose guest bytes changed since they were last recorded or
+		// compared, with no Update (CPU rewrites of accesses over 1 MiB, emulator write-backs).
+		std::vector<std::pair<uint64_t, uint64_t>> rewritten; // [begin, end)
+		{
+			std::scoped_lock      lock(r.mutex);
+			std::vector<uint8_t>  page(PageSize);
+			std::vector<uint64_t> changed;
+			for (const auto& [address, hash]: r.pages) {
+				if (LibKernel::Memory::CopySparseMemory(address, page.data(), PageSize) &&
+				    XXH3_64bits(page.data(), PageSize) != hash) {
+					changed.push_back(address);
+				}
+			}
+			std::sort(changed.begin(), changed.end());
+			for (const auto address: changed) {
+				if (!rewritten.empty() && rewritten.back().second == address) {
+					rewritten.back().second += PageSize;
+				} else {
+					rewritten.emplace_back(address, address + PageSize);
+				}
+			}
+		}
 		std::vector<Unpublished> unpublished_end;
 		publish_gpu_data(unpublished_end);
 		std::scoped_lock lock(r.mutex);
@@ -473,6 +532,7 @@ void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish
 			bytes.resize(end - begin);
 			if (LibKernel::Memory::CopySparseMemory(begin, bytes.data(), bytes.size())) {
 				Write(r, Expect {begin, end - begin, XXH3_64bits(bytes.data(), bytes.size())});
+				Write(r, Unordered {begin, end - begin, UnorderedHash(bytes)});
 				expects++;
 			}
 		}
@@ -506,16 +566,23 @@ void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish
 			for (const auto index: in_flight) {
 				if (index < r.submits) std::fprintf(info, "in_flight_end %u\n", index);
 			}
+			for (const auto& [begin, end]: rewritten) {
+				const bool out = std::ranges::any_of(outputs, [&](const auto& o) {
+					return std::get<0>(o) < end && begin < std::get<0>(o) + std::get<1>(o);
+				});
+				std::fprintf(info, "rewritten 0x%016llx 0x%llx out=%d\n", static_cast<unsigned long long>(begin),
+				             static_cast<unsigned long long>(end - begin), out);
+			}
 			std::fclose(info);
 		}
 		const bool complete = r.file != nullptr && std::fclose(r.file) == 0;
 		r.file          = nullptr;
 		const auto line = fmt::format(
 		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} updates={} "
-		    "shaders={} missing_shaders={} expects={} in_flight_end={} started_before={} unpublished_start={} unpublished_referenced={} unpublished_referenced_bytes={} unpublished_outputs={} publish_start_ms={:.1f} record_ms={:.1f} "
+		    "shaders={} missing_shaders={} expects={} in_flight_end={} started_before={} unpublished_start={} unpublished_referenced={} unpublished_referenced_bytes={} unpublished_outputs={} rewritten_runs={} publish_start_ms={:.1f} record_ms={:.1f} "
 		    "end_ms={:.1f} frame_ms={:.1f}",
 		    r.path, frame - 1, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, r.submits, r.updates,
-		    r.shaders.size(), r.missing_shaders, expects, in_flight_count, r.started_before, r.unpublished_start.size(), unpublished_ref, unpublished_ref_bytes, unpublished_outputs, Ms(r.publish_time), Ms(r.touch_time),
+		    r.shaders.size(), r.missing_shaders, expects, in_flight_count, r.started_before, r.unpublished_start.size(), unpublished_ref, unpublished_ref_bytes, unpublished_outputs, rewritten.size(), Ms(r.publish_time), Ms(r.touch_time),
 		    Ms(Clock::now() - end_start), Ms(end_start - r.start));
 		LOGF("%s\n", line.c_str());
 		if (FILE* log = std::fopen((dir / "capture.log").string().c_str(), "a")) {

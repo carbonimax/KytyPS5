@@ -81,7 +81,19 @@ struct InFlight {
 	uint32_t submit = 0;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight>;
+// Order-independent hash (UnorderedHash) of the range of the Expect just before it: a replay whose
+// bytes are a permutation of the game's records (atomic append lists) keeps it.
+struct Unordered {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t hash    = 0;
+};
+
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered>;
+
+// Sum of a 64-bit mix of each dword (a zero-padded tail counts as one): equal for any permutation
+// of records whose size is a multiple of 4 bytes.
+[[nodiscard]] uint64_t UnorderedHash(std::span<const uint8_t> bytes);
 
 struct Capture {
 	std::vector<Record> records;
@@ -115,6 +127,13 @@ void                    TouchSlow(uint64_t address, uint64_t size, Out output);
 // Guest bytes the GPU side is about to use.
 inline void Touch(uint64_t address, uint64_t size, Out output = Out::None) {
 	if (Recording()) TouchSlow(address, size, output);
+}
+// Guest bytes the GPU side writes itself (TryWriteBacking: write-backs, CP labels, expanded color
+// keys). The replay writes them again, so they are not Updates: before the write (`after` false),
+// CPU changes of recorded pages until now become Updates; after it, their hashes take the new bytes.
+void GpuWriteSlow(uint64_t address, uint64_t size, bool after);
+inline void GpuWrite(uint64_t address, uint64_t size, bool after) {
+	if (Recording()) GpuWriteSlow(address, size, after);
 }
 // While Recording(): a submission's first slice (queue as in Submit); returns its Submit index
 // (UINT32_MAX when recording stopped meanwhile).
