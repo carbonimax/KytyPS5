@@ -186,11 +186,16 @@ struct PageManager::Impl {
 	}
 
 	~Impl() {
-		for (const auto& region: region_storage) {
+		for (uint64_t index = 0; index < REGION_COUNT; index++) {
+			auto* region = regions[index].load(std::memory_order_relaxed);
+			if (region == nullptr) continue;
 			SpinGuard lock(region->lock);
-			for (auto& page: region->pages) {
+			for (uint64_t i = 0; i < REGION_PAGES; i++) {
+				const auto& page = region->pages[i];
 				if (page.write_watchers != 0 || page.access_watchers != 0) {
-					Fatal("destroyed with live page state");
+					Fatal("destroyed with live page state at 0x%016" PRIx64 " (write %u, access %u)",
+					      index * REGION_SIZE + i * PAGE_SIZE, static_cast<unsigned>(page.write_watchers),
+					      static_cast<unsigned>(page.access_watchers));
 				}
 			}
 		}

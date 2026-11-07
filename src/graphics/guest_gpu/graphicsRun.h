@@ -15,6 +15,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -42,6 +43,14 @@ public:
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
+	// Same, giving up once every queued submission stayed blocked (waiting on memory nobody writes)
+	// for timeout_ms; busy work that progresses is waited for. Also true, without the timeout, once
+	// every queued submission is blocked and its command memory is in `may_stay` (capture replay).
+	bool              WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay = {});
+	// Capture replay, after WaitForIdle: drops the queued (blocked) submissions; returns how many.
+	uint32_t          DropQueued();
+	// Diagnostics: one line per queued submission (queue, commands, depth, next packet dwords).
+	[[nodiscard]] std::string DescribeQueued();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -64,6 +73,7 @@ private:
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
+		bool                      started         = false;
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
@@ -92,6 +102,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
+	bool                                           m_stalled           = false; // every front blocked, no progress since
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =

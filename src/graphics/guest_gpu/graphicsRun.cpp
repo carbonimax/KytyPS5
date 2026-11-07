@@ -773,6 +773,60 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
+bool GuestGpu::WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay) {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	Common::LockGuard lock(m_queue_mutex);
+	uint64_t          stalled_since_us = 0; // this waiter's clock: the GPU thread keeps only a flag
+	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		// A submission queued after the stall started is not blocked yet: the stall flag is stale.
+		const bool stalled = m_stalled && !m_processing && m_commands.empty() &&
+		                     std::ranges::all_of(m_queues, [](const auto& queue) { return queue.empty() || queue.front().blocked; });
+		if (!m_stalled) {
+			stalled_since_us = 0;
+		} else if (stalled) {
+			const auto now = PerfStats::SteadyUs();
+			if (stalled_since_us == 0) stalled_since_us = now;
+			if (now - stalled_since_us >= uint64_t {timeout_ms} * 1000u) return false;
+			const bool expected = std::ranges::all_of(m_queues, [&](const auto& queue) {
+				return std::ranges::all_of(queue, [&](const Submission& s) {
+					return std::ranges::find(may_stay, s.commands.data()) != may_stay.end();
+				});
+			});
+			if (expected) return true;
+		}
+		m_idle.WaitFor(&m_queue_mutex, 10000);
+	}
+	return true;
+}
+
+std::string GuestGpu::DescribeQueued() {
+	Common::LockGuard lock(m_queue_mutex);
+	std::string       out;
+	for (uint32_t id = 0; id < QueueCount; id++) {
+		for (const auto& s: m_queues[id]) {
+			const auto rest = s.execution.RemainingBuffers();
+			const auto next = rest.empty() ? std::span<const uint32_t> {} : rest.front();
+			out += fmt::format("queue={} commands=0x{:x} dw={} started={} depth={} next=0x{:x}", id,
+			                   reinterpret_cast<uint64_t>(s.commands.data()), s.commands.size(), s.started,
+			                   rest.size(), reinterpret_cast<uint64_t>(next.data()));
+			for (const auto dw: next.first(std::min<size_t>(next.size(), 8))) out += fmt::format(" {:08x}", dw);
+			out += '\n';
+		}
+	}
+	return out;
+}
+
+uint32_t GuestGpu::DropQueued() {
+	EXIT_IF(IsGpuThread());
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing) m_idle.WaitFor(&m_queue_mutex, 10000);
+	const auto dropped = m_submission_count;
+	for (auto& queue: m_queues) queue.clear();
+	m_submission_count = 0;
+	m_idle.SignalAll();
+	return dropped;
+}
+
 void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -812,6 +866,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					gpu->m_stalled = true;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -851,7 +906,8 @@ void GuestGpu::ThreadRun(void* data) {
 			PerfStats::MaybeReport();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			gpu->m_processing = false;
+			gpu->m_processing        = false;
+			gpu->m_stalled           = false;
 			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_idle.SignalAll();
 			}
@@ -870,6 +926,7 @@ void GuestGpu::ThreadRun(void* data) {
 		PerfStats::MaybeReport();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (complete || submission.execution.MadeProgress()) gpu->m_stalled = false;
 		if (!complete) {
 			// A yielded submission can resume as soon as the compute queues were served.
 			submission.blocked = !submission.yielded;
@@ -895,6 +952,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	// KYTY_CP_PIPELINE: the scheduler and caches change hands at submission boundaries.
 	CpPipeline::Drain();
+	submission.started = true;
 	FlushBatchedUploads();
 	cp.BufferInit();
 	bool complete = true;
@@ -1391,7 +1449,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	// Stall only this command processor, not the host command lane or other queues.
-	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	if (m_renderer.HasVideoOut() && !m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
 	                                                 static_cast<int>(display_buffer_index))) {
 		SuspendPm4();
 	}
@@ -1745,6 +1803,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		LOGF("CommandProcessor::Flip()\n");
 	}
 	m_renderer.GetOcclusionQueries().Publish();
+	if (!m_renderer.HasVideoOut()) return;
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
