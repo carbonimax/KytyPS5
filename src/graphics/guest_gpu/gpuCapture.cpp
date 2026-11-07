@@ -163,6 +163,16 @@ bool GetPayload(Reader& r, Unordered& u) {
 	return true;
 }
 
+void PutPayload(Writer& w, const CpState& c) {
+	w.Put(c.queue);
+	w.Put(static_cast<uint32_t>(c.bytes.size()));
+	w.PutBytes(c.bytes);
+}
+bool GetPayload(Reader& r, CpState& c) {
+	uint32_t size = 0;
+	return r.Get(c.queue) && r.Get(size) && size != 0 && r.GetBytes(c.bytes, size);
+}
+
 template <size_t I = 0>
 bool ParseRecord(uint32_t type, Reader& payload, Record& record) {
 	if constexpr (I < std::variant_size_v<Record>) {
@@ -638,7 +648,7 @@ bool AtScopeBoundary() {
 	return Recording() && ((r.first > 0 && r.submits == r.first) || (r.last != UINT32_MAX && r.submits > r.last));
 }
 
-void ScopeBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight) {
+void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight) {
 	auto& r     = GetRecorder();
 	bool  start = false;
 	{
@@ -659,9 +669,11 @@ void ScopeBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in
 	r.unpublished_start = std::move(unpublished);
 	r.published_start   = std::move(published);
 	r.publish_time += Clock::now() - publish_start;
+	for (auto& state: cp_states()) Write(r, std::move(state));
 }
 
-void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight, uint32_t started_before) {
+void FrameBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight,
+                   uint32_t started_before) {
 	static const int64_t target = [] {
 		const char* v = std::getenv("KYTY_GPU_CAPTURE_FRAME");
 		return v != nullptr ? std::strtoll(v, nullptr, 0) : int64_t {-1};
@@ -702,6 +714,9 @@ void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in
 	SerializeHeader(r.out);
 	std::fwrite(r.out.data(), 1, r.out.size(), r.file);
 	r.written = r.out.size();
+	if (r.first == 0) {
+		for (auto& state: cp_states()) Write(r, std::move(state));
+	}
 	r.pages.clear();
 	r.shaders.clear();
 	r.outputs.clear();

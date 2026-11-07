@@ -49,6 +49,9 @@ public:
 	bool              WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay = {});
 	// Capture replay, after WaitForIdle: drops the queued (blocked) submissions; returns how many.
 	uint32_t          DropQueued();
+	// Capture replay, before the first submission: a queue's (0 or a compute queue as in SubmitCompute)
+	// command processor state from GpuCapture::CpState; false for another build's layout.
+	bool              RestoreCpState(uint32_t queue, std::span<const uint8_t> bytes);
 	// Diagnostics: one line per queued submission (queue, commands, depth, next packet dwords).
 	[[nodiscard]] std::string DescribeQueued();
 	[[nodiscard]] int GetFrameNum() const;

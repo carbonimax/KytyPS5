@@ -79,6 +79,10 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	// GPU capture: the state later submissions inherit, as raw bytes of this build's layout;
+	// RestoreState rejects another size (a capture from a build with another layout).
+	[[nodiscard]] std::vector<uint8_t> SaveState() const;
+	bool                               RestoreState(std::span<const uint8_t> bytes);
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);

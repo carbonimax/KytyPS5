@@ -15161,6 +15161,19 @@ public:
     // 1 s with every queue blocked, the Updates are written anyway.
     // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
     constexpr uint32_t idle_timeout_ms = 1000;
+    // The command processor state each queue had when the recording started (compute queues across
+    // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
+    // (diagnostics) replays from reset processors, as before the record existed.
+    static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
+    uint32_t cp_states = 0;
+    for (const auto &record : capture.records) {
+      if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
+        Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
+                fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
+        cp_states++;
+      }
+    }
+    if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
     uint32_t busy = 0;
     size_t submit_index = 0;
     for (const auto &record : capture.records) {
@@ -15424,6 +15437,36 @@ public:
             "an order-only difference of a known list was counted");
     CheckGpuCaptureStencilPublish();
     CheckGpuCapturePublishOrder();
+    CheckGpuCaptureCpState();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // CpState: a command processor's state survives SaveState -> file -> RestoreState, and the replay
+  // refuses a state of another layout.
+  void CheckGpuCaptureCpState() {
+    constexpr const char *name = "GpuCaptureCpState";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    CommandProcessor cp(context, 0x20);
+    cp.SetIndexBaseAddress(0x123456789ull);
+    cp.GetUcfg().SetIndexOffset(77);
+    cp.GetShCtx().SetCsUserSgpr(3, 0xabcdu);
+    GpuCapture::Capture capture;
+    capture.records.push_back(GpuCapture::CpState{0x20, cp.SaveState()});
+    const auto parsed = GpuCapture::Parse(GpuCapture::Serialize(capture), nullptr);
+    const auto *state = parsed.has_value() ? std::get_if<GpuCapture::CpState>(&parsed->records[0]) : nullptr;
+    Require(name, "parse", state != nullptr && state->queue == 0x20, "the CpState record did not round-trip");
+    CommandProcessor restored(context, 0x20);
+    Require(name, "restore",
+            restored.RestoreState(state->bytes) && restored.SaveState() == state->bytes &&
+                restored.GetUcfg().GetIndexOffset() == 77 && restored.GetShCtx().GetCs().cs_user_sgpr.value[3] == 0xabcdu,
+            "the restored state differs");
+    auto shorter = state->bytes;
+    shorter.pop_back();
+    Require(name, "other layout", !restored.RestoreState(shorter) && !context.GetGpu().RestoreCpState(0x20, shorter),
+            "a state of another size was restored");
+    context.ShutdownGpu();
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

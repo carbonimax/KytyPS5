@@ -89,7 +89,15 @@ struct Unordered {
 	uint64_t hash    = 0;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered>;
+// The command processor state a queue (as in Submit) had when the recording started: compute queues
+// keep theirs across frames, and a scope starting after submission 0 inherits every queue's. Raw bytes
+// of the recording build's layout (CommandProcessor::SaveState); replay restores it before the first Submit.
+struct CpState {
+	uint32_t             queue = 0;
+	std::vector<uint8_t> bytes;
+};
+
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered, CpState>;
 
 // Sum of a 64-bit mix of each dword (a zero-padded tail counts as one): equal for any permutation
 // of records whose size is a multiple of 4 bytes.
@@ -128,6 +136,8 @@ struct Published {
 	const char* kind      = "";
 };
 using Publish = std::function<void(std::vector<Unpublished>&, std::vector<Published>&)>;
+// Every command processor's state (CpState), called only when a recording starts.
+using SaveCpStates = std::function<std::vector<CpState>()>;
 
 extern const bool       g_enabled;
 extern std::atomic_bool g_recording;
@@ -159,7 +169,7 @@ void UseShader(uint64_t address);
 // GPU-resident data back to guest memory and lists what it skipped and wrote. `in_flight`: RecordSubmit indices of the submissions
 // still queued; `started_before`: queued submissions already started (not replayable when a
 // recording starts now).
-void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight,
+void FrameBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight,
                    uint32_t started_before);
 // Scoped captures: KYTY_GPU_CAPTURE_SUBMITS=a-b (or a trigger file holding "a-b") records only the
 // frame's submissions a..b (in processing order, from 0), as Submits 0..b-a, and the ranges they use.
@@ -167,7 +177,7 @@ void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in
 // (GPU-resident data is published first) or b + 1 (the recording ends there, Expects included).
 bool AtScopeBoundary();
 // GPU thread, when AtScopeBoundary(); same arguments as FrameBoundary.
-void ScopeBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight);
+void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight);
 
 } // namespace Libs::Graphics::GpuCapture
 
