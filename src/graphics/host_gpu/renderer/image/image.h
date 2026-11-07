@@ -105,12 +105,16 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept {
+	// `stamp` (GpuCapture::StampWrites()): also record the order of this write among all images; off, the
+	// shared counter is never touched (the front and back CP threads would bounce its cache line).
+	void               MarkGpuModified(bool stamp) noexcept {
 		m_gpu_modified = true;
-		// Load and store, not a locked add: callers hold the texture cache lock, and a duplicate value
-		// would only tie two images in the publish order.
-		gpu_write_seq = gpu_writes.load(std::memory_order_relaxed) + 1u;
-		gpu_writes.store(gpu_write_seq, std::memory_order_relaxed);
+		if (stamp) [[unlikely]] {
+			// Load and store, not a locked add: callers hold the texture cache lock, and a duplicate value
+			// would only tie two images in the publish order.
+			gpu_write_seq = gpu_writes.load(std::memory_order_relaxed) + 1u;
+			gpu_writes.store(gpu_write_seq, std::memory_order_relaxed);
+		}
 	}
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 

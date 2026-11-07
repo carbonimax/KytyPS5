@@ -599,7 +599,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		destination.MarkGpuModified(GpuCapture::StampWrites());
 	}
 	destination.ClearBufferModified();
 }
@@ -619,7 +619,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	destination.CopyMip(source, mip, layer,
 	                    m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal));
 	if (source.IsGpuModified()) {
-		destination.MarkGpuModified();
+		destination.MarkGpuModified(GpuCapture::StampWrites());
 	}
 }
 
@@ -1630,7 +1630,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	}
 	image.ClearBufferModified();
 	image.RefreshComplete();
-	image.MarkGpuModified();
+	image.MarkGpuModified(GpuCapture::StampWrites());
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,

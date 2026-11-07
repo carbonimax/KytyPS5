@@ -883,7 +883,7 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	if (!Graphics::GpuCapture::Recording()) {
+	if (!Graphics::GpuCapture::Recording()) [[likely]] {
 		return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 	}
 	// Only the GPU side writes the backing directly: a GPU capture does not replay it as an Update.

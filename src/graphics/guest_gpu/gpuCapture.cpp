@@ -265,6 +265,11 @@ std::optional<Capture> Parse(std::span<const uint8_t> file, std::string* error) 
 }
 
 const bool       g_enabled = std::getenv("KYTY_GPU_CAPTURE") != nullptr;
+bool             g_stamp_writes = Enabled();
+#if !defined(KYTY_GPU_CAPTURE_RECORDING)
+// KYTY_GPU_CAPTURE set on a build without the recording hooks: say so instead of silently recording nothing.
+[[maybe_unused]] const bool g_warned =g_enabled && std::fprintf(stderr, "KYTY_GPU_CAPTURE ignored: build with -DKYTY_GPU_CAPTURE=ON\n") > 0;
+#endif
 std::atomic_bool g_recording {false};
 
 namespace {

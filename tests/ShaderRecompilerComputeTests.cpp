@@ -58027,6 +58027,8 @@ void CheckDriverCacheWriter(VulkanHarness &vulkan) {
 
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
+  // Capture publish and replay need the images' GPU write order, kept by the emulator only under KYTY_GPU_CAPTURE.
+  GpuCapture::g_stamp_writes = true;
 
   // The legacy MAD rounding fixtures expect the platform's default MAD form whatever the caller's
   // environment, so pin it before the emitter caches its policy: fma(a, b, -0.0) + c on Apple,

@@ -141,12 +141,21 @@ using SaveCpStates = std::function<std::vector<CpState>()>;
 
 extern const bool       g_enabled;
 extern std::atomic_bool g_recording;
+// Images keep their last-GPU-write order (Image::gpu_write_seq) for the publish: Enabled(), or a test.
+extern bool             g_stamp_writes;
+#if defined(KYTY_GPU_CAPTURE_RECORDING)
 inline bool             Enabled() noexcept { return g_enabled; }
 inline bool             Recording() noexcept { return g_recording.load(std::memory_order_relaxed); }
+#else
+// Built without the CMake option KYTY_GPU_CAPTURE: every recording hook folds away.
+constexpr bool          Enabled() noexcept { return false; }
+constexpr bool          Recording() noexcept { return false; }
+#endif
+inline bool             StampWrites() noexcept { return g_stamp_writes; }
 void                    TouchSlow(uint64_t address, uint64_t size, Out output);
 // Guest bytes the GPU side is about to use.
 inline void Touch(uint64_t address, uint64_t size, Out output = Out::None) {
-	if (Recording()) TouchSlow(address, size, output);
+	if (Recording()) [[unlikely]] TouchSlow(address, size, output);
 }
 // Guest bytes the GPU side writes itself (TryWriteBacking: write-backs, CP labels, expanded color
 // keys), called around the write while Recording(). The replay writes them again, so they are not
