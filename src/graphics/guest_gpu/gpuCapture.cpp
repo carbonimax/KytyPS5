@@ -642,10 +642,13 @@ void ParseScope(Recorder& r, const char* text) {
 
 } // namespace
 
-bool AtScopeBoundary() {
+bool AtScopeBoundary(bool fresh, std::span<const uint32_t> pending) {
 	auto&            r = GetRecorder();
 	std::scoped_lock lock(r.mutex);
-	return Recording() && ((r.first > 0 && r.submits == r.first) || (r.last != UINT32_MAX && r.submits > r.last));
+	if (!Recording()) return false;
+	if (fresh && r.first > 0 && r.submits == r.first) return true;
+	return r.last != UINT32_MAX && r.submits > r.last &&
+	       std::ranges::none_of(pending, [&](uint32_t i) { return i >= r.first && i <= r.last; });
 }
 
 void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight) {

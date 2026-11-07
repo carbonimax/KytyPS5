@@ -1023,7 +1023,17 @@ bool GuestGpu::Process(Submission& submission) {
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
 		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;
-		if ((!submission.started || submission.capture_submit == UINT32_MAX) && GpuCapture::AtScopeBoundary()) {
+		std::vector<uint32_t> pending;
+		if (submission.started && submission.capture_submit != UINT32_MAX) pending.push_back(submission.capture_submit);
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			for (const auto& queue: m_queues) {
+				for (const auto& queued: queue) {
+					if (queued.capture_submit != UINT32_MAX) pending.push_back(queued.capture_submit);
+				}
+			}
+		}
+		if (GpuCapture::AtScopeBoundary(!submission.started || submission.capture_submit == UINT32_MAX, pending)) {
 			CaptureBoundary(false);
 		}
 		if (!GpuCapture::Recording()) {
