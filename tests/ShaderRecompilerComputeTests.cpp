@@ -98,6 +98,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -15015,7 +15016,11 @@ public:
   // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
   // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
   // Returns the number of mismatching ranges.
-  uint32_t ReplayGpuCapture(const char *name, const GpuCapture::Capture &capture) {
+  // `nondet`: Expects two replays of this capture disagreed on (address -> true when only the order
+  // of their dwords differed), from <capture>.nondet.txt. Such an Expect is not counted as a
+  // mismatch when it differs the same way ("order": the game's dword multiset still matches).
+  uint32_t ReplayGpuCapture(const char *name, const GpuCapture::Capture &capture,
+                            const std::unordered_map<uint64_t, bool> &nondet = {}) {
     namespace Memory = Libs::LibKernel::Memory;
     constexpr uint64_t block = 0x10000;
     std::vector<std::pair<uint64_t, uint64_t>> blocks;
@@ -15105,15 +15110,36 @@ public:
     auto &gpu = context.GetGpu();
     // Updates by the submission that saw them (Submit index; a file holds one frame), in file order.
     std::vector<std::vector<const GpuCapture::Update *>> updates;
+    // KYTY_REPLAY_DROP_INNER_UPDATES=1 (diagnostics, for captures recorded before GpuWrite): an
+    // Update of a page first recorded inside the same submission is dropped instead of being
+    // written before that submission (the change happened during it, e.g. an emulator write-back).
+    static const bool drop_inner = std::getenv("KYTY_REPLAY_DROP_INNER_UPDATES") != nullptr;
+    std::unordered_map<uint64_t, size_t> first_submits; // page -> Submits recorded before its first bytes
+    uint32_t dropped = 0;
     for (const auto &record : capture.records) {
+      const auto *memory = std::get_if<GpuCapture::Memory>(&record);
+      const auto *zero = std::get_if<GpuCapture::Zero>(&record);
+      if (drop_inner && (memory != nullptr || zero != nullptr)) {
+        const auto address = memory != nullptr ? memory->address : zero->address;
+        const auto size = memory != nullptr ? memory->bytes.size() : zero->size;
+        for (uint64_t page = address & ~uint64_t{0xfff}; page < address + size; page += 0x1000) {
+          first_submits.try_emplace(page, updates.size());
+        }
+      }
       if (std::holds_alternative<GpuCapture::Submit>(record)) {
         updates.emplace_back();
       } else if (const auto *update = std::get_if<GpuCapture::Update>(&record)) {
         Require(name, "update submission", update->submit < updates.size(),
                 "an update names a submission not recorded before it");
+        const auto first = first_submits.find(update->address & ~uint64_t{0xfff});
+        if (drop_inner && first != first_submits.end() && first->second == update->submit + 1) {
+          dropped++;
+          continue;
+        }
         updates[update->submit].push_back(update);
       }
     }
+    if (drop_inner) std::printf("[gpu]     %s %u updates of pages first recorded in their submission dropped\n", name, dropped);
     // Submissions the game left waiting at the frame end stay blocked here too, as captured, with
     // the later Submits of their queue (the outer buffers of a resumed submission).
     std::vector<const GpuCapture::Submit *> submits;
@@ -15179,10 +15205,15 @@ public:
       context.GetTextureCache().DownloadGpuModified(&unpublished);
       context.GetBufferCache().ReadGpuModified();
     });
-    uint32_t mismatches = 0;
+    uint32_t mismatches = 0, accepted = 0;
     size_t expect_index = 0;
-    for (const auto &record : capture.records) {
-      if (const auto *expect = std::get_if<GpuCapture::Expect>(&record)) {
+    for (size_t record_index = 0; record_index < capture.records.size(); record_index++) {
+      if (const auto *expect = std::get_if<GpuCapture::Expect>(&capture.records[record_index])) {
+        const auto *unordered = record_index + 1 < capture.records.size()
+            ? std::get_if<GpuCapture::Unordered>(&capture.records[record_index + 1]) : nullptr;
+        if (unordered != nullptr && (unordered->address != expect->address || unordered->size != expect->size)) {
+          unordered = nullptr;
+        }
         const auto before = initial[expect_index++];
         context.GetBufferCache().ReadMemory(expect->address, expect->size);
         std::vector<uint8_t> bytes(expect->size);
@@ -15199,10 +15230,21 @@ public:
             std::fclose(f);
           }
         }
+        bool accept = false;
         if (hash != expect->hash) {
           // unchanged=capture: the game left the range as it was before the frame; =replay: the replay did.
           std::printf(" unchanged=%s", expect->hash == before ? (hash == before ? "both" : "capture")
                                                               : (hash == before ? "replay" : "neither"));
+          // unordered=<replay's Unordered hash>:same|differs: same: the game's dwords in another order.
+          const auto replay_set = GpuCapture::UnorderedHash(bytes);
+          const bool same_set = unordered != nullptr && replay_set == unordered->hash;
+          std::printf(" unordered=%016" PRIx64 ":%s", replay_set,
+                      unordered == nullptr ? "none" : same_set ? "same" : "differs");
+          if (const auto known = nondet.find(expect->address); known != nondet.end()) {
+            // Known nondeterministic: values are accepted, order-only needs the same dword multiset.
+            accept = !known->second || same_set;
+            std::printf(" nondet=%s%s", known->second ? "order" : "values", accept ? "_accepted" : "");
+          }
           for (const auto &u : unpublished) {
             if (u.address < expect->address + expect->size && u.address + u.size > expect->address) {
               std::printf(" unpublished=%s:0x%" PRIx64 "+0x%" PRIx64, u.reason, u.address, u.size);
@@ -15210,9 +15252,11 @@ public:
           }
         }
         std::printf("\n");
-        mismatches += hash == expect->hash ? 0 : 1;
+        mismatches += hash == expect->hash || accept ? 0 : 1;
+        accepted += accept ? 1 : 0;
       }
     }
+    if (accepted != 0) std::printf("[gpu]     %s %u known nondeterministic Expects accepted\n", name, accepted);
     if (blocked_at_end) {
       // The blocked queue keeps polling guest memory, so it cannot be unmapped: leave the process.
       std::printf("[gpu]     %s mismatches=%u, a queue is still blocked: exit without unmapping\n", name, mismatches);
@@ -15358,6 +15402,99 @@ public:
     std::get<GpuCapture::Expect>(wrong.records.back()).hash ^= 1u;
     Require(name, "mismatch detected", ReplayGpuCapture(name, wrong) == 1,
             "a wrong expected hash was not reported");
+    // Known nondeterministic Expects (<capture>.nondet.txt): "values" is accepted, "order" only
+    // when the replay holds the game's dwords (Unordered hash); an unlisted one stays a mismatch.
+    Require(name, "nondet values", ReplayGpuCapture(name, wrong, {{output, false}}) == 0,
+            "a known nondeterministic Expect was counted");
+    Require(name, "nondet order without multiset", ReplayGpuCapture(name, wrong, {{output, true}}) == 1,
+            "an order-only Expect was accepted without the game's dwords");
+    auto shuffled = *parsed;
+    const std::array<u32, 4> reversed{label_values[3], label_values[2], label_values[1], label_values[0]};
+    const auto labels_expect = std::ranges::find_if(shuffled.records, [&](const GpuCapture::Record &record) {
+      const auto *e = std::get_if<GpuCapture::Expect>(&record);
+      return e != nullptr && e->address == labels;
+    });
+    std::get<GpuCapture::Expect>(*labels_expect).hash = XXH3_64bits(reversed.data(), sizeof(reversed));
+    shuffled.records.insert(labels_expect + 1,
+        GpuCapture::Unordered{labels, sizeof(reversed),
+                              GpuCapture::UnorderedHash({reinterpret_cast<const uint8_t *>(reversed.data()), sizeof(reversed)})});
+    Require(name, "order difference detected", ReplayGpuCapture(name, shuffled) == 1,
+            "an order-only difference was not reported");
+    Require(name, "nondet order", ReplayGpuCapture(name, shuffled, {{labels, true}}) == 0,
+            "an order-only difference of a known list was counted");
+    CheckGpuCaptureStencilPublish();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The capture publish writes the stencil plane of a GPU-written depth/stencil image (held by
+  // the depth owner, no image of its own) to guest memory, layer by layer.
+  void CheckGpuCaptureStencilPublish() {
+    constexpr const char *name = "GpuCaptureStencilPublish";
+    constexpr uint64_t base = 0x0000000207000000ull, size = 0x10000, stencil = base + 0x1000;
+    constexpr uint32_t layers = 2, texels = 8 * 4;
+    namespace Memory = Libs::LibKernel::Memory;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map memory",
+            Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size, size, 0,
+                                               &offset) == 0 &&
+                Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, layers * texels * sizeof(float), vk::Format::eD32SfloatS8Uint,
+                                 Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+                                 {8, 4, 1}, layers, 4, 1);
+      desc.type = BindingType::DepthTarget;
+      desc.info.stencil = {stencil, layers * texels};
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      desc.view_info.type = vk::ImageViewType::e2DArray;
+      desc.view_info.layer_count = layers;
+      const auto id = cache.FindImage(desc);
+      auto &image = cache.GetImage(id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      constexpr std::array<uint8_t, layers> values{0x5a, 0xa5};
+      for (uint32_t layer = 0; layer < layers; layer++) {
+        const vk::ClearDepthStencilValue clear{0.5f, values[layer]};
+        const vk::ImageSubresourceRange range{desc.view_info.aspect, 0, 1, layer, 1};
+        scheduler.Current().Handle().clearDepthStencilImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+      }
+      cache.MarkGpuWritten(id);
+      std::vector<GpuCapture::Unpublished> unpublished;
+      cache.DownloadGpuModified(&unpublished);
+      std::vector<uint8_t> plane(layers * texels);
+      std::vector<float> depth(layers * texels);
+      Require(name, "published",
+              unpublished.empty() && Memory::TryReadBacking(stencil, plane.data(), plane.size()) &&
+                  Memory::TryReadBacking(base, depth.data(), depth.size() * sizeof(float)),
+              "the depth/stencil image or its stencil plane was not published");
+      for (uint32_t i = 0; i < plane.size(); i++) {
+        Require(name, "stencil bytes", plane[i] == values[i / texels] && depth[i] == 0.5f,
+                fmt::format("byte {} of the published planes is wrong", i));
+      }
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap memory",
+            Memory::KernelMunmap(base, size) == 0 && Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -15382,7 +15519,20 @@ public:
       expects += std::holds_alternative<GpuCapture::Expect>(record) ? 1 : 0;
       submits += std::holds_alternative<GpuCapture::Submit>(record) ? 1 : 0;
     }
-    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture);
+    // <capture>.nondet.txt (from two replays, s6d/nondet.py): "nondet <address> <size> order|values".
+    std::unordered_map<uint64_t, bool> nondet;
+    std::string side(path);
+    if (side.ends_with(".kygpucap")) side.resize(side.size() - 9);
+    if (FILE *f = std::fopen((side + ".nondet.txt").c_str(), "r")) {
+      unsigned long long address = 0, size = 0;
+      char kind[16] = {};
+      while (std::fscanf(f, " nondet %llx %llx %15s", &address, &size, kind) == 3) {
+        nondet[address] = std::strcmp(kind, "order") == 0;
+      }
+      std::fclose(f);
+      std::printf("[gpu]     GpuReplay %zu known nondeterministic Expects (%s.nondet.txt)\n", nondet.size(), side.c_str());
+    }
+    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet);
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
                 " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
