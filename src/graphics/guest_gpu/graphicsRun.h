@@ -15,6 +15,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -43,8 +44,13 @@ public:
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	// Same, giving up once every queued submission stayed blocked (waiting on memory nobody writes)
-	// for timeout_ms; busy work that progresses is waited for.
-	bool              WaitForIdle(uint32_t timeout_ms);
+	// for timeout_ms; busy work that progresses is waited for. Also true, without the timeout, once
+	// every queued submission is blocked and its command memory is in `may_stay` (capture replay).
+	bool              WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay = {});
+	// Capture replay, after WaitForIdle: drops the queued (blocked) submissions; returns how many.
+	uint32_t          DropQueued();
+	// Diagnostics: one line per queued submission (queue, commands, depth, next packet dwords).
+	[[nodiscard]] std::string DescribeQueued();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -97,7 +103,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
-	uint64_t                                       m_stalled_since_us  = 0; // all fronts blocked since; 0 = progressing
+	bool                                           m_stalled           = false; // every front blocked, no progress since
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =

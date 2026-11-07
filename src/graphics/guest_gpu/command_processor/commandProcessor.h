@@ -37,6 +37,14 @@ public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
 	// Stopped at a packet boundary to let queued compute work run first.
 	[[nodiscard]] bool Yielded() const noexcept { return m_yielded; }
+	// The unprocessed rest of each buffer (indirect buffers pushed), innermost first.
+	[[nodiscard]] std::vector<std::span<const uint32_t>> RemainingBuffers() const {
+		std::vector<std::span<const uint32_t>> rest;
+		for (auto it = m_buffer_stack.rbegin(); it != m_buffer_stack.rend(); ++it) {
+			rest.push_back(it->commands.subspan(it->offset_dw));
+		}
+		return rest;
+	}
 
 private:
 	friend class CommandProcessor;

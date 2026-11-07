@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -91,7 +92,7 @@ public:
 	void ProcessDownloadImages();
 	// GPU thread, between submissions (GPU capture): downloads every GPU-modified image that can
 	// be downloaded to guest memory and waits for it.
-	void DownloadGpuModified();
+	void DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped = nullptr);
 	void RunGarbageCollector();
 
 private:
@@ -174,7 +175,8 @@ private:
 	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
 	                        FindImageMemo* memo);
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, Buffer* staging = nullptr);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

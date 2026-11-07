@@ -98,6 +98,10 @@ void PutPayload(Writer& w, const Update& u) {
 	w.Put<uint32_t>(0);
 	PutPayload(w, Memory {u.address, u.bytes});
 }
+void PutPayload(Writer& w, const InFlight& f) {
+	w.Put(f.submit);
+	w.Put<uint32_t>(0);
+}
 void PutPayload(Writer& w, const Zero& z) {
 	w.Put(z.address);
 	w.Put(z.size);
@@ -140,6 +144,10 @@ bool GetPayload(Reader& r, Update& u) {
 	u.address = m.address;
 	u.bytes   = std::move(m.bytes);
 	return true;
+}
+bool GetPayload(Reader& r, InFlight& f) {
+	uint32_t reserved = 0;
+	return r.Get(f.submit) && r.Get(reserved) && reserved == 0;
 }
 bool GetPayload(Reader& r, Zero& z) {
 	return r.Get(z.address) && r.Get(z.size) && z.size != 0 && z.address + z.size > z.address;
@@ -243,9 +251,10 @@ struct Recorder {
 	std::unordered_map<uint64_t, uint64_t>     pages;   // recorded this frame -> XXH3 of the last bytes
 	std::unordered_set<uint64_t>               shaders; // recorded this frame
 	std::unordered_map<uint64_t, Shader>       kept;    // every registered shader
-	std::vector<std::pair<uint64_t, uint64_t>> outputs;
+	std::vector<std::tuple<uint64_t, uint64_t, Out>> outputs;
+	std::vector<Unpublished>                         unpublished_start;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
-	uint64_t          missing_shaders = 0, written = 0, updates = 0;
+	uint64_t          missing_shaders = 0, written = 0, updates = 0, started_before = 0;
 	uint32_t          current = 0; // Submit index of the slice being processed
 	Clock::duration   touch_time {}, publish_time {};
 	Clock::time_point start;
@@ -308,7 +317,7 @@ void RecordRun(Recorder& r, uint64_t begin, uint64_t end) {
 }
 
 // Caller holds the mutex.
-void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
+void TouchLocked(Recorder& r, uint64_t address, uint64_t size, Out output) {
 	if (!Recording() || size == 0 || address == 0) return;
 	// shortcut: ranges over 1 GiB are not recorded (bad descriptors); raise it if a game needs them.
 	if (size > (uint64_t {1} << 30u) || address + size < address) {
@@ -316,7 +325,7 @@ void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
 		return;
 	}
 	const auto start = Clock::now();
-	if (output) r.outputs.emplace_back(address, size);
+	if (output != Out::None) r.outputs.emplace_back(address, size, output);
 	// Pages recorded earlier in the frame and changed since (CPU rings) become Updates.
 	// shortcut: only accesses up to 1 MiB are compared; raise it if a replay misses larger rewrites.
 	const bool           compare = size <= (uint64_t {1} << 20u);
@@ -354,7 +363,7 @@ void TouchLocked(Recorder& r, uint64_t address, uint64_t size, bool output) {
 
 } // namespace
 
-void TouchSlow(uint64_t address, uint64_t size, bool output) {
+void TouchSlow(uint64_t address, uint64_t size, Out output) {
 	auto&            r = GetRecorder();
 	std::scoped_lock lock(r.mutex);
 	TouchLocked(r, address, size, output);
@@ -368,7 +377,7 @@ uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
 	Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
 	r.current = static_cast<uint32_t>(r.submits++);
 	// Updates of reused command memory belong to this Submit.
-	TouchLocked(r, address, commands.size_bytes(), false);
+	TouchLocked(r, address, commands.size_bytes(), Out::None);
 	return r.current;
 }
 
@@ -400,20 +409,21 @@ void UseShader(uint64_t address) {
 		shader = it->second;
 		Write(r, shader);
 	}
-	TouchSlow(address, shader.code_size_bytes, false);
-	TouchSlow(shader.input_semantics, uint64_t {shader.num_input_semantics} * sizeof(ShaderSemantic), false);
+	TouchSlow(address, shader.code_size_bytes, Out::None);
+	TouchSlow(shader.input_semantics, uint64_t {shader.num_input_semantics} * sizeof(ShaderSemantic), Out::None);
 	if (const auto* user_data = reinterpret_cast<const ShaderUserData*>(shader.user_data)) {
-		TouchSlow(shader.user_data, sizeof(ShaderUserData), false);
+		TouchSlow(shader.user_data, sizeof(ShaderUserData), Out::None);
 		TouchSlow(reinterpret_cast<uint64_t>(user_data->direct_resource_offset),
-		          uint64_t {user_data->direct_resource_count} * sizeof(uint16_t), false);
+		          uint64_t {user_data->direct_resource_count} * sizeof(uint16_t), Out::None);
 		for (uint32_t i = 0; i < 4; i++) {
 			TouchSlow(reinterpret_cast<uint64_t>(user_data->sharp_resource_offset[i]),
-			          uint64_t {user_data->sharp_resource_count[i]} * sizeof(ShaderSharp), false);
+			          uint64_t {user_data->sharp_resource_count[i]} * sizeof(ShaderSharp), Out::None);
 		}
 	}
 }
 
-void FrameBoundary(const std::function<void()>& publish_gpu_data) {
+void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight,
+                   uint32_t started_before) {
 	static const std::filesystem::path dir    = std::getenv("KYTY_GPU_CAPTURE");
 	static const int64_t               target = [] {
 		const char* v = std::getenv("KYTY_GPU_CAPTURE_FRAME");
@@ -424,14 +434,33 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	if (r.file != nullptr) {
 		const auto end_start = Clock::now();
 		g_recording.store(false, std::memory_order_relaxed);
-		publish_gpu_data();
+		std::vector<Unpublished> unpublished_end;
+		publish_gpu_data(unpublished_end);
 		std::scoped_lock lock(r.mutex);
+		uint64_t         in_flight_count = 0;
+		for (const auto index: in_flight) {
+			if (index < r.submits) {
+				Write(r, InFlight {index});
+				in_flight_count++;
+			}
+		}
 		Write(r, FrameEnd {});
 		// The outputs are published like the inputs, then hashed.
 		auto& outputs = r.outputs;
 		std::sort(outputs.begin(), outputs.end());
+		outputs.erase(std::unique(outputs.begin(), outputs.end()), outputs.end());
+		// An output the publish could not write back (compressed, MSAA...) holds stale guest bytes: no Expect.
+		uint64_t unpublished_outputs = 0;
+		std::erase_if(outputs, [&](const auto& output) {
+			const auto& [address, size, kind] = output;
+			const bool stale = std::ranges::any_of(unpublished_end, [&](const Unpublished& u) {
+				return u.address < address + size && address < u.address + u.size;
+			});
+			unpublished_outputs += stale ? 1 : 0;
+			return stale;
+		});
 		std::vector<std::pair<uint64_t, uint64_t>> merged; // [begin, end)
-		for (const auto& [address, size]: outputs) {
+		for (const auto& [address, size, kind]: outputs) {
 			if (!merged.empty() && address <= merged.back().second) {
 				merged.back().second = std::max(merged.back().second, address + size);
 			} else {
@@ -447,14 +476,46 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 				expects++;
 			}
 		}
+		// Diagnostics beside the capture: each output range and kind, and the GPU-resident images
+		// not written back (with whether the frame referenced them).
+		const auto referenced = [&](const Unpublished& u) {
+			for (uint64_t page = u.address & ~(PageSize - 1); page < u.address + u.size; page += PageSize) {
+				if (r.pages.contains(page)) return true;
+			}
+			return false;
+		};
+		uint64_t unpublished_ref = 0, unpublished_ref_bytes = 0;
+		if (FILE* info = std::fopen((r.path.substr(0, r.path.size() - 9) + ".info.txt").c_str(), "w")) {
+			constexpr const char* kinds[] = {"none", "buffer", "color", "dma"};
+			for (const auto& [address, size, kind]: outputs) {
+				std::fprintf(info, "out %s 0x%016llx 0x%llx\n", kinds[static_cast<int>(kind)],
+				             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
+			}
+			for (const auto* list: {&r.unpublished_start, &unpublished_end}) {
+				for (const auto& u: *list) {
+					const bool ref = referenced(u);
+					if (list == &r.unpublished_start && ref) {
+						unpublished_ref++;
+						unpublished_ref_bytes += u.size;
+					}
+					std::fprintf(info, "unpublished %s %s 0x%016llx 0x%llx referenced=%d\n",
+					             list == &r.unpublished_start ? "start" : "end", u.reason,
+					             static_cast<unsigned long long>(u.address), static_cast<unsigned long long>(u.size), ref);
+				}
+			}
+			for (const auto index: in_flight) {
+				if (index < r.submits) std::fprintf(info, "in_flight_end %u\n", index);
+			}
+			std::fclose(info);
+		}
 		const bool complete = r.file != nullptr && std::fclose(r.file) == 0;
 		r.file          = nullptr;
 		const auto line = fmt::format(
 		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} updates={} "
-		    "shaders={} missing_shaders={} expects={} publish_start_ms={:.1f} record_ms={:.1f} "
+		    "shaders={} missing_shaders={} expects={} in_flight_end={} started_before={} unpublished_start={} unpublished_referenced={} unpublished_referenced_bytes={} unpublished_outputs={} publish_start_ms={:.1f} record_ms={:.1f} "
 		    "end_ms={:.1f} frame_ms={:.1f}",
 		    r.path, frame - 1, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, r.submits, r.updates,
-		    r.shaders.size(), r.missing_shaders, expects, Ms(r.publish_time), Ms(r.touch_time),
+		    r.shaders.size(), r.missing_shaders, expects, in_flight_count, r.started_before, r.unpublished_start.size(), unpublished_ref, unpublished_ref_bytes, unpublished_outputs, Ms(r.publish_time), Ms(r.touch_time),
 		    Ms(Clock::now() - end_start), Ms(end_start - r.start));
 		LOGF("%s\n", line.c_str());
 		if (FILE* log = std::fopen((dir / "capture.log").string().c_str(), "a")) {
@@ -465,9 +526,11 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	std::error_code error;
 	const bool      triggered = std::filesystem::remove(dir / "trigger", error);
 	if (static_cast<int64_t>(frame) != target && !triggered) return;
-	const auto publish_start = Clock::now();
-	publish_gpu_data();
+	const auto               publish_start = Clock::now();
+	std::vector<Unpublished> unpublished;
+	publish_gpu_data(unpublished);
 	std::scoped_lock lock(r.mutex);
+	r.unpublished_start = std::move(unpublished);
 	r.path = (dir / fmt::format("frame_{:06d}.kygpucap", frame)).string();
 	r.file = std::fopen(r.path.c_str(), "wb");
 	if (r.file == nullptr) {
@@ -482,8 +545,9 @@ void FrameBoundary(const std::function<void()>& publish_gpu_data) {
 	r.shaders.clear();
 	r.outputs.clear();
 	r.stored = r.zero = r.unreadable = r.skipped = r.submits = r.missing_shaders = r.updates = 0;
-	r.current = 0;
-	r.touch_time   = {};
+	r.current        = 0;
+	r.started_before = started_before;
+	r.touch_time     = {};
 	r.publish_time = Clock::now() - publish_start;
 	r.start        = Clock::now();
 	g_recording.store(true, std::memory_order_relaxed);

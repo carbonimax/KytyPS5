@@ -1560,7 +1560,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	if (GpuCapture::Recording()) {
-		GpuCapture::Touch(image.info.data.address, image.info.data.size, true);
+		GpuCapture::Touch(image.info.data.address, image.info.data.size, GpuCapture::Out::Color);
 		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
 	}
 	TouchImage(image);
@@ -1929,7 +1929,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1938,13 +1938,14 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	auto&      reusable = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	Buffer&    download = staging != nullptr ? *staging : reusable;
+	auto [mapped, offset] = staging != nullptr ? std::pair {staging->Mapped().data(), uint64_t {0}}
+	                                           : reusable.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
 		EXIT("TextureCache: failed to map reusable download buffer\n");
 	}
-	download.Commit();
+	if (staging == nullptr) reusable.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -2135,23 +2136,39 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::DownloadGpuModified() {
+void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped) {
 	std::vector<ImageId> ids;
+	const auto           limit = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size();
 	{
 		std::scoped_lock lock {m_lock};
-		const auto limit = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size();
 		m_slot_images.ForEach([&](ImageId id, Image& image) {
-			if (image.registered && image.IsGpuModified() && image.info.data.size <= limit) {
+			if (!image.registered || !image.IsGpuModified()) return;
+			const char* reason = image.depth_id                ? "depth_alias"
+			                     : !image.SafeToDownload()    ? "cpu_or_buffer_modified"
+			                     : CanDownload(image)         ? nullptr
+			                     : image.info.samples != 1    ? "msaa"
+			                     : UploadBinding(image) == BindingType::DepthTarget ? "depth_format"
+			                     : image.info.metadata.compression != VideoOutCompression::Uncompressed ? "compressed"
+			                                                                                             : "format";
+			if (reason == nullptr) {
 				ids.push_back(id);
+			} else if (skipped != nullptr) {
+				skipped->push_back({image.info.data.address, image.info.data.size, reason});
 			}
 		});
 	}
-	// One image at a time: the download buffer is reused.
+	// One image at a time: the download buffer is reused; a larger image gets its own buffer.
 	for (const auto id: ids) {
-		bool downloaded = false;
+		bool                    downloaded = false;
+		std::unique_ptr<Buffer> staging;
 		{
 			std::scoped_lock lock {m_lock};
-			downloaded = DownloadImageMemory(id);
+			const auto       size = m_slot_images[id].info.data.size;
+			if (size > limit) {
+				staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+				                                   vk::BufferUsageFlagBits::eTransferDst, size);
+			}
+			downloaded = DownloadImageMemory(id, staging.get());
 		}
 		if (downloaded) {
 			m_scheduler.Finish();

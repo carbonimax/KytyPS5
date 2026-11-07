@@ -740,7 +740,7 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
-		if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, true);
+		if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, GpuCapture::Out::Dma);
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
@@ -754,7 +754,7 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
 	if (!src_gds) GpuCapture::Touch(src_address_or_offset_or_immediate, num_bytes);
-	if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, true);
+	if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, GpuCapture::Out::Dma);
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
 }
@@ -780,16 +780,58 @@ void GuestGpu::WaitForIdle() {
 	}
 }
 
-bool GuestGpu::WaitForIdle(uint32_t timeout_ms) {
+bool GuestGpu::WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay) {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
+	uint64_t          stalled_since_us = 0; // this waiter's clock: the GPU thread keeps only a flag
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
-		if (m_stalled_since_us != 0 && PerfStats::SteadyUs() - m_stalled_since_us >= uint64_t {timeout_ms} * 1000u) {
-			return false;
+		// A submission queued after the stall started is not blocked yet: the stall flag is stale.
+		const bool stalled = m_stalled && !m_processing && m_commands.empty() &&
+		                     std::ranges::all_of(m_queues, [](const auto& queue) { return queue.empty() || queue.front().blocked; });
+		if (!m_stalled) {
+			stalled_since_us = 0;
+		} else if (stalled) {
+			const auto now = PerfStats::SteadyUs();
+			if (stalled_since_us == 0) stalled_since_us = now;
+			if (now - stalled_since_us >= uint64_t {timeout_ms} * 1000u) return false;
+			const bool expected = std::ranges::all_of(m_queues, [&](const auto& queue) {
+				return std::ranges::all_of(queue, [&](const Submission& s) {
+					return std::ranges::find(may_stay, s.commands.data()) != may_stay.end();
+				});
+			});
+			if (expected) return true;
 		}
 		m_idle.WaitFor(&m_queue_mutex, 10000);
 	}
 	return true;
+}
+
+std::string GuestGpu::DescribeQueued() {
+	Common::LockGuard lock(m_queue_mutex);
+	std::string       out;
+	for (uint32_t id = 0; id < QueueCount; id++) {
+		for (const auto& s: m_queues[id]) {
+			const auto rest = s.execution.RemainingBuffers();
+			const auto next = rest.empty() ? std::span<const uint32_t> {} : rest.front();
+			out += fmt::format("queue={} commands=0x{:x} dw={} started={} depth={} next=0x{:x}", id,
+			                   reinterpret_cast<uint64_t>(s.commands.data()), s.commands.size(), s.started,
+			                   rest.size(), reinterpret_cast<uint64_t>(next.data()));
+			for (const auto dw: next.first(std::min<size_t>(next.size(), 8))) out += fmt::format(" {:08x}", dw);
+			out += '\n';
+		}
+	}
+	return out;
+}
+
+uint32_t GuestGpu::DropQueued() {
+	EXIT_IF(IsGpuThread());
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_processing) m_idle.WaitFor(&m_queue_mutex, 10000);
+	const auto dropped = m_submission_count;
+	for (auto& queue: m_queues) queue.clear();
+	m_submission_count = 0;
+	m_idle.SignalAll();
+	return dropped;
 }
 
 void GuestGpu::ThreadRun(void* data) {
@@ -831,7 +873,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
-					if (gpu->m_stalled_since_us == 0) gpu->m_stalled_since_us = PerfStats::SteadyUs();
+					gpu->m_stalled = true;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -872,7 +914,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing        = false;
-			gpu->m_stalled_since_us  = 0;
+			gpu->m_stalled           = false;
 			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_idle.SignalAll();
 			}
@@ -891,7 +933,7 @@ void GuestGpu::ThreadRun(void* data) {
 		PerfStats::MaybeReport();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
-		if (complete || submission.execution.MadeProgress()) gpu->m_stalled_since_us = 0;
+		if (complete || submission.execution.MadeProgress()) gpu->m_stalled = false;
 		if (!complete) {
 			// A yielded submission can resume as soon as the compute queues were served.
 			submission.blocked = !submission.yielded;
@@ -919,11 +961,21 @@ bool GuestGpu::Process(Submission& submission) {
 	CpPipeline::Drain();
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
+		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;
 		if (!submission.started) {
-			submission.capture_submit = GpuCapture::RecordSubmit(
-			    submission.commands, submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1);
-		} else if (submission.capture_submit != UINT32_MAX) {
-			GpuCapture::ResumeSubmit(submission.capture_submit);
+			submission.capture_submit = GpuCapture::RecordSubmit(submission.commands, queue);
+		} else {
+			if (submission.capture_submit == UINT32_MAX) {
+				// Started before the recording (a wait across the frame boundary): one Submit per
+				// remaining buffer, innermost first, replayed in that order on the same queue.
+				// shortcut: CP registers the submission set before the frame are not recorded.
+				for (const auto rest: submission.execution.RemainingBuffers()) {
+					if (rest.empty()) continue;
+					const auto index = GpuCapture::RecordSubmit(rest, queue);
+					if (submission.capture_submit == UINT32_MAX) submission.capture_submit = index;
+				}
+			}
+			if (submission.capture_submit != UINT32_MAX) GpuCapture::ResumeSubmit(submission.capture_submit);
 		}
 	}
 	submission.started = true;
@@ -953,10 +1005,23 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.BufferFlush();
 			cp.Reset();
 			if (GpuCapture::Enabled()) {
-				GpuCapture::FrameBoundary([this] {
-					m_renderer.GetTextureCache().DownloadGpuModified();
-					m_renderer.GetBufferCache().ReadGpuModified();
-				});
+				std::vector<uint32_t> in_flight;
+				uint32_t              started_before = 0;
+				{
+					Common::LockGuard lock(m_queue_mutex);
+					for (const auto& queue: m_queues) {
+						for (const auto& queued: queue) {
+							if (queued.capture_submit != UINT32_MAX) in_flight.push_back(queued.capture_submit);
+							started_before += queued.started ? 1 : 0;
+						}
+					}
+				}
+				GpuCapture::FrameBoundary(
+				    [this](std::vector<GpuCapture::Unpublished>& skipped) {
+					    m_renderer.GetTextureCache().DownloadGpuModified(&skipped);
+					    m_renderer.GetBufferCache().ReadGpuModified();
+				    },
+				    in_flight, started_before);
 			}
 			break;
 	}

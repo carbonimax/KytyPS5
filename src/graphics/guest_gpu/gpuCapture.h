@@ -75,7 +75,13 @@ struct Expect {
 	uint64_t hash    = 0;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update>;
+// A submission (Submit index) the game's GPU had started but not finished at the frame end (a
+// wait nobody released yet): replay leaves it blocked as captured instead of failing.
+struct InFlight {
+	uint32_t submit = 0;
+};
+
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight>;
 
 struct Capture {
 	std::vector<Record> records;
@@ -92,13 +98,22 @@ void SerializeRecord(std::vector<uint8_t>& out, const Record& record);
 // frame KYTY_GPU_CAPTURE_FRAME=N (suspend points processed before it) and the frame after each
 // <dir>/trigger file appears, to <dir>/frame_<N>.kygpucap. Guest bytes are recorded at their first use
 // in the frame; GPU-resident data is published to guest memory when recording starts.
+// What a Touch range is: outputs (non-None) are hashed at the frame end (Expect).
+enum class Out : uint8_t { None, Buffer, Color, Dma };
+// GPU-resident data the publish could not write back to guest memory (diagnostics).
+struct Unpublished {
+	uint64_t    address = 0;
+	uint64_t    size    = 0;
+	const char* reason  = "";
+};
+
 extern const bool       g_enabled;
 extern std::atomic_bool g_recording;
 inline bool             Enabled() noexcept { return g_enabled; }
 inline bool             Recording() noexcept { return g_recording.load(std::memory_order_relaxed); }
-void                    TouchSlow(uint64_t address, uint64_t size, bool output);
-// Guest bytes the GPU side is about to use; `output` ranges are hashed at the frame end (Expect).
-inline void Touch(uint64_t address, uint64_t size, bool output = false) {
+void                    TouchSlow(uint64_t address, uint64_t size, Out output);
+// Guest bytes the GPU side is about to use.
+inline void Touch(uint64_t address, uint64_t size, Out output = Out::None) {
 	if (Recording()) TouchSlow(address, size, output);
 }
 // While Recording(): a submission's first slice (queue as in Submit); returns its Submit index
@@ -112,8 +127,11 @@ void KeepShader(Shader shader);
 // While Recording(): a shader-map lookup; records the shader and its guest data once per frame.
 void UseShader(uint64_t address);
 // GPU thread, at each processed suspend point while Enabled(). `publish_gpu_data` writes
-// GPU-resident data back to guest memory.
-void FrameBoundary(const std::function<void()>& publish_gpu_data);
+// GPU-resident data back to guest memory and lists what it skipped. `in_flight`: RecordSubmit indices of the submissions
+// still queued; `started_before`: queued submissions already started (not replayable when a
+// recording starts now).
+void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight,
+                   uint32_t started_before);
 
 } // namespace Libs::Graphics::GpuCapture
 
