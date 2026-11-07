@@ -273,6 +273,7 @@ struct Recorder {
 	std::unordered_map<uint64_t, Shader>       kept;    // every registered shader
 	std::vector<std::tuple<uint64_t, uint64_t, Out>> outputs;
 	std::vector<Unpublished>                         unpublished_start;
+	std::vector<Published>                           published_start;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
 	uint64_t          missing_shaders = 0, written = 0, updates = 0, started_before = 0, gpu_writes = 0;
 	uint32_t          current = 0; // frame index of the submission whose slice is being processed
@@ -474,8 +475,6 @@ const std::filesystem::path& CaptureDir() {
 	return dir;
 }
 
-using Publish = std::function<void(std::vector<Unpublished>&)>;
-
 // Ends the recording: publish, InFlight, FrameEnd, Expects, diagnostics, close.
 void Finish(Recorder& r, const Publish& publish_gpu_data, std::span<const uint32_t> in_flight) {
 	const auto in_file = [&](uint32_t index) { return index < r.submits && index >= r.first && index <= r.last; };
@@ -505,7 +504,8 @@ void Finish(Recorder& r, const Publish& publish_gpu_data, std::span<const uint32
 			}
 		}
 		std::vector<Unpublished> unpublished_end;
-		publish_gpu_data(unpublished_end);
+		std::vector<Published>   published_end;
+		publish_gpu_data(unpublished_end, published_end);
 		std::scoped_lock lock(r.mutex);
 		uint64_t         in_flight_count = 0;
 		for (const auto index: in_flight) {
@@ -581,6 +581,15 @@ void Finish(Recorder& r, const Publish& publish_gpu_data, std::span<const uint32
 					             static_cast<unsigned long long>(u.address), static_cast<unsigned long long>(u.size), ref);
 				}
 			}
+			for (const auto* list: {&r.published_start, &published_end}) {
+				for (size_t i = 0; i < list->size(); i++) {
+					const auto& p = (*list)[i];
+					std::fprintf(info, "published %s %zu %s 0x%016llx 0x%llx seq=%llu slot=%u\n",
+					             list == &r.published_start ? "start" : "end", i, p.kind,
+					             static_cast<unsigned long long>(p.address), static_cast<unsigned long long>(p.size),
+					             static_cast<unsigned long long>(p.write_seq), p.slot);
+				}
+			}
 			for (const auto index: in_flight) {
 				if (in_file(index)) std::fprintf(info, "in_flight_end %u\n", index - r.first);
 			}
@@ -644,9 +653,11 @@ void ScopeBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in
 	// shortcut: CP registers set by the earlier submissions are not recorded; start scopes at 0 when they matter.
 	const auto               publish_start = Clock::now();
 	std::vector<Unpublished> unpublished;
-	publish_gpu_data(unpublished);
+	std::vector<Published>   published;
+	publish_gpu_data(unpublished, published);
 	std::scoped_lock lock(r.mutex);
 	r.unpublished_start = std::move(unpublished);
+	r.published_start   = std::move(published);
 	r.publish_time += Clock::now() - publish_start;
 }
 
@@ -672,9 +683,11 @@ void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in
 	ParseScope(r, triggered && scope[0] != 0 ? scope : submits);
 	const auto               publish_start = Clock::now();
 	std::vector<Unpublished> unpublished;
-	if (r.first == 0) publish_gpu_data(unpublished);
+	std::vector<Published>   published;
+	if (r.first == 0) publish_gpu_data(unpublished, published);
 	std::scoped_lock lock(r.mutex);
 	r.unpublished_start = std::move(unpublished);
+	r.published_start   = std::move(published);
 	r.capture_frame     = frame;
 	r.path              = (dir / (r.first == 0 && r.last == UINT32_MAX
 	                                  ? fmt::format("frame_{:06d}.kygpucap", frame)

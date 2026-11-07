@@ -1030,8 +1030,8 @@ void GuestGpu::CaptureBoundary(bool frame_end) {
 			}
 		}
 	}
-	const auto publish = [this](std::vector<GpuCapture::Unpublished>& skipped) {
-		m_renderer.GetTextureCache().DownloadGpuModified(&skipped);
+	const auto publish = [this](std::vector<GpuCapture::Unpublished>& skipped, std::vector<GpuCapture::Published>& written) {
+		m_renderer.GetTextureCache().DownloadGpuModified(&skipped, &written);
 		m_renderer.GetBufferCache().ReadGpuModified();
 	};
 	if (frame_end) {

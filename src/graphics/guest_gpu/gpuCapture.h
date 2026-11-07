@@ -118,6 +118,16 @@ struct Unpublished {
 	uint64_t    size    = 0;
 	const char* reason  = "";
 };
+// An image the publish wrote back, in publish order (diagnostics): last GPU write order (Image::gpu_write_seq)
+// and cache slot, to see which of two overlapping images wrote the guest bytes last.
+struct Published {
+	uint64_t    address   = 0;
+	uint64_t    size      = 0;
+	uint64_t    write_seq = 0;
+	uint32_t    slot      = 0;
+	const char* kind      = "";
+};
+using Publish = std::function<void(std::vector<Unpublished>&, std::vector<Published>&)>;
 
 extern const bool       g_enabled;
 extern std::atomic_bool g_recording;
@@ -146,10 +156,10 @@ void KeepShader(Shader shader);
 // While Recording(): a shader-map lookup; records the shader and its guest data once per frame.
 void UseShader(uint64_t address);
 // GPU thread, at each processed suspend point while Enabled(). `publish_gpu_data` writes
-// GPU-resident data back to guest memory and lists what it skipped. `in_flight`: RecordSubmit indices of the submissions
+// GPU-resident data back to guest memory and lists what it skipped and wrote. `in_flight`: RecordSubmit indices of the submissions
 // still queued; `started_before`: queued submissions already started (not replayable when a
 // recording starts now).
-void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight,
+void FrameBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight,
                    uint32_t started_before);
 // Scoped captures: KYTY_GPU_CAPTURE_SUBMITS=a-b (or a trigger file holding "a-b") records only the
 // frame's submissions a..b (in processing order, from 0), as Submits 0..b-a, and the ranges they use.
@@ -157,7 +167,7 @@ void FrameBoundary(const std::function<void(std::vector<Unpublished>&)>& publish
 // (GPU-resident data is published first) or b + 1 (the recording ends there, Expects included).
 bool AtScopeBoundary();
 // GPU thread, when AtScopeBoundary(); same arguments as FrameBoundary.
-void ScopeBoundary(const std::function<void(std::vector<Unpublished>&)>& publish_gpu_data, std::span<const uint32_t> in_flight);
+void ScopeBoundary(const Publish& publish_gpu_data, std::span<const uint32_t> in_flight);
 
 } // namespace Libs::Graphics::GpuCapture
 

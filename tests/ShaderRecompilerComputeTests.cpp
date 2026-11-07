@@ -15423,6 +15423,77 @@ public:
     Require(name, "nondet order", ReplayGpuCapture(name, shuffled, {{labels, true}}) == 0,
             "an order-only difference of a known list was counted");
     CheckGpuCaptureStencilPublish();
+    CheckGpuCapturePublishOrder();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Two registered GPU-written images over the same guest bytes: the capture publish writes the
+  // one written last after the other, whatever their cache slots.
+  void CheckGpuCapturePublishOrder() {
+    constexpr const char *name = "GpuCapturePublishOrder";
+    constexpr uint64_t base = 0x0000000207000000ull, size = 0x10000, bytes = 8 * 4 * 4;
+    namespace Memory = Libs::LibKernel::Memory;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map memory",
+            Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size, size, 0,
+                                               &offset) == 0 &&
+                Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto older_desc = MakeLinearDesc(base, bytes, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {8, 4, 1}, 1, 4, 1);
+      auto newer_desc = MakeLinearDesc(base, bytes, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {4, 8, 1}, 1, 4, 1);
+      const auto older = cache.FindImage(older_desc);
+      const auto newer = cache.FindImage(newer_desc);
+      Require(name, "two images", older != newer && cache.GetImage(older).registered && cache.GetImage(newer).registered,
+              "the overlapping images were not both kept");
+      // Written in the reverse of the slot order: the slot-order publish wrote the stale image last.
+      const auto write = [&](ImageId id, uint32_t value) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        vk::ClearColorValue clear{};
+        clear.uint32 = std::array<uint32_t, 4>{value, value, value, value};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                                                     &clear, 1, &range);
+        cache.MarkGpuWritten(id);
+      };
+      const bool reversed = newer.index < older.index;
+      write(reversed ? older : newer, 0x11111111u);
+      write(reversed ? newer : older, 0x22222222u);
+      std::vector<GpuCapture::Unpublished> unpublished;
+      std::vector<GpuCapture::Published> written;
+      cache.DownloadGpuModified(&unpublished, &written);
+      std::array<uint32_t, bytes / 4> published{};
+      Require(name, "published",
+              unpublished.empty() && written.size() == 2 && Memory::TryReadBacking(base, published.data(), bytes),
+              "the images were not both published");
+      Require(name, "newest last", std::ranges::all_of(published, [](uint32_t v) { return v == 0x22222222u; }),
+              fmt::format("guest holds 0x{:08x}, not the newest image", published[0]));
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap memory",
+            Memory::KernelMunmap(base, size) == 0 && Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 

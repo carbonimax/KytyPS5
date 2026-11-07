@@ -105,7 +105,10 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		gpu_write_seq  = gpu_writes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	}
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -140,6 +143,7 @@ public:
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
 	static inline std::atomic<uint64_t> serials {0};
+	static inline std::atomic<uint64_t> gpu_writes {0};
 
 	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -158,6 +162,8 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// Order of the last MarkGpuModified among all images: overlapping images are written back oldest first.
+	uint64_t         gpu_write_seq      = 0;
 	// TextureCache::MaterializeColorClear's last check that found none of `keys` left in these
 	// metadata runs. It holds while BufferCache::ColorMetadataEpoch() keeps the recorded value.
 	struct ColorClearCheck {

@@ -91,8 +91,9 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	// GPU thread, between submissions (GPU capture): downloads every GPU-modified image that can
-	// be downloaded to guest memory and waits for it.
-	void DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped = nullptr);
+	// be downloaded to guest memory, oldest GPU write first, and waits for it.
+	void DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped = nullptr,
+	                         std::vector<GpuCapture::Published>*   written = nullptr);
 	void RunGarbageCollector();
 
 private:

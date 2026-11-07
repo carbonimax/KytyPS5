@@ -2166,7 +2166,8 @@ void TextureCache::RunGarbageCollector() {
 	}
 }
 
-void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped) {
+void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped,
+                                       std::vector<GpuCapture::Published>*   written) {
 	std::vector<ImageId> ids;
 	const auto           limit = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download).Size();
 	{
@@ -2188,6 +2189,8 @@ void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* ski
 				skipped->push_back({image.info.data.address, image.info.data.size, reason});
 			}
 		});
+		// Oldest GPU write first: where a stale registered image overlaps a newer one, the newer bytes land last.
+		std::ranges::stable_sort(ids, {}, [&](ImageId id) { return m_slot_images[id].gpu_write_seq; });
 	}
 	// One image at a time: the download buffer is reused; a larger image gets its own buffer.
 	for (const auto id: ids) {
@@ -2200,10 +2203,17 @@ void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* ski
 				staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 				                                   vk::BufferUsageFlagBits::eTransferDst, size);
 			}
-			downloaded = DownloadImageMemory(id, staging.get(), true);
+			downloaded       = DownloadImageMemory(id, staging.get(), true);
+			const auto& image = m_slot_images[id];
 			if (!downloaded && skipped != nullptr) {
-				const auto& info = m_slot_images[id].info;
-				skipped->push_back({info.data.address, info.data.size, "backing"});
+				skipped->push_back({image.info.data.address, image.info.data.size, "backing"});
+			}
+			if (downloaded && written != nullptr) {
+				written->push_back({image.info.data.address, image.info.data.size, image.gpu_write_seq, id.index,
+				                    image.depth_id            ? "stencil"
+				                    : image.info.IsDepth()    ? "depth"
+				                    : image.usage.render_target ? "color"
+				                                                : "other"});
 			}
 		}
 		if (downloaded) {
