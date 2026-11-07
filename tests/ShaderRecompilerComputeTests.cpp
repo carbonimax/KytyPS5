@@ -276,6 +276,10 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+  // Suspend points that collect nothing.
+  static void SkipFrames(TextureCache &cache, uint64_t frames) {
+    cache.m_gc_tick += frames;
+  }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -299,7 +303,7 @@ struct TextureCacheTestAccess {
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
-        image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.tick_accessed_last = tick;
         live.push_back(id);
       }
     });
@@ -4087,6 +4091,17 @@ public:
                 second_wait == 0 && second_count == 1 && second_event.data == 0xa2u,
             "a GDS release interrupt overtook an earlier interrupt");
 
+    // Repeats of the newest undelivered data count in its event instead of queuing.
+    for (const uint32_t data : {1u, 1u, 2u, 3u, 3u}) {
+      context.TriggerInterrupt(0, data);
+    }
+    const bool coalesced =
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.fflags == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 2 &&
+        wait_for_interrupt(interrupt_event, interrupt_count) == 0 && interrupt_event.data == 3;
+    Require("GpuCommandLane", "interrupt coalescing", coalesced,
+            "undelivered interrupts with the same data were not counted in one event");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -6289,6 +6304,34 @@ public:
                   ImageHeapTestAccess::TailPageDirty(heap),
               "a write fault next to a table left its page watched");
       draw();
+      // The last suspend point released texture 0's image from the smaller
+      // table. Images age in frames, not command buffers: an alias frees it
+      // only after 16 frames.
+      const auto released =
+          TextureCacheTestAccess::FindImages(textures, texture(0), 64u);
+      const auto alias = [&](Prospero::TileMode tile) {
+        auto desc = MakeLinearDesc(
+            texture(0), 64u, vk::Format::eR8G8B8A8Unorm, Format::k8_8_8_8UNorm,
+            Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+        desc.info.tile_mode = tile;
+        desc.info.UpdateSize();
+        return textures.FindImage(desc);
+      };
+      for (uint32_t submit = 0; submit <= 16u; ++submit)
+        scheduler.Flush();
+      const auto standard = alias(Prospero::TileMode::kStandard4KB);
+      Require(name, "frame lifetime",
+              released.size() == 1u && standard != released[0] &&
+                  TextureCacheTestAccess::Contains(textures, released[0]) &&
+                  textures.GetImage(standard).tick_accessed_last ==
+                      TextureCacheTestAccess::GcTick(textures),
+              "one frame's command buffers aged a released heap image out, or "
+              "an alias missed its frame");
+      TextureCacheTestAccess::SkipFrames(textures, 17u);
+      (void)alias(Prospero::TileMode::kStandard256B);
+      Require(name, "frame aging",
+              !TextureCacheTestAccess::Contains(textures, released[0]),
+              "an alias kept a heap image unused for 17 frames");
       context.UnmapMemory(base, idle_table - base);
       scheduler.Finish();
       device.destroyPipelineLayout(layout, nullptr);
@@ -56678,6 +56721,17 @@ void CheckPm4Flip() {
               static_cast<int64_t>(flip_status[3]) == flip_arg &&
               VideoOut::VideoOutIsFlipPending(handle) == 0,
           "the flip status did not report the completed flip");
+
+  // Vblanks while the event is undelivered count in that one event.
+  Require(name, "vblank event",
+          VideoOut::VideoOutAddVblankEvent(flips, handle, nullptr) == 0,
+          "vblank event registration failed");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  timeout = 0;
+  Require(name, "vblank count",
+          EventQueue::KernelWaitEqueue(flips, &event, 1, &count, &timeout) == 0 &&
+              VideoOut::VideoOutGetEventCount(&event) >= 2,
+          "undelivered vblanks were queued as separate events");
 
   gpu.WaitForIdle();
   // Each pre-vblank event carries the port's pre-vblank count.
