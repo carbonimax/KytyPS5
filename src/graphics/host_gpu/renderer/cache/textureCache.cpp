@@ -2145,27 +2145,25 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 	if (image.depth_id ? !capture || !CanDownloadStencil(image) : !CanDownload(image, capture)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      reusable = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	if (!image.SafeToDownload() || (staging == nullptr && range.size > reusable.Size())) {
+	const auto range = image.info.data;
+	if (!image.SafeToDownload()) {
 		return false;
 	}
-	Buffer&    download = staging != nullptr ? *staging : reusable;
-	auto [mapped, offset] = staging != nullptr ? std::pair {staging->Mapped().data(), uint64_t {0}}
-	                                           : reusable.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
-	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
-	}
-	if (staging == nullptr) reusable.Commit();
-	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
+	// The capture's staging buffer, or the download ring with a temporary buffer past its size.
+	auto download = staging != nullptr
+	                    ? StreamBuffer::Download {staging, staging->Mapped().data(), 0, nullptr}
+	                    : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
+	                          .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	if (!LibKernel::Memory::TryReadBacking(range.address, download.mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	download.buffer->Flush(download.offset, range.size);
 
 	if (image.depth_id) {
-		DownloadStencil(image, download, offset);
+		DownloadStencil(image, *download.buffer, download.offset);
 	} else {
-		DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+		DownloadImage(image, *download.buffer, download.offset, range.size,
+		              image.info.resources.levels);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
@@ -2174,8 +2172,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
-	barrier.offset              = offset;
+	barrier.buffer              = download.buffer->Handle();
+	barrier.offset              = download.offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
@@ -2190,10 +2188,11 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, &download, write_back, mapped, offset,
+	m_scheduler.DeferPriorityOperation([this, download = std::move(download), write_back,
 	                                    trapped = m_readback_storage_images] {
-		download.Invalidate(offset, write_back.range.size);
-		LibKernel::Memory::WriteBacking(write_back.range.address, mapped, write_back.range.size);
+		download.buffer->Invalidate(download.offset, write_back.range.size);
+		LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
+		                                write_back.range.size);
 		if (trapped) {
 			m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
 			                                               write_back.range.size);
