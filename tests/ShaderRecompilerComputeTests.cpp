@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -56,6 +57,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -65,6 +67,7 @@
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
+#include "loader/x64InstructionEmulator.h"
 #include "spirv-tools/libspirv.hpp"
 #include "SrtWalkerTestMemory.h"
 
@@ -95,6 +98,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -108,7 +112,10 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <variant>
 #include <vector>
+
+#include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 #include <cerrno>
@@ -15049,6 +15056,647 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
+  // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
+  // Returns the number of mismatching ranges.
+  // `nondet`: Expects two replays of this capture disagreed on (address -> true when only the order
+  // of their dwords differed), from <capture>.nondet.txt. Such an Expect is not counted as a
+  // mismatch when it differs the same way ("order": the game's dword multiset still matches).
+  uint32_t ReplayGpuCapture(const char *name, const GpuCapture::Capture &capture,
+                            const std::unordered_map<uint64_t, bool> &nondet = {}) {
+    namespace Memory = Libs::LibKernel::Memory;
+    constexpr uint64_t block = 0x10000;
+    std::vector<std::pair<uint64_t, uint64_t>> blocks;
+    for (const auto &record : capture.records) {
+      const auto *memory = std::get_if<GpuCapture::Memory>(&record);
+      const auto *zero = std::get_if<GpuCapture::Zero>(&record);
+      const auto *update = std::get_if<GpuCapture::Update>(&record);
+      if (memory != nullptr || zero != nullptr || update != nullptr) {
+        const auto address = memory != nullptr ? memory->address
+                             : zero != nullptr ? zero->address
+                                               : update->address;
+        const auto size = memory != nullptr ? memory->bytes.size()
+                          : zero != nullptr ? zero->size
+                                            : update->bytes.size();
+        const auto begin = address & ~(block - 1);
+        const auto end = (address + size + block - 1) & ~(block - 1);
+        Require(name, "memory range", GuestRange{begin, end - begin}.Valid(),
+                "capture memory is outside the guest address space");
+        blocks.emplace_back(begin, end);
+      }
+    }
+    std::ranges::sort(blocks);
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    for (const auto &range : blocks) {
+      if (!merged.empty() && range.first <= merged.back().second) {
+        merged.back().second = std::max(merged.back().second, range.second);
+      } else {
+        merged.push_back(range);
+      }
+    }
+    std::vector<int64_t> direct_offsets;
+    for (const auto &[begin, end] : merged) {
+      int64_t offset = -1;
+      void *mapped = reinterpret_cast<void *>(begin);
+      Require(name, "map memory",
+              Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
+                                                 end - begin, block, 0, &offset) == 0 &&
+                  Memory::KernelMapDirectMemory(&mapped, end - begin, 0x3, 0x10, offset,
+                                                block) == 0 &&
+                  mapped == reinterpret_cast<void *>(begin),
+              "fixed mapping of capture memory failed");
+      std::memset(mapped, 0, end - begin);
+      direct_offsets.push_back(offset);
+    }
+    for (const auto &record : capture.records) {
+      if (const auto *memory = std::get_if<GpuCapture::Memory>(&record)) {
+        std::memcpy(reinterpret_cast<void *>(memory->address), memory->bytes.data(),
+                    memory->bytes.size());
+      }
+    }
+    // Diagnostics: each Expect's bytes before the frame, to tell a range one side left unchanged.
+    std::vector<uint64_t> initial;
+    for (const auto &record : capture.records) {
+      if (const auto *expect = std::get_if<GpuCapture::Expect>(&record)) {
+        initial.push_back(XXH3_64bits(reinterpret_cast<const void *>(expect->address), expect->size));
+      }
+    }
+    // Registration reads the shader code and user data, so it follows the memory.
+    for (const auto &record : capture.records) {
+      if (const auto *shader = std::get_if<GpuCapture::Shader>(&record)) {
+        static_assert(sizeof(GpuCapture::Shader::Register) == sizeof(ShaderRegister));
+        ShaderMapUserData(shader->address,
+            {.type = static_cast<Prospero::ShaderBinaryType>(shader->type),
+             .user_data = reinterpret_cast<ShaderUserData *>(shader->user_data),
+             .input_semantics = reinterpret_cast<ShaderSemantic *>(shader->input_semantics),
+             .num_input_semantics = shader->num_input_semantics,
+             .code_size_bytes = shader->code_size_bytes,
+             .scratch_size_dwords = shader->scratch_size_dwords,
+             .cx_registers = reinterpret_cast<const ShaderRegister *>(shader->cx_registers.data()),
+             .sh_registers = reinterpret_cast<const ShaderRegister *>(shader->sh_registers.data()),
+             .num_cx_registers = static_cast<uint32_t>(shader->cx_registers.size()),
+             .num_sh_registers = static_cast<uint32_t>(shader->sh_registers.size())});
+      }
+    }
+
+    EnsureRuntimeContext();
+    // Game shaders may use the int64 buffer atomics the device enables, as in the emulator; the
+    // other fixtures keep the emulated path.
+    const bool int64_atomics = std::exchange(m_runtime_context.shader_buffer_int64_atomics_enabled,
+                                             m_buffer_int64_atomics);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    Memory::InstallGpuResources(&context);
+    for (const auto &[begin, end] : merged) {
+      context.MapMemory(begin, end - begin);
+    }
+    auto &gpu = context.GetGpu();
+    // Updates by the submission that saw them (Submit index; a file holds one frame), in file order.
+    std::vector<std::vector<const GpuCapture::Update *>> updates;
+    // KYTY_REPLAY_DROP_INNER_UPDATES=1 (diagnostics, for captures recorded before GpuWrite): an
+    // Update of a page first recorded inside the same submission is dropped instead of being
+    // written before that submission (the change happened during it, e.g. an emulator write-back).
+    static const bool drop_inner = std::getenv("KYTY_REPLAY_DROP_INNER_UPDATES") != nullptr;
+    std::unordered_map<uint64_t, size_t> first_submits; // page -> Submits recorded before its first bytes
+    uint32_t dropped = 0;
+    for (const auto &record : capture.records) {
+      const auto *memory = std::get_if<GpuCapture::Memory>(&record);
+      const auto *zero = std::get_if<GpuCapture::Zero>(&record);
+      if (drop_inner && (memory != nullptr || zero != nullptr)) {
+        const auto address = memory != nullptr ? memory->address : zero->address;
+        const auto size = memory != nullptr ? memory->bytes.size() : zero->size;
+        for (uint64_t page = address & ~uint64_t{0xfff}; page < address + size; page += 0x1000) {
+          first_submits.try_emplace(page, updates.size());
+        }
+      }
+      if (std::holds_alternative<GpuCapture::Submit>(record)) {
+        updates.emplace_back();
+      } else if (const auto *update = std::get_if<GpuCapture::Update>(&record)) {
+        Require(name, "update submission", update->submit < updates.size(),
+                "an update names a submission not recorded before it");
+        const auto first = first_submits.find(update->address & ~uint64_t{0xfff});
+        if (drop_inner && first != first_submits.end() && first->second == update->submit + 1) {
+          dropped++;
+          continue;
+        }
+        updates[update->submit].push_back(update);
+      }
+    }
+    if (drop_inner) std::printf("[gpu]     %s %u updates of pages first recorded in their submission dropped\n", name, dropped);
+    // Submissions the game left waiting at the frame end stay blocked here too, as captured, with
+    // the later Submits of their queue (the outer buffers of a resumed submission).
+    std::vector<const GpuCapture::Submit *> submits;
+    for (const auto &record : capture.records) {
+      if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) submits.push_back(submit);
+    }
+    std::vector<const uint32_t *> in_flight;
+    for (const auto &record : capture.records) {
+      if (const auto *f = std::get_if<GpuCapture::InFlight>(&record)) {
+        Require(name, "in-flight submission", f->submit < submits.size(), "an in-flight record names no submission");
+        for (size_t i = f->submit; i < submits.size(); i++) {
+          if (submits[i]->queue == submits[f->submit]->queue) {
+            in_flight.push_back(reinterpret_cast<const uint32_t *>(submits[i]->address));
+          }
+        }
+      }
+    }
+    // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle: after
+    // 1 s with every queue blocked, the Updates are written anyway.
+    // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
+    constexpr uint32_t idle_timeout_ms = 1000;
+    // The command processor state each queue had when the recording started (compute queues across
+    // frames, every queue for a scope starting after submission 0). KYTY_REPLAY_NO_CP_STATE=1
+    // (diagnostics) replays from reset processors, as before the record existed.
+    static const bool no_cp_state = std::getenv("KYTY_REPLAY_NO_CP_STATE") != nullptr;
+    uint32_t cp_states = 0;
+    for (const auto &record : capture.records) {
+      if (const auto *state = std::get_if<GpuCapture::CpState>(&record); state != nullptr && !no_cp_state) {
+        Require(name, "cp state", gpu.RestoreCpState(state->queue, state->bytes),
+                fmt::format("the CP state of queue 0x{:x} has another layout (capture from another build)", state->queue));
+        cp_states++;
+      }
+    }
+    if (cp_states != 0) std::printf("[gpu]     %s %u queue states restored\n", name, cp_states);
+    uint32_t busy = 0;
+    size_t submit_index = 0;
+    for (const auto &record : capture.records) {
+      if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
+        const auto &pending = updates[submit_index++];
+        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+        for (const auto *update : pending) {
+          std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
+                      update->bytes.size());
+        }
+        const std::span commands{reinterpret_cast<const uint32_t *>(submit->address),
+                                 submit->dword_count};
+        if (submit->queue == 0) {
+          gpu.Submit(commands);
+        } else {
+          gpu.SubmitCompute(submit->queue, commands);
+        }
+        // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
+        static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
+        if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
+      } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
+        gpu.SuspendPoint();
+      }
+    }
+    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
+    busy += blocked_at_end ? 1 : 0;
+    if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
+    const auto queued = gpu.DescribeQueued();
+    if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
+    if (!blocked_at_end && !in_flight.empty()) {
+      std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
+                  in_flight.size(), gpu.DropQueued());
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+    });
+    // Outputs are published as the capture published them.
+    std::vector<GpuCapture::Unpublished> unpublished;
+    gpu.SendCommandSync([&] {
+      context.GetTextureCache().DownloadGpuModified(&unpublished);
+      context.GetBufferCache().ReadGpuModified();
+    });
+    uint32_t mismatches = 0, accepted = 0;
+    size_t expect_index = 0;
+    for (size_t record_index = 0; record_index < capture.records.size(); record_index++) {
+      if (const auto *expect = std::get_if<GpuCapture::Expect>(&capture.records[record_index])) {
+        const auto *unordered = record_index + 1 < capture.records.size()
+            ? std::get_if<GpuCapture::Unordered>(&capture.records[record_index + 1]) : nullptr;
+        if (unordered != nullptr && (unordered->address != expect->address || unordered->size != expect->size)) {
+          unordered = nullptr;
+        }
+        const auto before = initial[expect_index++];
+        context.GetBufferCache().ReadMemory(expect->address, expect->size);
+        std::vector<uint8_t> bytes(expect->size);
+        const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
+        const auto hash = read ? XXH3_64bits(bytes.data(), bytes.size()) : 0;
+        std::printf("[gpu]     %s 0x%016" PRIx64 "+0x%" PRIx64 " hash %016" PRIx64 " %s", name,
+                    expect->address, expect->size, hash, hash == expect->hash ? "ok" : "MISMATCH");
+        // KYTY_REPLAY_DUMP=<dir> (diagnostics): the replayed bytes of each mismatching range.
+        static const char *dump_dir = std::getenv("KYTY_REPLAY_DUMP");
+        if (hash != expect->hash && dump_dir != nullptr) {
+          const auto path = fmt::format("{}/{:016x}.bin", dump_dir, expect->address);
+          if (FILE *f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(bytes.data(), 1, bytes.size(), f);
+            std::fclose(f);
+          }
+        }
+        bool accept = false;
+        if (hash != expect->hash) {
+          // unchanged=capture: the game left the range as it was before the frame; =replay: the replay did.
+          std::printf(" unchanged=%s", expect->hash == before ? (hash == before ? "both" : "capture")
+                                                              : (hash == before ? "replay" : "neither"));
+          // unordered=<replay's Unordered hash>:same|differs: same: the game's dwords in another order.
+          const auto replay_set = GpuCapture::UnorderedHash(bytes);
+          const bool same_set = unordered != nullptr && replay_set == unordered->hash;
+          std::printf(" unordered=%016" PRIx64 ":%s", replay_set,
+                      unordered == nullptr ? "none" : same_set ? "same" : "differs");
+          if (const auto known = nondet.find(expect->address); known != nondet.end()) {
+            // Known nondeterministic: values are accepted, order-only needs the same dword multiset.
+            accept = !known->second || same_set;
+            std::printf(" nondet=%s%s", known->second ? "order" : "values", accept ? "_accepted" : "");
+          }
+          for (const auto &u : unpublished) {
+            if (u.address < expect->address + expect->size && u.address + u.size > expect->address) {
+              std::printf(" unpublished=%s:0x%" PRIx64 "+0x%" PRIx64, u.reason, u.address, u.size);
+            }
+          }
+        }
+        std::printf("\n");
+        mismatches += hash == expect->hash || accept ? 0 : 1;
+        accepted += accept ? 1 : 0;
+      }
+    }
+    if (accepted != 0) std::printf("[gpu]     %s %u known nondeterministic Expects accepted\n", name, accepted);
+    if (blocked_at_end) {
+      // The blocked queue keeps polling guest memory, so it cannot be unmapped: leave the process.
+      std::printf("[gpu]     %s mismatches=%u, a queue is still blocked: exit without unmapping\n", name, mismatches);
+      std::fflush(stdout);
+      std::_Exit(2);
+    }
+    gpu.SendCommandSync([&] {
+      // Cache buffers are rounded and grown past the captured blocks (unmapped here, mapped in the
+      // game): the gaps between blocks are unmapped too, so no page watcher outlives the caches.
+      if (!merged.empty()) context.UnmapMemory(merged.front().first, merged.back().second - merged.front().first);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    Memory::InstallGpuResources(nullptr);
+    m_runtime_context.shader_buffer_int64_atomics_enabled = int64_atomics;
+    for (size_t i = 0; i < merged.size(); i++) {
+      const auto size = merged[i].second - merged[i].first;
+      Require(name, "unmap memory",
+              Memory::KernelMunmap(merged[i].first, size) == 0 &&
+                  Memory::KernelReleaseDirectMemory(direct_offsets[i], size) == 0,
+              "capture memory release failed");
+    }
+    return mismatches;
+  }
+
+  // A synthetic capture (no game content): graphics and compute command lists with an indirect
+  // buffer, CP writes, a DMA copy, an end-of-pipe label and a compute dispatch set up by PM4.
+  void CheckGpuCaptureReplay() {
+    constexpr const char *name = "GpuCaptureReplay";
+    constexpr uint64_t base = 0x0000000206000000ull;
+    constexpr uint64_t dcb = base, ib = base + 0x1000, acb = base + 0x2000;
+    constexpr uint64_t code_address = base + 0x3000, labels = base + 0x4000;
+    constexpr uint64_t dma_src = base + 0x5000, dma_dst = base + 0x6000, output = base + 0x8000;
+    constexpr u32 stored = 0xc0ffee01u;
+    using Words = std::vector<u32>;
+    const auto write_data = [](uint64_t address, u32 value) {
+      return Words{KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0, static_cast<u32>(address),
+                   static_cast<u32>(address >> 32u), value};
+    };
+    const auto set_sh = [](u32 reg, std::initializer_list<u32> values) {
+      Words packet{KYTY_PM4(static_cast<u32>(values.size()) + 2u, Pm4::IT_SET_SH_REG, 0), reg};
+      packet.insert(packet.end(), values);
+      return packet;
+    };
+    Words graphics;
+    const auto append = [&](const Words &packet) {
+      graphics.insert(graphics.end(), packet.begin(), packet.end());
+    };
+
+    Words shader;
+    AppendVMovLiteral(&shader, 1, stored);
+    shader.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    shader.push_back(EncodeMubuf1(1, 3, 0));
+    AppendEnd(&shader);
+    ShaderBufferResource out{};
+    out.UpdateAddress48(output);
+    out.fields[2] = sizeof(u32);
+    out.fields[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+
+    const auto indirect = write_data(labels + 4, 0x22222222u);
+    append(write_data(labels, 0x11111111u));
+    append({KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0), static_cast<u32>(ib),
+            static_cast<u32>(ib >> 32u), 0x0f200000u | static_cast<u32>(indirect.size())});
+    append({KYTY_PM4(7, Pm4::IT_DMA_DATA, 0), 0, static_cast<u32>(dma_src),
+            static_cast<u32>(dma_src >> 32u), static_cast<u32>(dma_dst),
+            static_cast<u32>(dma_dst >> 32u), 0x100});
+    append(set_sh(Pm4::COMPUTE_PGM_LO,
+                  {static_cast<u32>(code_address >> 8u), static_cast<u32>(code_address >> 40u)}));
+    append(set_sh(Pm4::COMPUTE_PGM_RSRC2, {16u << Pm4::COMPUTE_PGM_RSRC2_USER_SGPR_SHIFT}));
+    append(set_sh(Pm4::COMPUTE_NUM_THREAD_X, {1, 1, 1}));
+    append(set_sh(Pm4::COMPUTE_USER_DATA_0 + 12,
+                  {out.fields[0], out.fields[1], out.fields[2], out.fields[3]}));
+    append({KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41u});
+    append({KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0), 0x28u | (5u << 8u) | (1u << 21u), 1u << 29u,
+            static_cast<u32>(labels + 8), static_cast<u32>((labels + 8) >> 32u), 0x33333333u, 0,
+            0});
+    const auto compute = write_data(labels + 12, 0x44444444u);
+    // Still waiting at the frame end in the game (label never released): stays blocked in the replay.
+    constexpr uint64_t hold = base + 0x7000;
+    Words held{KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, static_cast<u32>(labels + 16),
+               static_cast<u32>((labels + 16) >> 32u), 1, UINT32_MAX, 0};
+    for (const auto dw : write_data(labels + 20, 0x66666666u)) held.push_back(dw);
+
+    std::vector<uint8_t> dma_bytes(0x100);
+    for (size_t i = 0; i < dma_bytes.size(); i++) dma_bytes[i] = static_cast<uint8_t>(i * 7u + 1u);
+    const auto bytes_of = [](const Words &list) {
+      const auto *p = reinterpret_cast<const uint8_t *>(list.data());
+      return std::vector<uint8_t>(p, p + list.size() * sizeof(u32));
+    };
+    constexpr std::array<u32, 4> label_values{0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+
+    GpuCapture::Capture capture;
+    auto &records = capture.records;
+    records.emplace_back(GpuCapture::Memory{dcb, bytes_of(graphics)});
+    // The indirect buffer and the compute list are rewritten during the frame (reused command
+    // memory): each Update names the submission that saw it, whatever queue was recorded last.
+    records.emplace_back(GpuCapture::Memory{ib, bytes_of(write_data(labels + 4, 0x99999999u))});
+    records.emplace_back(GpuCapture::Memory{acb, bytes_of(write_data(labels + 12, 0x55555555u))});
+    records.emplace_back(GpuCapture::Memory{code_address, bytes_of(shader)});
+    records.emplace_back(GpuCapture::Memory{dma_src, dma_bytes});
+    // A zero page in its own 64 KiB block: mapped and zero-filled by the replay.
+    constexpr uint64_t zero_page = base + 0x20000;
+    records.emplace_back(GpuCapture::Zero{zero_page, 0x1000});
+    records.emplace_back(GpuCapture::Shader{
+        .address = code_address, .type = static_cast<u32>(Prospero::ShaderBinaryType::kCs),
+        .code_size_bytes = static_cast<u32>(shader.size() * sizeof(u32))});
+    records.emplace_back(GpuCapture::Submit{dcb, 0, static_cast<u32>(graphics.size())});
+    records.emplace_back(GpuCapture::Submit{acb, 0x20, static_cast<u32>(compute.size())});
+    records.emplace_back(GpuCapture::Update{acb, 1, bytes_of(compute)});
+    records.emplace_back(GpuCapture::Update{ib, 0, bytes_of(indirect)});
+    records.emplace_back(GpuCapture::Memory{hold, bytes_of(held)});
+    records.emplace_back(GpuCapture::Submit{hold, 0x21, static_cast<u32>(held.size())});
+    records.emplace_back(GpuCapture::InFlight{2});
+    records.emplace_back(GpuCapture::FrameEnd{});
+    constexpr std::array<u32, 2> held_labels{};
+    records.emplace_back(GpuCapture::Expect{labels + 16, sizeof(held_labels),
+                                            XXH3_64bits(held_labels.data(), sizeof(held_labels))});
+    records.emplace_back(GpuCapture::Expect{labels, sizeof(label_values),
+                                            XXH3_64bits(label_values.data(), sizeof(label_values))});
+    records.emplace_back(GpuCapture::Expect{dma_dst, dma_bytes.size(),
+                                            XXH3_64bits(dma_bytes.data(), dma_bytes.size())});
+    const std::vector<uint8_t> zeros(0x1000);
+    records.emplace_back(GpuCapture::Expect{zero_page, zeros.size(), XXH3_64bits(zeros.data(), zeros.size())});
+    records.emplace_back(GpuCapture::Expect{output, sizeof(stored), XXH3_64bits(&stored, sizeof(stored))});
+
+    // The file format round-trips and rejects damaged or unknown files.
+    const auto file = GpuCapture::Serialize(capture);
+    std::string error;
+    const auto parsed = GpuCapture::Parse(file, &error);
+    Require(name, "round trip",
+            parsed.has_value() && parsed->records.size() == records.size() &&
+                GpuCapture::Serialize(*parsed) == file,
+            "parse failed: " + error);
+    Require(name, "truncated", !GpuCapture::Parse(std::span{file}.first(file.size() - 9), &error),
+            "a truncated capture was accepted");
+    auto future = file;
+    future[8] = static_cast<uint8_t>(GpuCapture::Version + 1);
+    Require(name, "version", !GpuCapture::Parse(future, &error), "an unknown version was accepted");
+
+    Require(name, "replay", ReplayGpuCapture(name, *parsed) == 0, "replayed output differs");
+    // A wrong expectation must be reported, so the comparison above is live.
+    auto wrong = *parsed;
+    std::get<GpuCapture::Expect>(wrong.records.back()).hash ^= 1u;
+    Require(name, "mismatch detected", ReplayGpuCapture(name, wrong) == 1,
+            "a wrong expected hash was not reported");
+    // Known nondeterministic Expects (<capture>.nondet.txt): "values" is accepted, "order" only
+    // when the replay holds the game's dwords (Unordered hash); an unlisted one stays a mismatch.
+    Require(name, "nondet values", ReplayGpuCapture(name, wrong, {{output, false}}) == 0,
+            "a known nondeterministic Expect was counted");
+    Require(name, "nondet order without multiset", ReplayGpuCapture(name, wrong, {{output, true}}) == 1,
+            "an order-only Expect was accepted without the game's dwords");
+    auto shuffled = *parsed;
+    const std::array<u32, 4> reversed{label_values[3], label_values[2], label_values[1], label_values[0]};
+    const auto labels_expect = std::ranges::find_if(shuffled.records, [&](const GpuCapture::Record &record) {
+      const auto *e = std::get_if<GpuCapture::Expect>(&record);
+      return e != nullptr && e->address == labels;
+    });
+    std::get<GpuCapture::Expect>(*labels_expect).hash = XXH3_64bits(reversed.data(), sizeof(reversed));
+    shuffled.records.insert(labels_expect + 1,
+        GpuCapture::Unordered{labels, sizeof(reversed),
+                              GpuCapture::UnorderedHash({reinterpret_cast<const uint8_t *>(reversed.data()), sizeof(reversed)})});
+    Require(name, "order difference detected", ReplayGpuCapture(name, shuffled) == 1,
+            "an order-only difference was not reported");
+    Require(name, "nondet order", ReplayGpuCapture(name, shuffled, {{labels, true}}) == 0,
+            "an order-only difference of a known list was counted");
+    CheckGpuCaptureStencilPublish();
+    CheckGpuCapturePublishOrder();
+    CheckGpuCaptureCpState();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // CpState: a command processor's state survives SaveState -> file -> RestoreState, and the replay
+  // refuses a state of another layout.
+  void CheckGpuCaptureCpState() {
+    constexpr const char *name = "GpuCaptureCpState";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    CommandProcessor cp(context, 0x20);
+    cp.SetIndexBaseAddress(0x123456789ull);
+    cp.GetUcfg().SetIndexOffset(77);
+    cp.GetShCtx().SetCsUserSgpr(3, 0xabcdu);
+    GpuCapture::Capture capture;
+    capture.records.push_back(GpuCapture::CpState{0x20, cp.SaveState()});
+    const auto parsed = GpuCapture::Parse(GpuCapture::Serialize(capture), nullptr);
+    const auto *state = parsed.has_value() ? std::get_if<GpuCapture::CpState>(&parsed->records[0]) : nullptr;
+    Require(name, "parse", state != nullptr && state->queue == 0x20, "the CpState record did not round-trip");
+    CommandProcessor restored(context, 0x20);
+    Require(name, "restore",
+            restored.RestoreState(state->bytes) && restored.SaveState() == state->bytes &&
+                restored.GetUcfg().GetIndexOffset() == 77 && restored.GetShCtx().GetCs().cs_user_sgpr.value[3] == 0xabcdu,
+            "the restored state differs");
+    auto shorter = state->bytes;
+    shorter.pop_back();
+    Require(name, "other layout", !restored.RestoreState(shorter) && !context.GetGpu().RestoreCpState(0x20, shorter),
+            "a state of another size was restored");
+    context.ShutdownGpu();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Two registered GPU-written images over the same guest bytes: the capture publish writes the
+  // one written last after the other, whatever their cache slots.
+  void CheckGpuCapturePublishOrder() {
+    constexpr const char *name = "GpuCapturePublishOrder";
+    constexpr uint64_t base = 0x0000000207000000ull, size = 0x10000, bytes = 8 * 4 * 4;
+    namespace Memory = Libs::LibKernel::Memory;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map memory",
+            Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size, size, 0,
+                                               &offset) == 0 &&
+                Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto older_desc = MakeLinearDesc(base, bytes, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {8, 4, 1}, 1, 4, 1);
+      auto newer_desc = MakeLinearDesc(base, bytes, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {4, 8, 1}, 1, 4, 1);
+      const auto older = cache.FindImage(older_desc);
+      const auto newer = cache.FindImage(newer_desc);
+      Require(name, "two images", older != newer && cache.GetImage(older).registered && cache.GetImage(newer).registered,
+              "the overlapping images were not both kept");
+      // Written in the reverse of the slot order: the slot-order publish wrote the stale image last.
+      const auto write = [&](ImageId id, uint32_t value) {
+        auto &image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                      scheduler.Current().Handle());
+        vk::ClearColorValue clear{};
+        clear.uint32 = std::array<uint32_t, 4>{value, value, value, value};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        scheduler.Current().Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                                                     &clear, 1, &range);
+        cache.MarkGpuWritten(id);
+      };
+      const bool reversed = newer.index < older.index;
+      write(reversed ? older : newer, 0x11111111u);
+      write(reversed ? newer : older, 0x22222222u);
+      std::vector<GpuCapture::Unpublished> unpublished;
+      std::vector<GpuCapture::Published> written;
+      cache.DownloadGpuModified(&unpublished, &written);
+      std::array<uint32_t, bytes / 4> published{};
+      Require(name, "published",
+              unpublished.empty() && written.size() == 2 && Memory::TryReadBacking(base, published.data(), bytes),
+              "the images were not both published");
+      Require(name, "newest last", std::ranges::all_of(published, [](uint32_t v) { return v == 0x22222222u; }),
+              fmt::format("guest holds 0x{:08x}, not the newest image", published[0]));
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap memory",
+            Memory::KernelMunmap(base, size) == 0 && Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The capture publish writes the stencil plane of a GPU-written depth/stencil image (held by
+  // the depth owner, no image of its own) to guest memory, layer by layer.
+  void CheckGpuCaptureStencilPublish() {
+    constexpr const char *name = "GpuCaptureStencilPublish";
+    constexpr uint64_t base = 0x0000000207000000ull, size = 0x10000, stencil = base + 0x1000;
+    constexpr uint32_t layers = 2, texels = 8 * 4;
+    namespace Memory = Libs::LibKernel::Memory;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map memory",
+            Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size, size, 0,
+                                               &offset) == 0 &&
+                Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, layers * texels * sizeof(float), vk::Format::eD32SfloatS8Uint,
+                                 Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+                                 {8, 4, 1}, layers, 4, 1);
+      desc.type = BindingType::DepthTarget;
+      desc.info.stencil = {stencil, layers * texels};
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      desc.view_info.type = vk::ImageViewType::e2DArray;
+      desc.view_info.layer_count = layers;
+      const auto id = cache.FindImage(desc);
+      auto &image = cache.GetImage(id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      constexpr std::array<uint8_t, layers> values{0x5a, 0xa5};
+      for (uint32_t layer = 0; layer < layers; layer++) {
+        const vk::ClearDepthStencilValue clear{0.5f, values[layer]};
+        const vk::ImageSubresourceRange range{desc.view_info.aspect, 0, 1, layer, 1};
+        scheduler.Current().Handle().clearDepthStencilImage(
+            image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+      }
+      cache.MarkGpuWritten(id);
+      std::vector<GpuCapture::Unpublished> unpublished;
+      cache.DownloadGpuModified(&unpublished);
+      std::vector<uint8_t> plane(layers * texels);
+      std::vector<float> depth(layers * texels);
+      Require(name, "published",
+              unpublished.empty() && Memory::TryReadBacking(stencil, plane.data(), plane.size()) &&
+                  Memory::TryReadBacking(base, depth.data(), depth.size() * sizeof(float)),
+              "the depth/stencil image or its stencil plane was not published");
+      for (uint32_t i = 0; i < plane.size(); i++) {
+        Require(name, "stencil bytes", plane[i] == values[i / texels] && depth[i] == 0.5f,
+                fmt::format("byte {} of the published planes is wrong", i));
+      }
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap memory",
+            Memory::KernelMunmap(base, size) == 0 && Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // --gpu-replay <file>: replays a local capture (KYTY_GPU_CAPTURE); 0 when every Expect matches.
+  int ReplayGpuCaptureFile(const char *path) {
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> file;
+    if (FILE *f = std::fopen(path, "rb")) {
+      std::vector<uint8_t> chunk(64u << 20u);
+      for (size_t n; (n = std::fread(chunk.data(), 1, chunk.size(), f)) != 0;) {
+        file.insert(file.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
+      }
+      std::fclose(f);
+    }
+    std::string error;
+    auto capture = GpuCapture::Parse(file, &error);
+    Require("GpuReplay", "parse", capture.has_value(), std::string(path) + ": " + error);
+    file = {};
+    uint64_t memory = 0, expects = 0, submits = 0;
+    for (const auto &record : capture->records) {
+      if (const auto *m = std::get_if<GpuCapture::Memory>(&record)) memory += m->bytes.size();
+      expects += std::holds_alternative<GpuCapture::Expect>(record) ? 1 : 0;
+      submits += std::holds_alternative<GpuCapture::Submit>(record) ? 1 : 0;
+    }
+    // <capture>.nondet.txt (from two replays of the same capture): "nondet <address> <size> order|values".
+    std::unordered_map<uint64_t, bool> nondet;
+    std::string side(path);
+    if (side.ends_with(".kygpucap")) side.resize(side.size() - 9);
+    if (FILE *f = std::fopen((side + ".nondet.txt").c_str(), "r")) {
+      unsigned long long address = 0, size = 0;
+      char kind[16] = {};
+      while (std::fscanf(f, " nondet %llx %llx %15s", &address, &size, kind) == 3) {
+        nondet[address] = std::strcmp(kind, "order") == 0;
+      }
+      std::fclose(f);
+      std::printf("[gpu]     GpuReplay %zu known nondeterministic Expects (%s.nondet.txt)\n", nondet.size(), side.c_str());
+    }
+    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet);
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
+                " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
+                path, capture->records.size(), memory, submits, expects, mismatches, ms);
+    return mismatches == 0 ? 0 : 1;
+  }
+
   void CheckSampledDccClear() {
     constexpr const char *name = "SampledDccClear";
     constexpr uintptr_t base = 0x0000000205000000ull;
@@ -24335,6 +24983,7 @@ private:
   // the depth feedback loop is a pipeline property instead of per-draw state.
   bool m_feedback_loop_dynamic = false;
   bool m_sampler_filter_minmax = false;
+  bool m_buffer_int64_atomics = false; // enabled on the device (fixtures still declare it off)
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
@@ -24364,7 +25013,14 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              if (LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr)) return true;
+              // As in the emulator: an SRT walker load of an unmapped address (unused null
+              // descriptor pointer) reads zero.
+              if (const auto length = ShaderRecompiler::IR::SrtWalkerLoadLength(info.exception_address)) {
+                Loader::X64InstructionEmulator::SkipLoad(info.native_context, length);
+                return true;
+              }
+              return false;
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
@@ -24727,6 +25383,7 @@ private:
       device_features12.bufferDeviceAddress = true;
       device_features12.timelineSemaphore = min_lod_fallback || portable_graphics;
     }
+    m_buffer_int64_atomics = device_features12.shaderBufferInt64Atomics == VK_TRUE;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -57833,6 +58490,36 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSampleSrgb8_8<2>());
     vulkan.CheckSampledSrgbViews();
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-capture-replay-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuCaptureReplay();
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--gpu-replay") == 0) {
+    VulkanHarness vulkan;
+    return vulkan.ReplayGpuCaptureFile(argv[2]);
+  }
+  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly.
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-replay-dir-only") == 0) {
+    const char *dir = std::getenv("KYTY_GPU_REPLAY_DIR");
+    std::vector<std::string> files;
+    std::error_code error;
+    if (dir != nullptr) {
+      for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
+        if (entry.path().extension() == ".kygpucap") files.push_back(entry.path().string());
+      }
+    }
+    if (files.empty()) {
+      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir != nullptr ? dir : "unset");
+      return 0;
+    }
+    std::ranges::sort(files);
+    VulkanHarness vulkan;
+    int failed = 0;
+    for (const auto &file : files) failed += vulkan.ReplayGpuCaptureFile(file.c_str()) != 0 ? 1 : 0;
+    std::printf("GpuReplayDir %zu captures, %d differ\n", files.size(), failed);
+    return failed == 0 ? 0 : 1;
   }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
     VulkanHarness vulkan;
