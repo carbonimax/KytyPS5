@@ -17096,6 +17096,7 @@ public:
       uint64_t alignment;
     };
     constexpr std::array cases{
+        TileCase{Prospero::TileMode::kStandard256B, 0x100, 0x100},
         TileCase{Prospero::TileMode::kStandard4KB, 0x4000, 0x1000},
         TileCase{Prospero::TileMode::kStandard64KB, 0x10000, 0x10000},
     };
@@ -60188,6 +60189,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--standard-tile-rt-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--rt1d-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorDiscovery();
@@ -60214,11 +60220,6 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--standard64-rt-only") == 0) {
     CheckStandard64RenderTargetTileRoundTrip();
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--standard-tile-rt-only") == 0) {
-    VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-only") == 0) {
