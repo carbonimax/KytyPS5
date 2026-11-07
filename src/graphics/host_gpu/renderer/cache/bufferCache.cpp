@@ -1653,6 +1653,10 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
 }
 
+bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	return m_gpu_modified_ranges.Contains(vaddr, size);
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
