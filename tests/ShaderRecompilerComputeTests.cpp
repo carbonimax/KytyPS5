@@ -58189,6 +58189,27 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     return vulkan.ReplayGpuCaptureFile(argv[2]);
   }
+  // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly.
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-replay-dir-only") == 0) {
+    const char *dir = std::getenv("KYTY_GPU_REPLAY_DIR");
+    std::vector<std::string> files;
+    std::error_code error;
+    if (dir != nullptr) {
+      for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
+        if (entry.path().extension() == ".kygpucap") files.push_back(entry.path().string());
+      }
+    }
+    if (files.empty()) {
+      std::printf("GpuReplayDir skipped: no .kygpucap in KYTY_GPU_REPLAY_DIR (%s)\n", dir != nullptr ? dir : "unset");
+      return 0;
+    }
+    std::ranges::sort(files);
+    VulkanHarness vulkan;
+    int failed = 0;
+    for (const auto &file : files) failed += vulkan.ReplayGpuCaptureFile(file.c_str()) != 0 ? 1 : 0;
+    std::printf("GpuReplayDir %zu captures, %d differ\n", files.size(), failed);
+    return failed == 0 ? 0 : 1;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckMsaaStorageClear();

@@ -902,6 +902,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME gpu_capture_replay
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
+	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); skipped where it is unset.
+	add_test(NAME gpu_capture_replay_local
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
+	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
