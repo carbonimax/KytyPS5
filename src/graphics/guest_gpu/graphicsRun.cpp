@@ -740,6 +740,7 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
+		if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, true);
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
@@ -781,13 +782,12 @@ void GuestGpu::WaitForIdle() {
 
 bool GuestGpu::WaitForIdle(uint32_t timeout_ms) {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
-	const auto        deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
-		const auto left = deadline - std::chrono::steady_clock::now();
-		if (left <= std::chrono::steady_clock::duration::zero()) return false;
-		m_idle.WaitFor(&m_queue_mutex,
-		               static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(left).count()));
+		if (m_stalled_since_us != 0 && PerfStats::SteadyUs() - m_stalled_since_us >= uint64_t {timeout_ms} * 1000u) {
+			return false;
+		}
+		m_idle.WaitFor(&m_queue_mutex, 10000);
 	}
 	return true;
 }
@@ -831,6 +831,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					if (gpu->m_stalled_since_us == 0) gpu->m_stalled_since_us = PerfStats::SteadyUs();
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false)) {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
@@ -870,7 +871,8 @@ void GuestGpu::ThreadRun(void* data) {
 			PerfStats::MaybeReport();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
-			gpu->m_processing = false;
+			gpu->m_processing        = false;
+			gpu->m_stalled_since_us  = 0;
 			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_idle.SignalAll();
 			}
@@ -889,6 +891,7 @@ void GuestGpu::ThreadRun(void* data) {
 		PerfStats::MaybeReport();
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+		if (complete || submission.execution.MadeProgress()) gpu->m_stalled_since_us = 0;
 		if (!complete) {
 			// A yielded submission can resume as soon as the compute queues were served.
 			submission.blocked = !submission.yielded;

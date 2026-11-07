@@ -42,7 +42,8 @@ public:
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
-	// Same, giving up after timeout_ms: false while a queue still waits (on memory nobody writes).
+	// Same, giving up once every queued submission stayed blocked (waiting on memory nobody writes)
+	// for timeout_ms; busy work that progresses is waited for.
 	bool              WaitForIdle(uint32_t timeout_ms);
 	[[nodiscard]] int GetFrameNum() const;
 
@@ -96,6 +97,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
+	uint64_t                                       m_stalled_since_us  = 0; // all fronts blocked since; 0 = progressing
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =

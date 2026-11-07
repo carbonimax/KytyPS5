@@ -15107,8 +15107,9 @@ public:
         updates[update->submit].push_back(update);
       }
     }
-    // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle.
-    // shortcut: Updates are then written while earlier work may still run (no WaitValue breaker yet).
+    // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle: after
+    // 1 s with every queue blocked, the Updates are written anyway.
+    // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
     constexpr uint32_t idle_timeout_ms = 1000;
     uint32_t busy = 0;
     size_t submit_index = 0;
@@ -15131,7 +15132,8 @@ public:
         gpu.SuspendPoint();
       }
     }
-    if (!gpu.WaitForIdle(10 * idle_timeout_ms)) busy++;
+    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms);
+    busy += blocked_at_end ? 1 : 0;
     if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
     auto &scheduler = context.GetCommandScheduler();
     gpu.SendCommandSync([&] {
@@ -15154,6 +15156,12 @@ public:
                     expect->address, expect->size, hash, hash == expect->hash ? "ok" : "MISMATCH");
         mismatches += hash == expect->hash ? 0 : 1;
       }
+    }
+    if (blocked_at_end) {
+      // The blocked queue keeps polling guest memory, so it cannot be unmapped: leave the process.
+      std::printf("[gpu]     %s mismatches=%u, a queue is still blocked: exit without unmapping\n", name, mismatches);
+      std::fflush(stdout);
+      std::_Exit(2);
     }
     gpu.SendCommandSync([&] {
       for (const auto &[begin, end] : merged) {
