@@ -4154,6 +4154,7 @@ private:
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
 			    image.atomic64 == atomic64) {
+				image.cube |= memory.image_cube;
 				Merge(image, op, pc);
 				image.min_lod_sampler_exact &= (memory.image_sample_flags & Decoder::ImageSampleFlagUnnormalized) == 0;
 				image.implicit_only = image.implicit_only && implicit;
@@ -4171,6 +4172,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.cube           = memory.image_cube;
 		image.atomic64       = atomic64;
 		image.implicit_only  = implicit;
 		Merge(image, op, pc);

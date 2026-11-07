@@ -114,6 +114,7 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
+bool        ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size);
 // Returns the unique reaching definition of a scalar register (UINT32_MAX: the entry value),
 // or nothing when paths disagree or cross a scalar call. With crossed_calls, a path may cross an
