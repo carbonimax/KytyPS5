@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/alignment.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -1164,6 +1165,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
 		uint8_t code = 0;
+		GpuCapture::Touch(address, sizeof(code));
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
@@ -1516,6 +1518,11 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size);
+		GpuCapture::Touch(image.info.stencil.address, image.info.stencil.size);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
+	}
 	TouchImage(image);
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
@@ -1550,6 +1557,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size, GpuCapture::Out::Color);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
+	}
 	TouchImage(image);
 	image.usage.render_target = true;
 	RefreshImage(id);
@@ -1563,6 +1574,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	}
+	if (GpuCapture::Recording()) {
+		GpuCapture::Touch(image.info.data.address, image.info.data.size);
+		GpuCapture::Touch(desc.info.stencil.address, desc.info.stencil.size);
+		GpuCapture::Touch(image.info.metadata.range.address, image.info.metadata.range.size);
 	}
 	TouchImage(image);
 	if (desc.info.HasStencil()) {

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
@@ -1068,6 +1069,7 @@ void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	GpuCapture::Touch(vaddr, size);
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -1446,6 +1448,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	GpuCapture::Touch(vaddr, size, is_written ? GpuCapture::Out::Buffer : GpuCapture::Out::None);
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");

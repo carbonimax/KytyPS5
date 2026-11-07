@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
@@ -882,7 +883,14 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
-	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	if (!Graphics::GpuCapture::Recording()) {
+		return g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	}
+	// Only the GPU side writes the backing directly: a GPU capture does not replay it as an Update.
+	Graphics::GpuCapture::GpuWriteSlow(vaddr, size, false);
+	const bool written = g_guest_address_space->TryWriteBacking(vaddr, data, size);
+	Graphics::GpuCapture::GpuWriteSlow(vaddr, size, true);
+	return written;
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {

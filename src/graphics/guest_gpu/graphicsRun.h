@@ -74,6 +74,7 @@ private:
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
 		bool                      started         = false;
+		uint32_t                  capture_submit  = UINT32_MAX; // GpuCapture::RecordSubmit index
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
@@ -82,6 +83,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// GPU capture: the frame boundary (GpuCapture::FrameBoundary).
+	void              CaptureBoundary();
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 	// Graphics processing yields at a packet boundary when compute work was queued since `seen`.
