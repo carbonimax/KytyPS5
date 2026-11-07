@@ -1613,6 +1613,19 @@ void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+void BufferCache::ReadGpuModified() {
+	std::vector<std::pair<uint64_t, uint64_t>> dirty;
+	for (const auto& [vaddr, id]: m_buffers) {
+		const auto& buffer = m_slot_buffers[id];
+		if (IsRegionGpuModified(buffer.CpuAddress(), buffer.Size())) {
+			dirty.emplace_back(buffer.CpuAddress(), buffer.Size());
+		}
+	}
+	for (const auto& [vaddr, size]: dirty) {
+		ReadMemory(vaddr, size);
+	}
+}
+
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }

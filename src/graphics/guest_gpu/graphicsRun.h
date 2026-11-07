@@ -49,6 +49,9 @@ public:
 	bool              WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay = {});
 	// Capture replay, after WaitForIdle: drops the queued (blocked) submissions; returns how many.
 	uint32_t          DropQueued();
+	// Capture replay, before the first submission: a queue's (0 or a compute queue as in SubmitCompute)
+	// command processor state from GpuCapture::CpState; false for another build's layout.
+	bool              RestoreCpState(uint32_t queue, std::span<const uint8_t> bytes);
 	// Diagnostics: one line per queued submission (queue, commands, depth, next packet dwords).
 	[[nodiscard]] std::string DescribeQueued();
 	[[nodiscard]] int GetFrameNum() const;
@@ -83,8 +86,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
-	// GPU capture: the frame boundary (GpuCapture::FrameBoundary).
-	void              CaptureBoundary();
+	// GPU capture: the frame boundary (`frame_end`) or a scope boundary (GpuCapture::ScopeBoundary).
+	void              CaptureBoundary(bool frame_end);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 	// Graphics processing yields at a packet boundary when compute work was queued since `seen`.

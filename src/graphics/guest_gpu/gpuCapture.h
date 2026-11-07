@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -116,9 +117,27 @@ void SerializeRecord(std::vector<uint8_t>& out, const Record& record);
 // Recording in the emulator. KYTY_GPU_CAPTURE=<dir> enables it (off by default); it records GPU
 // frame KYTY_GPU_CAPTURE_FRAME=N (suspend points processed before it) and the frame after each
 // <dir>/trigger file appears, to <dir>/frame_<N>.kygpucap. Guest bytes are recorded at their first use
-// in the frame.
+// in the frame; GPU-resident data is published to guest memory when recording starts.
 // What a Touch range is: outputs (non-None) are hashed at the frame end (Expect).
 enum class Out : uint8_t { None, Buffer, Color, Dma };
+// GPU-resident data the publish could not write back to guest memory (diagnostics).
+struct Unpublished {
+	uint64_t    address = 0;
+	uint64_t    size    = 0;
+	const char* reason  = "";
+};
+// An image the publish wrote back, in publish order (diagnostics): last GPU write order (Image::gpu_write_seq)
+// and cache slot, to see which of two overlapping images wrote the guest bytes last.
+struct Published {
+	uint64_t    address   = 0;
+	uint64_t    size      = 0;
+	uint64_t    write_seq = 0;
+	uint32_t    slot      = 0;
+	const char* kind      = "";
+};
+using Publish = std::function<void(std::vector<Unpublished>&, std::vector<Published>&)>;
+// Every command processor's state (CpState), called only when a recording starts.
+using SaveCpStates = std::function<std::vector<CpState>()>;
 
 extern const bool       g_enabled;
 extern std::atomic_bool g_recording;
@@ -144,10 +163,21 @@ void ResumeSubmit(uint32_t index);
 void KeepShader(Shader shader);
 // While Recording(): a shader-map lookup; records the shader and its guest data once per frame.
 void UseShader(uint64_t address);
-// GPU thread, at each processed suspend point while Enabled(). `in_flight`: RecordSubmit indices of
-// the submissions still queued; `started_before`: queued submissions already started (not
-// replayable when a recording starts now).
-void FrameBoundary(std::span<const uint32_t> in_flight, uint32_t started_before);
+// GPU thread, at each processed suspend point while Enabled(). `publish_gpu_data` writes
+// GPU-resident data back to guest memory and lists what it skipped and wrote. `in_flight`: RecordSubmit indices of the submissions
+// still queued; `started_before`: queued submissions already started (not replayable when a
+// recording starts now).
+void FrameBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight,
+                   uint32_t started_before);
+// Scoped captures: KYTY_GPU_CAPTURE_SUBMITS=a-b (or a trigger file holding "a-b") records only the
+// frame's submissions a..b (in processing order, from 0), as Submits 0..b-a, and the ranges they use.
+// While Recording(), before each slice: true at the first slice of submission a > 0 (`fresh`: a new
+// submission; GPU-resident data is published first), or once submission b + 1 was reached and no
+// submission of the scope is left (`pending`: Submit indices of the slice's submission when resumed
+// and of the queued ones), so the replay never runs scope work past what was recorded.
+bool AtScopeBoundary(bool fresh, std::span<const uint32_t> pending);
+// GPU thread, when AtScopeBoundary(); same arguments as FrameBoundary.
+void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight);
 
 } // namespace Libs::Graphics::GpuCapture
 

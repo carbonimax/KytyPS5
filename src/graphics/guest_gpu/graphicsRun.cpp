@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <deque>
 #include <map>
 #include <memory>
@@ -550,6 +551,66 @@ void CommandProcessor::Reset() {
 	m_dispatch_indirect_args_base_addr = 0;
 }
 
+namespace {
+// shortcut: a context pushed by ContextStateOperation (m_saved_ctx) is not kept; submissions are not seen to cross one.
+struct SavedCpState {
+	HW::Context    ctx;
+	HW::UserConfig ucfg;
+	HW::Shader     sh;
+	uint64_t       index_base_addr                  = 0;
+	uint64_t       draw_indirect_args_base_addr     = 0;
+	uint64_t       dispatch_indirect_args_base_addr = 0;
+	uint64_t       num_instances_addr               = 0;
+	uint32_t       index_type_and_size              = 0;
+	uint32_t       index_buffer_size                = 0;
+	uint32_t       num_instances                    = 1;
+	bool           predicate_skip                   = false;
+};
+static_assert(std::is_trivially_copyable_v<SavedCpState>);
+} // namespace
+
+std::vector<uint8_t> CommandProcessor::SaveState() const {
+	const SavedCpState state {m_ctx,
+	                          m_ucfg,
+	                          m_sh_ctx,
+	                          m_index_base_addr,
+	                          m_draw_indirect_args_base_addr,
+	                          m_dispatch_indirect_args_base_addr,
+	                          m_num_instances_addr,
+	                          m_index_type_and_size,
+	                          m_index_buffer_size,
+	                          m_num_instances,
+	                          m_predicate_skip};
+	const auto* p = reinterpret_cast<const uint8_t*>(&state);
+	return {p, p + sizeof(state)};
+}
+
+bool CommandProcessor::RestoreState(std::span<const uint8_t> bytes) {
+	if (bytes.size() != sizeof(SavedCpState)) return false;
+	SavedCpState state;
+	std::memcpy(&state, bytes.data(), sizeof(state));
+	m_ctx                              = state.ctx;
+	m_ucfg                             = state.ucfg;
+	m_sh_ctx                           = state.sh;
+	m_saved_ctx.reset();
+	m_index_base_addr                  = state.index_base_addr;
+	m_draw_indirect_args_base_addr     = state.draw_indirect_args_base_addr;
+	m_dispatch_indirect_args_base_addr = state.dispatch_indirect_args_base_addr;
+	m_num_instances_addr               = state.num_instances_addr;
+	m_index_type_and_size              = state.index_type_and_size;
+	m_index_buffer_size                = state.index_buffer_size;
+	m_num_instances                    = state.num_instances;
+	m_predicate_skip                   = state.predicate_skip;
+	return true;
+}
+
+bool GuestGpu::RestoreCpState(uint32_t queue, std::span<const uint8_t> bytes) {
+	if (queue != 0 && (queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount)) return false;
+	bool restored = false;
+	SendCommandSync([&] { restored = GetProcessor(queue == 0 ? 0 : queue - ComputeQueueBase + 1).RestoreState(bytes); });
+	return restored;
+}
+
 void CommandProcessor::ApplyContextStateOperation(ContextStateOperation operation) {
 	switch (operation) {
 		case ContextStateOperation::Clear: m_ctx.Reset(); break;
@@ -962,7 +1023,22 @@ bool GuestGpu::Process(Submission& submission) {
 	// After the drain: the previous slice's guest reads are attributed to its own submission.
 	if (GpuCapture::Recording() && submission.type == SubmissionType::Commands) {
 		const uint32_t queue = submission.queue_id == 0 ? 0 : ComputeQueueBase + submission.queue_id - 1;
-		if (!submission.started) {
+		std::vector<uint32_t> pending;
+		if (submission.started && submission.capture_submit != UINT32_MAX) pending.push_back(submission.capture_submit);
+		{
+			Common::LockGuard lock(m_queue_mutex);
+			for (const auto& queue: m_queues) {
+				for (const auto& queued: queue) {
+					if (queued.capture_submit != UINT32_MAX) pending.push_back(queued.capture_submit);
+				}
+			}
+		}
+		if (GpuCapture::AtScopeBoundary(!submission.started || submission.capture_submit == UINT32_MAX, pending)) {
+			CaptureBoundary(false);
+		}
+		if (!GpuCapture::Recording()) {
+			// The scope ended before this submission.
+		} else if (!submission.started) {
 			submission.capture_submit = GpuCapture::RecordSubmit(submission.commands, queue);
 		} else {
 			if (submission.capture_submit == UINT32_MAX) {
@@ -1004,7 +1080,7 @@ bool GuestGpu::Process(Submission& submission) {
 			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
-			if (GpuCapture::Enabled()) CaptureBoundary();
+			if (GpuCapture::Enabled()) CaptureBoundary(true);
 			break;
 	}
 
@@ -1013,7 +1089,7 @@ bool GuestGpu::Process(Submission& submission) {
 	return complete;
 }
 
-void GuestGpu::CaptureBoundary() {
+void GuestGpu::CaptureBoundary(bool frame_end) {
 	std::vector<uint32_t> in_flight;
 	uint32_t              started_before = 0;
 	{
@@ -1025,7 +1101,22 @@ void GuestGpu::CaptureBoundary() {
 			}
 		}
 	}
-	GpuCapture::FrameBoundary(in_flight, started_before);
+	const auto publish = [this](std::vector<GpuCapture::Unpublished>& skipped, std::vector<GpuCapture::Published>& written) {
+		m_renderer.GetTextureCache().DownloadGpuModified(&skipped, &written);
+		m_renderer.GetBufferCache().ReadGpuModified();
+	};
+	const auto cp_states = [this] {
+		std::vector<GpuCapture::CpState> states {{0, m_gfx_cp->SaveState()}};
+		for (uint32_t i = 0; i < ComputeQueueCount; i++) {
+			if (m_compute_cp[i] != nullptr) states.push_back({ComputeQueueBase + i, m_compute_cp[i]->SaveState()});
+		}
+		return states;
+	};
+	if (frame_end) {
+		GpuCapture::FrameBoundary(publish, cp_states, in_flight, started_before);
+	} else {
+		GpuCapture::ScopeBoundary(publish, cp_states, in_flight);
+	}
 }
 
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,

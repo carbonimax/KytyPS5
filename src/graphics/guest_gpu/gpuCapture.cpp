@@ -282,11 +282,16 @@ struct Recorder {
 	std::unordered_set<uint64_t>               shaders; // recorded this frame
 	std::unordered_map<uint64_t, Shader>       kept;    // every registered shader
 	std::vector<std::tuple<uint64_t, uint64_t, Out>> outputs;
+	std::vector<Unpublished>                         unpublished_start;
+	std::vector<Published>                           published_start;
 	uint64_t          frame = 0, stored = 0, zero = 0, unreadable = 0, skipped = 0, submits = 0;
 	uint64_t          missing_shaders = 0, written = 0, updates = 0, started_before = 0, gpu_writes = 0;
 	uint32_t          current = 0; // frame index of the submission whose slice is being processed
+	// Scope (KYTY_GPU_CAPTURE_SUBMITS=a-b, or a trigger file holding "a-b"): only the frame's submissions
+	// first..last are recorded, as Submits 0..last-first; publish before first, the recording ends before last+1.
+	uint32_t          first = 0, last = UINT32_MAX;
 	uint64_t          capture_frame = 0;
-	Clock::duration   touch_time {};
+	Clock::duration   touch_time {}, publish_time {};
 	Clock::time_point start;
 };
 
@@ -296,6 +301,8 @@ Recorder& GetRecorder() {
 }
 
 double Ms(Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); }
+
+bool InScope(const Recorder& r) { return r.current >= r.first && r.current <= r.last; }
 
 // Caller holds the mutex.
 void Write(Recorder& r, const Record& record) {
@@ -348,7 +355,7 @@ void RecordRun(Recorder& r, uint64_t begin, uint64_t end) {
 
 // Caller holds the mutex.
 void TouchLocked(Recorder& r, uint64_t address, uint64_t size, Out output) {
-	if (!Recording() || size == 0 || address == 0) return;
+	if (!Recording() || size == 0 || address == 0 || !InScope(r)) return;
 	// shortcut: ranges over 1 GiB are not recorded (bad descriptors); raise it if a game needs them.
 	if (size > (uint64_t {1} << 30u) || address + size < address) {
 		r.skipped++;
@@ -374,7 +381,7 @@ void TouchLocked(Recorder& r, uint64_t address, uint64_t size, Out output) {
 					const auto hash = XXH3_64bits(bytes.data(), PageSize);
 					if (hash != it->second) {
 						it->second = hash;
-						Write(r, Update {page, r.current, bytes});
+						Write(r, Update {page, r.current - r.first, bytes});
 						r.updates++;
 					}
 				}
@@ -402,7 +409,8 @@ void TouchSlow(uint64_t address, uint64_t size, Out output) {
 void GpuWriteSlow(uint64_t address, uint64_t size, bool after) {
 	auto&            r = GetRecorder();
 	std::scoped_lock lock(r.mutex);
-	if (!Recording() || size == 0 || address + size < address) return;
+	// Out of the scope the page keeps its hash: the next Touch in the scope makes the change an Update.
+	if (!Recording() || size == 0 || address + size < address || !InScope(r)) return;
 	r.gpu_writes++;
 	std::vector<uint8_t> bytes(PageSize);
 	for (uint64_t page = address & ~(PageSize - 1); page < address + size; page += PageSize) {
@@ -410,7 +418,7 @@ void GpuWriteSlow(uint64_t address, uint64_t size, bool after) {
 		if (it == r.pages.end() || !LibKernel::Memory::CopySparseMemory(page, bytes.data(), PageSize)) continue;
 		const auto hash = XXH3_64bits(bytes.data(), PageSize);
 		if (hash != it->second && !after) {
-			Write(r, Update {page, r.current, bytes});
+			Write(r, Update {page, r.current - r.first, bytes});
 			r.updates++;
 		}
 		it->second = hash;
@@ -423,7 +431,7 @@ uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue) {
 	std::scoped_lock lock(r.mutex);
 	if (!Recording()) return UINT32_MAX;
 	r.current = static_cast<uint32_t>(r.submits++);
-	Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
+	if (InScope(r)) Write(r, Submit {address, queue, static_cast<uint32_t>(commands.size())});
 	// Updates of reused command memory belong to this Submit.
 	TouchLocked(r, address, commands.size_bytes(), Out::None);
 	return r.current;
@@ -448,7 +456,7 @@ void UseShader(uint64_t address) {
 	Shader shader;
 	{
 		std::scoped_lock lock(r.mutex);
-		if (!Recording() || !r.shaders.insert(address).second) return;
+		if (!Recording() || !InScope(r) || !r.shaders.insert(address).second) return;
 		const auto it = r.kept.find(address);
 		if (it == r.kept.end()) {
 			r.missing_shaders++;
@@ -477,9 +485,9 @@ const std::filesystem::path& CaptureDir() {
 	return dir;
 }
 
-// Ends the recording: InFlight, FrameEnd, Expects, diagnostics, close.
-void Finish(Recorder& r, std::span<const uint32_t> in_flight) {
-	const auto in_file = [&](uint32_t index) { return index < r.submits; };
+// Ends the recording: publish, InFlight, FrameEnd, Expects, diagnostics, close.
+void Finish(Recorder& r, const Publish& publish_gpu_data, std::span<const uint32_t> in_flight) {
+	const auto in_file = [&](uint32_t index) { return index < r.submits && index >= r.first && index <= r.last; };
 	{
 		const auto end_start = Clock::now();
 		g_recording.store(false, std::memory_order_relaxed);
@@ -505,18 +513,32 @@ void Finish(Recorder& r, std::span<const uint32_t> in_flight) {
 				}
 			}
 		}
+		std::vector<Unpublished> unpublished_end;
+		std::vector<Published>   published_end;
+		publish_gpu_data(unpublished_end, published_end);
 		std::scoped_lock lock(r.mutex);
 		uint64_t         in_flight_count = 0;
 		for (const auto index: in_flight) {
 			if (in_file(index)) {
-				Write(r, InFlight {index});
+				Write(r, InFlight {index - r.first});
 				in_flight_count++;
 			}
 		}
 		Write(r, FrameEnd {});
+		// The outputs are published like the inputs, then hashed.
 		auto& outputs = r.outputs;
 		std::sort(outputs.begin(), outputs.end());
 		outputs.erase(std::unique(outputs.begin(), outputs.end()), outputs.end());
+		// An output the publish could not write back (compressed, MSAA...) holds stale guest bytes: no Expect.
+		uint64_t unpublished_outputs = 0;
+		std::erase_if(outputs, [&](const auto& output) {
+			const auto& [address, size, kind] = output;
+			const bool stale = std::ranges::any_of(unpublished_end, [&](const Unpublished& u) {
+				return u.address < address + size && address < u.address + u.size;
+			});
+			unpublished_outputs += stale ? 1 : 0;
+			return stale;
+		});
 		std::vector<std::pair<uint64_t, uint64_t>> merged; // [begin, end)
 		for (const auto& [address, size, kind]: outputs) {
 			if (!merged.empty() && address <= merged.back().second) {
@@ -542,15 +564,44 @@ void Finish(Recorder& r, std::span<const uint32_t> in_flight) {
 				}
 			}
 		}
-		// Diagnostics beside the capture: each output range and kind.
+		// Diagnostics beside the capture: each output range and kind, and the GPU-resident images
+		// not written back (with whether the frame referenced them).
+		const auto referenced = [&](const Unpublished& u) {
+			for (uint64_t page = u.address & ~(PageSize - 1); page < u.address + u.size; page += PageSize) {
+				if (r.pages.contains(page)) return true;
+			}
+			return false;
+		};
+		uint64_t unpublished_ref = 0, unpublished_ref_bytes = 0;
 		if (FILE* info = std::fopen((r.path.substr(0, r.path.size() - 9) + ".info.txt").c_str(), "w")) {
 			constexpr const char* kinds[] = {"none", "buffer", "color", "dma"};
 			for (const auto& [address, size, kind]: outputs) {
 				std::fprintf(info, "out %s 0x%016llx 0x%llx\n", kinds[static_cast<int>(kind)],
 				             static_cast<unsigned long long>(address), static_cast<unsigned long long>(size));
 			}
+			for (const auto* list: {&r.unpublished_start, &unpublished_end}) {
+				for (const auto& u: *list) {
+					const bool ref = referenced(u);
+					if (list == &r.unpublished_start && ref) {
+						unpublished_ref++;
+						unpublished_ref_bytes += u.size;
+					}
+					std::fprintf(info, "unpublished %s %s 0x%016llx 0x%llx referenced=%d\n",
+					             list == &r.unpublished_start ? "start" : "end", u.reason,
+					             static_cast<unsigned long long>(u.address), static_cast<unsigned long long>(u.size), ref);
+				}
+			}
+			for (const auto* list: {&r.published_start, &published_end}) {
+				for (size_t i = 0; i < list->size(); i++) {
+					const auto& p = (*list)[i];
+					std::fprintf(info, "published %s %zu %s 0x%016llx 0x%llx seq=%llu slot=%u\n",
+					             list == &r.published_start ? "start" : "end", i, p.kind,
+					             static_cast<unsigned long long>(p.address), static_cast<unsigned long long>(p.size),
+					             static_cast<unsigned long long>(p.write_seq), p.slot);
+				}
+			}
 			for (const auto index: in_flight) {
-				if (in_file(index)) std::fprintf(info, "in_flight_end %u\n", index);
+				if (in_file(index)) std::fprintf(info, "in_flight_end %u\n", index - r.first);
 			}
 			for (const auto& [begin, end]: rewritten) {
 				const bool out = std::ranges::any_of(outputs, [&](const auto& o) {
@@ -563,13 +614,16 @@ void Finish(Recorder& r, std::span<const uint32_t> in_flight) {
 		}
 		const bool complete = r.file != nullptr && std::fclose(r.file) == 0;
 		r.file              = nullptr;
+		const auto in_scope = std::min<uint64_t>(r.submits, uint64_t {r.last} + 1) - std::min<uint64_t>(r.submits, r.first);
 		const auto line     = fmt::format(
-		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} updates={} "
-		    "shaders={} missing_shaders={} expects={} in_flight_end={} started_before={} rewritten_runs={} gpu_writes={} record_ms={:.1f} "
+		    "GPUCAPTURE {} frame={} complete={} bytes={} memory={} zero={} unreadable={} skipped={} submits={} frame_submits={} scope={}-{} updates={} "
+		    "shaders={} missing_shaders={} expects={} in_flight_end={} started_before={} unpublished_start={} unpublished_referenced={} unpublished_referenced_bytes={} unpublished_outputs={} rewritten_runs={} gpu_writes={} publish_start_ms={:.1f} record_ms={:.1f} "
 		    "end_ms={:.1f} frame_ms={:.1f}",
-		    r.path, r.capture_frame, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, r.submits, r.updates,
-		    r.shaders.size(), r.missing_shaders, expects, in_flight_count, r.started_before, rewritten.size(), r.gpu_writes,
-		    Ms(r.touch_time), Ms(Clock::now() - end_start), Ms(end_start - r.start));
+		    r.path, r.capture_frame, complete, r.written, r.stored, r.zero, r.unreadable, r.skipped, in_scope, r.submits, r.first,
+		    static_cast<int64_t>(r.last == UINT32_MAX ? -1 : int64_t {r.last}), r.updates, r.shaders.size(), r.missing_shaders,
+		    expects, in_flight_count, r.started_before, r.unpublished_start.size(), unpublished_ref, unpublished_ref_bytes,
+		    unpublished_outputs, rewritten.size(), r.gpu_writes, Ms(r.publish_time), Ms(r.touch_time), Ms(Clock::now() - end_start),
+		    Ms(end_start - r.start));
 		LOGF("%s\n", line.c_str());
 		if (FILE* log = std::fopen((CaptureDir() / "capture.log").string().c_str(), "a")) {
 			std::fprintf(log, "%s\n", line.c_str());
@@ -578,23 +632,82 @@ void Finish(Recorder& r, std::span<const uint32_t> in_flight) {
 	}
 }
 
+// "a-b" or "a" (one submission); anything else is the whole frame.
+void ParseScope(Recorder& r, const char* text) {
+	unsigned a = 0, b = 0;
+	const int n = text != nullptr ? std::sscanf(text, "%u-%u", &a, &b) : 0;
+	r.first     = n >= 1 ? a : 0;
+	r.last      = n == 2 ? std::max(a, b) : n == 1 ? a : UINT32_MAX;
+}
+
 } // namespace
 
-void FrameBoundary(std::span<const uint32_t> in_flight, uint32_t started_before) {
+bool AtScopeBoundary(bool fresh, std::span<const uint32_t> pending) {
+	auto&            r = GetRecorder();
+	std::scoped_lock lock(r.mutex);
+	if (!Recording()) return false;
+	if (fresh && r.first > 0 && r.submits == r.first) return true;
+	return r.last != UINT32_MAX && r.submits > r.last &&
+	       std::ranges::none_of(pending, [&](uint32_t i) { return i >= r.first && i <= r.last; });
+}
+
+void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight) {
+	auto& r     = GetRecorder();
+	bool  start = false;
+	{
+		std::scoped_lock lock(r.mutex);
+		start = r.first > 0 && r.submits == r.first;
+	}
+	if (!start) {
+		Finish(r, publish_gpu_data, in_flight);
+		return;
+	}
+	// The scope starts mid-frame: GPU-resident data of the earlier submissions goes to guest memory first.
+	// shortcut: CP registers set by the earlier submissions are not recorded; start scopes at 0 when they matter.
+	const auto               publish_start = Clock::now();
+	std::vector<Unpublished> unpublished;
+	std::vector<Published>   published;
+	publish_gpu_data(unpublished, published);
+	std::scoped_lock lock(r.mutex);
+	r.unpublished_start = std::move(unpublished);
+	r.published_start   = std::move(published);
+	r.publish_time += Clock::now() - publish_start;
+	for (auto& state: cp_states()) Write(r, std::move(state));
+}
+
+void FrameBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight,
+                   uint32_t started_before) {
 	static const int64_t target = [] {
 		const char* v = std::getenv("KYTY_GPU_CAPTURE_FRAME");
 		return v != nullptr ? std::strtoll(v, nullptr, 0) : int64_t {-1};
 	}();
+	static const char* submits = std::getenv("KYTY_GPU_CAPTURE_SUBMITS");
 	const auto&        dir     = CaptureDir();
 	auto&              r       = GetRecorder();
 	const auto         frame   = ++r.frame; // suspend points processed = number of the frame that starts
-	if (r.file != nullptr) Finish(r, in_flight);
+	if (r.file != nullptr) Finish(r, publish_gpu_data, in_flight);
+	// A trigger file may hold the scope ("a-b"); it replaces KYTY_GPU_CAPTURE_SUBMITS for that frame.
+	char scope[32] = {};
+	if (FILE* t = std::fopen((dir / "trigger").string().c_str(), "r")) {
+		if (std::fgets(scope, sizeof(scope), t) == nullptr) scope[0] = 0;
+		std::fclose(t);
+	}
 	std::error_code error;
 	const bool      triggered = std::filesystem::remove(dir / "trigger", error);
 	if (static_cast<int64_t>(frame) != target && !triggered) return;
+	ParseScope(r, triggered && scope[0] != 0 ? scope : submits);
+	const auto               publish_start = Clock::now();
+	std::vector<Unpublished> unpublished;
+	std::vector<Published>   published;
+	if (r.first == 0) publish_gpu_data(unpublished, published);
 	std::scoped_lock lock(r.mutex);
-	r.capture_frame = frame;
-	r.path          = (dir / fmt::format("frame_{:06d}.kygpucap", frame)).string();
+	r.unpublished_start = std::move(unpublished);
+	r.published_start   = std::move(published);
+	r.capture_frame     = frame;
+	r.path              = (dir / (r.first == 0 && r.last == UINT32_MAX
+	                                  ? fmt::format("frame_{:06d}.kygpucap", frame)
+	                                  : fmt::format("frame_{:06d}_s{}-{}.kygpucap", frame, r.first, r.last)))
+	             .string();
 	r.file = std::fopen(r.path.c_str(), "wb");
 	if (r.file == nullptr) {
 		LOGF("GPUCAPTURE cannot create %s\n", r.path.c_str());
@@ -604,6 +717,9 @@ void FrameBoundary(std::span<const uint32_t> in_flight, uint32_t started_before)
 	SerializeHeader(r.out);
 	std::fwrite(r.out.data(), 1, r.out.size(), r.file);
 	r.written = r.out.size();
+	if (r.first == 0) {
+		for (auto& state: cp_states()) Write(r, std::move(state));
+	}
 	r.pages.clear();
 	r.shaders.clear();
 	r.outputs.clear();
@@ -611,6 +727,7 @@ void FrameBoundary(std::span<const uint32_t> in_flight, uint32_t started_before)
 	r.current        = 0;
 	r.started_before = started_before;
 	r.touch_time     = {};
+	r.publish_time   = Clock::now() - publish_start;
 	r.start          = Clock::now();
 	g_recording.store(true, std::memory_order_relaxed);
 }
