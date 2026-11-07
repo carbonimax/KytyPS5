@@ -15066,6 +15066,13 @@ public:
                     memory->bytes.size());
       }
     }
+    // Diagnostics: each Expect's bytes before the frame, to tell a range one side left unchanged.
+    std::vector<uint64_t> initial;
+    for (const auto &record : capture.records) {
+      if (const auto *expect = std::get_if<GpuCapture::Expect>(&record)) {
+        initial.push_back(XXH3_64bits(reinterpret_cast<const void *>(expect->address), expect->size));
+      }
+    }
     // Registration reads the shader code and user data, so it follows the memory.
     for (const auto &record : capture.records) {
       if (const auto *shader = std::get_if<GpuCapture::Shader>(&record)) {
@@ -15107,6 +15114,23 @@ public:
         updates[update->submit].push_back(update);
       }
     }
+    // Submissions the game left waiting at the frame end stay blocked here too, as captured, with
+    // the later Submits of their queue (the outer buffers of a resumed submission).
+    std::vector<const GpuCapture::Submit *> submits;
+    for (const auto &record : capture.records) {
+      if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) submits.push_back(submit);
+    }
+    std::vector<const uint32_t *> in_flight;
+    for (const auto &record : capture.records) {
+      if (const auto *f = std::get_if<GpuCapture::InFlight>(&record)) {
+        Require(name, "in-flight submission", f->submit < submits.size(), "an in-flight record names no submission");
+        for (size_t i = f->submit; i < submits.size(); i++) {
+          if (submits[i]->queue == submits[f->submit]->queue) {
+            in_flight.push_back(reinterpret_cast<const uint32_t *>(submits[i]->address));
+          }
+        }
+      }
+    }
     // A queue waiting on memory a later Update writes (CPU labels) never lets the GPU go idle: after
     // 1 s with every queue blocked, the Updates are written anyway.
     // shortcut: no WaitValue breaker yet, so a blocked queue may then read them too early.
@@ -15116,7 +15140,7 @@ public:
     for (const auto &record : capture.records) {
       if (const auto *submit = std::get_if<GpuCapture::Submit>(&record)) {
         const auto &pending = updates[submit_index++];
-        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms)) busy++;
+        if (!pending.empty() && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
         for (const auto *update : pending) {
           std::memcpy(reinterpret_cast<void *>(update->address), update->bytes.data(),
                       update->bytes.size());
@@ -15128,32 +15152,64 @@ public:
         } else {
           gpu.SubmitCompute(submit->queue, commands);
         }
+        // KYTY_REPLAY_SERIAL=1 (diagnostics): no queue overlap, each submission runs alone in capture order.
+        static const bool serial = std::getenv("KYTY_REPLAY_SERIAL") != nullptr;
+        if (serial && !gpu.WaitForIdle(idle_timeout_ms, in_flight)) busy++;
       } else if (std::holds_alternative<GpuCapture::FrameEnd>(record)) {
         gpu.SuspendPoint();
       }
     }
-    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms);
+    const bool blocked_at_end = !gpu.WaitForIdle(10 * idle_timeout_ms, in_flight);
     busy += blocked_at_end ? 1 : 0;
     if (busy != 0) std::printf("[gpu]     %s %u updates or the end while a queue still waits\n", name, busy);
+    const auto queued = gpu.DescribeQueued();
+    if (!queued.empty()) std::printf("[gpu]     %s queued at the end:\n%s", name, queued.c_str());
+    if (!blocked_at_end && !in_flight.empty()) {
+      std::printf("[gpu]     %s in flight at the frame end: %zu captured, %u left blocked and dropped\n", name,
+                  in_flight.size(), gpu.DropQueued());
+    }
     auto &scheduler = context.GetCommandScheduler();
     gpu.SendCommandSync([&] {
       scheduler.Finish();
       scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
     });
     // Outputs are published as the capture published them.
+    std::vector<GpuCapture::Unpublished> unpublished;
     gpu.SendCommandSync([&] {
-      context.GetTextureCache().DownloadGpuModified();
+      context.GetTextureCache().DownloadGpuModified(&unpublished);
       context.GetBufferCache().ReadGpuModified();
     });
     uint32_t mismatches = 0;
+    size_t expect_index = 0;
     for (const auto &record : capture.records) {
       if (const auto *expect = std::get_if<GpuCapture::Expect>(&record)) {
+        const auto before = initial[expect_index++];
         context.GetBufferCache().ReadMemory(expect->address, expect->size);
         std::vector<uint8_t> bytes(expect->size);
         const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
         const auto hash = read ? XXH3_64bits(bytes.data(), bytes.size()) : 0;
-        std::printf("[gpu]     %s 0x%016" PRIx64 "+0x%" PRIx64 " hash %016" PRIx64 " %s\n", name,
+        std::printf("[gpu]     %s 0x%016" PRIx64 "+0x%" PRIx64 " hash %016" PRIx64 " %s", name,
                     expect->address, expect->size, hash, hash == expect->hash ? "ok" : "MISMATCH");
+        // KYTY_REPLAY_DUMP=<dir> (diagnostics): the replayed bytes of each mismatching range.
+        static const char *dump_dir = std::getenv("KYTY_REPLAY_DUMP");
+        if (hash != expect->hash && dump_dir != nullptr) {
+          const auto path = fmt::format("{}/{:016x}.bin", dump_dir, expect->address);
+          if (FILE *f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(bytes.data(), 1, bytes.size(), f);
+            std::fclose(f);
+          }
+        }
+        if (hash != expect->hash) {
+          // unchanged=capture: the game left the range as it was before the frame; =replay: the replay did.
+          std::printf(" unchanged=%s", expect->hash == before ? (hash == before ? "both" : "capture")
+                                                              : (hash == before ? "replay" : "neither"));
+          for (const auto &u : unpublished) {
+            if (u.address < expect->address + expect->size && u.address + u.size > expect->address) {
+              std::printf(" unpublished=%s:0x%" PRIx64 "+0x%" PRIx64, u.reason, u.address, u.size);
+            }
+          }
+        }
+        std::printf("\n");
         mismatches += hash == expect->hash ? 0 : 1;
       }
     }
@@ -15164,9 +15220,9 @@ public:
       std::_Exit(2);
     }
     gpu.SendCommandSync([&] {
-      for (const auto &[begin, end] : merged) {
-        context.UnmapMemory(begin, end - begin);
-      }
+      // Cache buffers are rounded and grown past the captured blocks (unmapped here, mapped in the
+      // game): the gaps between blocks are unmapped too, so no page watcher outlives the caches.
+      if (!merged.empty()) context.UnmapMemory(merged.front().first, merged.back().second - merged.front().first);
       scheduler.Finish();
     });
     context.ShutdownGpu();
@@ -15234,6 +15290,11 @@ public:
             static_cast<u32>(labels + 8), static_cast<u32>((labels + 8) >> 32u), 0x33333333u, 0,
             0});
     const auto compute = write_data(labels + 12, 0x44444444u);
+    // Still waiting at the frame end in the game (label never released): stays blocked in the replay.
+    constexpr uint64_t hold = base + 0x7000;
+    Words held{KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0), 0x10u | 3u, static_cast<u32>(labels + 16),
+               static_cast<u32>((labels + 16) >> 32u), 1, UINT32_MAX, 0};
+    for (const auto dw : write_data(labels + 20, 0x66666666u)) held.push_back(dw);
 
     std::vector<uint8_t> dma_bytes(0x100);
     for (size_t i = 0; i < dma_bytes.size(); i++) dma_bytes[i] = static_cast<uint8_t>(i * 7u + 1u);
@@ -15262,7 +15323,13 @@ public:
     records.emplace_back(GpuCapture::Submit{acb, 0x20, static_cast<u32>(compute.size())});
     records.emplace_back(GpuCapture::Update{acb, 1, bytes_of(compute)});
     records.emplace_back(GpuCapture::Update{ib, 0, bytes_of(indirect)});
+    records.emplace_back(GpuCapture::Memory{hold, bytes_of(held)});
+    records.emplace_back(GpuCapture::Submit{hold, 0x21, static_cast<u32>(held.size())});
+    records.emplace_back(GpuCapture::InFlight{2});
     records.emplace_back(GpuCapture::FrameEnd{});
+    constexpr std::array<u32, 2> held_labels{};
+    records.emplace_back(GpuCapture::Expect{labels + 16, sizeof(held_labels),
+                                            XXH3_64bits(held_labels.data(), sizeof(held_labels))});
     records.emplace_back(GpuCapture::Expect{labels, sizeof(label_values),
                                             XXH3_64bits(label_values.data(), sizeof(label_values))});
     records.emplace_back(GpuCapture::Expect{dma_dst, dma_bytes.size(),
