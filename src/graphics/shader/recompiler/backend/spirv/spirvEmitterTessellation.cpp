@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -16,7 +19,50 @@ bool IsTessellationPatch(IR::TessellationAttribute kind) {
 	return kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
 }
 
-uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
+uint32_t ControlPointStride(const ShaderTessellationInputInfo& tess, IR::TessellationAttribute kind) {
+	using Attribute = IR::TessellationAttribute;
+	return kind == Attribute::LocalOutput || kind == Attribute::ControlInput ? tess.ls_stride
+	                                                                          : tess.hs_stride;
+}
+
+// One variable per location for per-control-point interfaces (KYTY_TESS_HS_MODEL, default 1):
+// with one uvec4[points][12] array of arrays, the AMD Windows driver stores the HS control
+// points 25 dwords apart, so they overlap. 0 keeps the array (of arrays).
+bool SplitLocations() {
+	const char* value = std::getenv("KYTY_TESS_HS_MODEL");
+	return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// The address modulo the control point stride, when known at compile time.
+// shortcut: ignores 32-bit wrap-around; ring addresses stay far below 2^32.
+std::optional<uint32_t> ConstantOffset(IR::Value value, uint32_t stride) {
+	using Opcode = IR::ValueOpcode;
+	value        = value.Resolve();
+	if (value.IsImmediate()) return value.U32() % stride;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return std::nullopt;
+	const auto opcode = inst->GetOpcode();
+	if (opcode != Opcode::IAdd32 && opcode != Opcode::IMul32 &&
+	    opcode != Opcode::ShiftLeftLogical32)
+		return std::nullopt;
+	const auto lhs = ConstantOffset(inst->Arg(0), stride);
+	std::optional<uint32_t> rhs;
+	if (opcode == Opcode::ShiftLeftLogical32) {
+		const auto shift = inst->Arg(1).Resolve();
+		if (!shift.IsImmediate() || shift.U32() >= 32u) return std::nullopt;
+		rhs = static_cast<uint32_t>((uint64_t {1} << shift.U32()) % stride);
+	} else {
+		rhs = ConstantOffset(inst->Arg(1), stride);
+	}
+	if (opcode != Opcode::IAdd32 && ((lhs && *lhs == 0u) || (rhs && *rhs == 0u))) return 0u;
+	if (!lhs || !rhs) return std::nullopt;
+	return static_cast<uint32_t>(opcode == Opcode::IAdd32 ? (uint64_t {*lhs} + *rhs) % stride
+	                                                      : (uint64_t {*lhs} * *rhs) % stride);
+}
+
+// `location`: the split variable to address (UINT32_MAX for the array layout).
+uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst,
+                             uint32_t location = UINT32_MAX) {
 	auto& state          = ctx.state;
 	using Attribute      = IR::TessellationAttribute;
 	const auto  kind     = static_cast<Attribute>(inst.Arg(0).U32());
@@ -43,8 +89,7 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (patch) {
 		address = EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, tess.patch_base));
 	}
-	const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
-	const auto stride = local ? tess.ls_stride : tess.hs_stride;
+	const auto stride = ControlPointStride(tess, kind);
 	const auto offset =
 	    patch ? address : EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, stride));
 	const auto attribute =
@@ -54,9 +99,17 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2)),
 	                  ConstantU32(state, 3));
 	const auto type = TypePointer(state, storage, TypeU32(state));
+	const auto split =
+	    location != UINT32_MAX
+	        ? state.tess_location_variables.at(static_cast<uint32_t>(kind)).at(location)
+	        : 0u;
 	if (kind == Attribute::LocalOutput || patch) {
-		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
-		                          component);
+		if (split != 0u) {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, split, component);
+		} else {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute,
+			                          component);
+		}
 	} else {
 		// An HS writes only its own control point but may read any other.
 		const auto vertex =
@@ -64,10 +117,32 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		            inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute
 		        ? EmitLaneId(state)
 		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
-		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
-		                          component);
+		if (split != 0u) {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, split, vertex, component);
+		} else {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex,
+			                          attribute, component);
+		}
 	}
 	return pointer;
+}
+
+// Split layout: the location of a compile-time offset, else UINT32_MAX and the run-time
+// location in `dynamic`.
+uint32_t SplitLocation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t& dynamic) {
+	auto&      state  = ctx.state;
+	const auto stride = ControlPointStride(state.input_info.vertex->tess,
+	                                       static_cast<IR::TessellationAttribute>(inst.Arg(0).U32()));
+	if (const auto offset = ConstantOffset(inst.Arg(1), stride)) return *offset / 16u;
+	dynamic = EmitBinaryU32(
+	    state, spv::OpShiftRightLogical,
+	    EmitBinaryU32(state, spv::OpUMod, ctx.Arg(inst, 1), ConstantU32(state, stride)),
+	    ConstantU32(state, 4));
+	return UINT32_MAX;
+}
+
+uint32_t IsLocation(EmitterState& state, uint32_t dynamic, uint32_t location) {
+	return Binary(state, spv::OpIEqual, TypeBool(state), dynamic, ConstantU32(state, location));
 }
 
 } // namespace
@@ -93,6 +168,7 @@ void DefineTessellationInterfaces(EmitterState& state) {
 	const auto  array = [&](uint32_t type, uint32_t count) {
 		return state.builder.Type(spv::OpTypeArray, type, ConstantU32(state, count));
 	};
+	const bool split = SplitLocations();
 	for (uint32_t index = 0; index < used.size(); index++) {
 		if (!used[index]) continue;
 		const auto kind  = static_cast<Attribute>(index);
@@ -106,12 +182,26 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			// HS and TES share the reflected patch layout so their interfaces match.
 			type = array(TypeU32Vector(state, 4), (tess.patch_size + 15u) / 16u);
 		} else {
-			const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
-			const auto stride = local ? tess.ls_stride : tess.hs_stride;
-			type              = array(TypeU32Vector(state, 4), (stride + 15u) / 16u);
-			if (kind != Attribute::LocalOutput) {
-				type = array(type, local ? tess.input_control_points : tess.output_control_points);
+			const auto locations = (ControlPointStride(tess, kind) + 15u) / 16u;
+			const auto points    = kind == Attribute::ControlInput ? tess.input_control_points
+			                                                       : tess.output_control_points;
+			if (split) {
+				// uvec4 (LS) or uvec4[points] at each location.
+				const auto element = kind == Attribute::LocalOutput
+				                         ? TypeU32Vector(state, 4)
+				                         : array(TypeU32Vector(state, 4), points);
+				auto& variables = state.tess_location_variables[index];
+				for (uint32_t location = 0; location < locations; location++) {
+					variables.push_back(
+					    DefineInterfaceVariable(state, element, storage, "tess_location"));
+					state.builder.AddAnnotation(spv::OpDecorate, variables.back(),
+					                            spv::DecorationLocation, location);
+				}
+				state.tess_variables[index] = variables.front();
+				continue;
 			}
+			type = array(TypeU32Vector(state, 4), locations);
+			if (kind != Attribute::LocalOutput) type = array(type, points);
 		}
 		auto& variable = state.tess_variables[index];
 		variable       = DefineInterfaceVariable(state, type, storage, "tess_attributes");
@@ -160,9 +250,22 @@ void DefineTessellationExecutionModes(EmitterState& state) {
 
 uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, 2), [&] {
-		const auto value = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value,
-		                              TessellationPointer(ctx, inst));
+		auto&       state = ctx.state;
+		const auto  load  = [&](uint32_t location) {
+            return Unary(state, spv::OpLoad, TypeU32(state),
+                         TessellationPointer(ctx, inst, location));
+		};
+		const auto& split = state.tess_location_variables.at(inst.Arg(0).U32());
+		if (split.empty()) return load(UINT32_MAX);
+		uint32_t dynamic = 0;
+		if (const auto location = SplitLocation(ctx, inst, dynamic); location != UINT32_MAX)
+			return load(location);
+		// The offset is below the stride, so exactly one location matches.
+		auto value = load(0);
+		for (uint32_t location = 1; location < split.size(); location++) {
+			value = Select(state, TypeU32(state), IsLocation(state, dynamic, location),
+			               load(location), value);
+		}
 		return value;
 	});
 }
@@ -175,7 +278,21 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
 			value = floating;
 		}
-		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+		const auto store = [&](uint32_t location) {
+			ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst, location),
+			                              value);
+		};
+		const auto& split = ctx.state.tess_location_variables.at(inst.Arg(0).U32());
+		uint32_t    dynamic  = 0;
+		const auto  location = split.empty() ? UINT32_MAX : SplitLocation(ctx, inst, dynamic);
+		if (split.empty() || location != UINT32_MAX) {
+			store(location);
+			return;
+		}
+		for (uint32_t index = 0; index < split.size(); index++) {
+			EmitIfCondition(ctx.state, IsLocation(ctx.state, dynamic, index),
+			                [&] { store(index); });
+		}
 	});
 }
 
