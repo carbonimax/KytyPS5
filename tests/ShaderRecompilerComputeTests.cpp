@@ -15891,9 +15891,9 @@ public:
   }
 
   // --gpu-replay <file>: replays a local capture (KYTY_GPU_CAPTURE); 0 when every Expect matches.
-  // --gpu-replay-record <file> (`record`): the same, then, when it passes, stores this platform's
-  // hashes in <capture>.platform.kygpucap, with the color thumbnails when the sidecar has none yet and
-  // this replay matched the game's own hashes on every Expect.
+  // --gpu-replay-record <file> (`record`): the same, then, when it passes (or KYTY_REPLAY_RECORD_FORCE=1),
+  // stores this platform's hashes in <capture>.platform.kygpucap, with the color thumbnails when the
+  // sidecar has none yet and this replay matched the game's own hashes on every Expect.
   int ReplayGpuCaptureFile(const char *path, bool record = false) {
     const auto start = std::chrono::steady_clock::now();
     const auto read_file = [](const std::string &file_path) {
@@ -15949,10 +15949,12 @@ public:
                 " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
                 path, capture->records.size(), memory, submits, expects, mismatches, ms);
     if (!record) return mismatches == 0 ? 0 : 1;
-    // shortcut: a non-color Expect that differs on a new platform (float compute output) blocks the record, as
-    // it has no thumbnail; add a tolerance or a forced record once such a platform is measured.
-    if (mismatches != 0) {
-      std::printf("[gpu]     GpuReplay record refused: %u Expects differ\n", mismatches);
+    // KYTY_REPLAY_RECORD_FORCE=1 records differing hashes too, after a human check of the PNGs: an intended
+    // rendering change, or a platform whose non-color Expects (no thumbnail) differ.
+    static const bool force = std::getenv("KYTY_REPLAY_RECORD_FORCE") != nullptr;
+    if (mismatches != 0 && !force) {
+      std::printf("[gpu]     GpuReplay record refused: %u Expects differ (KYTY_REPLAY_RECORD_FORCE=1 records them)\n",
+                  mismatches);
       return 1;
     }
     // Thumbnails stand for the game's targets only when this replay holds the game's bytes everywhere.
