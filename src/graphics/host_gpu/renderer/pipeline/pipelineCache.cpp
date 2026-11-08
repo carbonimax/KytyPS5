@@ -951,7 +951,8 @@ struct PipelineCache::ProgramCache {
 		           .storage_bounds_verify_address =
 		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u,
 		           .r8_srgb_views   = graphics.r8_srgb_views,
-		           .r8g8_srgb_views = graphics.r8g8_srgb_views} {
+		           .r8g8_srgb_views = graphics.r8g8_srgb_views,
+		           .relaxed_float   = Config::RelaxedShaderFloatEnabled()} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
