@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <unordered_map>
 #include <utility>
 
@@ -105,9 +106,12 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 	};
 
 	uint32_t stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
+	// Control point stores whose offset reaches past the own block (another control point's).
+	uint32_t point_stores = 0, cross_stores = 0;
 	for (bool repeat = true; repeat;) {
-		repeat    = false;
-		registers = entry;
+		repeat       = false;
+		registers    = entry;
+		point_stores = cross_stores = 0;
 		for (const auto& inst: program.instructions) {
 			if (const auto join = joins.find(inst.pc); join != joins.end()) {
 				merge(registers, join->second);
@@ -139,6 +143,8 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
 					                     (stride != 0u && stride != address.coefficient));
 					stride = address.coefficient;
+					point_stores++;
+					cross_stores += address.constant + inst.offset >= stride ? 1u : 0u;
 				} else if (control_store) {
 					// Other HS outputs are patch constants; later patches sit lower in the ring.
 					const auto begin = address.constant + inst.offset;
@@ -213,6 +219,13 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		}
 	}
 	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
+	if (!local) {
+		char line[96];
+		std::snprintf(line, sizeof(line),
+		              "Tessellation HS stores: control_point=%u other_control_point=%u\n",
+		              point_stores, cross_stores);
+		Log::WriteToConsoleAndLog(line);
+	}
 	(local ? info.ls_stride : info.hs_stride) = stride;
 	if (patch_end != 0u) {
 		EXIT_NOT_IMPLEMENTED(patch_begin < stride * control_points);

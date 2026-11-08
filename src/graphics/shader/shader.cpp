@@ -899,11 +899,11 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Tessellation programs: ls=0x{:016x} hs=0x{:016x} tes=0x{:016x} control_points={}->{} "
 			    "domain={} partitioning={} topology={} ls_stride={} hs_stride={} patch_base=0x{:x} "
-			    "patch_size={}\n",
+			    "patch_size={} ls_hs_config=0x{:x}\n",
 			    local_hash, control_hash, evaluation_hash, tess.input_control_points,
 			    tess.output_control_points, tess.domain, tess.partitioning, tess.output_topology,
 			    entry->second.ls_stride, entry->second.hs_stride, entry->second.patch_base,
-			    entry->second.patch_size));
+			    entry->second.patch_size, sh.m_vgtLsHsConfig));
 		}
 		tess = entry->second;
 	}

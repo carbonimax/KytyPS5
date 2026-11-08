@@ -628,6 +628,19 @@ void EmitTessProbeStore(EmitterState& state, uint32_t dword, uint32_t value) {
 	});
 }
 
+void EmitTessProbeAdd(EmitterState& state, uint32_t dword, uint32_t value) {
+	if (state.tess_probe_won == 0) return;
+	// Branch-free so that it can sit in any block (a vote may end a loop header).
+	const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+	                           Binary(state, spv::OpIAdd, TypeU64(state), state.tess_probe_record,
+	                                  ConstantU64(state, dword * 4ull)));
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpAtomicIAdd, TypeU32(state), old, pointer, ConstantU32(state, spv::ScopeDevice),
+	    ConstantU32(state, spv::MemorySemanticsMaskNone),
+	    Select(state, TypeU32(state), state.tess_probe_won, value, ConstantU32(state, 0)));
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -1059,6 +1072,18 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,
 	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+	// KYTY_TESS_PROBE (HS): words 150-155 count each vote's executions, local and voted trues.
+	if (ctx.state.program.stage == ShaderType::TessellationControl &&
+	    ctx.state.tess_probe_won != 0 && ctx.state.tess_probe_votes < 6u) {
+		auto&      state = ctx.state;
+		const auto u32   = TypeU32(state);
+		const auto add   = EmitAddU32(
+            state,
+            EmitAddU32(state, ConstantU32(state, 1),
+                       Select(state, u32, predicate, ConstantU32(state, 256), ConstantU32(state, 0))),
+            Select(state, u32, result, ConstantU32(state, 65536), ConstantU32(state, 0)));
+		EmitTessProbeAdd(state, 150u + state.tess_probe_votes++, add);
+	}
 	return result;
 }
 

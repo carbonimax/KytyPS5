@@ -110,9 +110,12 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
+	// KYTY_TESS_HS_MODEL=1: the control point variable of each location.
+	std::vector<uint32_t>                            tess_split_variables;
 	// KYTY_TESS_PROBE: U64 address of this invocation's record and whether it owns it.
 	uint32_t                                         tess_probe_record = 0;
 	uint32_t                                         tess_probe_won    = 0;
+	uint32_t                                         tess_probe_votes  = 0;
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
@@ -482,6 +485,10 @@ void EmitStorageBoundsCount(EmitterState& state, StorageBoundsCounter counter);
 bool TessProbeEnabled(const EmitterState& state);
 void EmitTessProbeClaim(EmitterState& state);
 void EmitTessProbeStore(EmitterState& state, uint32_t dword, uint32_t value);
+// Adds `value` to record word `dword` (a constant index).
+void EmitTessProbeAdd(EmitterState& state, uint32_t dword, uint32_t value);
+// HS: records the invocation's whole control point output block at words 208-255.
+void EmitTessProbeOutputs(EmitterState& state);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

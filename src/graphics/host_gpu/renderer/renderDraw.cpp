@@ -1498,7 +1498,7 @@ static bool TessProbeDraw(const GraphicContext& graphics, const DrawRenderState&
 			fmt::print(out, "{} {}",
 			           record < Probe::LsRecords ? "ls" : record < Probe::HsBase ? "tes" : "hs",
 			           record);
-			for (uint32_t i = 1; i < (record < Probe::LsRecords ? 13u : 248u); i++)
+			for (uint32_t i = 1; i < (record < Probe::LsRecords ? 13u : Probe::RecordDwords); i++)
 				fmt::print(out, " {:08x}", words[i]);
 			fmt::print(out, "\n");
 		}

@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -16,7 +18,40 @@ bool IsTessellationPatch(IR::TessellationAttribute kind) {
 	return kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
 }
 
-uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
+// KYTY_TESS_HS_MODEL=1: HS control point outputs and the matching TES inputs as one arrayed
+// variable per location. With one array-of-arrays variable of 12 locations per control point,
+// the AMD Windows driver stores control points 25 dwords apart, so they overlap.
+bool SplitControlPoints(IR::TessellationAttribute kind) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TESS_HS_MODEL");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && (kind == IR::TessellationAttribute::ControlOutput ||
+	                   kind == IR::TessellationAttribute::EvaluationInput);
+}
+
+// The byte offset within a control point when the address is c or c + stride * k * x.
+std::optional<uint32_t> ConstantControlPointOffset(IR::Value address, uint32_t stride) {
+	address = address.Resolve();
+	if (address.IsImmediate()) return address.U32() % stride;
+	const auto* sum = address.TryInstruction();
+	if (sum == nullptr || sum->GetOpcode() != IR::ValueOpcode::IAdd32) return std::nullopt;
+	for (size_t index = 0; index < 2u; index++) {
+		const auto constant = sum->Arg(index).Resolve();
+		const auto* product = sum->Arg(1u - index).Resolve().TryInstruction();
+		if (!constant.IsImmediate() || product == nullptr ||
+		    product->GetOpcode() != IR::ValueOpcode::IMul32)
+			continue;
+		for (size_t factor = 0; factor < 2u; factor++) {
+			const auto value = product->Arg(factor).Resolve();
+			if (value.IsImmediate() && value.U32() % stride == 0u) return constant.U32() % stride;
+		}
+	}
+	return std::nullopt;
+}
+
+uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst,
+                             uint32_t location = UINT32_MAX) {
 	auto& state          = ctx.state;
 	using Attribute      = IR::TessellationAttribute;
 	const auto  kind     = static_cast<Attribute>(inst.Arg(0).U32());
@@ -64,10 +99,30 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		            inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute
 		        ? EmitLaneId(state)
 		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
-		state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute,
-		                          component);
+		if (location != UINT32_MAX) {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer,
+			                          state.tess_split_variables.at(location), vertex, component);
+		} else {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex,
+			                          attribute, component);
+		}
 	}
 	return pointer;
+}
+
+// Split control points: the location of a constant offset, or UINT32_MAX and the dynamic one.
+uint32_t SplitLocation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t& dynamic) {
+	const auto stride = ctx.state.input_info.vertex->tess.hs_stride;
+	if (const auto offset = ConstantControlPointOffset(inst.Arg(1), stride)) return *offset / 16u;
+	dynamic = EmitBinaryU32(
+	    ctx.state, spv::OpShiftRightLogical,
+	    EmitBinaryU32(ctx.state, spv::OpUMod, ctx.Arg(inst, 1), ConstantU32(ctx.state, stride)),
+	    ConstantU32(ctx.state, 4));
+	return UINT32_MAX;
+}
+
+uint32_t IsLocation(EmitterState& state, uint32_t dynamic, uint32_t location) {
+	return Binary(state, spv::OpIEqual, TypeBool(state), dynamic, ConstantU32(state, location));
 }
 
 // KYTY_TESS_PROBE: records the word at the access's address. LS outputs repeat every LS stride.
@@ -134,7 +189,18 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			}
 		}
 		auto& variable = state.tess_variables[index];
-		variable       = DefineInterfaceVariable(state, type, storage, "tess_attributes");
+		if (SplitControlPoints(kind)) {
+			const auto element = array(TypeU32Vector(state, 4), tess.output_control_points);
+			for (uint32_t location = 0; location < (tess.hs_stride + 15u) / 16u; location++) {
+				const auto split = DefineInterfaceVariable(state, element, storage, "tess_points");
+				state.builder.AddAnnotation(spv::OpDecorate, split, spv::DecorationLocation,
+				                            location);
+				state.tess_split_variables.push_back(split);
+			}
+			variable = state.tess_split_variables.front();
+			continue;
+		}
+		variable = DefineInterfaceVariable(state, type, storage, "tess_attributes");
 		if (kind == Attribute::Factor) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn,
 			                            spv::BuiltInTessLevelOuter);
@@ -180,9 +246,26 @@ void DefineTessellationExecutionModes(EmitterState& state) {
 
 uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, 2), [&] {
-		const auto value = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value,
-		                              TessellationPointer(ctx, inst));
+		auto& state = ctx.state;
+		const auto kind = static_cast<IR::TessellationAttribute>(inst.Arg(0).U32());
+		uint32_t   value;
+		if (uint32_t dynamic = 0; SplitControlPoints(kind)) {
+			const auto location = SplitLocation(ctx, inst, dynamic);
+			if (location != UINT32_MAX) {
+				value = Unary(state, spv::OpLoad, TypeU32(state),
+				              TessellationPointer(ctx, inst, location));
+			} else {
+				value = ConstantU32(state, 0);
+				for (uint32_t index = 0; index < state.tess_split_variables.size(); index++) {
+					value = Select(state, TypeU32(state), IsLocation(state, dynamic, index),
+					               Unary(state, spv::OpLoad, TypeU32(state),
+					                     TessellationPointer(ctx, inst, index)),
+					               value);
+				}
+			}
+		} else {
+			value = Unary(state, spv::OpLoad, TypeU32(state), TessellationPointer(ctx, inst));
+		}
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::EvaluationInput))
 			ProbeTessellationWord(ctx, inst, 0u, 191u, value);
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlInput))
@@ -202,13 +285,70 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
 			value = floating;
 		}
-		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+		const auto kind = static_cast<IR::TessellationAttribute>(inst.Arg(0).U32());
+		if (uint32_t dynamic = 0; SplitControlPoints(kind)) {
+			const auto location = SplitLocation(ctx, inst, dynamic);
+			if (location != UINT32_MAX) {
+				ctx.state.builder.AddFunction(spv::OpStore,
+				                              TessellationPointer(ctx, inst, location), value);
+			} else {
+				for (uint32_t index = 0; index < ctx.state.tess_split_variables.size(); index++) {
+					EmitIfCondition(ctx.state, IsLocation(ctx.state, dynamic, index), [&] {
+						ctx.state.builder.AddFunction(spv::OpStore,
+						                              TessellationPointer(ctx, inst, index), value);
+					});
+				}
+			}
+		} else {
+			ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+		}
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::LocalOutput))
 			ProbeTessellationWord(ctx, inst, 0u, 31u, value);
-		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlOutput))
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlOutput)) {
+			auto& state = ctx.state;
 			ProbeTessellationWord(ctx, inst, 0u, 47u, value, 160u,
-			                      ctx.state.input_info.vertex->tess.hs_stride);
+			                      state.input_info.vertex->tess.hs_stride);
+			// Word 148: writes in the high half, writes to another control point's block in the
+			// low half; word 149: the last such address.
+			if (state.tess_probe_won != 0) {
+				const auto address = ctx.Arg(inst, 1);
+				const auto other   = Binary(
+                    state, spv::OpINotEqual, TypeBool(state),
+                    EmitBinaryU32(state, spv::OpUDiv, address,
+                                  ConstantU32(state, state.input_info.vertex->tess.hs_stride)),
+                    EmitLaneId(state));
+				EmitTessProbeAdd(state, 148u,
+				                 Select(state, TypeU32(state), other, ConstantU32(state, 0x10001u),
+				                        ConstantU32(state, 0x10000u)));
+				EmitIfCondition(state, other,
+				                [&] { EmitTessProbeStore(state, ConstantU32(state, 149u), address); });
+			}
+		}
 	});
+}
+
+void EmitTessProbeOutputs(EmitterState& state) {
+	const auto variable =
+	    state.tess_variables[static_cast<uint32_t>(IR::TessellationAttribute::ControlOutput)];
+	if (state.program.stage != ShaderType::TessellationControl || state.tess_probe_won == 0 ||
+	    variable == 0)
+		return;
+	const auto words = std::min(state.input_info.vertex->tess.hs_stride / 4u, 48u);
+	const auto type  = TypePointer(state, spv::StorageClassOutput, TypeU32(state));
+	const auto point = EmitLaneId(state);
+	for (uint32_t word = 0; word < words; word++) {
+		const auto pointer = state.builder.AllocateId();
+		if (SplitControlPoints(IR::TessellationAttribute::ControlOutput)) {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer,
+			                          state.tess_split_variables.at(word / 4u), point,
+			                          ConstantU32(state, word % 4u));
+		} else {
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, variable, point,
+			                          ConstantU32(state, word / 4u), ConstantU32(state, word % 4u));
+		}
+		EmitTessProbeStore(state, ConstantU32(state, 208u + word),
+		                   Unary(state, spv::OpLoad, TypeU32(state), pointer));
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

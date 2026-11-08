@@ -84,6 +84,7 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+	EmitTessProbeOutputs(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
 		auto& state = ctx.state;
 		const auto primitive = EmitGetBuiltin(
