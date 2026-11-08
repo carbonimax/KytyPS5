@@ -61,12 +61,13 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 	return true;
 }
 
-// KYTY_STAGING_DEVICE=1 (default 0): the upload staging ring in device-local host-visible memory
-// when the device has a Resizable BAR heap (HasResizableBarHeap).
+// KYTY_STAGING_DEVICE (default 1; 0 = host memory): the upload staging ring in device-local
+// host-visible memory when the device has a Resizable BAR heap (HasResizableBarHeap). If that heap
+// is full or over budget, VMA falls back to the next compatible memory type (host memory).
 [[nodiscard]] bool StagingInDevice(const GraphicContext& graphics) {
 	static const bool requested = [] {
 		const char* value = std::getenv("KYTY_STAGING_DEVICE");
-		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
 	}();
 	return requested && HasResizableBarHeap(graphics.physical_device_properties.deviceType,
 	                                        graphics.physical_device_memory_properties);
@@ -127,7 +128,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	if (prefer_device) {
 		const auto type = allocation_result.memoryType;
 		const auto heap = graphics.physical_device_memory_properties.memoryTypes[type].heapIndex;
-		std::printf("StreamBuffer: KYTY_STAGING_DEVICE=1 staging ring %" PRIu64
+		std::printf("StreamBuffer: Resizable BAR staging ring %" PRIu64
 		            " MiB in memory type %u (flags 0x%x) heap %u (%" PRIu64 " MiB)\n",
 		            size >> 20u, type, properties, heap,
 		            uint64_t {graphics.physical_device_memory_properties.memoryHeaps[heap].size} >> 20u);
