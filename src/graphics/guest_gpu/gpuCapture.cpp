@@ -173,6 +173,36 @@ bool GetPayload(Reader& r, CpState& c) {
 	return r.Get(c.queue) && r.Get(size) && size != 0 && r.GetBytes(c.bytes, size);
 }
 
+void PutPayload(Writer& w, const Thumb& t) {
+	w.Put(t.address);
+	w.Put(t.width);
+	w.Put(t.height);
+	w.PutBytes(t.rgba);
+}
+bool GetPayload(Reader& r, Thumb& t) {
+	return r.Get(t.address) && r.Get(t.width) && r.Get(t.height) && t.width != 0 && t.height != 0 &&
+	       t.width <= 4096 && t.height <= 4096 && r.GetBytes(t.rgba, uint64_t {t.width} * t.height * 4);
+}
+
+void PutPayload(Writer& /*w*/, const WaitValue& /*v*/) {}
+bool GetPayload(Reader& /*r*/, WaitValue& /*v*/) { return false; }
+
+void PutPayload(Writer& w, const Platform& p) {
+	w.Put(p.vendor_id);
+	w.Put(p.device_id);
+	w.Put(p.driver_version);
+	w.Put(static_cast<uint32_t>(p.hashes.size()));
+	for (const auto& e: p.hashes) PutPayload(w, e);
+}
+bool GetPayload(Reader& r, Platform& p) {
+	uint32_t count = 0;
+	if (!r.Get(p.vendor_id) || !r.Get(p.device_id) || !r.Get(p.driver_version) || !r.Get(count)) return false;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!GetPayload(r, p.hashes.emplace_back())) return false;
+	}
+	return true;
+}
+
 template <size_t I = 0>
 bool ParseRecord(uint32_t type, Reader& payload, Record& record) {
 	if constexpr (I < std::variant_size_v<Record>) {

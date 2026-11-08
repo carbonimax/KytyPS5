@@ -570,17 +570,20 @@ static_assert(std::is_trivially_copyable_v<SavedCpState>);
 } // namespace
 
 std::vector<uint8_t> CommandProcessor::SaveState() const {
-	const SavedCpState state {m_ctx,
-	                          m_ucfg,
-	                          m_sh_ctx,
-	                          m_index_base_addr,
-	                          m_draw_indirect_args_base_addr,
-	                          m_dispatch_indirect_args_base_addr,
-	                          m_num_instances_addr,
-	                          m_index_type_and_size,
-	                          m_index_buffer_size,
-	                          m_num_instances,
-	                          m_predicate_skip};
+	SavedCpState state;
+	// The padding bytes are saved too: zeroed, two saves of one state are equal.
+	std::memset(static_cast<void*>(&state), 0, sizeof(state));
+	state.ctx                              = m_ctx;
+	state.ucfg                             = m_ucfg;
+	state.sh                               = m_sh_ctx;
+	state.index_base_addr                  = m_index_base_addr;
+	state.draw_indirect_args_base_addr     = m_draw_indirect_args_base_addr;
+	state.dispatch_indirect_args_base_addr = m_dispatch_indirect_args_base_addr;
+	state.num_instances_addr               = m_num_instances_addr;
+	state.index_type_and_size              = m_index_type_and_size;
+	state.index_buffer_size                = m_index_buffer_size;
+	state.num_instances                    = m_num_instances;
+	state.predicate_skip                   = m_predicate_skip;
 	const auto* p = reinterpret_cast<const uint8_t*>(&state);
 	return {p, p + sizeof(state)};
 }

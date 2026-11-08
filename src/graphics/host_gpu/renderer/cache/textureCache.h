@@ -94,6 +94,11 @@ public:
 	// be downloaded to guest memory, oldest GPU write first, and waits for it.
 	void DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped = nullptr,
 	                         std::vector<GpuCapture::Published>*   written = nullptr);
+	// GPU thread, GPU capture replay: `width` x `height` RGBA8 box-filtered thumbnail of mip 0, layer 0 of the
+	// newest GPU-written single-sample color target starting at `address` within `size` bytes (blit to RGBA8,
+	// then averaged on the CPU). False when there is none or its format cannot be blitted.
+	[[nodiscard]] bool Thumbnail(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+	                             std::vector<uint8_t>& rgba);
 	void RunGarbageCollector();
 
 private:
