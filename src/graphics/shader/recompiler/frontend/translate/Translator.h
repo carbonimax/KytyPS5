@@ -193,6 +193,7 @@ private:
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
+	void Integer16Mad32(const Decoder::Instruction& inst, bool sign);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
 	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);

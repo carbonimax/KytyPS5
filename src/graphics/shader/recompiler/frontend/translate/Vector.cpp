@@ -377,6 +377,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MUL_LO_U16: return Integer16Binary(inst, IR::ValueOpcode::IMul32, false);
 		case O::V_MAD_I16: return Integer16Mad(inst, true);
 		case O::V_MAD_U16: return Integer16Mad(inst, false);
+		case O::V_MAD_I32_I16: return Integer16Mad32(inst, true);
+		case O::V_MAD_U32_U16: return Integer16Mad32(inst, false);
 		case O::V_MED3_I16: return Integer16Ternary(inst, IR::ValueOpcode::SMedTri32, true);
 		case O::V_MIN3_U16: return Integer16Ternary(inst, IR::ValueOpcode::UMinTri32, false);
 		case O::V_MIN3_I16: return Integer16Ternary(inst, IR::ValueOpcode::SMinTri32, true);

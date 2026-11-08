@@ -30,6 +30,43 @@ void Translator::Integer16Mad(const Decoder::Instruction& inst, bool sign) {
 	Write16Bits(DestinationOperand(inst), result);
 }
 
+void Translator::Integer16Mad32(const Decoder::Instruction& inst, bool sign) {
+	const auto lhs            = ReadU16AsU32(inst.src0, sign);
+	const auto rhs            = ReadU16AsU32(inst.src1, sign);
+	auto       addend_operand = inst.src2;
+	addend_operand.op_sel     = false;
+	auto addend               = ReadU32(addend_operand);
+	if (inst.src2.op_sel) {
+		// The high half is zero-extended for both signednesses (measured on RDNA2 by rps5e).
+		addend = ir.ShiftRightLogical(addend, IR::U32(IR::Value(16u)));
+	}
+	const auto product = ir.IMul(lhs, rhs);
+	auto       result  = ir.IAdd(product, addend);
+	if (inst.dst.clamp) {
+		if (sign) {
+			// Overflow: the sum's sign differs from both operands' (the product cannot overflow).
+			const auto overflow = ir.ShiftRightLogical(
+			    ir.BitwiseAnd(ir.BitwiseXor(product, result), ir.BitwiseXor(addend, result)),
+			    IR::U32(IR::Value(31u)));
+			const auto saturated =
+			    ir.BitwiseXor(ir.ShiftRightArithmetic(product, IR::U32(IR::Value(31u))),
+			                  IR::U32(IR::Value(0x7fffffffu)));
+			result = ir.Select(ir.INotEqual(overflow, IR::U32(IR::Value(0u))), saturated, result);
+		} else {
+			result = ir.Select(ir.ULessThan(result, product), IR::U32(IR::Value(0xffffffffu)),
+			                   result);
+		}
+	}
+	if (inst.dst.op_sel) {
+		// The low 16 bits move to the high half; the low half is cleared.
+		result = ir.ShiftLeftLogical(result, IR::U32(IR::Value(16u)));
+	}
+	auto destination   = DestinationOperand(inst);
+	destination.op_sel = false;
+	destination.clamp  = false;
+	WriteOperand(destination, result);
+}
+
 void Translator::Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                   bool sign) {
 	const auto result = IR::U32(ir.Emit(

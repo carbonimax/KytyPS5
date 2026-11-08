@@ -30910,6 +30910,82 @@ TestCase Vop3MadU16(u32 wave_size) {
   return test;
 }
 
+// V_MAD_U32_U16 / V_MAD_I32_I16: op_sel bits 0-1 pick each 16-bit factor's half, bit 2 takes the
+// high half of the 32-bit addend zero-extended (both signednesses), bit 3 writes the low 16 bits
+// of the (clamped) sum to the high half and clears the low half.
+TestCase Vop3Mad32x16() {
+  using O = ShaderOpcode;
+  constexpr std::array<std::array<u32, 3>, 5> inputs{{
+      {0x00030002u, 0x00050007u, 0x80000001u},
+      {0xffff0002u, 0x0003fffeu, 0x7fff8000u},
+      {0xffffffffu, 0xffffffffu, 0xffffffffu},
+      {0x7fff8000u, 0x80007fffu, 0x7fffffffu}, // Signed positive overflow; literal addend.
+      {0x80008000u, 0x7fff7fffu, 0x80000000u}}}; // Signed negative overflow.
+  TestCase test;
+  test.name = "Vop3Mad32x16";
+  for (const auto &input : inputs) test.initial.insert(test.initial.end(), input.begin(), input.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    for (u32 variant = 0; variant < 64; ++variant) {
+      const u32 selectors = variant & 15u;
+      const bool clamp = (variant & 16u) != 0;
+      const bool sign = (variant & 32u) != 0;
+      for (u32 operand = 0; operand < 3; ++operand) {
+        AppendVMovU32(&code, 30, (i * 3 + operand) * sizeof(u32));
+        AppendBufferLoadDword(&code, 2 + operand, 30);
+      }
+      AppendVMovLiteral(&code, 9, 0xa5a5beefu);
+      AppendVop3(&code, sign ? 0x375 : 0x373, 9, Vgpr(2), Vgpr(3), i == 3 ? 255 : Vgpr(4), 0,
+                 selectors, clamp);
+      if (i == 3) code.push_back(inputs[i][2]);
+      AppendStoreVgpr(&code, 9, static_cast<u32>(test.expected.size()));
+      const auto half = [&](u32 operand) {
+        const u32 bits = (inputs[i][operand] >> (((selectors >> operand) & 1u) * 16)) & 0xffffu;
+        return sign ? int64_t{static_cast<int16_t>(bits)} : int64_t{bits};
+      };
+      const u32 addend = selectors & 4u ? inputs[i][2] >> 16 : inputs[i][2];
+      const int64_t wide = half(0) * half(1) +
+                           (sign && !(selectors & 4u) ? int64_t{static_cast<int32_t>(addend)}
+                                                      : int64_t{addend});
+      u32 result = static_cast<u32>(wide);
+      if (clamp) {
+        result = sign ? static_cast<u32>(static_cast<int32_t>(
+                            std::clamp<int64_t>(wide, INT32_MIN, INT32_MAX)))
+                      : static_cast<u32>(std::min<int64_t>(wide, UINT32_MAX));
+      }
+      test.expected.push_back(selectors & 8u ? result << 16 : result);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U32_U16, O::V_MAD_I32_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// A dynamic buffer offset that is negative as a signed value is a huge unsigned one: out of
+// range, so the load reads zero instead of wrapping to the bytes before the buffer.
+TestCase BufferNegativeDynamicOffsetReadsZero() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferNegativeDynamicOffsetReadsZero";
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, 0xfffffffcu);
+  AppendBufferLoadDword(&code, 0, 20);                   // OFFEN vaddr = -4.
+  AppendSMovLiteral(&code, 9, 0xfffffffcu);
+  code.insert(code.end(), {EncodeSmem0(0x08, 8), EncodeSmem1(0, 9),      // soffset = -4.
+                           EncodeSmem0(0x08, 10), EncodeSmem1(4, 125)}); // In-range control.
+  code.insert(code.end(), {EncodeVop1(0x01, 1, 8), EncodeVop1(0x01, 2, 10)});
+  for (u32 i = 0; i < 3; ++i) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0u, 0u, 0x22222222u, 0x44444444u};
+  test.storage_buffer_range_bytes = 16;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::S_BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -51653,6 +51729,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop3MadU16(32));
   cases.push_back(Vop3MadU16(64));
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
+  AddCase(Vop3Mad32x16);
+  AddCase(BufferNegativeDynamicOffsetReadsZero);
   AddCase(Vop3F32ClampFlushesNaN);
   cases.push_back(Vop3Integer16Ternary(32));
   cases.push_back(Vop3Integer16Ternary(64));
@@ -58697,6 +58775,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop2SdwaMulU24Destinations(32));
     RunCase(&vulkan, Vop2SdwaMulU24Destinations(64));
     RunCase(&vulkan, VectorVop3IntegerOps());
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--fork-correctness-only") == 0) {
+    // One case per run: a failing case exits the process.
+    const std::string_view name = argv[2];
+    VulkanHarness vulkan;
+    if (name == "mad32x16") RunCase(&vulkan, Vop3Mad32x16());
+    else if (name == "negative-offset") RunCase(&vulkan, BufferNegativeDynamicOffsetReadsZero());
+    else if (name == "ds-minmax") {
+      RunCase(&vulkan, DsFloatMinMaxClasses(false));
+      RunCase(&vulkan, DsFloatMinMaxClasses(true));
+    } else return 2;
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {
