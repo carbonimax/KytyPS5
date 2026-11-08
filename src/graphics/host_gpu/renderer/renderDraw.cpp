@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -1383,6 +1384,130 @@ static bool DrawWritesAnything(const DrawRenderState& state) {
 	       (state.ps_active && writes(state.ps_input_info.stage));
 }
 
+// KYTY_TESS_PROBE=<LS hash>,<TES hash>: writes tessprobe.txt with the guest inputs of the first
+// probed patch draws, then the GPU records (Spirv::TessProbe) once those draws are done. With
+// KYTY_TESS_PROBE_DRAW=<n>, only the n-th probed draw runs, so that all records come from it.
+// Returns false for a probed draw to drop.
+static bool TessProbeDraw(const GraphicContext& graphics, const DrawRenderState& state,
+                          const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                          const DrawIndexBufferSource& index_source) {
+	using Probe = ShaderRecompiler::Spirv::TessProbe;
+	const auto& ls = state.vertex_info[0];
+	if (graphics.tess_probe_data == nullptr || !ls.stage ||
+	    ls.stage.program->stage != ShaderType::Local)
+		return true;
+	static const std::string hashes = std::getenv("KYTY_TESS_PROBE");
+	if (hashes.find(fmt::format("{:016x}", ls.stage.program->shader_hash)) == std::string::npos)
+		return true;
+	static const char*           only  = std::getenv("KYTY_TESS_PROBE_DRAW");
+	static std::atomic<uint32_t> count = 0;
+	static FILE*                 out   = std::fopen("tessprobe.txt", "w");
+	const auto                   index = count.fetch_add(1);
+	const bool keep = only == nullptr || std::strtoul(only, nullptr, 10) == index;
+	if (out == nullptr) return keep;
+	const auto read = [](uint64_t address, void* data, uint64_t size) {
+		if (!LibKernel::Memory::TryReadBufferBacking(address, data, size))
+			std::memcpy(data, reinterpret_cast<const void*>(address), size);
+	};
+	if (index < 16u) {
+		const auto& user = ls.stage.resources->user_data;
+		const auto  word = [&](int reg) {
+            return reg >= 0 && static_cast<size_t>(reg) < user.size() ? uint64_t {user[reg]} : 0u;
+		};
+		fmt::print(out, "draw {} indexed={} count={} instances={} vertex_offset={} first_instance={} "
+		                "index_address={:#x} index_size={}\n",
+		           index, draw.indexed, draw.index_count, draw.instance_count, emit.vertex_offset,
+		           emit.first_instance, index_source.address, index_source.guest_element_size);
+		fmt::print(out, "user");
+		for (const auto value: user) fmt::print(out, " {:08x}", value);
+		fmt::print(out, "\n");
+		std::array<uint32_t, 8> attributes {};
+		const auto attribute_table = word(ls.fetch_attrib_reg) | word(ls.fetch_attrib_reg + 1) << 32u;
+		const auto buffer_table    = word(ls.fetch_buffer_reg) | word(ls.fetch_buffer_reg + 1) << 32u;
+		const auto attribute_count = std::min<uint32_t>(ls.resources_num, attributes.size());
+		if (attribute_table != 0 && buffer_table != 0) {
+			read(attribute_table, attributes.data(), attribute_count * 4u);
+		}
+		std::array<std::array<uint32_t, 4>, 8> sharps {};
+		for (uint32_t i = 0; i < attribute_count; i++) {
+			const auto& r   = ls.resources[i];
+			const auto& dst = ls.resources_dst[i];
+			if (buffer_table != 0) read(buffer_table + (attributes[i] & 0x1fu) * 16u, sharps[i].data(), 16);
+			fmt::print(out, "attr {} word={:08x} raw_sharp={:08x} {:08x} {:08x} {:08x} resolved={:08x} "
+			                "{:08x} {:08x} {:08x} attr_id={} fetch_index={} reg={} regs={}\n",
+			           i, attributes[i], sharps[i][0], sharps[i][1], sharps[i][2], sharps[i][3],
+			           r.fields[0], r.fields[1], r.fields[2], r.fields[3], dst.attr_id,
+			           dst.fetch_index, dst.register_start, dst.registers_num);
+		}
+		std::array<uint32_t, 2048> indices {};
+		const auto                index_count = std::min<uint32_t>(draw.index_count, indices.size());
+		for (uint32_t i = 0; i < index_count; i++) indices[i] = i;
+		if (draw.indexed && index_source.address != 0) {
+			const auto element = index_source.guest_element_size;
+			std::array<uint8_t, 2048 * 4> bytes {};
+			read(index_source.address, bytes.data(), uint64_t {index_count} * element);
+			for (uint32_t i = 0; i < index_count; i++) {
+				indices[i] = element == 4 ? bytes[4 * i] | bytes[4 * i + 1] << 8u |
+				                                bytes[4 * i + 2] << 16u | uint32_t {bytes[4 * i + 3]} << 24u
+				             : element == 2 ? bytes[2 * i] | bytes[2 * i + 1] << 8u
+				                            : bytes[i];
+			}
+		}
+		fmt::print(out, "indices");
+		for (uint32_t i = 0; i < index_count; i++) fmt::print(out, " {}", indices[i]);
+		fmt::print(out, "\n");
+		// Guest bytes of each attribute from the raw tables: base + offset + stride * vertex.
+		for (uint32_t i = 0; i < index_count; i++) {
+			const auto vertex = static_cast<int64_t>(indices[i]) + emit.vertex_offset;
+			fmt::print(out, "v {}", vertex);
+			for (uint32_t a = 0; a < attribute_count; a++) {
+				const auto base   = sharps[a][0] | uint64_t {sharps[a][1] & 0xffffu} << 32u;
+				const auto stride = (sharps[a][1] >> 16u) & 0x3fffu;
+				const auto fetch  = (attributes[a] >> 26u) & 1u ? 0 : vertex;
+				std::array<uint32_t, 4> data {};
+				if (base != 0) read(base + ((attributes[a] >> 14u) & 0xfffu) + stride * fetch, data.data(), 16);
+				fmt::print(out, " | {:08x} {:08x} {:08x} {:08x}", data[0], data[1], data[2], data[3]);
+			}
+			fmt::print(out, "\n");
+		}
+		// HS buffers (stencil tables) and constants.
+		if (const auto& hs = state.vertex_info[1]; hs.stage) {
+			const auto& snapshot = *hs.stage.resources;
+			fmt::print(out, "hs_srt");
+			for (const auto value: snapshot.flattened_srt) fmt::print(out, " {:08x}", value);
+			fmt::print(out, "\n");
+			for (size_t b = 0; b < snapshot.buffers.size(); b++) {
+				const auto& d    = snapshot.buffers[b].dwords;
+				const auto  base = d[0] | uint64_t {d[1] & 0xffffu} << 32u;
+				fmt::print(out, "hs_buffer {} {:08x} {:08x} {:08x} {:08x}", b, d[0], d[1], d[2], d[3]);
+				std::array<uint32_t, 512> data {};
+				if (base != 0) read(base, data.data(), std::min<uint64_t>(sizeof(data), d[2] * std::max(1u, (d[1] >> 16u) & 0x3fffu)));
+				for (const auto value: data) fmt::print(out, " {:08x}", value);
+				fmt::print(out, "\n");
+			}
+		}
+		std::fflush(out);
+	}
+	// Patch draws can run at a few per second: dump at growing counts, each one complete.
+	if (index == 32u || index == 128u || index == 512u || index == 2048u) {
+		fmt::print(out, "records after {} draws\n", index);
+		const auto* data = graphics.tess_probe_data;
+		for (uint32_t record = 0; record < Probe::HsBase + Probe::HsRecords; record++) {
+			const auto* words = data + record * Probe::RecordDwords;
+			if (words[0] == 0 || record == Probe::LsRecords || record == Probe::HsBase - 1u) continue;
+			fmt::print(out, "{} {}",
+			           record < Probe::LsRecords ? "ls" : record < Probe::HsBase ? "tes" : "hs",
+			           record);
+			for (uint32_t i = 1; i < (record < Probe::LsRecords ? 13u : 248u); i++)
+				fmt::print(out, " {:08x}", words[i]);
+			fmt::print(out, "\n");
+		}
+		fmt::print(out, "end\n");
+		std::fflush(out);
+	}
+	return keep;
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1662,7 +1787,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		} else if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (args_buffer.first == nullptr) {
-			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+			static thread_local bool probe_keep = true;
+			if (pass == 0)
+				probe_keep = TessProbeDraw(m_context.GetGraphics(), state, draw, emit, index_source);
+			if (probe_keep) EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 		} else if (draw.indexed) {
 			vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
 			                              emit.indirect.count, emit.indirect.stride);

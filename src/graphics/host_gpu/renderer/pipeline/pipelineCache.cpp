@@ -949,6 +949,7 @@ struct PipelineCache::ProgramCache {
 		           .storage_bounds_alignment = graphics.storage_bounds_alignment,
 		           .storage_bounds_verify_address =
 		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u,
+		           .tess_probe_address = graphics.tess_probe_address,
 		           .r8_srgb_views   = graphics.r8_srgb_views,
 		           .r8g8_srgb_views = graphics.r8g8_srgb_views} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
@@ -1071,9 +1072,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		m_async           = async != nullptr && async[0] == '1';
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
 	}
-	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
-		// The verify shaders embed this launch's counter address.
-		PipelineCacheLog("Shader store: disabled (KYTY_BOUNDS_MODE=2)");
+	if ((graphics.storage_bounds_verify || graphics.tess_probe_address != 0) &&
+	    GetShaderStoreMode() != ShaderStoreMode::Off) {
+		// The verify and probe shaders embed this launch's buffer addresses.
+		PipelineCacheLog("Shader store: disabled (KYTY_BOUNDS_MODE=2 or KYTY_TESS_PROBE)");
 	} else if (GetShaderStoreMode() != ShaderStoreMode::Off) {
 		if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
 			m_store   = std::make_unique<ShaderStore>();

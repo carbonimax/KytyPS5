@@ -70,6 +70,26 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return pointer;
 }
 
+// KYTY_TESS_PROBE: records the word at the access's address. LS outputs repeat every LS stride.
+void ProbeTessellationWord(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t base,
+                           uint32_t last, uint32_t value, uint32_t first = 4u,
+                           uint32_t modulus = 0u) {
+	auto& state = ctx.state;
+	if (state.tess_probe_won == 0) return;
+	auto address = ctx.Arg(inst, 1);
+	if (base != 0u) address = EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, base));
+	if (state.program.stage == ShaderType::Local) {
+		address = EmitBinaryU32(state, spv::OpUMod, address,
+		                        ConstantU32(state, state.input_info.vertex->tess.ls_stride));
+	}
+	if (modulus != 0u)
+		address = EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, modulus));
+	const auto word = EmitUMin32(
+	    state, EmitBinaryU32(state, spv::OpShiftRightLogical, address, ConstantU32(state, 2)),
+	    ConstantU32(state, last));
+	EmitTessProbeStore(state, EmitAddU32(state, word, ConstantU32(state, first)), value);
+}
+
 } // namespace
 
 void DefineTessellationInterfaces(EmitterState& state) {
@@ -163,6 +183,13 @@ uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& ins
 		const auto value = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value,
 		                              TessellationPointer(ctx, inst));
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::EvaluationInput))
+			ProbeTessellationWord(ctx, inst, 0u, 191u, value);
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlInput))
+			ProbeTessellationWord(ctx, inst, 0u, 143u, value);
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::PatchInput))
+			ProbeTessellationWord(ctx, inst, ctx.state.input_info.vertex->tess.patch_base, 23u,
+			                      value, 196u);
 		return value;
 	});
 }
@@ -176,6 +203,11 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			value = floating;
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::LocalOutput))
+			ProbeTessellationWord(ctx, inst, 0u, 31u, value);
+		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::ControlOutput))
+			ProbeTessellationWord(ctx, inst, 0u, 47u, value, 160u,
+			                      ctx.state.input_info.vertex->tess.hs_stride);
 	});
 }
 

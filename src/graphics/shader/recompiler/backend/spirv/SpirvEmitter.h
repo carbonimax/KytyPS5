@@ -29,6 +29,27 @@ enum class StorageBoundsCounter : uint32_t {
 	Count,
 };
 
+// KYTY_TESS_PROBE records of TessProbe::RecordDwords words. Word 0 is the claim (first writer
+// wins), words 1-3 identify the invocation. LS: by VertexIndex modulo LsRecords (1 VertexIndex,
+// 2 InstanceIndex),
+// words 4-12 the LS outputs. TES: for each of the first patches, its 4 domain corners and the
+// first interior point of each domain quadrant (1 PrimitiveId, 2-3 TessCoord bits), words 4-195
+// the control point words read (address / 4), 196-219 the patch constant words read, 240-243
+// the exported position, 244-247 the same after the clip-space conversion. One spare record after each range
+// takes the invocations that record nothing.
+struct TessProbe {
+	static constexpr uint32_t RecordDwords = 256;
+	static constexpr uint32_t LsRecords    = 512;
+	static constexpr uint32_t TesPatches   = 64;
+	static constexpr uint32_t TesBase      = LsRecords + 1u;
+	static constexpr uint32_t TesRecords   = TesPatches * 8u;
+	// HS: by PrimitiveId * 4 + InvocationId (1 PrimitiveId, 2 InvocationId), words 4-147 the
+	// input words read (address / 4), 160-207 the own output words written.
+	static constexpr uint32_t HsBase       = TesBase + TesRecords + 1u;
+	static constexpr uint32_t HsRecords    = TesPatches * 4u;
+	static constexpr uint32_t Bytes        = (HsBase + HsRecords + 1u) * RecordDwords * 4u;
+};
+
 // Host device capabilities that change the emitted SPIR-V. Built once per device.
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
@@ -40,6 +61,8 @@ struct Profile {
 	uint32_t storage_bounds_alignment = 4;
 	// KYTY_BOUNDS_MODE=2: device address of the StorageBoundsCounter words, 0 otherwise.
 	uint64_t storage_bounds_verify_address = 0;
+	// KYTY_TESS_PROBE: device address of the TessProbe records, 0 otherwise.
+	uint64_t tess_probe_address = 0;
 	// 8 and 8_8 sRGB textures sample through sRGB views; without one the shader decodes them.
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;

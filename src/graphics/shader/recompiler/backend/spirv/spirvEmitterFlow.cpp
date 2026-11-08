@@ -5,7 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -490,6 +494,140 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+
+bool TessProbeEnabled(const EmitterState& state) {
+	static const std::string hashes = [] {
+		const char* value = std::getenv("KYTY_TESS_PROBE");
+		return std::string(value != nullptr ? value : "");
+	}();
+	const auto stage = state.program.stage;
+	if (state.profile.tess_probe_address == 0u ||
+	    (stage != ShaderType::Local && stage != ShaderType::TessellationEvaluation &&
+	     stage != ShaderType::TessellationControl))
+		return false;
+	char hash[24];
+	std::snprintf(hash, sizeof(hash), "%016" PRIx64, state.program.shader_hash);
+	return hashes.find(hash) != std::string::npos;
+}
+
+static void LogTessProbe(const EmitterState& state, bool enabled) {
+	char line[96];
+	std::snprintf(line, sizeof(line), "Tessellation probe: stage=%u hash=%016" PRIx64 " %s\n",
+	              static_cast<uint32_t>(state.program.stage), state.program.shader_hash,
+	              enabled ? "recorded" : "not selected");
+	Log::WriteToConsoleAndLog(line);
+}
+
+void EmitTessProbeClaim(EmitterState& state) {
+	if (state.profile.tess_probe_address != 0u &&
+	    (state.program.stage == ShaderType::Local ||
+	     state.program.stage == ShaderType::TessellationEvaluation ||
+	     state.program.stage == ShaderType::TessellationControl))
+		LogTessProbe(state, TessProbeEnabled(state));
+	if (!TessProbeEnabled(state)) return;
+	const auto u32  = TypeU32(state);
+	const auto bool_type = TypeBool(state);
+	const auto equal = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpIEqual, bool_type, lhs, ConstantU32(state, rhs));
+	};
+	const auto both = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpLogicalAnd, bool_type, lhs, rhs);
+	};
+	const auto either = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpLogicalOr, bool_type, lhs, rhs);
+	};
+	std::array<uint32_t, 3> keys {};
+	uint32_t                ok, slot;
+	if (state.program.stage == ShaderType::Local) {
+		keys[0] = EmitBuiltinU32(state, IR::StageInputKind::VertexIndex, 0);
+		keys[1] = EmitBuiltinU32(state, IR::StageInputKind::InstanceIndex, 0);
+		keys[2] = ConstantU32(state, 0);
+		// Draw offsets move VertexIndex anywhere: records keep the first vertex of each residue.
+		ok   = ConstantBool(state, true);
+		slot = EmitBinaryU32(state, spv::OpBitwiseAnd, keys[0],
+		                     ConstantU32(state, TessProbe::LsRecords - 1u));
+	} else if (state.program.stage == ShaderType::TessellationControl) {
+		keys[0] = EmitBuiltinU32(state, IR::StageInputKind::PrimitiveId, 0);
+		keys[1] = EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0);
+		keys[2] = ConstantU32(state, 0);
+		ok      = both(Binary(state, spv::OpULessThan, bool_type, keys[0],
+		                      ConstantU32(state, TessProbe::TesPatches)),
+		               Binary(state, spv::OpULessThan, bool_type, keys[1], ConstantU32(state, 4)));
+		const auto index = EmitAddU32(
+		    state, EmitBinaryU32(state, spv::OpIMul, keys[0], ConstantU32(state, 4)), keys[1]);
+		slot = Select(state, u32, ok, EmitAddU32(state, index, ConstantU32(state, TessProbe::HsBase)),
+		              ConstantU32(state, TessProbe::HsBase + TessProbe::HsRecords));
+	} else {
+		auto primitive = InputVariableForKind(state, IR::StageInputKind::PrimitiveId);
+		if (primitive == 0) {
+			// The guest TES did not read its patch ID.
+			primitive = DefineInterfaceVariable(state, TypeI32(state), spv::StorageClassInput,
+			                                    "probe_primitive_id");
+			state.builder.AddAnnotation(spv::OpDecorate, primitive, spv::DecorationBuiltIn,
+			                            spv::BuiltInPrimitiveId);
+		}
+		keys[0] = Unary(state, spv::OpBitcast, u32,
+		                Unary(state, spv::OpLoad, TypeI32(state), primitive));
+		keys[1] = EmitBuiltinU32(state, IR::StageInputKind::TessCoord, 0);
+		keys[2] = EmitBuiltinU32(state, IR::StageInputKind::TessCoord, 1);
+		const auto u_one = equal(keys[1], 0x3f800000u);
+		const auto v_one = equal(keys[2], 0x3f800000u);
+		const auto u_edge = either(equal(keys[1], 0u), u_one);
+		const auto v_edge = either(equal(keys[2], 0u), v_one);
+		const auto corner = both(u_edge, v_edge);
+		const auto inner  = both(Unary(state, spv::OpLogicalNot, bool_type, u_edge),
+		                         Unary(state, spv::OpLogicalNot, bool_type, v_edge));
+		ok = both(either(corner, inner), Binary(state, spv::OpULessThan, bool_type, keys[0],
+		                                        ConstantU32(state, TessProbe::TesPatches)));
+		// Corners 0-3; interior points 4-7 by quadrant (TessCoord bits order like the values).
+		const auto high = [&](uint32_t bits, uint32_t limit) {
+			return Binary(state, spv::OpUGreaterThanEqual, bool_type, bits, ConstantU32(state, limit));
+		};
+		const auto u_high = Select(state, u32, high(keys[1], 0x3f000000u), ConstantU32(state, 1),
+		                           ConstantU32(state, 0));
+		const auto v_high = Select(state, u32, high(keys[2], 0x3f000000u), ConstantU32(state, 2),
+		                           ConstantU32(state, 0));
+		const auto kind = EmitAddU32(
+		    state, EmitAddU32(state, u_high, v_high),
+		    Select(state, u32, inner, ConstantU32(state, 4), ConstantU32(state, 0)));
+		const auto index = EmitAddU32(
+		    state, EmitBinaryU32(state, spv::OpIMul, keys[0], ConstantU32(state, 8)), kind);
+		slot = Select(state, u32, ok, EmitAddU32(state, index, ConstantU32(state, TessProbe::TesBase)),
+		              ConstantU32(state, TessProbe::TesBase + TessProbe::TesRecords));
+	}
+	const auto offset = Binary(state, spv::OpIMul, TypeU64(state),
+	                           Unary(state, spv::OpUConvert, TypeU64(state), slot),
+	                           ConstantU64(state, TessProbe::RecordDwords * 4u));
+	state.tess_probe_record = Binary(state, spv::OpIAdd, TypeU64(state), offset,
+	                                 ConstantU64(state, state.profile.tess_probe_address));
+	const auto claim = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+	                         state.tess_probe_record);
+	const auto old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicCompareExchange, u32, old, claim,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+	                          ConstantU32(state, 1), ConstantU32(state, 0));
+	state.tess_probe_won = both(ok, equal(old, 0u));
+	for (uint32_t key = 0; key < keys.size(); key++) {
+		EmitTessProbeStore(state, ConstantU32(state, key + 1u), keys[key]);
+	}
+}
+
+// Stores `value` at word `dword` (a U32 id) of the invocation's record if it owns one.
+void EmitTessProbeStore(EmitterState& state, uint32_t dword, uint32_t value) {
+	if (state.tess_probe_won == 0) return;
+	EmitIfCondition(state, state.tess_probe_won, [&] {
+		const auto offset = Unary(state, spv::OpUConvert, TypeU64(state),
+		                          EmitBinaryU32(state, spv::OpShiftLeftLogical, dword,
+		                                        ConstantU32(state, 2)));
+		const auto pointer =
+		    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+		          Binary(state, spv::OpIAdd, TypeU64(state), state.tess_probe_record, offset));
+		state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, 4u);
+	});
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -706,10 +844,22 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          ConstantU32(state, 0));
 			}
 		}
+		const auto probe_position = [&](uint32_t first) {
+			if (exp.kind != IR::ExportTargetKind::Position || state.tess_probe_won == 0) return;
+			const auto bits = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);
+			for (uint32_t component = 0; component < 4u; component++) {
+				const auto word = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, bits,
+				                          component);
+				EmitTessProbeStore(state, ConstantU32(state, first + component), word);
+			}
+		};
+		probe_position(240u);
 		if (exp.kind == IR::ExportTargetKind::Position &&
 		    state.input_info.vertex->clip_space.enabled) {
 			value = ConvertPositionToClipSpace(state, value);
 		}
+		probe_position(244u);
 		if (exp.kind == IR::ExportTargetKind::Position && state.user_clip_planes != 0) {
 			EmitUserClipDistances(state, value);
 		}

@@ -73,6 +73,11 @@ struct GraphicContext {
 	const volatile uint32_t*           storage_bounds_verify_counters        = nullptr;
 	VkBuffer                           storage_bounds_verify_buffer          = VK_NULL_HANDLE;
 	VmaAllocation                      storage_bounds_verify_allocation      = nullptr;
+	// KYTY_TESS_PROBE: host-mapped Spirv::TessProbe records, 0 when off.
+	uint64_t                           tess_probe_address                    = 0;
+	const volatile uint32_t*           tess_probe_data                       = nullptr;
+	VkBuffer                           tess_probe_buffer                     = VK_NULL_HANDLE;
+	VmaAllocation                      tess_probe_allocation                 = nullptr;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
@@ -136,6 +141,7 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	// KYTY_BOUNDS_MODE=2: allocates the verify counters (needs the allocator); false on failure.
 	[[nodiscard]] bool CreateStorageBoundsVerify();
+	[[nodiscard]] bool CreateTessProbe();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }

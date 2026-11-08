@@ -110,6 +110,9 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
+	// KYTY_TESS_PROBE: U64 address of this invocation's record and whether it owns it.
+	uint32_t                                         tess_probe_record = 0;
+	uint32_t                                         tess_probe_won    = 0;
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
@@ -473,6 +476,12 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
                                    uint32_t index);
 // KYTY_BOUNDS_MODE=2: atomically increments one Spirv::StorageBoundsCounter.
 void EmitStorageBoundsCount(EmitterState& state, StorageBoundsCounter counter);
+
+// KYTY_TESS_PROBE=<hash>[,...]: LS and TES programs with those hashes record their tessellation
+// data at Profile::tess_probe_address (TessProbe layout).
+bool TessProbeEnabled(const EmitterState& state);
+void EmitTessProbeClaim(EmitterState& state);
+void EmitTessProbeStore(EmitterState& state, uint32_t dword, uint32_t value);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);

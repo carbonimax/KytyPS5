@@ -18,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -170,28 +171,44 @@ bool GraphicContext::CreateAllocator() {
 	return true;
 }
 
-bool GraphicContext::CreateStorageBoundsVerify() {
-	EXIT_IF(allocator == nullptr || storage_bounds_verify_buffer != VK_NULL_HANDLE);
+// Zeroed host-mapped buffer that shaders write through its device address.
+static bool CreateMappedDeviceBuffer(VmaAllocator allocator, vk::Device device, uint32_t size,
+                                     VkBuffer& buffer, VmaAllocation& allocation,
+                                     const volatile uint32_t*& data, uint64_t& address) {
 	VkBufferCreateInfo buffer_info {};
 	buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	buffer_info.size  = 64;
+	buffer_info.size  = size;
 	buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
 	alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 	VmaAllocationInfo allocation_info {};
-	if (vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &storage_bounds_verify_buffer,
-	                    &storage_bounds_verify_allocation, &allocation_info) != VK_SUCCESS ||
+	if (vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &buffer, &allocation,
+	                    &allocation_info) != VK_SUCCESS ||
 	    allocation_info.pMappedData == nullptr) {
 		return false;
 	}
-	std::memset(allocation_info.pMappedData, 0, 64);
-	storage_bounds_verify_counters = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
+	std::memset(allocation_info.pMappedData, 0, size);
+	data = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
 	vk::BufferDeviceAddressInfo address_info {};
-	address_info.buffer           = storage_bounds_verify_buffer;
-	storage_bounds_verify_address = device.getBufferAddress(address_info);
-	return storage_bounds_verify_address != 0;
+	address_info.buffer = buffer;
+	address             = device.getBufferAddress(address_info);
+	return address != 0;
+}
+
+bool GraphicContext::CreateTessProbe() {
+	EXIT_IF(allocator == nullptr || tess_probe_buffer != VK_NULL_HANDLE);
+	return CreateMappedDeviceBuffer(allocator, device, ShaderRecompiler::Spirv::TessProbe::Bytes,
+	                                tess_probe_buffer, tess_probe_allocation, tess_probe_data,
+	                                tess_probe_address);
+}
+
+bool GraphicContext::CreateStorageBoundsVerify() {
+	EXIT_IF(allocator == nullptr || storage_bounds_verify_buffer != VK_NULL_HANDLE);
+	return CreateMappedDeviceBuffer(allocator, device, 64, storage_bounds_verify_buffer,
+	                                storage_bounds_verify_allocation, storage_bounds_verify_counters,
+	                                storage_bounds_verify_address);
 }
 
 void GraphicContext::DestroyAllocator() {
@@ -203,6 +220,12 @@ void GraphicContext::DestroyAllocator() {
 		storage_bounds_verify_buffer   = VK_NULL_HANDLE;
 		storage_bounds_verify_counters = nullptr;
 		storage_bounds_verify_address  = 0;
+	}
+	if (tess_probe_buffer != VK_NULL_HANDLE) {
+		vmaDestroyBuffer(allocator, tess_probe_buffer, tess_probe_allocation);
+		tess_probe_buffer  = VK_NULL_HANDLE;
+		tess_probe_data    = nullptr;
+		tess_probe_address = 0;
 	}
 	{
 		std::lock_guard lock(g_image_pool.mutex);

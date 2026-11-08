@@ -774,7 +774,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
 	const bool physical_addresses = state.program.info.uses_dma || state.program.info.uses_image_heap ||
-	                                state.profile.storage_bounds_verify_address != 0u;
+	                                state.profile.storage_bounds_verify_address != 0u ||
+	                                TessProbeEnabled(state);
 	if (physical_addresses) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);

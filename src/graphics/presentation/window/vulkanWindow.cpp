@@ -1285,6 +1285,13 @@ void WindowContext::CreateVulkan() {
 	if (graphic_ctx.storage_bounds_verify && !graphic_ctx.CreateStorageBoundsVerify()) {
 		EXIT("Could not create the KYTY_BOUNDS_MODE=2 counters");
 	}
+	if (const char* probe = std::getenv("KYTY_TESS_PROBE"); probe != nullptr && probe[0] != 0) {
+		if (!graphic_ctx.CreateTessProbe()) {
+			EXIT("Could not create the KYTY_TESS_PROBE records");
+		}
+		LOGF("KYTY_TESS_PROBE=%s: records at 0x%016" PRIx64 "\n", probe,
+		     graphic_ctx.tess_probe_address);
+	}
 	PerfStats::SetStorageBoundsCounters(graphic_ctx.storage_bounds_verify_counters);
 	graphic_ctx.stencil_copy_via_buffer = ResolveStencilCopyViaBuffer(graphic_ctx);
 
