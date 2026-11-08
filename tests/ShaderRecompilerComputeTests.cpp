@@ -30963,6 +30963,29 @@ TestCase Vop3Mad32x16() {
   return test;
 }
 
+// A dynamic buffer offset that is negative as a signed value is a huge unsigned one: out of
+// range, so the load reads zero instead of wrapping to the bytes before the buffer.
+TestCase BufferNegativeDynamicOffsetReadsZero() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferNegativeDynamicOffsetReadsZero";
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, 0xfffffffcu);
+  AppendBufferLoadDword(&code, 0, 20);                   // OFFEN vaddr = -4.
+  AppendSMovLiteral(&code, 9, 0xfffffffcu);
+  code.insert(code.end(), {EncodeSmem0(0x08, 8), EncodeSmem1(0, 9),      // soffset = -4.
+                           EncodeSmem0(0x08, 10), EncodeSmem1(4, 125)}); // In-range control.
+  code.insert(code.end(), {EncodeVop1(0x01, 1, 8), EncodeVop1(0x01, 2, 10)});
+  for (u32 i = 0; i < 3; ++i) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.expected = {0u, 0u, 0x22222222u, 0x44444444u};
+  test.storage_buffer_range_bytes = 16;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::S_BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -51707,6 +51730,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop3MadU16(64));
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Mad32x16);
+  AddCase(BufferNegativeDynamicOffsetReadsZero);
   AddCase(Vop3F32ClampFlushesNaN);
   cases.push_back(Vop3Integer16Ternary(32));
   cases.push_back(Vop3Integer16Ternary(64));
@@ -58758,7 +58782,11 @@ int main(int argc, char **argv) {
     const std::string_view name = argv[2];
     VulkanHarness vulkan;
     if (name == "mad32x16") RunCase(&vulkan, Vop3Mad32x16());
-    else return 2;
+    else if (name == "negative-offset") RunCase(&vulkan, BufferNegativeDynamicOffsetReadsZero());
+    else if (name == "ds-minmax") {
+      RunCase(&vulkan, DsFloatMinMaxClasses(false));
+      RunCase(&vulkan, DsFloatMinMaxClasses(true));
+    } else return 2;
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-u16-only") == 0) {

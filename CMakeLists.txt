@@ -849,6 +849,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_mad_f32_product COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-product-only)
 	add_test(NAME shader_recompiler_mad_f32_product_spirv COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mad-f32-product-spirv-only)
 	add_test(NAME shader_recompiler_mad32x16 COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only mad32x16)
+	add_test(NAME shader_recompiler_negative_offset COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only negative-offset)
+	add_test(NAME shader_recompiler_ds_minmax COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --fork-correctness-only ds-minmax)
 	add_test(NAME shader_recompiler_helper_quad
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-append-helper-quad-only)
 	add_test(NAME shader_recompiler_tessellation
