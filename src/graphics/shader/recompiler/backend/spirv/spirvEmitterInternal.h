@@ -110,6 +110,9 @@ struct EmitterState {
 	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, IR::NumTessellationAttributes> tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
+	// KYTY_TESS_HS_MODEL (default 1): the variable of each location of a per-control-point
+	// interface; empty with 0, where one array (of arrays) holds all locations.
+	std::array<std::vector<uint32_t>, IR::NumTessellationAttributes> tess_location_variables {};
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;

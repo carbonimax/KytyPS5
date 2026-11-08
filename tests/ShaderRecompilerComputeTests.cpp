@@ -52034,6 +52034,43 @@ bool HasPatchInterface(const std::string &assembly, const std::string &storage, 
              std::string::npos;
 }
 
+// The Locations of the non-Patch variables of a pointee type and storage class (`accessed`:
+// only those a dword access chain addresses).
+std::set<u32> InterfaceLocations(const std::string &assembly, const std::string &storage,
+                                 const std::string &type, bool accessed = false) {
+  std::set<u32> locations;
+  const auto variable = " = OpVariable %_ptr_" + storage + "_" + type + " " + storage + "\n";
+  for (auto end = assembly.find(variable); end != std::string::npos;
+       end = assembly.find(variable, end + 1)) {
+    const auto begin = assembly.rfind('%', end);
+    const auto id = assembly.substr(begin, end - begin);
+    if (assembly.find("OpDecorate " + id + " Patch\n") != std::string::npos ||
+        (accessed && assembly.find("OpAccessChain %_ptr_" + storage + "_uint " + id + " ") ==
+                         std::string::npos)) {
+      continue;
+    }
+    const auto decoration = "OpDecorate " + id + " Location ";
+    const auto at = assembly.find(decoration);
+    locations.insert(at == std::string::npos
+                         ? UINT32_MAX
+                         : static_cast<u32>(std::stoul(assembly.substr(at + decoration.size()))));
+  }
+  return locations;
+}
+
+// nullptr: the default layout (KYTY_TESS_HS_MODEL unset).
+void SetTessellationLayout(const char *value) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  _putenv_s("KYTY_TESS_HS_MODEL", value != nullptr ? value : "");
+#else
+  if (value != nullptr) {
+    setenv("KYTY_TESS_HS_MODEL", value, 1);
+  } else {
+    unsetenv("KYTY_TESS_HS_MODEL");
+  }
+#endif
+}
+
 void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u32 domain = 1,
                               u32 output_topology = 2, u32 partitioning = 2) {
   using namespace ShaderRecompiler;
@@ -52149,9 +52186,46 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
           "CP0 patch stores must reflect the HS patch constant range");
 
   using Attribute = IR::TessellationAttribute;
+  SetTessellationLayout(nullptr);
   auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
   auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
   auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  SetTessellationLayout("0");
+  const auto array_hs =
+      CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  SetTessellationLayout(nullptr);
+  // The AMD Windows driver overlaps HS control points declared as one uvec4[points][12].
+  const auto locations = [](u32 stride) {
+    std::set<u32> result;
+    for (u32 location = 0; location < (stride + 15) / 16; location++) {
+      result.insert(location);
+    }
+    return result;
+  };
+  const auto points = "_arr_v4uint_uint_" + std::to_string(control_points);
+  Require(name, "one variable per location",
+          InterfaceLocations(ls.assembly, "Output", "v4uint") == locations(ls_stride) &&
+              InterfaceLocations(hs.assembly, "Input", points) == locations(ls_stride) &&
+              InterfaceLocations(hs.assembly, "Output", points) == locations(hs_stride) &&
+              InterfaceLocations(ds.assembly, "Input", points) == locations(hs_stride) &&
+              (ls.assembly + hs.assembly + ds.assembly).find("_arr__arr_v4uint") ==
+                  std::string::npos,
+          "per-control-point interfaces must declare one variable per location by default");
+  // Stores at 28, 32 and hs_stride - 8 pick their locations at compile time; the masked
+  // control point address (v1 & 0x1f00) + v2 is only known at run time, so each store is
+  // guarded on every location.
+  const u32 last = (hs_stride + 15) / 16 - 1;
+  Require(name, "store locations",
+          InterfaceLocations(hs.assembly, "Output", points, true) ==
+              (hs_stride == 256 ? locations(hs_stride) : std::set<u32>{1, 2, last}),
+          "HS stores must reach the location of their offset");
+  Require(name, "array of arrays layout",
+          InterfaceLocations(array_hs.assembly, "Output",
+                             "_arr__arr_v4uint_uint_" + std::to_string((hs_stride + 15) / 16) +
+                                 "_uint_" + std::to_string(control_points)) ==
+                  std::set<u32>{0} &&
+              InterfaceLocations(array_hs.assembly, "Output", points).empty(),
+          "KYTY_TESS_HS_MODEL=0 must keep one array of arrays");
   Require(name, "separate DS offsets", ls.addresses[Attribute::LocalOutput] == std::set<u32>{4, 12},
           "DS_WRITE2 must preserve both independently encoded offsets");
   Require(name, "offchip component addressing",
