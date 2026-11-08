@@ -17370,9 +17370,13 @@ public:
         ShaderStageRuntime runtime{&program, &snapshot};
         PreparedBindings bindings;
         executor.PrepareBindings(runtime, bindings);
+        // Two descriptions of CPU-written bytes stay side by side (KYTY_IMAGE_CHURN_OPT); a
+        // GPU-written source is still replaced.
+        const bool gpu_written = format == Prospero::BufferFormat::k16UNorm;
         Require(name, "overlapping dimension discovery",
-                !texture_cache.GetImage(bindings.images[0].image_id).registered,
-                "the 2D descriptor did not replace its earlier 3D alias");
+                texture_cache.GetImage(bindings.images[0].image_id).registered != gpu_written,
+                gpu_written ? "the 2D descriptor did not replace its earlier GPU-written 3D alias"
+                            : "the 2D descriptor evicted a 3D alias of the same CPU bytes");
         executor.RebindImages(bindings);
         auto output = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
         constexpr std::array image_types{vk::ImageType::e3D, vk::ImageType::e2D};
@@ -17402,6 +17406,12 @@ public:
                 ReadBuffer(name, output, 2) == std::vector<u32>{expected, expected},
                 "an alias replacement retired image contents before queued GPU reads");
         DestroyBuffer(&output);
+        if (!gpu_written) {
+          texture_cache.MarkGpuWritten(bindings.images[1].image_id);
+          Require(name, "overlapping dimension GPU write",
+                  !texture_cache.GetImage(bindings.images[0].image_id).registered,
+                  "a GPU write kept a stale 3D alias of the same bytes");
+        }
       }
 
       for (const bool volume_first : {false, true}) {

@@ -164,6 +164,9 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Another description of the same guest bytes stays registered beside this one while both
+	// only mirror those bytes (KYTY_IMAGE_CHURN_OPT); a GPU write to either drops the others.
+	bool             guest_siblings = false;
 	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
