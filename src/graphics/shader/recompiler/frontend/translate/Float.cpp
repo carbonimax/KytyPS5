@@ -2,9 +2,51 @@
 
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
+
+// KYTY_F16_ROUNDING (spirvEmitterAlu.cpp): 0 keeps the f32 fma rounded twice.
+static bool F16RoundNearestEven() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_ROUNDING");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+IR::F32 Translator::Float16Fma(IR::F32 a, IR::F32 b, IR::F32 c) {
+	if (!F16RoundNearestEven()) {
+		return IR::F32(ir.Emit(IR::ValueOpcode::FPFma32, {a, b, c}));
+	}
+	// f16 operands: the product is exact in f32 and every nonzero sum is at least 2^-48. TwoSum
+	// gives the exact error of the f32 sum, which then rounds to odd so that the later f16
+	// rounding to nearest even rounds only once.
+	const auto add = [&](IR::Value lhs, IR::Value rhs) {
+		return IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {lhs, rhs}));
+	};
+	const auto sub = [&](IR::Value lhs, IR::Value rhs) {
+		return IR::F32(ir.Emit(IR::ValueOpcode::FPSub32, {lhs, rhs}));
+	};
+	const auto product   = IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {a, b}));
+	const auto sum       = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32, {a, b, c})); // product + c
+	const auto virtual_c = sub(sum, product);
+	const auto error     = add(sub(product, sub(sum, virtual_c)), sub(c, virtual_c));
+	// A NaN error (infinite or NaN sum) compares unordered and keeps the sum.
+	const auto inexact =
+	    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdNotEqual32, {error, IR::Value::F32(0.0f)}));
+	const auto bits    = ir.BitCastU32(sum);
+	const auto even    = ir.IEqual(ir.BitwiseAnd(bits, IR::U32(IR::Value(1u))), IR::U32(IR::Value(0u)));
+	// The odd neighbour lies on the side of the error: one ulp away from zero when the error has
+	// the sign of the sum, toward zero otherwise.
+	const auto away    = ir.IEqual(ir.ShiftRightLogical(ir.BitwiseXor(bits, ir.BitCastU32(error)),
+	                                                    IR::U32(IR::Value(31u))),
+	                               IR::U32(IR::Value(0u)));
+	const auto odd     = ir.Select(away, ir.IAdd(bits, IR::U32(IR::Value(1u))),
+	                               ir.ISub(bits, IR::U32(IR::Value(1u))));
+	return ir.BitCastF32(ir.Select(ir.LogicalAnd(inexact, even), odd, bits));
+}
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
@@ -12,10 +54,10 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high);
 		const auto rhs = ReadF16LaneAsF32(inst.src1, high);
 		IR::F32    result;
-		if (accumulator) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.dst, high)}));
-		} else if (inst.src_count == 3u) {
-			result = IR::F32(ir.Emit(opcode, {lhs, rhs, ReadF16LaneAsF32(inst.src2, high)}));
+		if (accumulator || inst.src_count == 3u) {
+			const auto addend = ReadF16LaneAsF32(accumulator ? inst.dst : inst.src2, high);
+			result = opcode == IR::ValueOpcode::FPFma32 ? Float16Fma(lhs, rhs, addend)
+			                                            : IR::F32(ir.Emit(opcode, {lhs, rhs, addend}));
 		} else {
 			result = IR::F32(ir.Emit(opcode, {lhs, rhs}));
 		}
@@ -110,6 +152,12 @@ void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
+	}
+	// Mixed f32 sources leave the product inexact: the f32 fma then rounds twice.
+	if (opcode == IR::ValueOpcode::FPFma32 && !mix) {
+		WriteF16(DestinationOperand(inst),
+		         Float16Fma(IR::F32(args[0]), IR::F32(args[1]), IR::F32(args[2])));
+		return;
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
 }

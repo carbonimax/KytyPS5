@@ -114,6 +114,67 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
+uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits) {
+	// Round to nearest even in integers: AMD compiles PackHalf2x16 to a truncating conversion.
+	// NaN and infinity follow EmitF32BitsToF16RtzBits.
+	const auto u32 = TypeU32(state);
+	const auto add = [&](uint32_t lhs, uint32_t rhs) {
+		return Binary(state, spv::OpIAdd, u32, lhs, rhs);
+	};
+	const auto shr = [&](uint32_t value, uint32_t count) {
+		return Binary(state, spv::OpShiftRightLogical, u32, value, count);
+	};
+	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign = EmitAndConstant(state, shr(bits, ConstantU32(state, 16)), 0x8000u);
+	const auto exp  = shr(abs, ConstantU32(state, 23));
+	const auto mant = EmitAndConstant(state, abs, 0x007fffffu);
+
+	// Half subnormals count 2^-24 units: shift the significand by 126 - exp, adding half a unit
+	// minus one plus the kept lsb. Shifts stay < 32; from 25 on the result is zero.
+	const auto shift = EmitUMin32(
+	    state, Binary(state, spv::OpISub, u32, ConstantU32(state, 126), exp), ConstantU32(state, 31));
+	const auto significand = EmitOrU32(state, mant, ConstantU32(state, 0x00800000u));
+	const auto half_unit   = shr(ConstantU32(state, 0x40000000u),
+	                             Binary(state, spv::OpISub, u32, ConstantU32(state, 31), shift));
+	const auto sub_bias = add(Binary(state, spv::OpISub, u32, half_unit, ConstantU32(state, 1)),
+	                          EmitAndConstant(state, shr(significand, shift), 1u));
+	const auto sub      = shr(add(significand, sub_bias), shift);
+
+	// Normals: the same rounding on the 13 dropped bits; a carry past max half gives infinity.
+	const auto normal_bias =
+	    add(ConstantU32(state, 0x0fffu), EmitAndConstant(state, shr(abs, ConstantU32(state, 13)), 1u));
+	const auto normal = EmitUMin32(
+	    state,
+	    Binary(state, spv::OpISub, u32, shr(add(abs, normal_bias), ConstantU32(state, 13)),
+	           ConstantU32(state, 0x1c000u)),
+	    ConstantU32(state, 0x7c00u));
+	const auto finite = Select(state, u32,
+	                           EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                           sub, normal);
+	const auto nan     = EmitOrU32(state, EmitAndConstant(state, shr(abs, ConstantU32(state, 13)), 0x03ffu),
+	                               ConstantU32(state, 0x7e00u));
+	const auto special = Select(state, u32, EmitCompareU32Constant(state, spv::OpIEqual, mant, 0),
+	                            ConstantU32(state, 0x7c00u), nan);
+	const auto magnitude = Select(
+	    state, u32, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u),
+	    special, finite);
+	return EmitOrU32(state, sign, magnitude);
+}
+
+namespace {
+
+// KYTY_F16_ROUNDING=0 keeps the host PackHalf2x16 for f16 ALU results (truncating on AMD);
+// 1 (default) rounds to nearest even, the default MODE rounding of the guest.
+bool F16RoundNearestEven() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_ROUNDING");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+} // namespace
+
 namespace {
 
 // How a legacy MAD (V_MAD_F32, V_MAC_F32...) keeps its two roundings. SPIRV-Cross keeps a
@@ -191,10 +252,26 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
+	if (F16RoundNearestEven()) {
+		return EmitF32BitsToF16RteBits(state, EmitBitcastF32ToU32(state, arg0));
+	}
 	const auto pair = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
 	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
+	return EmitGlslPackHalf2x16(state, pair);
+}
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t pair) {
+	if (!F16RoundNearestEven()) {
+		return EmitGlslPackHalf2x16(state, pair);
+	}
+	const auto half = [&](uint32_t index) {
+		return EmitF32BitsToF16RteBits(
+		    state, EmitBitcastF32ToU32(
+		               state, EmitNative<spv::OpCompositeExtract, IR::Type::F32>(state, pair, index)));
+	};
+	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
+	    state, half(0u), half(1u), ConstantU32(state, 16), ConstantU32(state, 16));
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
