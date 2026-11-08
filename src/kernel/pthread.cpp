@@ -23,6 +23,8 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -1029,6 +1031,27 @@ void PthreadInitSelfForMainThread() {
 	     g_pthread_self->unique_id, os_thread_id,
 	     reinterpret_cast<uint64_t>(g_pthread_self->attr->stack_addr),
 	     static_cast<uint64_t>(g_pthread_self->attr->stack_size));
+}
+
+void PthreadSetGuestFpuControl() {
+#if defined(__x86_64__) || defined(_M_X64)
+	uint16_t       found = 0;
+	const uint16_t guest = 0x037f;
+	asm volatile("fnstcw %0" : "=m"(found));
+	asm volatile("fldcw %0" : : "m"(guest));
+	static const bool log = [] {
+		const char* value = std::getenv("KYTY_X87_LOG");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	static std::atomic<int> logged {0};
+	if (log && logged.fetch_add(1) < 2) {
+		uint32_t mxcsr = 0;
+		asm volatile("stmxcsr %0" : "=m"(mxcsr));
+		std::printf("x87: control word at guest entry 0x%04x, set 0x%04x, mxcsr 0x%08x (kept)\n", found, guest,
+		            mxcsr);
+		std::fflush(stdout);
+	}
+#endif
 }
 
 void* PthreadCreateMainGuestStack() {
@@ -3274,6 +3297,7 @@ static void* RunThread(void* arg) {
 	    ~static_cast<uintptr_t>(0x0f));
 	Memory::PrepareGuestStack(reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	                          thread->attr->stack_size, thread->name.c_str(), thread->attr->stack_user);
+	PthreadSetGuestFpuControl();
 	ret = RunOnGuestStack(thread->arg, thread->entry, stack_top);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
