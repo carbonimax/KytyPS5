@@ -783,6 +783,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	DefineF16Functions(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

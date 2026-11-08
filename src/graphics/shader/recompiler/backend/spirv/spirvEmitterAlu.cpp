@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -114,7 +115,20 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
-uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits) {
+namespace {
+
+// A call to a helper function of the module, allocated on first use (DefineF16Functions).
+template <typename... Args>
+uint32_t CallF16Function(EmitterState& state, uint32_t& function, uint32_t type, Args... args) {
+	if (function == 0) {
+		function = state.builder.AllocateId();
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, type, result, function, args...);
+	return result;
+}
+
+uint32_t F32BitsToF16RteBitsBody(EmitterState& state, uint32_t bits) {
 	// Round to nearest even in integers: AMD compiles PackHalf2x16 to a truncating conversion.
 	// NaN and infinity follow EmitF32BitsToF16RtzBits.
 	const auto u32 = TypeU32(state);
@@ -159,6 +173,84 @@ uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits) {
 	    state, u32, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u),
 	    special, finite);
 	return EmitOrU32(state, sign, magnitude);
+}
+
+uint32_t FPFmaF16OddBody(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	// f16 operands: the product is exact in f32 and every nonzero sum is at least 2^-48. TwoSum
+	// gives the exact error of the f32 sum, which then rounds to odd so that the later f16
+	// rounding to nearest even rounds only once.
+	const auto u32       = TypeU32(state);
+	const auto product   = EmitFPMul32(state, a, b);
+	const auto sum       = EmitFPFma32(state, a, b, c); // product + c
+	const auto virtual_c = EmitFPSub32(state, sum, product);
+	const auto error     = EmitFPAdd32(state, EmitFPSub32(state, product, EmitFPSub32(state, sum, virtual_c)),
+	                                   EmitFPSub32(state, c, virtual_c));
+	// A NaN error (infinite or NaN sum) compares unordered and keeps the sum.
+	const auto inexact = Binary(state, spv::OpFOrdNotEqual, TypeBool(state), error, ConstantF32(state, 0));
+	const auto bits    = EmitBitcastF32ToU32(state, sum);
+	const auto even    = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, bits, 1u), 0u);
+	// The odd neighbour lies on the side of the error: one ulp away from zero when the error has
+	// the sign of the sum, toward zero otherwise.
+	const auto away = EmitCompareU32Constant(
+	    state, spv::OpIEqual,
+	    Binary(state, spv::OpShiftRightLogical, u32,
+	           Binary(state, spv::OpBitwiseXor, u32, bits, EmitBitcastF32ToU32(state, error)),
+	           ConstantU32(state, 31)),
+	    0u);
+	const auto odd = Select(state, u32, away, Binary(state, spv::OpIAdd, u32, bits, ConstantU32(state, 1)),
+	                        Binary(state, spv::OpISub, u32, bits, ConstantU32(state, 1)));
+	return Unary(state, spv::OpBitcast, TypeF32(state),
+	             Select(state, u32, Binary(state, spv::OpLogicalAnd, TypeBool(state), inexact, even),
+	                    odd, bits));
+}
+
+} // namespace
+
+uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits) {
+	return CallF16Function(state, state.f16_rte_function, TypeU32(state), bits);
+}
+
+uint32_t EmitFPFmaF16Odd32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	return CallF16Function(state, state.f16_fma_odd_function, TypeF32(state), a, b, c);
+}
+
+void DefineF16Functions(EmitterState& state) {
+	if (state.f16_rte_function == 0 && state.f16_fma_odd_function == 0) {
+		return;
+	}
+	const auto define = [&](uint32_t function, const char* name, uint32_t type,
+	                        std::span<const uint32_t> params, auto body) {
+		if (function == 0) {
+			return;
+		}
+		state.builder.AddName(function, name);
+		uint32_t signature = 0;
+		switch (params.size()) {
+			case 1: signature = state.builder.Type(spv::OpTypeFunction, type, params[0]); break;
+			default:
+				signature = state.builder.Type(spv::OpTypeFunction, type, params[0], params[1], params[2]);
+				break;
+		}
+		state.builder.AddFunction(spv::OpFunction, type, function, spv::FunctionControlMaskNone,
+		                          signature);
+		std::array<uint32_t, 3> args {};
+		for (size_t i = 0; i < params.size(); i++) {
+			args[i] = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpFunctionParameter, params[i], args[i]);
+		}
+		EmitLabel(state, state.builder.AllocateId());
+		state.builder.AddFunction(spv::OpReturnValue, body(args));
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	};
+	const auto u32 = TypeU32(state);
+	const auto f32 = TypeF32(state);
+	const std::array<uint32_t, 1> rte_params {u32};
+	const std::array<uint32_t, 3> fma_params {f32, f32, f32};
+	define(state.f16_rte_function, "f32_bits_to_f16_rte", u32, rte_params,
+	       [&](const auto& args) { return F32BitsToF16RteBitsBody(state, args[0]); });
+	define(state.f16_fma_odd_function, "fma_f16_round_odd", f32, fma_params, [&](const auto& args) {
+		return FPFmaF16OddBody(state, args[0], args[1], args[2]);
+	});
 }
 
 namespace {

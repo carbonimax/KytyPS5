@@ -125,6 +125,9 @@ struct EmitterState {
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 4>, uint32_t>        indirect_buffer_load_functions;
+	// f16 rounding helpers (KYTY_F16_ROUNDING=1), defined after main by DefineF16Functions.
+	uint32_t                                         f16_rte_function        = 0;
+	uint32_t                                         f16_fma_odd_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         bvh8_result_type       = 0;
 	uint32_t                                         bvh8_intersect_function = 0;
@@ -564,6 +567,7 @@ inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, ui
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
 uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits);
+void     DefineF16Functions(EmitterState& state);
 
 void EmitProgram(EmitterState& state);
 
