@@ -1,5 +1,6 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/guestStacks.h"
 
 #include <barrier>
 #include <cstdint>
@@ -485,6 +486,35 @@ void TestDeferredProtectCoalesces() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+// A watch placed over a live guest stack leaves the stack's pages (whole pages, also a partial one)
+// writable and protects the rest; releasing the stack reports the range as unseen CPU writes.
+void TestLiveStackPagesKeepAccess() {
+  namespace Stacks = Libs::Graphics::GuestStacks;
+  PageManager manager;
+  constexpr auto page_size = TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(page_size * 5);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto stack = address + page_size + 64;
+  const auto stack_size = page_size * 2 - 128; // pages 1 and 2, both partly
+  Stacks::Register(stack, stack_size, "test stack");
+  manager.UpdatePageWatchers<true>(address, page_size * 5);
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size) &&
+            IsWritable(memory + page_size * 2) &&
+            Protection(memory + page_size * 3) == PAGE_READONLY &&
+            Protection(memory + page_size * 4) == PAGE_READONLY,
+        "watch protected the pages of a live stack");
+  Check(Stacks::Unregister(stack) == stack_size,
+        "released stack with a skipped watch was not reported as written");
+  manager.UpdatePageWatchers<false>(address, page_size * 5);
+  Stacks::Register(stack, stack_size, "test stack");
+  Check(Stacks::Unregister(stack) == 0, "stack without a skipped watch reported as written");
+  manager.UpdatePageWatchers<true>(address, page_size * 5);
+  Check(Protection(memory + page_size) == PAGE_READONLY,
+        "released stack still kept its pages writable");
+  manager.UpdatePageWatchers<false>(address, page_size * 5);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestRegionEndpointBatching() {
   PageManager manager;
   constexpr auto page_size = TRACKER_PAGE_SIZE;
@@ -755,6 +785,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestDeferredProtectCoalesces();
   TestRegionEndpointBatching();
+  TestLiveStackPagesKeepAccess();
   TestReadWriteWatcherInteractions();
   TestConcurrentSharedWatchers();
   TestFatalPaths();

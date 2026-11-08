@@ -27,6 +27,7 @@ struct Entry {
 	uint64_t begin = 0;
 	uint64_t end   = 0;
 	char     owner[48] {};
+	bool     skipped = false; // a protection was skipped: CPU writes to the range went unseen
 };
 
 inline constexpr uint64_t REGION_SHIFT = 22u; // 4 MiB, the tracker region size
@@ -125,15 +126,18 @@ void NoteInvalidated() noexcept {
 	S().invalidated.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Unregister(uint64_t begin) {
+uint64_t Unregister(uint64_t begin) {
 	auto&             s = S();
 	std::unique_lock lock(s.mutex);
 	auto it = std::find_if(s.entries.begin(), s.entries.end(),
 	                       [begin](const Entry& e) { return e.begin == begin; });
-	if (it != s.entries.end()) {
-		AdjustRegions(it->begin, it->end, -1);
-		s.entries.erase(it);
+	if (it == s.entries.end()) {
+		return 0;
 	}
+	const auto unseen = it->skipped ? it->end - it->begin : 0;
+	AdjustRegions(it->begin, it->end, -1);
+	s.entries.erase(it);
+	return unseen;
 }
 
 bool MaybeHit(uint64_t vaddr, uint64_t size) noexcept {
@@ -182,36 +186,45 @@ static void PrintBacktrace() {
 #endif
 }
 
-void OnProtect(uint64_t vaddr, uint64_t size, bool no_access) {
+bool SkipLive(uint64_t begin, uint64_t end, bool no_access, uint64_t* skip_begin, uint64_t* skip_end) {
 	auto&    s = S();
 	Entry    hit {};
 	uint64_t overlap_begin = 0, overlap_end = 0;
 	{
-		std::shared_lock lock(s.mutex);
-		for (const auto& e: s.entries) {
-			if (vaddr < e.end && vaddr + size > e.begin) {
-				hit           = e;
-				overlap_begin = std::max(vaddr, e.begin);
-				overlap_end   = std::min(vaddr + size, e.end);
-				break;
+		std::unique_lock lock(s.mutex);
+		Entry* lowest = nullptr;
+		for (auto& e: s.entries) {
+			const auto page_begin = e.begin & ~uint64_t {0xfff};
+			const auto page_end   = (e.end + 0xfff) & ~uint64_t {0xfff};
+			if (page_begin < end && page_end > begin && (lowest == nullptr || page_begin < overlap_begin)) {
+				lowest        = &e;
+				overlap_begin = page_begin;
+				overlap_end   = page_end;
 			}
 		}
+		if (lowest == nullptr) {
+			return false;
+		}
+		lowest->skipped = true;
+		hit             = *lowest;
 	}
-	if (hit.end == 0) {
-		return;
-	}
+	overlap_begin = std::max(overlap_begin, begin);
+	overlap_end   = std::min(overlap_end, end);
+	*skip_begin   = overlap_begin;
+	*skip_end     = overlap_end;
 	const auto n = (no_access ? s.hits_noaccess : s.hits_read).fetch_add(1, std::memory_order_relaxed) + 1;
 	const auto r = s.reports.fetch_add(1, std::memory_order_relaxed);
 	if (r < 32 || (r & 0xfffu) == 0) {
-		std::printf("STACK-PROTECT %s #%" PRIu64 " pages 0x%" PRIx64 "..0x%" PRIx64 " in stack %s 0x%" PRIx64
+		std::printf("STACK-PROTECT skipped %s #%" PRIu64 " pages 0x%" PRIx64 "..0x%" PRIx64 " in stack %s 0x%" PRIx64
 		            "..0x%" PRIx64 " (depth 0x%" PRIx64 "..0x%" PRIx64 " below top), total read=%" PRIu64
 		            " noaccess=%" PRIu64 "\n",
 		            no_access ? "noaccess" : "read-only", n, overlap_begin, overlap_end, hit.owner, hit.begin, hit.end,
-		            hit.end - overlap_end, hit.end - overlap_begin, s.hits_read.load(std::memory_order_relaxed),
-		            s.hits_noaccess.load(std::memory_order_relaxed));
+		            hit.end - std::min(overlap_end, hit.end), hit.end - overlap_begin,
+		            s.hits_read.load(std::memory_order_relaxed), s.hits_noaccess.load(std::memory_order_relaxed));
 		PrintBacktrace();
 		std::fflush(stdout);
 	}
+	return true;
 }
 
 // Guest fault handler: the registered range holding `rsp` and the host protection of its pages
