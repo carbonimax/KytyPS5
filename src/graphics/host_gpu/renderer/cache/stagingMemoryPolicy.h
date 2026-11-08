@@ -1,8 +1,9 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_STAGINGMEMORYPOLICY_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_STAGINGMEMORYPOLICY_H_
 
+#include "graphics/host_gpu/vulkanCommon.h"
+
 #include <cstdint>
-#include <vulkan/vulkan.hpp>
 
 namespace Libs::Graphics {
 
