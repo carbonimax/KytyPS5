@@ -331,6 +331,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x36fu, Opcode::V_LSHL_OR_B32},
     {0x371u, Opcode::V_AND_OR_B32},
     {0x372u, Opcode::V_OR3_B32},
+    {0x373u, Opcode::V_MAD_U32_U16},
+    {0x375u, Opcode::V_MAD_I32_I16},
     {0x377u, Opcode::V_PERMLANE16_B32},
     {0x378u, Opcode::V_PERMLANEX16_B32},
     {0x34bu, Opcode::V_FMA_F16},
@@ -1406,6 +1408,7 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 bool SupportsNativeVop3Clamp(Opcode opcode) {
 	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
 	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16 ||
+	       opcode == Opcode::V_MAD_U32_U16 || opcode == Opcode::V_MAD_I32_I16 ||
 	       opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MAX3_I16 ||
 	       opcode == Opcode::V_MAX3_U16 || opcode == Opcode::V_MED3_U16 ||
 	       opcode == Opcode::V_MUL_HI_I32_I24 || opcode == Opcode::V_MUL_HI_U32_U24;
@@ -1444,6 +1447,8 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 			// The high product fits in 32 bits, so clamp has no effect.
 			return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
+		case Opcode::V_MAD_U32_U16:
+		case Opcode::V_MAD_I32_I16: return abs != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_CVT_F32_UBYTE0:
 		case Opcode::V_CVT_F32_UBYTE1:
 		case Opcode::V_CVT_F32_UBYTE2:
@@ -1830,6 +1835,12 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		ApplyNativeVop3TernaryModifiers(inst, op_sel, abs, neg);
 	} else if (b16_ternary) {
 		ApplyNativeVop3B16TernarySelectors(inst, op_sel);
+	} else if (inst.opcode == Opcode::V_MAD_U32_U16 || inst.opcode == Opcode::V_MAD_I32_I16) {
+		// Bit 2 selects the addend's high half, bit 3 the destination half.
+		inst.src0.op_sel = (op_sel & 0x1u) != 0;
+		inst.src1.op_sel = (op_sel & 0x2u) != 0;
+		inst.src2.op_sel = (op_sel & 0x4u) != 0;
+		inst.dst.op_sel  = (op_sel & 0x8u) != 0;
 	} else if (b16_binary) {
 		ApplyNativeVop3B16BinaryModifiers(inst, op_sel);
 	} else if (pack_b32_f16) {
