@@ -38,8 +38,10 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 
 class Buffer {
 public:
+	// prefer_device: host-written memory placed in device-local memory (ReBAR staging ring).
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       bool prefer_device = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 

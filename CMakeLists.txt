@@ -532,6 +532,12 @@ add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(async_pipeline_policy_tests PRIVATE ${inc_headers})
 
+add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StagingMemoryPolicyTests.cpp"
+)
+target_link_libraries(staging_memory_policy_tests Vulkan::Headers)
+target_include_directories(staging_memory_policy_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -811,6 +817,7 @@ if(BUILD_TESTING)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
+	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
 	add_test(NAME aliased_mrt_incompatible COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-incompatible-only)
@@ -971,6 +978,7 @@ if(BUILD_TESTING)
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		async_pipeline_policy_tests
+		staging_memory_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
 		sync_on_address_tests

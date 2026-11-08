@@ -4,9 +4,13 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/stagingMemoryPolicy.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <array>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -57,10 +61,23 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 	return true;
 }
 
+// KYTY_STAGING_DEVICE (default 1; 0 = host memory): the upload staging ring in device-local
+// host-visible memory when the device has a Resizable BAR heap (HasResizableBarHeap). If that heap
+// is full or over budget, VMA falls back to the next compatible memory type (host memory).
+[[nodiscard]] bool StagingInDevice(const GraphicContext& graphics) {
+	static const bool requested = [] {
+		const char* value = std::getenv("KYTY_STAGING_DEVICE");
+		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+	}();
+	return requested && HasResizableBarHeap(graphics.physical_device_properties.deviceType,
+	                                        graphics.physical_device_memory_properties);
+}
+
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool prefer_device)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -81,7 +98,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
 	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
-	allocation_info.usage = AllocationUsage(usage);
+	allocation_info.usage =
+	    prefer_device ? VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE : AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -107,6 +125,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (prefer_device) {
+		const auto type = allocation_result.memoryType;
+		const auto heap = graphics.physical_device_memory_properties.memoryTypes[type].heapIndex;
+		std::printf("StreamBuffer: Resizable BAR staging ring %" PRIu64
+		            " MiB in memory type %u (flags 0x%x) heap %u (%" PRIu64 " MiB)\n",
+		            size >> 20u, type, properties, heap,
+		            uint64_t {graphics.physical_device_memory_properties.memoryHeaps[heap].size} >> 20u);
+		std::fflush(stdout);
+	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
@@ -207,7 +234,8 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
     : Buffer(graphics, scheduler, usage, 0,
-             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size),
+             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size,
+             usage == MemoryUsage::Upload && StagingInDevice(graphics)),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,

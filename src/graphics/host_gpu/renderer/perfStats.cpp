@@ -250,6 +250,9 @@ void MaybeReport() noexcept {
 	            n(Counter::WaitOtherCount), ms(Counter::SideReadNs), n(Counter::SideReadCount),
 	            static_cast<double>(n(Counter::Submits)) / seconds,
 	            static_cast<double>(n(Counter::IdleSubmits)) / seconds);
+	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
+	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
+	            n(Counter::StagingWriteCount));
 	if (BindProfEnabled()) {
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64

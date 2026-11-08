@@ -216,7 +216,12 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
                                         vk::BufferUsageFlags usage, const auto& write) {
 	const auto [mapped, offset] = staging.Map(size, alignment);
 	if (mapped != nullptr) {
-		write(mapped, offset);
+		{
+			PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs,
+			                             PerfStats::Counter::StagingWriteCount);
+			write(mapped, offset);
+		}
+		PerfStats::Add(PerfStats::Counter::StagingWriteBytes, size);
 		staging.Commit();
 		return {&staging, offset};
 	}
@@ -1378,7 +1383,10 @@ void BufferCache::FlushDeferredUploads() {
 	// One flush at a time: the protections of everything recorded so far, then all their copies.
 	std::lock_guard lock(m_deferred_mutex);
 	PageManager::FlushDeferredProtect();
+	PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs);
 	for (const auto& copy: m_deferred_copies) {
+		PerfStats::Add(PerfStats::Counter::StagingWriteBytes, copy.size);
+		PerfStats::Add(PerfStats::Counter::StagingWriteCount, 1);
 		if (!LibKernel::Memory::CopySparseMemory(copy.address, copy.destination, copy.size)) {
 			EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 		}
