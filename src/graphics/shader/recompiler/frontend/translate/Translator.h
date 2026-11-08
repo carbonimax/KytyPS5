@@ -59,6 +59,7 @@ private:
 	IR::F32                ApplyF32ResultModifiers(const Decoder::Operand& operand, IR::F32 value);
 	void                   WriteOperand(const Decoder::Operand& operand, IR::Value value);
 	IR::U32                PackHalf2x16(IR::F32 low, IR::F32 high);
+	IR::F32                Float16Fma(IR::F32 a, IR::F32 b, IR::F32 c);
 	void                   Write16Bits(const Decoder::Operand& operand, IR::U32 value);
 	void                   WriteF16(const Decoder::Operand& operand, IR::F32 value);
 	IR::U32                ReadU32(const Decoder::Operand& operand);

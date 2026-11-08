@@ -26084,6 +26084,212 @@ const char *ProbeNativeMinMaxSignalingNan(VulkanHarness *vulkan, const ShaderPro
   return difference;
 }
 
+double HalfToDouble(u32 h) {
+  const u32 exponent = (h >> 10u) & 0x1fu, mantissa = h & 0x3ffu;
+  const double sign = (h & 0x8000u) != 0u ? -1.0 : 1.0;
+  if (exponent == 0x1fu) return mantissa != 0u ? std::nan("") : sign * INFINITY;
+  if (exponent == 0u) return sign * std::ldexp(double(mantissa), -24);
+  return sign * std::ldexp(double(mantissa | 0x400u), int(exponent) - 25);
+}
+
+// IEEE binary16 bits of a double, rounded to nearest even or toward zero; NaN gives 0x7e00.
+u32 DoubleToHalf(double value, bool toward_zero = false) {
+  if (std::isnan(value)) return 0x7e00u;
+  const u32 sign = std::signbit(value) ? 0x8000u : 0u;
+  value = std::fabs(value);
+  if (std::isinf(value)) return sign | 0x7c00u;
+  if (value >= (toward_zero ? 65536.0 : 65520.0)) return sign | (toward_zero ? 0x7bffu : 0x7c00u);
+  if (value == 0.0) return sign;
+  int e = 0;
+  std::frexp(value, &e);
+  const int quantum = std::max(e - 1, -14) - 10;
+  const double scaled = std::ldexp(value, -quantum);
+  const double units = toward_zero ? std::trunc(scaled) : std::nearbyint(scaled);
+  const double rounded = std::ldexp(units, quantum);
+  if (rounded == 0.0) return sign;
+  std::frexp(rounded, &e);
+  if (e - 1 < -14) return sign | u32(units);
+  return sign | (u32(e - 1 + 15) << 10u) | (u32(std::ldexp(rounded, 10 - (e - 1))) - 0x400u);
+}
+
+// f32 bits to f16 bits; a NaN keeps its sign and top payload bits and becomes quiet.
+u32 FloatBitsToHalf(u32 bits, bool toward_zero) {
+  if ((bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0u) {
+    return ((bits >> 16u) & 0x8000u) | 0x7e00u | ((bits >> 13u) & 0x3ffu);
+  }
+  return DoubleToHalf(double(std::bit_cast<float>(bits)), toward_zero);
+}
+
+// fma of three halves rounded once: the double sum is exact up to its TwoSum error, which a
+// round to odd keeps for the final rounding.
+u32 FmaHalfReference(u32 a, u32 b, u32 c) {
+  const double product = HalfToDouble(a) * HalfToDouble(b), addend = HalfToDouble(c);
+  double sum = product + addend;
+  if (!std::isfinite(sum)) return DoubleToHalf(sum);
+  const double virtual_addend = sum - product;
+  const double error = (product - (sum - virtual_addend)) + (addend - virtual_addend);
+  if (error != 0.0 && (std::bit_cast<uint64_t>(sum) & 1u) == 0u) {
+    sum = std::nextafter(sum, error > 0.0 ? INFINITY : -INFINITY);
+  }
+  return DoubleToHalf(sum);
+}
+
+// f32 -> f16 results of the f16 ALU (round to nearest even, the default MODE rounding, with
+// KYTY_F16_ROUNDING unset or 1) and of V_CVT_PKRTZ_F16_F32 (toward zero), bit for bit, over
+// edge halves and floats (signed zeros, denormals, ties, max finite, overflow, NaNs) and random
+// words. An arithmetic NaN must be a quiet NaN; a converted NaN keeps sign and top payload.
+// With KYTY_F16_ROUNDING=0 it only reports the mismatches of the old path.
+u32 CheckF16Rounding(VulkanHarness *vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64, inputs = 3, outputs = 11;
+  TestCase test;
+  test.name = "F16Rounding";
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32,     O::BUFFER_LOAD_DWORD, O::V_PK_ADD_F16,  O::V_PK_MUL_F16,
+                  O::V_PK_FMA_F16,  O::V_PK_FMAC_F16,     O::V_ADD_F16,     O::V_FMA_F16,
+                  O::V_CVT_F16_F32, O::V_CVT_PKRTZ_F16_F32, O::V_MUL_F16,   O::V_FMAC_F16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  auto &code = test.code;
+  code.push_back(EncodeVop1(0x01, 40, Vgpr(0)));
+  for (u32 input = 0; input < inputs; input++) {
+    AppendVMovU32(&code, 30, input * lanes);
+    code.push_back(EncodeVop2(0x25, 30, Vgpr(40), 30));
+    code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
+    AppendBufferLoadDword(&code, 1 + input, 30);
+  }
+  AppendVop3p(&code, 0x0f, 10, Vgpr(1), Vgpr(2), 0, 0x3);
+  AppendVop3p(&code, 0x10, 11, Vgpr(1), Vgpr(2), 0, 0x3);
+  AppendVop3p(&code, 0x0e, 12, Vgpr(1), Vgpr(2), Vgpr(3), 0x7);
+  code.push_back(EncodeVop1(0x01, 13, Vgpr(3)));
+  code.push_back(EncodeVop2(0x3c, 13, Vgpr(1), 2));
+  // src0 high half in both lanes, src1 swapped, NEG on src0 high and src1 low.
+  AppendVop3p(&code, 0x0f, 14, Vgpr(1), Vgpr(2), 0, 0x1, 0x3, 0x1, 0x2);
+  code.push_back(EncodeVop2(0x32, 15, Vgpr(1), 2));
+  AppendVop3(&code, 0x34b, 16, Vgpr(1), Vgpr(2), Vgpr(3));
+  code.push_back(EncodeVop1(0x0a, 17, Vgpr(1)));
+  code.push_back(EncodeVop2(0x2f, 18, Vgpr(1), 2));
+  code.push_back(EncodeVop2(0x35, 19, Vgpr(1), 2));
+  code.push_back(EncodeVop1(0x01, 20, Vgpr(3)));
+  code.push_back(EncodeVop2(0x36, 20, Vgpr(1), 2));
+  for (u32 output = 0; output < outputs; output++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 10 + output, 40, (inputs + output) * lanes);
+  }
+  AppendEnd(&code);
+
+  constexpr u32 edges[] = {0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x0401, 0x3c00, 0xbc00,
+                           0x3c01, 0x3800, 0x1400, 0x6800, 0x6801, 0x7bff, 0xfbff, 0x7c00, 0xfc00,
+                           0x7e00, 0x7d00, 0xfe55, 0x0200, 0x5bff, 0x13ff};
+  constexpr u32 edge_count = static_cast<u32>(std::size(edges));
+  std::vector<std::array<u32, 3>> words;
+  for (u32 a = 0; a < edge_count; a++) {
+    for (u32 b = 0; b < edge_count; b++) {
+      for (u32 c = 0; c < edge_count; c += 3) {
+        words.push_back({edges[a] | (edges[b] << 16u), edges[b] | (edges[(a + c) % edge_count] << 16u),
+                         edges[c] | (edges[(b + c) % edge_count] << 16u)});
+      }
+    }
+  }
+  // Floats on, between and next to the halves, with both signs, and float specials.
+  std::vector<u32> floats = {0x00000001, 0x007fffff, 0x33000000, 0x33000001, 0x32ffffff, 0x33800000,
+                             0x477fe000, 0x477fefff, 0x477ff000, 0x477fffff, 0x47800000, 0x7f7fffff,
+                             0x7f800000, 0x7fc00000, 0x7f800001, 0x7fbfe000, 0x7fffffff, 0x3f7ff000};
+  for (const u32 h : {0x0000u, 0x0001u, 0x0002u, 0x0003u, 0x01ffu, 0x0200u, 0x03feu, 0x03ffu, 0x0400u,
+                      0x0401u, 0x0402u, 0x3bffu, 0x3c00u, 0x3c01u, 0x3c02u, 0x5bffu, 0x7bfeu, 0x7bffu}) {
+    const double above = h == 0x7bffu ? 65536.0 : HalfToDouble(h + 1u);
+    const float mid = static_cast<float>((HalfToDouble(h) + above) / 2.0);
+    for (const float value : {static_cast<float>(HalfToDouble(h)), mid, std::nextafter(mid, 0.0f),
+                              std::nextafter(mid, INFINITY)}) {
+      floats.push_back(std::bit_cast<u32>(value));
+    }
+  }
+  for (size_t i = 0, count = floats.size(); i < count; i++) floats.push_back(floats[i] ^ 0x80000000u);
+  u32 seed = 0x2545f491u;
+  const auto next = [&] { seed ^= seed << 13u; seed ^= seed >> 17u; seed ^= seed << 5u; return seed; };
+  for (size_t i = 0; i < floats.size(); i++) {
+    words.push_back({floats[i], floats[(i * 7u + 3u) % floats.size()], next()});
+  }
+  // Random words, and random floats in the half range.
+  for (u32 i = 0; i < 64u * 256u; i++) words.push_back({next(), next(), next()});
+  for (u32 i = 0; i < 64u * 64u; i++) {
+    words.push_back({0x30000000u + next() % 0x17800000u, 0x30000000u + next() % 0x17800000u, next()});
+  }
+
+  const char *mode = std::getenv("KYTY_F16_ROUNDING");
+  const bool nearest_even = mode == nullptr || mode[0] != '0';
+  const auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  constexpr const char *names[outputs] = {"v_pk_add_f16", "v_pk_mul_f16", "v_pk_fma_f16",
+                                          "v_pk_fmac_f16", "v_pk_add_f16 op_sel/neg", "v_add_f16",
+                                          "v_fma_f16", "v_cvt_f16_f32", "v_cvt_pkrtz_f16_f32",
+                                          "v_mul_f16", "v_fmac_f16"};
+  std::array<u32, outputs> off{}, checked{};
+  u32 printed = 0;
+  std::vector<u32> initial((inputs + outputs) * lanes);
+  for (size_t base = 0; base < words.size(); base += lanes) {
+    for (u32 lane = 0; lane < lanes; lane++) {
+      for (u32 input = 0; input < inputs; input++) {
+        initial[input * lanes + lane] = words[std::min(base + lane, words.size() - 1)][input];
+      }
+    }
+    auto buffer = vulkan->CreateStorageBuffer(test.name, initial, initial.size());
+    vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr);
+    const auto results = vulkan->ReadBuffer(test.name, buffer, initial.size());
+    vulkan->DestroyBuffer(&buffer);
+    for (u32 lane = 0; lane < lanes && base + lane < words.size(); lane++) {
+      const auto &w = words[base + lane];
+      for (u32 output = 0; output < outputs; output++) {
+        const bool packed = output <= 4u || output == 8u;
+        for (u32 half = 0; half < (packed ? 2u : 1u); half++) {
+          const u32 shift = half * 16u;
+          const u32 bits = (results[(inputs + output) * lanes + lane] >> shift) & 0xffffu;
+          const u32 a = (w[0] >> shift) & 0xffffu, b = (w[1] >> shift) & 0xffffu, c = (w[2] >> shift) & 0xffffu;
+          u32 expected = 0;
+          bool converted = false;
+          switch (output) {
+            case 0:
+            case 5: expected = DoubleToHalf(HalfToDouble(a) + HalfToDouble(b)); break;
+            case 1:
+            case 9: expected = DoubleToHalf(HalfToDouble(a) * HalfToDouble(b)); break;
+            case 2:
+            case 3:
+            case 6:
+            case 10: expected = FmaHalfReference(a, b, c); break;
+            case 4: {
+              const u32 lhs = ((w[0] >> 16u) & 0xffffu) ^ (half == 1u ? 0x8000u : 0u);
+              const u32 rhs = ((w[1] >> (half == 0u ? 16u : 0u)) & 0xffffu) ^ (half == 0u ? 0x8000u : 0u);
+              expected = DoubleToHalf(HalfToDouble(lhs) + HalfToDouble(rhs));
+              break;
+            }
+            case 7: expected = FloatBitsToHalf(w[0], false); converted = true; break;
+            default: expected = FloatBitsToHalf(w[half], true); converted = true; break;
+          }
+          const bool quiet_nan = (bits & 0x7e00u) == 0x7e00u;
+          const bool same = !converted && expected == 0x7e00u ? quiet_nan : bits == expected;
+          checked[output]++;
+          if (!same) {
+            off[output]++;
+            if (printed++ < 24u) {
+              std::printf("[compute]   %s half %u a=%08x b=%08x c=%08x result=%04x reference=%04x\n",
+                          names[output], half, w[0], w[1], w[2], bits, expected);
+            }
+          }
+        }
+      }
+    }
+  }
+  u32 total = 0, total_checked = 0;
+  for (u32 output = 0; output < outputs; output++) {
+    std::printf("[compute]   %-24s %6u results, %6u off\n", names[output], checked[output], off[output]);
+    total += off[output];
+    total_checked += checked[output];
+  }
+  std::printf("[compute] %-32s KYTY_F16_ROUNDING=%s: %u of %u f16 results differ from the reference\n",
+              test.name, nearest_even ? "1" : "0", total, total_checked);
+  return nearest_even ? total : 0u;
+}
+
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
     vulkan->SkipRasterizationCases(1);
@@ -32141,7 +32347,7 @@ TestCase VectorFractF16CapturedAndEdges() {
                   O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
+  test.required_spirv = {" Fract ", " UnpackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -32215,7 +32421,7 @@ TestCase VectorFractF16Modifiers() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract "};
   return test;
 }
 
@@ -32253,7 +32459,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Cos "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -32299,7 +32505,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -58154,6 +58360,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop3FloatConversions(64));
     RunCase(&vulkan, VectorFloatConversionOps());
     return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--f16-rounding-only") == 0) {
+    VulkanHarness vulkan;
+    return CheckF16Rounding(&vulkan) == 0u ? 0 : 1;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
     VulkanHarness vulkan;
