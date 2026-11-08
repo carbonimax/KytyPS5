@@ -990,8 +990,12 @@ void PrepareGuestStack(uint64_t vaddr, uint64_t size, const char* owner, bool su
 }
 
 void ReleaseGuestStack(uint64_t vaddr) {
-	if (vaddr != 0) {
-		Graphics::GuestStacks::Unregister(vaddr);
+	if (vaddr == 0) {
+		return;
+	}
+	// Watches skipped on the stack did not see its CPU writes: hand the range over as written.
+	if (const auto unseen = Graphics::GuestStacks::Unregister(vaddr); unseen != 0 && g_gpu_resources != nullptr) {
+		(void)g_gpu_resources->InvalidateMemory(vaddr, unseen);
 	}
 }
 

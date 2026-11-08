@@ -235,12 +235,33 @@ struct PageManager::Impl {
 			g_deferred_any.store(true, std::memory_order_relaxed);
 			return;
 		}
-		if (mode != Common::VirtualMemory::Mode::ReadWrite && GuestStacks::MaybeHit(vaddr, size)) [[unlikely]] {
-			GuestStacks::OnProtect(vaddr, size, mode == Common::VirtualMemory::Mode::NoAccess);
+		ForEachOutsideStacks(vaddr, size, mode, [](uint64_t begin, uint64_t bytes, Common::VirtualMemory::Mode m) {
+			if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(begin, bytes, m)) {
+				Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, begin,
+				      static_cast<uint32_t>(m));
+			}
+		});
+	}
+
+	// Applies `protect` to [vaddr, vaddr + size) except the pages of live guest stacks, which keep
+	// their access (GuestStacks): Windows writes a fault's exception frame on the faulting stack.
+	template <typename F>
+	static void ForEachOutsideStacks(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode, F&& protect) {
+		if (mode == Common::VirtualMemory::Mode::ReadWrite || !GuestStacks::MaybeHit(vaddr, size)) [[likely]] {
+			protect(vaddr, size, mode);
+			return;
 		}
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
-			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
-			      static_cast<uint32_t>(mode));
+		const auto end = vaddr + size;
+		for (auto at = vaddr; at < end;) {
+			uint64_t skip_begin = end, skip_end = end;
+			if (!GuestStacks::SkipLive(at, end, mode == Common::VirtualMemory::Mode::NoAccess, &skip_begin,
+			                           &skip_end)) {
+				skip_begin = skip_end = end;
+			}
+			if (skip_begin > at) {
+				protect(at, skip_begin - at, mode);
+			}
+			at = skip_end;
 		}
 	}
 
@@ -405,9 +426,11 @@ void PageManager::RestoreProtection(uint64_t vaddr, uint64_t size) noexcept {
 	bool       in_run    = false;
 	const auto flush     = [&](uint64_t at) {
         if (in_run) {
-            if (!Common::VirtualMemory::Protect(run_begin, at - run_begin, run_mode)) {
-                Fatal("protection restore failed at 0x%016" PRIx64, run_begin);
-            }
+            Impl::ForEachOutsideStacks(run_begin, at - run_begin, run_mode, [](uint64_t b, uint64_t n, Mode m) {
+                if (!Common::VirtualMemory::Protect(b, n, m)) {
+                    Fatal("protection restore failed at 0x%016" PRIx64, b);
+                }
+            });
             in_run = false;
         }
 	};

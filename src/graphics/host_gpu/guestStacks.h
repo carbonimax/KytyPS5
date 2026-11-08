@@ -25,17 +25,29 @@
 // a guest file read into that memory does: GPU-written bytes are published first, watches dropped,
 // cached copies re-uploaded on their next use). Memory recycled from textures or buffers then
 // carries no stale watch into the stack. 0 disables it.
+//
+// A watch placed later never protects the pages of a registered range (PageManager skips them): the
+// thread keeps its own access whatever the watches. CPU writes to those pages are then not seen, so
+// when a range that had a protection skipped is released, it is handed to the GPU tracking as
+// written by the CPU (ReleaseGuestStack).
+// shortcut: GPU-cached copies of a live stack's bytes are not refreshed while the stack is live, and a
+// fiber context the guest reuses without sceFiberFinalize stays unprotected; upgrade to a forced
+// refresh of skipped watches if a session ever shows stale stack-backed GPU data.
 namespace Libs::Graphics::GuestStacks {
 
 [[nodiscard]] bool InvalidateEnabled() noexcept;
 // Registers [begin, begin + size) (replaces an entry with the same base).
 void Register(uint64_t begin, uint64_t size, const char* owner);
-void Unregister(uint64_t begin);
+// Size of the released range when a protection was skipped in it (to invalidate), else 0.
+[[nodiscard]] uint64_t Unregister(uint64_t begin);
 void NoteInvalidated() noexcept;
 // Fast path for every protection: false unless a registered range shares a 4 MiB region.
 [[nodiscard]] bool MaybeHit(uint64_t vaddr, uint64_t size) noexcept;
-// A protection (read-only or no-access) of [vaddr, vaddr + size) that may touch a registered range.
-void OnProtect(uint64_t vaddr, uint64_t size, bool no_access);
+// A protection (read-only or no-access) of [begin, end): the lowest registered range overlapping it,
+// in whole pages clipped to [begin, end), is returned in [*skip_begin, *skip_end), counted and
+// reported; false when none overlaps.
+[[nodiscard]] bool SkipLive(uint64_t begin, uint64_t end, bool no_access, uint64_t* skip_begin,
+                            uint64_t* skip_end);
 // Guest fault handler: the registered range holding `rsp` and the host protection of the pages
 // around the stack pointer (the exception frame needs the pages below it writable).
 void Describe(uint64_t rsp);

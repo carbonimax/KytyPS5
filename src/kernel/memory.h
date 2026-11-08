@@ -151,7 +151,8 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // A guest thread stack or fiber context about to be used (Graphics::GuestStacks): registers it for
 // page-protection forensics and, for memory supplied by the guest (`supplied`), hands it to the GPU
-// tracking as written by the CPU (KYTY_STACK_INVALIDATE, default 1). ReleaseGuestStack: thread exit.
+// tracking as written by the CPU (KYTY_STACK_INVALIDATE, default 1). ReleaseGuestStack: thread exit
+// or fiber finalize; a range whose pages kept their access against a watch is handed over as written.
 void                   PrepareGuestStack(uint64_t vaddr, uint64_t size, const char* owner, bool supplied);
 void                   ReleaseGuestStack(uint64_t vaddr);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
