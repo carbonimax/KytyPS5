@@ -1,0 +1,193 @@
+#ifndef EMULATOR_SRC_GRAPHICS_GUEST_GPU_GPUCAPTURE_H_
+#define EMULATOR_SRC_GRAPHICS_GUEST_GPU_GPUCAPTURE_H_
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <span>
+#include <string>
+#include <variant>
+#include <vector>
+
+// GPU capture file: PM4 submissions, the guest memory and shaders they use, and expected output
+// hashes, replayed without the guest CPU or HLE (memory is mapped back at the same addresses).
+//
+// Layout (little-endian, fixed-width fields): a 16-byte header {char magic[8], u32 version,
+// u32 reserved}, then records {u32 type, u32 flags, u64 payload_size, payload, zero padding to
+// 8 bytes}. A reader rejects an unknown version, record type or flag.
+namespace Libs::Graphics::GpuCapture {
+
+constexpr uint32_t Version = 2;
+
+// Guest bytes at an address, restored before the first submission.
+struct Memory {
+	uint64_t             address = 0;
+	std::vector<uint8_t> bytes;
+};
+
+// A shader registration (ShaderMapUserData). user_data and input_semantics are guest pointers.
+struct Shader {
+	struct Register {
+		uint32_t offset = 0;
+		uint32_t value  = 0;
+	};
+	uint64_t              address             = 0;
+	uint64_t              user_data           = 0;
+	uint64_t              input_semantics     = 0;
+	uint32_t              type                = 0;
+	uint32_t              code_size_bytes     = 0;
+	uint32_t              scratch_size_dwords = 0;
+	uint32_t              num_input_semantics = 0;
+	std::vector<Register> cx_registers;
+	std::vector<Register> sh_registers;
+};
+
+// Commands in guest memory; queue 0 is graphics, 0x20.. are the compute queues.
+struct Submit {
+	uint64_t address     = 0;
+	uint32_t queue       = 0;
+	uint32_t dword_count = 0;
+};
+
+// Frame boundary (GuestGpu::SuspendPoint).
+struct FrameEnd {};
+
+// Zero-filled guest bytes (zero pages are not stored as Memory).
+struct Zero {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
+// Guest bytes the CPU rewrote during the frame (reused rings), seen while the GPU processed
+// submission `submit` (0-based index of its Submit record in the frame). Replay writes them, GPU
+// idle, right before that Submit.
+struct Update {
+	uint64_t             address = 0;
+	uint32_t             submit  = 0;
+	std::vector<uint8_t> bytes;
+};
+
+// XXH3-64 of guest memory after the replay.
+struct Expect {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t hash    = 0;
+};
+
+// A submission (Submit index) the game's GPU had started but not finished at the frame end (a
+// wait nobody released yet): replay leaves it blocked as captured instead of failing.
+struct InFlight {
+	uint32_t submit = 0;
+};
+
+// Order-independent hash (UnorderedHash) of the range of the Expect just before it: a replay whose
+// bytes are a permutation of the game's records (atomic append lists) keeps it.
+struct Unordered {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+	uint64_t hash    = 0;
+};
+
+// The command processor state a queue (as in Submit) had when the recording started: compute queues
+// keep theirs across frames, and a scope starting after submission 0 inherits every queue's. Raw bytes
+// of the recording build's layout (CommandProcessor::SaveState); replay restores it before the first Submit.
+struct CpState {
+	uint32_t             queue = 0;
+	std::vector<uint8_t> bytes;
+};
+
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered, CpState>;
+
+// Sum of a 64-bit mix of each dword (a zero-padded tail counts as one): equal for any permutation
+// of records whose size is a multiple of 4 bytes.
+[[nodiscard]] uint64_t UnorderedHash(std::span<const uint8_t> bytes);
+
+struct Capture {
+	std::vector<Record> records;
+};
+
+[[nodiscard]] std::vector<uint8_t> Serialize(const Capture& capture);
+// Streaming form of Serialize: the header, then each record appended to `out`.
+void SerializeHeader(std::vector<uint8_t>& out);
+void SerializeRecord(std::vector<uint8_t>& out, const Record& record);
+// nullopt and an error message on a malformed or unsupported file.
+[[nodiscard]] std::optional<Capture> Parse(std::span<const uint8_t> file, std::string* error);
+
+// Recording in the emulator. KYTY_GPU_CAPTURE=<dir> enables it (off by default); it records GPU
+// frame KYTY_GPU_CAPTURE_FRAME=N (suspend points processed before it) and the frame after each
+// <dir>/trigger file appears, to <dir>/frame_<N>.kygpucap. Guest bytes are recorded at their first use
+// in the frame; GPU-resident data is published to guest memory when recording starts.
+// What a Touch range is: outputs (non-None) are hashed at the frame end (Expect).
+enum class Out : uint8_t { None, Buffer, Color, Dma };
+// GPU-resident data the publish could not write back to guest memory (diagnostics).
+struct Unpublished {
+	uint64_t    address = 0;
+	uint64_t    size    = 0;
+	const char* reason  = "";
+};
+// An image the publish wrote back, in publish order (diagnostics): last GPU write order (Image::gpu_write_seq)
+// and cache slot, to see which of two overlapping images wrote the guest bytes last.
+struct Published {
+	uint64_t    address   = 0;
+	uint64_t    size      = 0;
+	uint64_t    write_seq = 0;
+	uint32_t    slot      = 0;
+	const char* kind      = "";
+};
+using Publish = std::function<void(std::vector<Unpublished>&, std::vector<Published>&)>;
+// Every command processor's state (CpState), called only when a recording starts.
+using SaveCpStates = std::function<std::vector<CpState>()>;
+
+extern const bool       g_enabled;
+extern std::atomic_bool g_recording;
+// Images keep their last-GPU-write order (Image::gpu_write_seq) for the publish: Enabled(), or a test.
+extern bool             g_stamp_writes;
+#if defined(KYTY_GPU_CAPTURE_RECORDING)
+inline bool             Enabled() noexcept { return g_enabled; }
+inline bool             Recording() noexcept { return g_recording.load(std::memory_order_relaxed); }
+#else
+// Built without the CMake option KYTY_GPU_CAPTURE: every recording hook folds away.
+constexpr bool          Enabled() noexcept { return false; }
+constexpr bool          Recording() noexcept { return false; }
+#endif
+inline bool             StampWrites() noexcept { return g_stamp_writes; }
+void                    TouchSlow(uint64_t address, uint64_t size, Out output);
+// Guest bytes the GPU side is about to use.
+inline void Touch(uint64_t address, uint64_t size, Out output = Out::None) {
+	if (Recording()) [[unlikely]] TouchSlow(address, size, output);
+}
+// Guest bytes the GPU side writes itself (TryWriteBacking: write-backs, CP labels, expanded color
+// keys), called around the write while Recording(). The replay writes them again, so they are not
+// Updates: before the write (`after` false), CPU changes of recorded pages until now become Updates;
+// after it, their hashes take the new bytes.
+void GpuWriteSlow(uint64_t address, uint64_t size, bool after);
+// While Recording(): a submission's first slice (queue as in Submit); returns its Submit index
+// (UINT32_MAX when recording stopped meanwhile).
+uint32_t RecordSubmit(std::span<const uint32_t> commands, uint32_t queue);
+// While Recording(): a later slice of the submission RecordSubmit numbered `index`; the Updates seen
+// until the next slice belong to it.
+void ResumeSubmit(uint32_t index);
+// While Enabled(): ShaderMapUserData keeps the register defaults, only valid during that call.
+void KeepShader(Shader shader);
+// While Recording(): a shader-map lookup; records the shader and its guest data once per frame.
+void UseShader(uint64_t address);
+// GPU thread, at each processed suspend point while Enabled(). `publish_gpu_data` writes
+// GPU-resident data back to guest memory and lists what it skipped and wrote. `in_flight`: RecordSubmit indices of the submissions
+// still queued; `started_before`: queued submissions already started (not replayable when a
+// recording starts now).
+void FrameBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight,
+                   uint32_t started_before);
+// Scoped captures: KYTY_GPU_CAPTURE_SUBMITS=a-b (or a trigger file holding "a-b") records only the
+// frame's submissions a..b (in processing order, from 0), as Submits 0..b-a, and the ranges they use.
+// While Recording(), before each slice: true at the first slice of submission a > 0 (`fresh`: a new
+// submission; GPU-resident data is published first), or once submission b + 1 was reached and no
+// submission of the scope is left (`pending`: Submit indices of the slice's submission when resumed
+// and of the queued ones), so the replay never runs scope work past what was recorded.
+bool AtScopeBoundary(bool fresh, std::span<const uint32_t> pending);
+// GPU thread, when AtScopeBoundary(); same arguments as FrameBoundary.
+void ScopeBoundary(const Publish& publish_gpu_data, const SaveCpStates& cp_states, std::span<const uint32_t> in_flight);
+
+} // namespace Libs::Graphics::GpuCapture
+
+#endif /* EMULATOR_SRC_GRAPHICS_GUEST_GPU_GPUCAPTURE_H_ */

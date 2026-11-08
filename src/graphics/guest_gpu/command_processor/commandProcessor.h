@@ -37,6 +37,14 @@ public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
 	// Stopped at a packet boundary to let queued compute work run first.
 	[[nodiscard]] bool Yielded() const noexcept { return m_yielded; }
+	// The unprocessed rest of each buffer (indirect buffers pushed), innermost first.
+	[[nodiscard]] std::vector<std::span<const uint32_t>> RemainingBuffers() const {
+		std::vector<std::span<const uint32_t>> rest;
+		for (auto it = m_buffer_stack.rbegin(); it != m_buffer_stack.rend(); ++it) {
+			rest.push_back(it->commands.subspan(it->offset_dw));
+		}
+		return rest;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -71,6 +79,10 @@ public:
 	HW::Context&    GetCtx() { return m_ctx; }
 	HW::UserConfig& GetUcfg() { return m_ucfg; }
 	HW::Shader&     GetShCtx() { return m_sh_ctx; }
+	// GPU capture: the state later submissions inherit, as raw bytes of this build's layout;
+	// RestoreState rejects another size (a capture from a build with another layout).
+	[[nodiscard]] std::vector<uint8_t> SaveState() const;
+	bool                               RestoreState(std::span<const uint8_t> bytes);
 
 	void SetIndexType(uint32_t index_type_and_size);
 	void SetIndexBaseAddress(uint64_t index_base_addr);

@@ -1,6 +1,7 @@
 #include "graphics/shader/shader.h"
 
 #include "common/alignment.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -87,6 +88,21 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 		EXIT("ShaderMapUserData shader=0x%016" PRIx64 " has invalid shader_size=0x%08" PRIx32 "\n",
 		     addr, data.code_size_bytes);
 	}
+	if (GpuCapture::Enabled()) {
+		GpuCapture::Shader shader {.address             = addr,
+		                           .user_data           = reinterpret_cast<uint64_t>(data.user_data),
+		                           .input_semantics     = reinterpret_cast<uint64_t>(data.input_semantics),
+		                           .type                = static_cast<uint32_t>(data.type),
+		                           .code_size_bytes     = data.code_size_bytes,
+		                           .scratch_size_dwords = data.scratch_size_dwords,
+		                           .num_input_semantics = data.num_input_semantics};
+		static_assert(sizeof(GpuCapture::Shader::Register) == sizeof(ShaderRegister));
+		const auto* cx = reinterpret_cast<const GpuCapture::Shader::Register*>(data.cx_registers);
+		const auto* sh = reinterpret_cast<const GpuCapture::Shader::Register*>(data.sh_registers);
+		shader.cx_registers.assign(cx, cx + (cx != nullptr ? data.num_cx_registers : 0));
+		shader.sh_registers.assign(sh, sh + (sh != nullptr ? data.num_sh_registers : 0));
+		GpuCapture::KeepShader(std::move(shader));
+	}
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
 	// Translation reads the bytes the hash covers.
@@ -113,6 +129,7 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+		if (GpuCapture::Recording()) GpuCapture::UseShader(addr);
 		return iter->second;
 	}
 
@@ -391,6 +408,10 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 		uint32_t attrib_count = 0;
 		for (const auto& in: metadata.input_semantics) {
 			attrib_count = std::max<uint32_t>(attrib_count, static_cast<uint32_t>(in.semantic) + 1u);
+		}
+		if (GpuCapture::Recording()) {
+			GpuCapture::Touch(reinterpret_cast<uint64_t>(attrib), uint64_t {attrib_count} * sizeof(uint32_t));
+			GpuCapture::Touch(reinterpret_cast<uint64_t>(buffer), sizeof(buffer_copy));
 		}
 		if (backing_reads && GuestGpu::IsGpuThread() && attrib_count <= attrib_copy.size()) {
 			const auto read_table = [](const uint32_t* table, uint32_t* out, uint32_t dwords) {

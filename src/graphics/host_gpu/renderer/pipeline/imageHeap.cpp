@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -227,6 +228,7 @@ bool ImageHeap::Refresh(Memory& memory) {
 		const auto [address, end] = PageRange(memory.base, memory.size, m_runs[run].first,
 		                                      m_runs[run].second);
 		m_scratch.resize((end - address) / 4u);
+		GpuCapture::Touch(address, end - address);
 		if (!LibKernel::Memory::TryReadBufferBacking(address, m_scratch.data(), end - address)) {
 			std::scoped_lock lock {m_mutex};
 			for (; run < m_runs.size(); ++run) {

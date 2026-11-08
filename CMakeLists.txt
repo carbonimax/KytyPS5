@@ -202,6 +202,13 @@ if(KYTY_THIN_LTO)
 	set_source_files_properties("${KYTY_SOURCE_DIR}/kernel/macosGuestAddressSpace.cpp" PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
+# GPU frame capture recording (KYTY_GPU_CAPTURE=<dir> at run time). Off, its hooks compile away: they
+# measurably slowed the CP even when idle. Capture replay (ctest gpu_capture_replay*) is built either way.
+option(KYTY_GPU_CAPTURE "Build the GPU frame capture recording hooks into the emulator" OFF)
+if(KYTY_GPU_CAPTURE)
+	add_compile_definitions(KYTY_GPU_CAPTURE_RECORDING=1)
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 # The shader store key (src/shader_store_key.cmake): the translation sources, hashed at build time,
@@ -900,6 +907,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
 	add_test(NAME msaa_storage
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
+	add_test(NAME gpu_capture_replay
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-capture-replay-only)
+	# Local game captures in KYTY_GPU_REPLAY_DIR (never committed); skipped where it is unset.
+	add_test(NAME gpu_capture_replay_local
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-replay-dir-only)
+	set_tests_properties(gpu_capture_replay_local PROPERTIES SKIP_REGULAR_EXPRESSION "GpuReplayDir skipped")
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler

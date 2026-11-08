@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -89,6 +90,10 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// GPU thread, between submissions (GPU capture): downloads every GPU-modified image that can
+	// be downloaded to guest memory, oldest GPU write first, and waits for it.
+	void DownloadGpuModified(std::vector<GpuCapture::Unpublished>* skipped = nullptr,
+	                         std::vector<GpuCapture::Published>*   written = nullptr);
 	void RunGarbageCollector();
 
 private:
@@ -147,11 +152,16 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
+	// `dcc_as_plain` (GPU capture): a compressed video-out image is written as if every DCC block
+	// were uncompressed, the layout the cache itself uploads for DCC targets.
+	[[nodiscard]] bool          CanDownload(const Image& image, bool dcc_as_plain = false) const;
+	[[nodiscard]] bool          CanDownloadStencil(const Image& plane) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	// The stencil aspect of a stencil association (`depth_id`), in its guest plane layout.
+	void DownloadStencil(Image& plane, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
@@ -171,7 +181,9 @@ private:
 	ImageId FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,
 	                        FindImageMemo* memo);
 
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// `staging`: a mapped download buffer of at least the image size, used instead of the reusable one.
+	// `capture` (GPU capture publish): also stencil associations and compressed video-out images.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, Buffer* staging = nullptr, bool capture = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
