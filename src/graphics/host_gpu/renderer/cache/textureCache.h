@@ -140,8 +140,16 @@ private:
 	[[nodiscard]] const std::vector<ImageId>& FindImageCandidates(uint64_t address, uint64_t size);
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
+	// Sets keep_both instead of recreating when the new description may sit beside the cached one.
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-	                                                ImageId cached);
+	                                                ImageId cached, bool& keep_both);
+	// The requested description may stay beside cached: both would only mirror the guest bytes.
+	[[nodiscard]] bool          KeepBeside(Image& cached, const ImageInfo& requested,
+	                                       BindingType binding);
+	// A GPU write makes image the only current description: frees its guest siblings.
+	void                        DropGuestSiblings(Image& image);
+	// KYTY_IMAGE_CHURN_OPT=2: compares image's native contents with its guest bytes on the GPU.
+	void                        VerifyGuestMirror(Image& image, const char* where);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cinttypes>
@@ -28,6 +29,7 @@
 #include <span>
 #include <tuple>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -48,6 +50,15 @@ bool MsaaZeroInit() {
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
 	}();
 	return enabled;
+}
+
+// KYTY_IMAGE_CHURN_OPT: 0 = off, 1 = on (default), 2 = on and verify against guest bytes.
+uint32_t ImageChurnOpt() {
+	static const uint32_t mode = [] {
+		const char* value = std::getenv("KYTY_IMAGE_CHURN_OPT");
+		return value == nullptr ? 1u : static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+	}();
+	return mode;
 }
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
@@ -598,6 +609,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 	}
 	if (source.IsGpuModified()) {
+		DropGuestSiblings(destination);
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
@@ -618,12 +630,13 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	destination.CopyMip(source, mip, layer,
 	                    m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal));
 	if (source.IsGpuModified()) {
+		DropGuestSiblings(destination);
 		destination.MarkGpuModified();
 	}
 }
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-                                          ImageId cached_id) {
+                                          ImageId cached_id, bool& keep_both) {
 	auto& cached = m_slot_images[cached_id];
 	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
 	    cached.info.tile_mode != requested.tile_mode) {
@@ -679,6 +692,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	if (!recreate) {
 		return cached_id;
+	}
+	if (KeepBeside(cached, requested, binding)) {
+		keep_both = true;
+		return {};
 	}
 	RefreshImage(cached_id);
 	auto info = requested;
@@ -800,8 +817,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
-		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+		bool keep_both = false;
+		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id, keep_both)) {
 			return {depth_id};
+		}
+		if (keep_both) {
+			return {merged_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
@@ -834,6 +855,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.extent.width == cached.info.extent.width &&
 		      requested.extent.height == cached.info.extent.height &&
 		      requested.extent.depth > cached.info.extent.depth))) {
+			if (KeepBeside(cached, requested, binding)) {
+				return {merged_id};
+			}
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
@@ -1453,6 +1477,14 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			                                    inserted.info.data.size)) {
 				inserted.MarkBufferModified();
 			}
+			for (const auto id: candidates) {
+				const auto* other = m_slot_images.try_get(id);
+				if (other != nullptr && other->registered && other->guest_siblings &&
+				    other->info.data == inserted.info.data) {
+					inserted.guest_siblings = true;
+					break;
+				}
+			}
 			if (MsaaZeroInit() && inserted.info.samples > 1 && !inserted.info.IsDepth() &&
 			    inserted.backing.image != nullptr && inserted.backing.layers != 0) {
 				// Defines the native image only; guest bytes are untouched. ClearImage commits a
@@ -1465,6 +1497,9 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 				           zero);
 			}
 		}
+	}
+	if (ImageChurnOpt() == 2 && result && m_slot_images[result].guest_siblings) {
+		VerifyGuestMirror(m_slot_images[result], "find");
 	}
 	if (memo != nullptr) {
 		*memo = keepable ? FindImageMemo {result, m_image_index_epoch} : FindImageMemo {};
@@ -1608,10 +1643,105 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 }
 
+bool TextureCache::KeepBeside(Image& cached, const ImageInfo& requested, BindingType binding) {
+	// Both images then hold the guest bytes: the old copy over a fresh upload rewrote them.
+	constexpr uint64_t MaxSiblingBytes = 64 * 1024;
+	if (ImageChurnOpt() == 0 || binding != BindingType::Texture || requested.data != cached.info.data ||
+	    requested.resources != cached.info.resources || requested.data.size > MaxSiblingBytes ||
+	    cached.IsGpuModified() || cached.IsBufferModified() || cached.depth_id ||
+	    !cached.stencil_ids.empty() || requested.samples != 1 || cached.info.samples != 1 ||
+	    cached.backing.samples != 1 || requested.HasStencil() || cached.info.HasStencil() ||
+	    requested.HasMetadata() || cached.info.metadata.kind != ImageMetadataKind::None ||
+	    requested.metadata.compression != VideoOutCompression::Uncompressed ||
+	    cached.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	if (ImageChurnOpt() == 2) {
+		VerifyGuestMirror(cached, "keep");
+	}
+	cached.guest_siblings = true;
+	return true;
+}
+
+void TextureCache::DropGuestSiblings(Image& image) {
+	if (!image.guest_siblings) {
+		return;
+	}
+	image.guest_siblings = false;
+	for (const auto id: FindImagesInRegion(image.info.data.address, image.info.data.size)) {
+		auto& sibling = m_slot_images[id];
+		if (&sibling != &image && sibling.registered && sibling.guest_siblings &&
+		    sibling.info.data == image.info.data) {
+			sibling.binding.needs_rebind |= sibling.binding.is_bound || sibling.binding.is_target;
+			FreeImage(id);
+		}
+	}
+}
+
+void TextureCache::VerifyGuestMirror(Image& image, const char* where) {
+	static std::atomic<uint64_t> checked {0}, mismatched {0}, skipped {0};
+	// Only an image that claims to hold the guest bytes now (no pending refresh) is compared.
+	if (image.IsCpuDirty() || image.IsBufferModified() || image.IsGpuModified() ||
+	    !CanDownload(image)) {
+		skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	const auto range    = image.info.data;
+	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	auto [mapped, offset] =
+	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	std::vector<uint8_t> guest(range.size);
+	if (mapped == nullptr || !LibKernel::Memory::TryReadBacking(range.address, guest.data(), range.size)) {
+		skipped.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	download.Commit();
+	// Bytes the native image does not cover (padding) read back as the guest's; the first byte
+	// (always covered) starts inverted, so a readback that writes nothing mismatches.
+	std::memcpy(mapped, guest.data(), range.size);
+	static_cast<uint8_t*>(mapped)[0] ^= 0xffu;
+	download.Flush(offset, range.size);
+	m_scheduler.EndRendering();
+	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
+	                              vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download.Handle();
+	barrier.offset              = offset;
+	barrier.size                = range.size;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                               1, &barrier, 0, nullptr);
+	const auto& info = image.info;
+	m_scheduler.DeferPriorityOperation([&download, mapped, offset, range, where, guest = std::move(guest),
+	                                    w = info.extent.width, h = info.extent.height,
+	                                    type = static_cast<uint32_t>(info.type),
+	                                    format = static_cast<uint32_t>(info.pixel_format)] {
+		download.Invalidate(offset, range.size);
+		const auto n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (std::memcmp(mapped, guest.data(), range.size) != 0) {
+			const auto bad = mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
+			LOGF_COLOR(Log::Color::BrightRed,
+			           "KYTY_IMAGE_CHURN_OPT=2 mismatch (%s) addr=0x%010" PRIx64 " size=%" PRIu64
+			           " %ux%u type=%u vk=%u: %" PRIu64 " of %" PRIu64 "\n",
+			           where, range.address, range.size, w, h, type, format, bad, n);
+		}
+		if ((n & (n - 1)) == 0) {
+			LOGF("KYTY_IMAGE_CHURN_OPT=2: %" PRIu64 " checked, %" PRIu64 " mismatches, %" PRIu64
+			     " skipped\n",
+			     n, mismatched.load(std::memory_order_relaxed), skipped.load(std::memory_order_relaxed));
+		}
+	});
+}
+
 void TextureCache::CommitGpuWrite(Image& image) {
 	if (!image.depth_id && image.backing.image == nullptr) {
 		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
+	DropGuestSiblings(image);
 	image.ClearBufferModified();
 	image.RefreshComplete();
 	image.MarkGpuModified();
@@ -1728,6 +1858,48 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                     range.levelCount != 1);
 		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
 		                    range.layerCount, &clear, command.Handle());
+		command.Handle().endRendering();
+		CommitGpuWrite(image);
+		return;
+	}
+	// A depth/stencil clear as a rendering load op leaves the image in the attachment layout:
+	// no TRANSFER_DST round trip before the next depth pass.
+	const auto& limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	if (ImageChurnOpt() != 0 && range.aspectMask != vk::ImageAspectFlagBits::eColor &&
+	    range.levelCount == 1 && !image.info.IsVolume() &&
+	    (image.backing.usage & vk::ImageUsageFlagBits::eDepthStencilAttachment) &&
+	    range.layerCount <= limits.maxFramebufferLayers &&
+	    std::max(image.info.extent.width >> range.baseMipLevel, 1u) <= limits.maxFramebufferWidth &&
+	    std::max(image.info.extent.height >> range.baseMipLevel, 1u) <= limits.maxFramebufferHeight) {
+		ImageViewInfo view {};
+		view.format      = image.backing.format;
+		view.type        = range.layerCount == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+		view.aspect      = aspects;
+		view.base_level  = range.baseMipLevel;
+		view.base_layer  = range.baseArrayLayer;
+		view.layer_count = range.layerCount;
+		view.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		image.Transit(vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		              vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+		                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+		              {}, command.Handle());
+		vk::RenderingAttachmentInfo attachments[2] {};
+		for (uint32_t i = 0; i < 2; i++) {
+			const auto aspect          = i == 0 ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eStencil;
+			attachments[i].imageView   = image.FindView(view);
+			attachments[i].imageLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+			attachments[i].loadOp      = (range.aspectMask & aspect) ? vk::AttachmentLoadOp::eClear
+			                                                         : vk::AttachmentLoadOp::eLoad;
+			attachments[i].storeOp     = vk::AttachmentStoreOp::eStore;
+			attachments[i].clearValue  = clear;
+		}
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent = {std::max(image.info.extent.width >> range.baseMipLevel, 1u),
+		                               std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
+		rendering.layerCount         = range.layerCount;
+		rendering.pDepthAttachment   = (aspects & vk::ImageAspectFlagBits::eDepth) ? &attachments[0] : nullptr;
+		rendering.pStencilAttachment = (aspects & vk::ImageAspectFlagBits::eStencil) ? &attachments[1] : nullptr;
+		command.Handle().beginRendering(&rendering);
 		command.Handle().endRendering();
 		CommitGpuWrite(image);
 		return;
