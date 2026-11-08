@@ -219,7 +219,8 @@ public:
 	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
 	// A missing pipeline: hands it to the workers (ahead of the predicted ones, in first-skip order;
 	// a predicted key moves there at its first skip) and returns true while the draw
-	// may still be skipped; false once it is created or its skip cap is reached (the draw waits).
+	// may still be skipped; false once it is created, or once its skip cap is reached while it is
+	// still queued (the draw waits and creates it).
 	[[nodiscard]] bool SkipMissing(const CommandBuffer& command, const DrawRenderState& state,
 	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
 	// Guest frames so far (the skip cap's clock).

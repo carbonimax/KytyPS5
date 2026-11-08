@@ -97,7 +97,7 @@ enum class Counter : uint32_t {
 	AsyncBlockDepthOnly, // no color attachment (depth-only: later passes test or sample it)
 	AsyncBlockQuery,     // an occlusion query counts its samples
 	AsyncBlockPasses,    // aliased-target passes
-	AsyncBlockCap,       // skipped for ASYNC_PIPELINE_SKIP_FRAMES guest frames already
+	AsyncBlockCap,       // skipped for ASYNC_PIPELINE_SKIP_FRAMES guest frames, still queued
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,

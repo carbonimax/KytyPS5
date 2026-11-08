@@ -2331,12 +2331,14 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 			m_prefetch_hook(m_prefetch_context);
 		}
 	}
-	// Past the cap the draw waits; a job still queued is then created inline (TakePending).
+	// Past the cap the draw waits; a job still queued is then created inline (TakePending). One a
+	// worker is creating stays skipped: waiting would block the CP for the rest of its creation,
+	// and the hole lasts at most one creation longer.
 	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame());
 	if (PerfStats::CompileLogEnabled()) [[unlikely]] {
 		LogSkip(*job, may_skip);
 	}
-	if (!may_skip) {
+	if (!may_skip && job->state.load(std::memory_order_acquire) == 0) {
 		PerfStats::Add(PerfStats::Counter::AsyncBlockCap, 1);
 		return false;
 	}
@@ -2376,7 +2378,7 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 	const auto frame = Frame();
 	const auto age   = frame - job.first_skip;
 	const bool first = job.log_frame == ASYNC_PIPELINE_NOT_SKIPPED;
-	if (may_skip && !first && (frame == job.log_frame || age % 5 != 0)) return;
+	if (!first && (frame == job.log_frame || (may_skip && age % 5 != 0))) return;
 	job.log_frame = frame;
 	int64_t pos   = -1;
 	size_t  len   = 0;
@@ -2392,7 +2394,7 @@ void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
 			}
 		}
 	}
-	// A (first skip) / Q (every 5 guest frames) / X (cap reached, the draw waits): time key_hash
+	// A (first skip) / Q (every 5 guest frames) / X (past the cap, once a frame): time key_hash
 	//   age_frames queue_pos(-1: not queued) queue_len state skip_miss
 	PerfStats::CompileLogLine("%c %" PRIu64 " %zx %" PRIu64 " %" PRId64 " %zu %u %d",
 	                          !may_skip ? 'X' : first ? 'A' : 'Q', PerfStats::SteadyUs(),
