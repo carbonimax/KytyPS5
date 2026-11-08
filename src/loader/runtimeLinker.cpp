@@ -1360,6 +1360,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	Libs::LibKernel::PthreadInitSelfForMainThread();
 	auto* main_stack_top = Libs::LibKernel::PthreadCreateMainGuestStack();
+	Libs::LibKernel::PthreadSetGuestFpuControl();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	// Guest code has no Windows stack probes and may jump over the guard page. Module

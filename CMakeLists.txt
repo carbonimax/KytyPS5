@@ -694,6 +694,9 @@ add_kyty_full_emulator_test(kernel_file_system_tests
 add_kyty_full_emulator_test(pthread_sched_param_tests "${KYTY_TESTS_DIR}/PthreadSchedParamTests.cpp")
 target_link_libraries(pthread_sched_param_tests ZArchive::zarchive)
 add_test(NAME pthread_sched_param COMMAND $<TARGET_FILE:pthread_sched_param_tests>)
+add_kyty_full_emulator_test(pthread_fpu_control_tests "${KYTY_TESTS_DIR}/PthreadFpuControlTests.cpp")
+target_link_libraries(pthread_fpu_control_tests ZArchive::zarchive)
+add_test(NAME pthread_fpu_control COMMAND $<TARGET_FILE:pthread_fpu_control_tests>)
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
