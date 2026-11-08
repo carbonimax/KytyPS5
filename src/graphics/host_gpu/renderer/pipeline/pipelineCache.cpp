@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -55,6 +56,18 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// GPU capture: the guest bytes the SRT walk loads, walked again while recording (the walk itself
+// keeps only the reads a specialization needs).
+void CaptureSrtReads(const ShaderRecompiler::IR::ResourcePlan& plan,
+                     const ShaderRecompiler::IR::SrtRuntime& runtime, const auto& snapshot) {
+	if (!GpuCapture::Recording()) return;
+	std::vector<uint32_t>                      flat;
+	std::vector<std::pair<uint64_t, uint64_t>> reads;
+	(void)ShaderRecompiler::IR::WalkSrt(plan, runtime, flat, &reads);
+	reads.insert(reads.end(), snapshot.specialization_reads.begin(), snapshot.specialization_reads.end());
+	for (const auto& [address, size]: reads) GpuCapture::Touch(address, size);
+}
 
 // Upstream uses 1 minute; here each vkGetPipelineCacheData stalls rendering 0.3-1 s in the driver,
 // even off the creating thread, so keep the previous 5 minutes.
@@ -138,6 +151,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
+	GpuCapture::Touch(address, values.size_bytes());
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -276,6 +290,7 @@ struct PipelineCache::ProgramCache {
 		                             uint32_t push_data_cursor, bool emulate_image_min_lod) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
+			CaptureSrtReads(resource_plan, runtime, resources);
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -762,6 +777,7 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization, !graphics.image_view_min_lod_enabled));
+			CaptureSrtReads(entry->second.resource_plan, runtime, entry->second.resources);
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor, !graphics.image_view_min_lod_enabled)) {

@@ -40,6 +40,8 @@ public:
 	void                                    ShutdownGpu();
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
+	// False without a display (GPU capture replay): flips are dropped.
+	[[nodiscard]] bool                      HasVideoOut() const { return m_video_out != nullptr; }
 
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }

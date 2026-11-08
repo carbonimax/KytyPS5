@@ -15,6 +15,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -42,6 +43,17 @@ public:
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
+	// Same, giving up once every queued submission stayed blocked (waiting on memory nobody writes)
+	// for timeout_ms; busy work that progresses is waited for. Also true, without the timeout, once
+	// every queued submission is blocked and its command memory is in `may_stay` (capture replay).
+	bool              WaitForIdle(uint32_t timeout_ms, std::span<const uint32_t* const> may_stay = {});
+	// Capture replay, after WaitForIdle: drops the queued (blocked) submissions; returns how many.
+	uint32_t          DropQueued();
+	// Capture replay, before the first submission: a queue's (0 or a compute queue as in SubmitCompute)
+	// command processor state from GpuCapture::CpState; false for another build's layout.
+	bool              RestoreCpState(uint32_t queue, std::span<const uint8_t> bytes);
+	// Diagnostics: one line per queued submission (queue, commands, depth, next packet dwords).
+	[[nodiscard]] std::string DescribeQueued();
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
@@ -64,6 +76,8 @@ private:
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
 		Pm4Execution              execution;
+		bool                      started         = false;
+		uint32_t                  capture_submit  = UINT32_MAX; // GpuCapture::RecordSubmit index
 		bool                      blocked         = false;
 		uint64_t                  flip_request_id = 0;
 		bool                      yielded         = false;
@@ -72,6 +86,8 @@ private:
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// GPU capture: the frame boundary (`frame_end`) or a scope boundary (GpuCapture::ScopeBoundary).
+	void              CaptureBoundary(bool frame_end);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 	// Graphics processing yields at a packet boundary when compute work was queued since `seen`.
@@ -92,6 +108,7 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_wake_pending      = false;
+	bool                                           m_stalled           = false; // every front blocked, no progress since
 	bool                                           m_shutdown_complete = false;
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
