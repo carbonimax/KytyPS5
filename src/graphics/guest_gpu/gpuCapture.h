@@ -97,7 +97,29 @@ struct CpState {
 	std::vector<uint8_t> bytes;
 };
 
-using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered, CpState>;
+// Box-filtered RGBA8 thumbnail (TextureCache::Thumbnail) of the color target starting at the address of an
+// Expect, made by a replay whose every Expect matched the game. A replay on a platform with no hashes of its
+// own compares it instead of the exact hash. Kept in the capture's sidecar file (<capture>.platform.kygpucap).
+struct Thumb {
+	uint64_t             address = 0;
+	uint32_t             width   = 0;
+	uint32_t             height  = 0;
+	std::vector<uint8_t> rgba;
+};
+
+// Type 12, reserved for the WaitValue breaker (not implemented): never written, rejected by the reader.
+struct WaitValue {};
+
+// The exact Expect hashes a replay got on one platform (device and driver), in the sidecar file.
+struct Platform {
+	uint32_t            vendor_id      = 0;
+	uint32_t            device_id      = 0;
+	uint32_t            driver_version = 0;
+	std::vector<Expect> hashes;
+};
+
+using Record = std::variant<Memory, Shader, Submit, FrameEnd, Expect, Zero, Update, InFlight, Unordered, CpState,
+                            Thumb, WaitValue, Platform>;
 
 // Sum of a 64-bit mix of each dword (a zero-padded tail counts as one): equal for any permutation
 // of records whose size is a multiple of 4 bytes.

@@ -115,6 +115,10 @@
 #include <variant>
 #include <vector>
 
+// Thumbnail PNGs of failing capture replays (the emulator's copy in libPngEnc.cpp is not linked here).
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 #include <xxhash.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -15056,14 +15060,74 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // Capture thumbnails (GpuCapture::Thumb): a pixel is over when one channel differs by more than
+  // ThumbTolerance / 255; two thumbnails match with at most 1 % of the pixels over.
+  static constexpr uint32_t ThumbWidth = 64, ThumbHeight = 36, ThumbTolerance = 4;
+  struct ThumbDiff {
+    uint32_t over = 0, max = 0;
+    bool ok = false;
+  };
+  static ThumbDiff CompareThumbs(std::span<const uint8_t> expected, std::span<const uint8_t> got) {
+    const auto pixels = static_cast<uint32_t>(expected.size() / 4);
+    if (expected.size() != got.size()) return {pixels, 255, false};
+    ThumbDiff diff;
+    for (size_t i = 0; i < pixels; i++) {
+      uint32_t channel = 0;
+      for (size_t c = 0; c < 4; c++) {
+        channel = std::max<uint32_t>(channel, static_cast<uint32_t>(std::abs(expected[i * 4 + c] - got[i * 4 + c])));
+      }
+      diff.max = std::max(diff.max, channel);
+      diff.over += channel > ThumbTolerance ? 1 : 0;
+    }
+    diff.ok = uint64_t{diff.over} * 100 <= pixels;
+    return diff;
+  }
+  // <prefix>_<address>.got.png, plus .expected.png and .diff.png (|difference| x 16) with an expected
+  // thumbnail; RGB only, so a target with alpha 0 stays visible.
+  static void WriteThumbPngs(const std::string &prefix, uint64_t address, std::span<const uint8_t> got,
+                             const std::vector<uint8_t> *expected) {
+    const auto write = [&](const char *kind, const auto &pixel) {
+      std::vector<uint8_t> rgb(got.size() / 4 * 3);
+      for (size_t i = 0; i < rgb.size(); i++) rgb[i] = pixel(i / 3 * 4 + i % 3);
+      stbi_write_png(fmt::format("{}_{:016x}.{}.png", prefix, address, kind).c_str(), ThumbWidth, ThumbHeight, 3,
+                     rgb.data(), ThumbWidth * 3);
+    };
+    write("got", [&](size_t i) { return got[i]; });
+    if (expected == nullptr || expected->size() != got.size()) return;
+    write("expected", [&](size_t i) { return (*expected)[i]; });
+    write("diff", [&](size_t i) { return static_cast<uint8_t>(std::min(255, std::abs((*expected)[i] - got[i]) * 16)); });
+  }
+  // The platform key of Platform records: this device and driver.
+  GpuCapture::Platform CurrentPlatform() {
+    EnsureRuntimeContext();
+    const auto &properties = m_runtime_context.GetPhysicalDeviceProperties();
+    return {properties.vendorID, properties.deviceID, properties.driverVersion, {}};
+  }
+  static bool SamePlatform(const GpuCapture::Platform &a, const GpuCapture::Platform &b) {
+    return a.vendor_id == b.vendor_id && a.device_id == b.device_id && a.driver_version == b.driver_version;
+  }
+  // A capture's sidecar file (<capture>.platform.kygpucap): Thumb and Platform records.
+  struct ReplaySidecar {
+    std::vector<GpuCapture::Record> records;
+    std::string png_prefix;                        // thumbnails of failing color Expects: <png_prefix>_<address>.*.png
+    GpuCapture::Platform *got = nullptr;           // when set: receives this replay's hashes ...
+    std::vector<GpuCapture::Thumb> *thumbs = nullptr; // ... and its color target thumbnails
+  };
+
   // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
   // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
   // Returns the number of mismatching ranges.
   // `nondet`: Expects two replays of this capture disagreed on (address -> true when only the order
   // of their dwords differed), from <capture>.nondet.txt. Such an Expect is not counted as a
   // mismatch when it differs the same way ("order": the game's dword multiset still matches).
+  // `sidecar`: a Platform record of this platform replaces the capture's hashes; when only other
+  // platforms have one, a color Expect with a Thumb passes on its thumbnail instead of its exact hash.
   uint32_t ReplayGpuCapture(const char *name, const GpuCapture::Capture &capture,
                             const std::unordered_map<uint64_t, bool> &nondet = {}) {
+    return ReplayGpuCapture(name, capture, nondet, ReplaySidecar{});
+  }
+  uint32_t ReplayGpuCapture(const char *name, const GpuCapture::Capture &capture,
+                            const std::unordered_map<uint64_t, bool> &nondet, const ReplaySidecar &sidecar) {
     namespace Memory = Libs::LibKernel::Memory;
     constexpr uint64_t block = 0x10000;
     std::vector<std::pair<uint64_t, uint64_t>> blocks;
@@ -15261,6 +15325,28 @@ public:
       context.GetTextureCache().DownloadGpuModified(&unpublished);
       context.GetBufferCache().ReadGpuModified();
     });
+    const auto platform = CurrentPlatform();
+    const GpuCapture::Platform *own = nullptr;
+    bool other_platforms = false;
+    std::unordered_map<uint64_t, const GpuCapture::Thumb *> thumbs;
+    for (const auto &record : sidecar.records) {
+      if (const auto *p = std::get_if<GpuCapture::Platform>(&record)) {
+        if (SamePlatform(*p, platform)) {
+          own = p;
+        } else {
+          other_platforms = true;
+        }
+      } else if (const auto *t = std::get_if<GpuCapture::Thumb>(&record)) {
+        thumbs[t->address] = t;
+      }
+    }
+    const bool by_thumbnail = own == nullptr && other_platforms;
+    if (!sidecar.records.empty()) {
+      std::printf("[gpu]     %s platform %04x:%04x driver 0x%x: %s, %zu thumbnails\n", name, platform.vendor_id,
+                  platform.device_id, platform.driver_version,
+                  own != nullptr ? "own hashes" : by_thumbnail ? "no hashes of its own, color Expects by thumbnail" : "capture hashes",
+                  thumbs.size());
+    }
     uint32_t mismatches = 0, accepted = 0;
     size_t expect_index = 0;
     for (size_t record_index = 0; record_index < capture.records.size(); record_index++) {
@@ -15275,11 +15361,39 @@ public:
         std::vector<uint8_t> bytes(expect->size);
         const bool read = Memory::TryReadBacking(expect->address, bytes.data(), bytes.size());
         const auto hash = read ? XXH3_64bits(bytes.data(), bytes.size()) : 0;
+        auto expected = expect->hash;
+        if (own != nullptr) {
+          const auto it = std::ranges::find_if(own->hashes, [&](const GpuCapture::Expect &e) {
+            return e.address == expect->address && e.size == expect->size;
+          });
+          if (it != own->hashes.end()) expected = it->hash;
+        }
+        if (sidecar.got != nullptr) sidecar.got->hashes.push_back({expect->address, expect->size, hash});
+        const auto found = thumbs.find(expect->address);
+        const auto *thumb = found != thumbs.end() ? found->second : nullptr;
+        std::vector<uint8_t> got;
+        bool has_thumb = false;
+        if (thumb != nullptr || hash != expected || sidecar.thumbs != nullptr) {
+          gpu.SendCommandSync([&] {
+            has_thumb = context.GetTextureCache().Thumbnail(expect->address, expect->size, ThumbWidth, ThumbHeight, got);
+          });
+        }
+        if (has_thumb && sidecar.thumbs != nullptr) sidecar.thumbs->push_back({expect->address, ThumbWidth, ThumbHeight, got});
+        const auto diff = thumb != nullptr && has_thumb ? CompareThumbs(thumb->rgba, got) : ThumbDiff{};
+        const bool thumb_pass = hash != expected && by_thumbnail && thumb != nullptr && has_thumb && diff.ok;
         std::printf("[gpu]     %s 0x%016" PRIx64 "+0x%" PRIx64 " hash %016" PRIx64 " %s", name,
-                    expect->address, expect->size, hash, hash == expect->hash ? "ok" : "MISMATCH");
+                    expect->address, expect->size, hash, hash == expected ? "ok" : thumb_pass ? "thumb_ok" : "MISMATCH");
+        if (thumb != nullptr) {
+          std::printf(" thumb over=%u/%zu max=%u%s", diff.over, thumb->rgba.size() / 4, diff.max, has_thumb ? "" : " no_image");
+        }
+        if (has_thumb && !sidecar.png_prefix.empty() && ((hash != expected && !thumb_pass) || (thumb != nullptr && !diff.ok))) {
+          WriteThumbPngs(sidecar.png_prefix, expect->address, got, thumb != nullptr ? &thumb->rgba : nullptr);
+          std::printf(" png=%s_%016" PRIx64 ".%s.png", sidecar.png_prefix.c_str(), expect->address,
+                      thumb != nullptr ? "{expected,got,diff}" : "got");
+        }
         // KYTY_REPLAY_DUMP=<dir> (diagnostics): the replayed bytes of each mismatching range.
         static const char *dump_dir = std::getenv("KYTY_REPLAY_DUMP");
-        if (hash != expect->hash && dump_dir != nullptr) {
+        if (hash != expected && dump_dir != nullptr) {
           const auto path = fmt::format("{}/{:016x}.bin", dump_dir, expect->address);
           if (FILE *f = std::fopen(path.c_str(), "wb")) {
             std::fwrite(bytes.data(), 1, bytes.size(), f);
@@ -15287,7 +15401,7 @@ public:
           }
         }
         bool accept = false;
-        if (hash != expect->hash) {
+        if (hash != expected && !thumb_pass) {
           // unchanged=capture: the game left the range as it was before the frame; =replay: the replay did.
           std::printf(" unchanged=%s", expect->hash == before ? (hash == before ? "both" : "capture")
                                                               : (hash == before ? "replay" : "neither"));
@@ -15308,7 +15422,7 @@ public:
           }
         }
         std::printf("\n");
-        mismatches += hash == expect->hash || accept ? 0 : 1;
+        mismatches += hash == expected || accept || thumb_pass ? 0 : 1;
         accepted += accept ? 1 : 0;
       }
     }
@@ -15478,9 +15592,130 @@ public:
             "an order-only difference was not reported");
     Require(name, "nondet order", ReplayGpuCapture(name, shuffled, {{labels, true}}) == 0,
             "an order-only difference of a known list was counted");
+    // Sidecar records round-trip; type 12 (WaitValue, reserved) is rejected.
+    const auto here = CurrentPlatform();
+    auto there = here;
+    there.driver_version ^= 1u;
+    const auto output_hash = XXH3_64bits(&stored, sizeof(stored));
+    const auto platform_with = [](const GpuCapture::Platform &key, uint64_t address, uint64_t size, uint64_t hash) {
+      auto p = key;
+      p.hashes = {{address, size, hash}};
+      return p;
+    };
+    GpuCapture::Capture side_file;
+    side_file.records.emplace_back(GpuCapture::Thumb{output, 2, 1, {1, 2, 3, 4, 5, 6, 7, 8}});
+    side_file.records.emplace_back(platform_with(here, output, sizeof(stored), output_hash));
+    const auto side_bytes = GpuCapture::Serialize(side_file);
+    const auto side_parsed = GpuCapture::Parse(side_bytes, &error);
+    Require(name, "sidecar round trip",
+            side_parsed.has_value() && GpuCapture::Serialize(*side_parsed) == side_bytes &&
+                std::get<GpuCapture::Platform>(side_parsed->records[1]).hashes.size() == 1,
+            "Thumb/Platform records did not round-trip: " + error);
+    GpuCapture::Capture reserved;
+    reserved.records.emplace_back(GpuCapture::WaitValue{});
+    Require(name, "reserved type", !GpuCapture::Parse(GpuCapture::Serialize(reserved), &error),
+            "a type 12 record was accepted");
+    // This platform's Platform record replaces the capture's hashes; another platform's is not used, and
+    // without a thumbnail (no color target here) the Expect stays exact.
+    ReplaySidecar own_wrong, own_right, other;
+    own_wrong.records.emplace_back(platform_with(here, output, sizeof(stored), output_hash ^ 1u));
+    own_right.records.emplace_back(platform_with(here, output, sizeof(stored), output_hash));
+    other.records.emplace_back(platform_with(there, output, sizeof(stored), output_hash ^ 1u));
+    Require(name, "own platform hash", ReplayGpuCapture(name, *parsed, {}, own_wrong) == 1 &&
+                                           ReplayGpuCapture(name, wrong, {}, own_right) == 0,
+            "the platform's hashes did not replace the capture's");
+    Require(name, "other platform", ReplayGpuCapture(name, *parsed, {}, other) == 0 && ReplayGpuCapture(name, wrong, {}, other) == 1,
+            "another platform's hashes were used, or a buffer Expect was not compared exactly");
+    CheckGpuCaptureThumbnail();
     CheckGpuCaptureStencilPublish();
     CheckGpuCapturePublishOrder();
     CheckGpuCaptureCpState();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A GPU-written color target's thumbnail is its RGBA8 image box-filtered (here a cleared 128 x 72
+  // target); it matches within the tolerance on 1 % of the pixels, fails past it and then writes its PNGs;
+  // an image that is not a render target has none.
+  void CheckGpuCaptureThumbnail() {
+    constexpr const char *name = "GpuCaptureThumbnail";
+    constexpr uint64_t base = 0x0000000207000000ull, size = 0x10000;
+    constexpr uint32_t width = ThumbWidth * 2, height = ThumbHeight * 2, bytes = width * height * 4;
+    static_assert(bytes <= size);
+    namespace Memory = Libs::LibKernel::Memory;
+    EnsureRuntimeContext();
+    int64_t offset = -1;
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map memory",
+            Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(), size, size, 0,
+                                               &offset) == 0 &&
+                Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed mapping failed");
+    std::memset(mapped, 0, size);
+    {
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      auto desc = MakeLinearDesc(base, bytes, vk::Format::eR8G8B8A8Unorm, Prospero::BufferFormat::k8_8_8_8UNorm,
+                                 Prospero::ImageType::kColor2D, {width, height, 1}, 1, 4, 1);
+      const auto id = cache.FindImage(desc);
+      auto &image = cache.GetImage(id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue clear{};
+      clear.float32 = std::array<float, 4>{16 / 255.0f, 96 / 255.0f, 200 / 255.0f, 1.0f};
+      const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                                                   &clear, 1, &range);
+      cache.MarkGpuWritten(id);
+      std::vector<uint8_t> thumb;
+      Require(name, "no target", !cache.Thumbnail(base, bytes, ThumbWidth, ThumbHeight, thumb),
+              "an image that is not a render target got a thumbnail");
+      image.usage.render_target = true;
+      Require(name, "thumbnail", cache.Thumbnail(base, bytes, ThumbWidth, ThumbHeight, thumb) &&
+                                     thumb.size() == size_t{ThumbWidth} * ThumbHeight * 4,
+              "the render target got no thumbnail");
+      for (size_t i = 0; i < thumb.size(); i++) {
+        constexpr std::array<uint8_t, 4> want{16, 96, 200, 255};
+        Require(name, "thumbnail pixels", thumb[i] == want[i % 4],
+                fmt::format("byte {} is {}, not {}", i, thumb[i], want[i % 4]));
+      }
+      // Tolerance: every channel off by 4 still matches; 23 of 2304 pixels (1 %) over it match, 24 do not.
+      auto shifted = thumb;
+      for (auto &b : shifted) b = static_cast<uint8_t>(b >= 4 ? b - 4 : b + 4);
+      auto over = [&](uint32_t pixels) {
+        auto t = thumb;
+        for (uint32_t p = 0; p < pixels; p++) t[p * 4] = static_cast<uint8_t>(t[p * 4] + 5);
+        return t;
+      };
+      const auto at_limit = CompareThumbs(thumb, over(23)), past = CompareThumbs(thumb, over(24));
+      Require(name, "tolerance",
+              CompareThumbs(thumb, thumb).over == 0 && CompareThumbs(thumb, shifted).ok && at_limit.ok &&
+                  at_limit.over == 23 && !past.ok && past.over == 24 && past.max == 5,
+              "the thumbnail tolerance is not +-4 on at most 1 % of the pixels");
+      // A failing comparison writes expected / got / diff.
+      const auto prefix = (std::filesystem::temp_directory_path() / "kyty_thumb_test").string();
+      WriteThumbPngs(prefix, base, over(24), &thumb);
+      for (const char *kind : {"expected", "got", "diff"}) {
+        const auto png = fmt::format("{}_{:016x}.{}.png", prefix, base, kind);
+        Require(name, "png", std::filesystem::file_size(png) > 0, png + " was not written");
+        std::filesystem::remove(png);
+      }
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      Memory::InstallGpuResources(nullptr);
+    }
+    Require(name, "unmap memory",
+            Memory::KernelMunmap(base, size) == 0 && Memory::KernelReleaseDirectMemory(offset, size) == 0,
+            "release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -15656,20 +15891,25 @@ public:
   }
 
   // --gpu-replay <file>: replays a local capture (KYTY_GPU_CAPTURE); 0 when every Expect matches.
-  int ReplayGpuCaptureFile(const char *path) {
+  // --gpu-replay-record <file> (`record`): the same, then, when it passes, stores this platform's
+  // hashes in <capture>.platform.kygpucap, with the color thumbnails when the sidecar has none yet and
+  // this replay matched the game's own hashes on every Expect.
+  int ReplayGpuCaptureFile(const char *path, bool record = false) {
     const auto start = std::chrono::steady_clock::now();
-    std::vector<uint8_t> file;
-    if (FILE *f = std::fopen(path, "rb")) {
-      std::vector<uint8_t> chunk(64u << 20u);
-      for (size_t n; (n = std::fread(chunk.data(), 1, chunk.size(), f)) != 0;) {
-        file.insert(file.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
+    const auto read_file = [](const std::string &file_path) {
+      std::vector<uint8_t> file;
+      if (FILE *f = std::fopen(file_path.c_str(), "rb")) {
+        std::vector<uint8_t> chunk(64u << 20u);
+        for (size_t n; (n = std::fread(chunk.data(), 1, chunk.size(), f)) != 0;) {
+          file.insert(file.end(), chunk.begin(), chunk.begin() + static_cast<ptrdiff_t>(n));
+        }
+        std::fclose(f);
       }
-      std::fclose(f);
-    }
+      return file;
+    };
     std::string error;
-    auto capture = GpuCapture::Parse(file, &error);
+    auto capture = GpuCapture::Parse(read_file(path), &error);
     Require("GpuReplay", "parse", capture.has_value(), std::string(path) + ": " + error);
-    file = {};
     uint64_t memory = 0, expects = 0, submits = 0;
     for (const auto &record : capture->records) {
       if (const auto *m = std::get_if<GpuCapture::Memory>(&record)) memory += m->bytes.size();
@@ -15689,12 +15929,63 @@ public:
       std::fclose(f);
       std::printf("[gpu]     GpuReplay %zu known nondeterministic Expects (%s.nondet.txt)\n", nondet.size(), side.c_str());
     }
-    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet);
+    ReplaySidecar sidecar;
+    sidecar.png_prefix = side;
+    const auto sidecar_path = side + ".platform.kygpucap";
+    if (std::filesystem::exists(sidecar_path)) {
+      auto parsed = GpuCapture::Parse(read_file(sidecar_path), &error);
+      Require("GpuReplay", "sidecar", parsed.has_value(), sidecar_path + ": " + error);
+      sidecar.records = std::move(parsed->records);
+    }
+    auto got = CurrentPlatform();
+    std::vector<GpuCapture::Thumb> thumbs;
+    if (record) {
+      sidecar.got = &got;
+      sidecar.thumbs = &thumbs;
+    }
+    const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet, sidecar);
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
                 " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
                 path, capture->records.size(), memory, submits, expects, mismatches, ms);
-    return mismatches == 0 ? 0 : 1;
+    if (!record) return mismatches == 0 ? 0 : 1;
+    // shortcut: a non-color Expect that differs on a new platform (float compute output) blocks the record, as
+    // it has no thumbnail; add a tolerance or a forced record once such a platform is measured.
+    if (mismatches != 0) {
+      std::printf("[gpu]     GpuReplay record refused: %u Expects differ\n", mismatches);
+      return 1;
+    }
+    // Thumbnails stand for the game's targets only when this replay holds the game's bytes everywhere.
+    std::vector<GpuCapture::Expect> game;
+    for (const auto &r : capture->records) {
+      if (const auto *e = std::get_if<GpuCapture::Expect>(&r)) game.push_back(*e);
+    }
+    const bool game_exact = std::ranges::equal(game, got.hashes, [](const auto &a, const auto &b) {
+      return a.address == b.address && a.size == b.size && a.hash == b.hash;
+    });
+    GpuCapture::Capture out;
+    bool have_thumbs = false;
+    for (auto &r : sidecar.records) {
+      if (const auto *p = std::get_if<GpuCapture::Platform>(&r); p != nullptr && SamePlatform(*p, got)) continue;
+      have_thumbs = have_thumbs || std::holds_alternative<GpuCapture::Thumb>(r);
+      out.records.push_back(std::move(r));
+    }
+    const bool add_thumbs = !have_thumbs && game_exact;
+    if (add_thumbs) {
+      for (auto &t : thumbs) out.records.emplace_back(std::move(t));
+    }
+    const auto hashes = got.hashes.size();
+    out.records.emplace_back(std::move(got));
+    const auto bytes = GpuCapture::Serialize(out);
+    FILE *f = std::fopen(sidecar_path.c_str(), "wb");
+    const bool written = f != nullptr && std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
+    if (f != nullptr) std::fclose(f);
+    std::printf("[gpu]     GpuReplay recorded %s: %zu hashes, %s\n", sidecar_path.c_str(), hashes,
+                !written ? "WRITE FAILED"
+                : have_thumbs ? "thumbnails kept"
+                : add_thumbs  ? fmt::format("{} thumbnails", thumbs.size()).c_str()
+                              : "no thumbnails (the replay differs from the game's hashes)");
+    return written ? 0 : 1;
   }
 
   void CheckSampledDccClear() {
@@ -58498,9 +58789,9 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCaptureReplay();
     return 0;
   }
-  if (argc == 3 && std::strcmp(argv[1], "--gpu-replay") == 0) {
+  if (argc == 3 && (std::strcmp(argv[1], "--gpu-replay") == 0 || std::strcmp(argv[1], "--gpu-replay-record") == 0)) {
     VulkanHarness vulkan;
-    return vulkan.ReplayGpuCaptureFile(argv[2]);
+    return vulkan.ReplayGpuCaptureFile(argv[2], std::strcmp(argv[1], "--gpu-replay-record") == 0);
   }
   // Local game captures (never in the repo): every *.kygpucap of KYTY_GPU_REPLAY_DIR must replay exactly.
   if (argc == 2 && std::strcmp(argv[1], "--gpu-replay-dir-only") == 0) {
@@ -58509,7 +58800,10 @@ int main(int argc, char **argv) {
     std::error_code error;
     if (dir != nullptr) {
       for (const auto &entry : std::filesystem::directory_iterator(dir, error)) {
-        if (entry.path().extension() == ".kygpucap") files.push_back(entry.path().string());
+        // Sidecars (<capture>.platform.kygpucap) are read with their capture.
+        if (entry.path().extension() == ".kygpucap" && entry.path().stem().extension() != ".platform") {
+          files.push_back(entry.path().string());
+        }
       }
     }
     if (files.empty()) {

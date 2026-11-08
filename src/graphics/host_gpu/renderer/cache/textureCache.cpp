@@ -2221,6 +2221,108 @@ void TextureCache::DownloadGpuModified(std::vector<GpuCapture::Unpublished>* ski
 	}
 }
 
+bool TextureCache::Thumbnail(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
+                             std::vector<uint8_t>& rgba) {
+	VulkanImage             converted;
+	std::unique_ptr<Buffer> download;
+	vk::Extent3D            extent;
+	{
+		std::scoped_lock lock {m_lock};
+		Image*           source = nullptr;
+		for (const auto id: FindImagesInRegion(address, size)) {
+			auto& image = m_slot_images[id];
+			if (image.info.data.address != address || image.info.data.size > size || !image.registered ||
+			    !image.IsGpuModified() || !image.usage.render_target || image.info.IsDepth() || image.depth_id ||
+			    image.info.samples != 1 || image.backing.image == nullptr) {
+				continue;
+			}
+			if (source == nullptr || image.gpu_write_seq > source->gpu_write_seq) source = &image;
+		}
+		if (source == nullptr || !(m_graphics.GetFormatProperties(source->backing.format).optimalTilingFeatures &
+		                           vk::FormatFeatureFlagBits::eBlitSrc)) {
+			return false;
+		}
+		extent = vk::Extent3D {source->backing.extent.width, source->backing.extent.height, 1};
+		vk::ImageCreateInfo create {};
+		create.imageType   = vk::ImageType::e2D;
+		create.extent      = extent;
+		create.mipLevels   = 1;
+		create.arrayLayers = 1;
+		create.format      = vk::Format::eR8G8B8A8Unorm;
+		create.tiling      = vk::ImageTiling::eOptimal;
+		create.usage       = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, converted)) return false;
+		download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                    vk::BufferUsageFlagBits::eTransferDst, uint64_t {extent.width} * extent.height * 4);
+		m_scheduler.EndRendering();
+		auto command = m_scheduler.Current().Handle();
+		source->Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, std::nullopt, command);
+		const vk::ImageSubresourceRange color {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		vk::ImageMemoryBarrier          barrier {};
+		barrier.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		barrier.oldLayout           = vk::ImageLayout::eUndefined;
+		barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = converted.image;
+		barrier.subresourceRange    = color;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+		                        nullptr, 0, nullptr, 1, &barrier);
+		const vk::Offset3D corner {static_cast<int32_t>(extent.width), static_cast<int32_t>(extent.height), 1};
+		vk::ImageBlit      blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = blit.srcSubresource;
+		blit.srcOffsets[1]  = corner;
+		blit.dstOffsets[1]  = corner;
+		// Same size: the blit only converts the format (sRGB decoded, floats clamped to [0, 1]).
+		command.blitImage(source->backing.image, vk::ImageLayout::eTransferSrcOptimal, converted.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eNearest);
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		barrier.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		barrier.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer, {}, 0,
+		                        nullptr, 0, nullptr, 1, &barrier);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = extent;
+		command.copyImageToBuffer(converted.image, vk::ImageLayout::eTransferSrcOptimal, download->Handle(), 1, &copy);
+		vk::BufferMemoryBarrier host {};
+		host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		host.buffer              = download->Handle();
+		host.size                = download->Size();
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+		                        1, &host, 0, nullptr);
+	}
+	m_scheduler.Finish();
+	download->Invalidate(0, download->Size());
+	m_graphics.DeleteImage(converted);
+	// Box filter: each thumbnail pixel is the rounded mean of the source pixels its cell covers.
+	const auto* pixels = download->Mapped().data();
+	rgba.assign(size_t {width} * height * 4, 0);
+	for (uint32_t ty = 0; ty < height; ty++) {
+		for (uint32_t tx = 0; tx < width; tx++) {
+			const uint64_t x0 = uint64_t {tx} * extent.width / width, x1 = std::max(x0 + 1, uint64_t {tx + 1} * extent.width / width);
+			const uint64_t y0 = uint64_t {ty} * extent.height / height, y1 = std::max(y0 + 1, uint64_t {ty + 1} * extent.height / height);
+			uint64_t       sum[4] {};
+			for (uint64_t y = y0; y < y1; y++) {
+				for (uint64_t x = x0; x < x1; x++) {
+					for (int c = 0; c < 4; c++) sum[c] += pixels[(y * extent.width + x) * 4 + c];
+				}
+			}
+			const uint64_t count = (x1 - x0) * (y1 - y0); // >= 1: x0 < x1 <= width, y0 < y1 <= height
+			for (int c = 0; c < 4; c++) {
+				rgba[(size_t {ty} * width + tx) * 4 + c] = static_cast<uint8_t>((sum[c] + count / 2) / count);
+			}
+		}
+	}
+	return true;
+}
+
 void TextureCache::ProcessDownloadImages() {
 	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;
