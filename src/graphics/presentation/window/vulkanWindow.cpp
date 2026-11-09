@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1076,10 +1077,12 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	Vr::OpenXrInit();
+	Dlss::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
+	Dlss::AppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1281,6 +1284,7 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1296,6 +1300,8 @@ void WindowContext::CreateVulkan() {
 		                            graphic_ctx.readback_family == graphic_ctx.queue_family ? 1u : 0u,
 		                            &graphic_ctx.readback_queue);
 	}
+	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1337,6 +1343,7 @@ WindowContext::~WindowContext() {
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
+	Dlss::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");

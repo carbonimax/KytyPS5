@@ -762,6 +762,12 @@ target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/t
 target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
 target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 
+add_executable(dlss_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DlssTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/dlss.cpp")
+target_link_libraries(dlss_tests common Vulkan::Headers SDL3::SDL3-static kyty_test_gtest)
+target_include_directories(dlss_tests PRIVATE ${inc_headers})
+
 add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
