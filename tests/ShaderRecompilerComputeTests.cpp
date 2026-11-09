@@ -25290,6 +25290,10 @@ private:
   bool m_barycentric_supported = false;
   bool m_resource_min_lod_enabled = false;
   bool m_maintenance8_enabled = false; // Only the full mode enables the extension.
+  // Full mode feature switches; all true there unless KYTY_HARNESS_RELAXED_FULL=1 and the device lacks them.
+  bool m_null_descriptor_enabled = false;
+  bool m_image_int64_atomics_enabled = false;
+  bool m_image_view_min_lod_enabled = false;
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
   // Full rasterization mode with VK_EXT_mesh_shader mesh and task shaders.
   bool m_mesh_task_enabled = false;
@@ -25334,15 +25338,15 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.shader_image_int64_atomics_enabled = m_mode == Mode::Full;
-    m_runtime_context.null_descriptor_enabled = m_mode == Mode::Full;
+    m_runtime_context.shader_image_int64_atomics_enabled = m_image_int64_atomics_enabled;
+    m_runtime_context.null_descriptor_enabled = m_null_descriptor_enabled;
     m_runtime_context.maintenance8_enabled = m_maintenance8_enabled;
     m_runtime_context.r8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8Srgb);
     m_runtime_context.r8g8_srgb_views = m_runtime_context.SamplesFiltered(vk::Format::eR8G8Srgb);
     m_runtime_context.stencil_copy_via_buffer =
         ResolveStencilCopyViaBuffer(m_runtime_context);
     // Only the full mode requires and enables minLod, together with maintenance8.
-    m_runtime_context.image_view_min_lod_enabled = m_maintenance8_enabled;
+    m_runtime_context.image_view_min_lod_enabled = m_image_view_min_lod_enabled;
     m_runtime_context.shader_resource_min_lod_enabled = m_resource_min_lod_enabled;
     m_runtime_context.conditional_rendering_enabled = m_conditional_rendering_enabled;
     if (m_mesh_task_enabled) {
@@ -25402,7 +25406,16 @@ private:
 
   void Init(Mode mode) {
     const bool full = mode == Mode::Full;
+    // KYTY_HARNESS_RELAXED_FULL=1: the full mode asks for a feature or extension only when the
+    // device has it, for devices such as MoltenVK that lack the 64-bit atomics, barycentrics,
+    // null descriptors, min LOD or shader clock. Cases that need a missing feature are not skipped
+    // yet: they fail at their own check. Off by default, so every device keeps the strict profile.
+    const char *relaxed_env = std::getenv("KYTY_HARNESS_RELAXED_FULL");
+    const bool relaxed = full && relaxed_env != nullptr && std::strcmp(relaxed_env, "1") == 0;
     m_maintenance8_enabled = full;
+    m_null_descriptor_enabled = full;
+    m_image_int64_atomics_enabled = full;
+    m_image_view_min_lod_enabled = full;
     const bool portable_compute = mode == Mode::PortableCompute;
     const bool portable_graphics = mode == Mode::PortableGraphics;
     const bool min_lod_fallback = mode == Mode::MinLodFallback;
@@ -25463,19 +25476,19 @@ private:
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if ((full && barycentric.fragmentShaderBarycentric != true) ||
+          if ((full && !relaxed && barycentric.fragmentShaderBarycentric != true) ||
               features.features.shaderInt64 != true ||
               (full && (features11.storageBuffer16BitAccess != true ||
                         features12.storageBuffer8BitAccess != true ||
                         features12.samplerMirrorClampToEdge != true ||
               features12.shaderOutputViewportIndex != true ||
-              features12.shaderBufferInt64Atomics != true ||
+              (!relaxed && features12.shaderBufferInt64Atomics != true) ||
               features12.shaderSampledImageArrayNonUniformIndexing != true ||
               features12.shaderStorageImageArrayNonUniformIndexing != true ||
               features12.shaderStorageBufferArrayNonUniformIndexing != true ||
-              features12.shaderSharedInt64Atomics != true ||
-                        image_atomic64.shaderImageInt64Atomics != true ||
-                        workgroup_layout.workgroupMemoryExplicitLayout != true)) ||
+              (!relaxed && (features12.shaderSharedInt64Atomics != true ||
+                            image_atomic64.shaderImageInt64Atomics != true ||
+                            workgroup_layout.workgroupMemoryExplicitLayout != true)))) ||
               features12.bufferDeviceAddress != true) {
             continue;
           }
@@ -25504,6 +25517,10 @@ private:
     m_physical_device.getFeatures(&available_features);
     vk::PhysicalDeviceVulkan11Features available_features11{};
     vk::PhysicalDeviceVulkan12Features available_features12{};
+    vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR available_workgroup_layout{};
+    vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT available_image_atomic64{};
+    available_workgroup_layout.pNext = &available_image_atomic64;
+    available_features11.pNext = &available_workgroup_layout;
     available_features12.pNext = &available_features11;
     available_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
@@ -25584,14 +25601,16 @@ private:
       Require("ImageMinLodFallback", "device", available_features12.timelineSemaphore == true, "missing GPU qualification: timeline semaphores are not supported");
     }
     if (full) {
+    if (!relaxed) {
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    }
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderImageGatherExtended == true &&
-                available_derivatives.computeDerivativeGroupQuads == true,
+                (relaxed || available_derivatives.computeDerivativeGroupQuads == true),
             "image gather or compute derivative quads are not supported");
     Require("VulkanHarness", "dispatch",
             available_features11.storageBuffer16BitAccess == true &&
@@ -25618,15 +25637,46 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.shaderStorageImageArrayNonUniformIndexing == true,
             "nonuniform storage image indexing is not supported");
+    if (!relaxed) {
     Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
             "image view minimum LOD is not supported");
       Require("VulkanHarness", "dispatch", available_maintenance8.maintenance8 == true,
               "maintenance8 dynamic image offsets are not supported");
       Require("VulkanHarness", "dispatch", available_clock.shaderDeviceClock == true,
               "shader device clock is not supported");
+    }
       Require("VulkanHarness", "graphics",
               available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
+    }
+    // Relaxed full mode: switch each missing feature off and say so; strict mode keeps them all on.
+    const bool want_barycentric = !relaxed || available_barycentric.fragmentShaderBarycentric;
+    const bool want_buffer_int64_atomics = !relaxed || available_features12.shaderBufferInt64Atomics;
+    const bool want_shared_int64_atomics = !relaxed || available_features12.shaderSharedInt64Atomics;
+    const bool want_workgroup_layout = !relaxed || available_workgroup_layout.workgroupMemoryExplicitLayout;
+    const bool want_derivative_quads = !relaxed || available_derivatives.computeDerivativeGroupQuads;
+    const bool want_min_lod = !relaxed || available_min_lod.minLod;
+    const bool want_maintenance8 = !relaxed || available_maintenance8.maintenance8;
+    const bool want_device_clock = !relaxed || available_clock.shaderDeviceClock;
+    if (full) {
+      m_null_descriptor_enabled = !relaxed || available_robustness2.nullDescriptor;
+      m_image_int64_atomics_enabled = !relaxed || available_image_atomic64.shaderImageInt64Atomics;
+      m_maintenance8_enabled = want_maintenance8;
+      m_image_view_min_lod_enabled = want_maintenance8 && want_min_lod;
+    }
+    if (relaxed) {
+      std::printf("[host]    RelaxedFull               absent and switched off:%s%s%s%s%s%s%s%s%s%s%s\n",
+                  want_barycentric ? "" : " fragmentShaderBarycentric",
+                  want_buffer_int64_atomics ? "" : " shaderBufferInt64Atomics",
+                  want_shared_int64_atomics ? "" : " shaderSharedInt64Atomics",
+                  m_image_int64_atomics_enabled ? "" : " shaderImageInt64Atomics",
+                  want_workgroup_layout ? "" : " workgroupMemoryExplicitLayout",
+                  want_derivative_quads ? "" : " computeDerivativeGroupQuads",
+                  want_min_lod ? "" : " imageViewMinLod",
+                  want_maintenance8 ? "" : " maintenance8",
+                  want_device_clock ? "" : " shaderDeviceClock",
+                  m_null_descriptor_enabled ? "" : " nullDescriptor",
+                  available_features.shaderFloat64 ? "" : " shaderFloat64");
     }
     const std::pair<const char *, bool> rasterization_prerequisites[] = {
         {"fillModeNonSolid", available_features.fillModeNonSolid},
@@ -25671,37 +25721,39 @@ private:
     device_info.pQueueCreateInfos = &queue_info;
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
-    device_features12.shaderSharedInt64Atomics = true;
+    device_features12.shaderSharedInt64Atomics = want_shared_int64_atomics;
     m_sampler_filter_minmax = full && available_features12.samplerFilterMinmax;
     device_features12.samplerFilterMinmax = m_sampler_filter_minmax;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
-    workgroup_layout.workgroupMemoryExplicitLayout = true;
+    workgroup_layout.workgroupMemoryExplicitLayout = want_workgroup_layout;
     device_features12.pNext = &device_features11;
     device_features11.pNext = &workgroup_layout;
     vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic64{};
-    image_atomic64.shaderImageInt64Atomics = true;
+    image_atomic64.shaderImageInt64Atomics = m_image_int64_atomics_enabled;
     workgroup_layout.pNext = &image_atomic64;
     if (!full) {
       device_features12 = {};
       device_features12.bufferDeviceAddress = true;
       device_features12.timelineSemaphore = min_lod_fallback || portable_graphics;
     }
+    if (relaxed) device_features12.shaderBufferInt64Atomics = want_buffer_int64_atomics;
     m_buffer_int64_atomics = device_features12.shaderBufferInt64Atomics == VK_TRUE;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
-    barycentric.fragmentShaderBarycentric = full || m_barycentric_supported;
+    const bool use_barycentric = (full && want_barycentric) || m_barycentric_supported;
+    barycentric.fragmentShaderBarycentric = use_barycentric;
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
     device_features13.pNext =
-        full || m_barycentric_supported ? static_cast<void *>(&barycentric)
+        use_barycentric ? static_cast<void *>(&barycentric)
              : static_cast<void *>(&device_features12);
     device_features13.dynamicRendering = full || portable_graphics || min_lod_fallback;
     device_features13.synchronization2 = full || portable_graphics || min_lod_fallback;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
-    derivatives.computeDerivativeGroupQuads = full;
+    derivatives.computeDerivativeGroupQuads = full && want_derivative_quads;
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
@@ -25721,18 +25773,18 @@ private:
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
-    min_lod.minLod = full;
+    min_lod.minLod = full && want_min_lod;
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
     vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
-    maintenance8.maintenance8 = true;
+    maintenance8.maintenance8 = want_maintenance8;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock{};
-    shader_clock.shaderDeviceClock = true;
+    shader_clock.shaderDeviceClock = want_device_clock;
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
-    robustness2.nullDescriptor = true;
+    robustness2.nullDescriptor = m_null_descriptor_enabled;
     // As the emulator: StorageBounds::Device leaves storage buffer bounds to the device.
     robustness2.robustBufferAccess2 = m_robust_storage_alignment != 0;
     robustness2.pNext = &maintenance8;
@@ -25790,6 +25842,14 @@ private:
     }
     if (m_mesh_task_enabled) {
       device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    }
+    if (relaxed) {
+      const auto has_extension = [&](const char *name) {
+        return std::ranges::any_of(extensions, [name](const vk::ExtensionProperties &extension) {
+          return std::strcmp(extension.extensionName, name) == 0;
+        });
+      };
+      std::erase_if(device_extensions, [&](const char *name) { return !has_extension(name); });
     }
     if (!full) {
       device_extensions.clear();
