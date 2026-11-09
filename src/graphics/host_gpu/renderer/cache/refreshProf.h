@@ -35,7 +35,7 @@ enum Reason : uint8_t {
 
 void NoteDirty(Image& image, uint8_t reason, uint64_t address, uint64_t size) noexcept;
 // The view a texture lookup asks for, kept until the next upload.
-void NoteView(uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers) noexcept;
+void NoteView(uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers, uint32_t min_lod) noexcept;
 void ClearView() noexcept;
 // One InitializeImage upload. `gpu_source`: the bytes came from the buffer cache, not the guest.
 // `skipped`: KYTY_REFRESH_SKIP_SAME kept the native image. `mismatch`: verify mode found the
