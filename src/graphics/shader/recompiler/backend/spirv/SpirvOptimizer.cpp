@@ -7,8 +7,9 @@
 #include <cstdlib>
 
 // The idea of running SPIRV-Tools on each recompiled module comes from AnyPS5's SpirvOptimizer.
-// The pass list is the -O recipe without the passes that fold or reorder float math
-// (simplification, CCP, if-conversion, loop unrolling, reduce-load-size).
+// Of the -O recipe, only value-numbering CSE shrinks our modules (the emitter already writes SSA
+// without dead code or local variables), and inlining grows them: the list is CSE and the
+// clean-up after it. Nothing folds or reorders float math.
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -34,29 +35,11 @@ bool OptimizeSpirv(std::vector<uint32_t>& spirv, uint32_t level, bool allow_offs
 	const auto begin = std::chrono::steady_clock::now();
 	auto&      stats = GetSpirvOptStats();
 	Optimizer  optimizer(SPV_ENV_VULKAN_1_3);
-	optimizer.RegisterPass(CreateWrapOpKillPass())
-	    .RegisterPass(CreateDeadBranchElimPass())
-	    .RegisterPass(CreateMergeReturnPass())
-	    .RegisterPass(CreateInlineExhaustivePass())
-	    .RegisterPass(CreateEliminateDeadFunctionsPass())
-	    .RegisterPass(CreatePrivateToLocalPass())
-	    .RegisterPass(CreateLocalSingleBlockLoadStoreElimPass())
-	    .RegisterPass(CreateLocalSingleStoreElimPass())
-	    .RegisterPass(CreateAggressiveDCEPass())
-	    .RegisterPass(CreateScalarReplacementPass(100))
-	    .RegisterPass(CreateLocalAccessChainConvertPass())
-	    .RegisterPass(CreateLocalSingleBlockLoadStoreElimPass())
-	    .RegisterPass(CreateLocalSingleStoreElimPass())
-	    .RegisterPass(CreateAggressiveDCEPass())
-	    .RegisterPass(CreateSSARewritePass())
-	    .RegisterPass(CreateAggressiveDCEPass())
-	    .RegisterPass(CreateRedundancyEliminationPass())
-	    .RegisterPass(CreateCopyPropagateArraysPass())
-	    .RegisterPass(CreateVectorDCEPass())
-	    .RegisterPass(CreateDeadInsertElimPass())
+	optimizer.RegisterPass(CreateRedundancyEliminationPass())
 	    .RegisterPass(CreateDeadBranchElimPass())
 	    .RegisterPass(CreateBlockMergePass())
-	    .RegisterPass(CreateLocalRedundancyEliminationPass())
+	    .RegisterPass(CreateVectorDCEPass())
+	    .RegisterPass(CreateDeadInsertElimPass())
 	    .RegisterPass(CreateAggressiveDCEPass())
 	    .RegisterPass(CreateCFGCleanupPass());
 	OptimizerOptions options;

@@ -7,9 +7,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-// KYTY_SPIRV_OPT: 0 (default) off; 1 runs SPIRV-Tools passes that keep float results (inlining,
-// load/store elimination, copy propagation, CSE, dead branches and code) on each emitted module;
-// 2 also validates the result and keeps the input when it fails.
+// KYTY_SPIRV_OPT: 0 (default) off; 1 runs SPIRV-Tools passes that keep float results (CSE, dead
+// branches and dead code) on each emitted module; 2 also validates the result and keeps the input
+// when it fails.
 [[nodiscard]] uint32_t SpirvOptLevelFromEnvironment();
 
 struct SpirvOptStats {

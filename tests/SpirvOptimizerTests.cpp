@@ -1,17 +1,20 @@
 // KYTY_SPIRV_OPT (step 5.16). Without arguments: a small module goes through OptimizeSpirv and
-// comes out valid, inlined and with the same entry points; a broken binary is left unchanged.
+// comes out valid, with one addition of two equal ones and the same entry points; a broken binary
+// is left unchanged.
 // With arguments: each is a shader store (_PipelineCache/<title>.shaders); every SPIR-V record in
 // it goes through OptimizeSpirv at level 2 and the instruction counts, optimizer time and
 // failures are printed (offline measurement, no GPU).
 #include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 
 #include <spirv-tools/libspirv.hpp>
+#include <spirv-tools/optimizer.hpp>
 #include <zstd.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -58,6 +61,7 @@ std::vector<std::string> EntryPoints(const std::vector<uint32_t>& spirv) {
 	return result;
 }
 
+// Two equal additions of a loaded value: CSE keeps one.
 constexpr const char* TestModule = R"(
 OpCapability Shader
 OpMemoryModel Logical GLSL450
@@ -74,25 +78,15 @@ OpDecorate %out Binding 0
 %ptr_sb = OpTypePointer StorageBuffer %block
 %out = OpVariable %ptr_sb StorageBuffer
 %ptr_sb_uint = OpTypePointer StorageBuffer %uint
-%ptr_fn_uint = OpTypePointer Function %uint
-%fn_uint = OpTypeFunction %uint %uint
 %c0 = OpConstant %uint 0
 %c7 = OpConstant %uint 7
-%add = OpFunction %uint None %fn_uint
-%x = OpFunctionParameter %uint
-%add_label = OpLabel
-%r = OpIAdd %uint %x %c7
-OpReturnValue %r
-OpFunctionEnd
 %main = OpFunction %void None %fn
 %label = OpLabel
-%v = OpVariable %ptr_fn_uint Function
-OpStore %v %c0
-%a = OpLoad %uint %v
-%b = OpFunctionCall %uint %add %a
-%b2 = OpFunctionCall %uint %add %a
-%s = OpIAdd %uint %b %b2
 %p = OpAccessChain %ptr_sb_uint %out %c0
+%a = OpLoad %uint %p
+%b = OpIAdd %uint %a %c7
+%b2 = OpIAdd %uint %a %c7
+%s = OpIMul %uint %b %b2
 OpStore %p %s
 OpReturn
 OpFunctionEnd
@@ -111,8 +105,8 @@ int RunUnitTest() {
 		Check(OptimizeSpirv(optimized, level, false), "the optimizer accepts the module");
 		Check(tools.Validate(optimized), "the optimized module is valid");
 		Check(EntryPoints(optimized) == entry_points, "same entry points");
-		Check(CountInstructions(optimized, 57u /* OpFunctionCall */) == 0, "calls inlined");
-		Check(CountInstructions(optimized, 61u /* OpLoad */) == 0, "the local load is gone");
+		Check(CountInstructions(optimized, 128u /* OpIAdd */) == 1, "the equal additions merged");
+		Check(CountInstructions(optimized, 61u /* OpLoad */) == 1, "the buffer load stays");
 		Check(CountInstructions(optimized) < before, "fewer instructions");
 		Check(optimized[1] == spirv[1], "same SPIR-V version");
 	}
@@ -175,7 +169,7 @@ double Median(std::vector<double> values) {
 // The SPIR-V records of a store file: its header (magic, format version, key size, key), then
 // 32-byte frame headers (compressed size, raw size, checksum, id, launch, type, uses) each followed
 // by a zstd frame; type 3 holds a module's SPIR-V words.
-int MeasureStore(const char* path) {
+int MeasureStore(const char* path, const char* dump_dir) {
 	std::ifstream        file(path, std::ios::binary);
 	std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 	if (bytes.size() < 16 || std::memcmp(bytes.data(), "KYSHSTOR", 8) != 0) {
@@ -190,6 +184,10 @@ int MeasureStore(const char* path) {
 	spvtools::SpirvTools         tools(SPV_ENV_VULKAN_1_3);
 	spvtools::ValidatorOptions   validator;
 	validator.SetAllowOffsetTextureOperand(true);
+	// KYTY_SPIRV_LIMIT=<n>: only every n-th module (a sample for quick experiments).
+	const char* limit_text = std::getenv("KYTY_SPIRV_LIMIT");
+	const auto  every      = limit_text != nullptr ? std::max(1, std::atoi(limit_text)) : 1;
+	uint32_t    index      = 0;
 	while (bytes.size() - offset >= 32) {
 		uint32_t compressed = 0, raw = 0;
 		uint64_t id = 0;
@@ -205,14 +203,44 @@ int MeasureStore(const char* path) {
 		if (type != 3 || raw == 0 || raw % 4 != 0 || !seen.insert(id).second) {
 			continue;
 		}
+		if (index++ % every != 0) {
+			continue;
+		}
 		std::vector<uint32_t> spirv(raw / 4);
 		if (ZSTD_decompress(spirv.data(), raw, data, compressed) != raw) {
 			continue;
 		}
 		ModuleResult result {.stage = Stage(spirv), .before = CountInstructions(spirv), .id = id};
+		if (dump_dir != nullptr) {
+			// KYTY_SPIRV_DUMP=<dir>: the input of every module, <id>.spv.
+			char name[64];
+			std::snprintf(name, sizeof(name), "/%016llx.spv", static_cast<unsigned long long>(id));
+			std::ofstream(std::string(dump_dir) + name, std::ios::binary)
+			    .write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(raw));
+		}
 		result.input_valid = tools.Validate(spirv.data(), spirv.size(), validator);
 		const auto begin   = std::chrono::steady_clock::now();
-		result.ok          = OptimizeSpirv(spirv, 2, true);
+		if (const char* passes = std::getenv("KYTY_SPIRV_PASSES"); passes != nullptr) {
+			// spirv-opt flags, space separated: try other pass lists offline.
+			std::vector<std::string> flags;
+			for (const char* p = passes; *p != 0;) {
+				const char* end = std::strchr(p, ' ');
+				flags.emplace_back(p, end != nullptr ? end - p : std::strlen(p));
+				p = end != nullptr ? end + 1 : p + std::strlen(p);
+			}
+			spvtools::Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+			result.ok = optimizer.RegisterPassesFromFlags(flags);
+			spvtools::OptimizerOptions options;
+			options.set_run_validator(false);
+			std::vector<uint32_t> out;
+			result.ok = result.ok && optimizer.Run(spirv.data(), spirv.size(), &out, options) &&
+			            tools.Validate(out.data(), out.size(), validator);
+			if (result.ok) {
+				spirv = std::move(out);
+			}
+		} else {
+			result.ok = OptimizeSpirv(spirv, 2, true);
+		}
 		result.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
 		result.after = CountInstructions(spirv);
 		results.push_back(result);
@@ -272,9 +300,10 @@ int main(int argc, char** argv) {
 	if (argc == 1) {
 		return RunUnitTest();
 	}
-	int result = 0;
+	int         result = 0;
+	const char* dump   = std::getenv("KYTY_SPIRV_DUMP");
 	for (int i = 1; i < argc; i++) {
-		result |= MeasureStore(argv[i]);
+		result |= MeasureStore(argv[i], dump);
 	}
 	return result;
 }
