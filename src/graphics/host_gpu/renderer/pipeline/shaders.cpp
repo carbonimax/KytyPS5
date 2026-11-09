@@ -561,6 +561,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, true);
+	if (tessellation && !t_quiet_creation) {
+		PerfStats::NoteTessPipeline(t_last_feedback.valid && !t_last_feedback.hit, creation_feedback.duration);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

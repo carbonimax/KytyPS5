@@ -101,6 +101,10 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	PatchDraws,          // tessellation patch draws, drawn or skipped (--no-tessellation)
+	TessPipelines,       // tessellation pipelines created, of which
+	TessPipelineMisses,  //   missed the pipeline cache
+	TessPipelineMissNs,
 	Count
 };
 
@@ -120,6 +124,7 @@ void               MaybeReport() noexcept;
 void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept;
 // A pipeline creation reported by VK_EXT_pipeline_creation_feedback (core in Vulkan 1.3).
 void NoteGraphicsPipelineFeedback(bool driver_cache_hit, uint64_t duration_ns) noexcept;
+void NoteTessPipeline(bool cache_miss, uint64_t duration_ns) noexcept;
 
 // KYTY_FRAME_TIMES=<file> (measurement, default off): one line per presented frame with its
 // steady-clock time in microseconds and the flip argument of the latest guest flip completed before

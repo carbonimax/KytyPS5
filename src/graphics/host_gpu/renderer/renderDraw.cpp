@@ -871,6 +871,13 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 	return true;
 }
 
+// KYTY_PERF_STATS: once per draw, drawn or skipped ("PERF tess" line).
+static void NotePatchDraw(const HW::UserConfig& ucfg) {
+	if (ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch) {
+		PerfStats::Add(PerfStats::Counter::PatchDraws, 1);
+	}
+}
+
 static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
                                     const DrawIndexBufferSource& source) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
@@ -1777,6 +1784,9 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
 	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
 	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr) {
+		NotePatchDraw(ucfg);
+	}
 	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1886,6 +1896,9 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	DrawRenderState  local_state {.indirect_offsets = args.indirect.offsets,
 	                              .indirect_count   = MeshIndirectGpuEnabled() ? args.indirect.count : 0};
 	DrawRenderState& state = prepared != nullptr ? *prepared : local_state;
+	if (prepared == nullptr) {
+		NotePatchDraw(ucfg);
+	}
 	if (prepared == nullptr && !GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
@@ -1989,6 +2002,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		CpPipeline::Note(CpPipeline::Stat::FallbackShaders);
 		return false;
 	}
+	NotePatchDraw(buffer.GetUserConfig()); // the body runs with a prepared state and does not count it
 	static const bool initialized = [this] {
 		m_context.GetPipelineCache().SetPrefetchHook(PipelinePrefetch, this);
 		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
