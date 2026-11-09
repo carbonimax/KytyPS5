@@ -32,6 +32,33 @@ template <class Queue>
 	return job;
 }
 
+// KYTY_PIPELINE_FAST_FIRST: optimised replacements of unoptimised pipelines run only while no miss
+// is queued, on at most `cap` workers at once, so a new miss still finds a free worker.
+template <class Queue>
+[[nodiscard]] bool AsyncPipelineHasWork(const Queue& skipped, const Queue& predicted,
+                                        const Queue& upgrades, uint32_t upgrading, uint32_t cap) {
+	return !skipped.empty() || !predicted.empty() || (!upgrades.empty() && upgrading < cap);
+}
+
+// The next job once AsyncPipelineHasWork: a miss (AsyncPipelinePop), else the oldest replacement
+// (`upgrade` set).
+template <class Queue>
+[[nodiscard]] typename Queue::value_type AsyncPipelinePopAny(Queue& skipped, Queue& predicted,
+                                                             Queue& upgrades, bool& upgrade) {
+	upgrade = skipped.empty() && predicted.empty();
+	return upgrade ? AsyncPipelinePop(upgrades, upgrades) : AsyncPipelinePop(skipped, predicted);
+}
+
+// A created replacement: `current` takes it and the handle to retire (destroyed once the command
+// buffers that may use it completed) is returned; an empty handle while it is not ready.
+template <class Handle>
+[[nodiscard]] Handle PipelineSwapReplacement(Handle& current, Handle& replacement, bool ready) {
+	if (!ready || replacement == Handle {}) {
+		return Handle {};
+	}
+	return std::exchange(current, std::exchange(replacement, Handle {}));
+}
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_ASYNCPIPELINEPOLICY_H_ */

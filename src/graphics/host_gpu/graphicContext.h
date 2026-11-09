@@ -30,6 +30,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               null_descriptor_enabled               = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// Vulkan 1.3 pipelineCreationCacheControl: FAIL_ON_PIPELINE_COMPILE_REQUIRED probes the cache.
+	bool                               pipeline_creation_cache_control       = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                                      shader_buffer_int64_atomics_enabled   = false;
 	bool                                      shader_cull_distance_enabled          = false;

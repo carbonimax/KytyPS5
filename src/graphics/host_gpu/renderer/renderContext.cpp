@@ -20,6 +20,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_command_scheduler.MarkMainRecorder();
+	m_pipeline_cache.SetRetireScheduler(&m_command_scheduler);
 }
 
 RenderContext::~RenderContext() {

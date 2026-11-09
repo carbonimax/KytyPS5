@@ -1005,6 +1005,10 @@ struct PipelineCache::PendingPipeline {
 	// KYTY_COMPILE_LOG: handed out by a skip miss (set before it is queued), last skip log frame (CP).
 	bool                               skip_miss = false;
 	uint64_t                           log_frame = ASYNC_PIPELINE_NOT_SKIPPED;
+	// KYTY_PIPELINE_FAST_FIRST: built unoptimised / the optimised replacement of such a pipeline
+	// (its `pipeline` holds the layouts of the one it replaces).
+	bool                               unoptimised = false;
+	bool                               upgrade     = false;
 };
 
 struct PipelineCache::ParallelPool {
@@ -1015,6 +1019,12 @@ struct PipelineCache::ParallelPool {
 	// KYTY_ASYNC_PIPELINE: keys whose draws are skipped, in first-skip order (AsyncPipelinePop). A
 	// job may sit in both queues; the second pop finds it taken.
 	std::deque<std::shared_ptr<PendingPipeline>> skipped;
+	// KYTY_PIPELINE_FAST_FIRST: optimised replacements, behind both queues (AsyncPipelineHasWork).
+	std::deque<std::shared_ptr<PendingPipeline>> upgrades;
+	uint32_t                                     upgrading   = 0;
+	uint32_t                                     upgrade_cap = 1;
+	uint64_t                                     upgrades_started = 0;
+	uint64_t                                     upgrades_swapped = 0;
 	uint32_t                                     running = 0;
 	bool                                         stop    = false;
 	std::vector<std::thread>                     threads;
@@ -1057,19 +1067,24 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 				std::unique_lock lock(pool.mutex);
 				for (;;) {
 					pool.work.wait(lock, [&pool] {
-						return pool.stop || !pool.skipped.empty() || !pool.queue.empty();
+						return pool.stop || AsyncPipelineHasWork(pool.skipped, pool.queue, pool.upgrades,
+						                                         pool.upgrading, pool.upgrade_cap);
 					});
 					if (pool.stop) return;
-					auto job = AsyncPipelinePop(pool.skipped, pool.queue);
+					bool upgrade = false;
+					auto job     = AsyncPipelinePopAny(pool.skipped, pool.queue, pool.upgrades, upgrade);
 					uint32_t queued = 0;
 					if (!job->state.compare_exchange_strong(queued, 1)) continue; // taken inline
 					pool.running++;
+					pool.upgrading += upgrade ? 1 : 0;
 					lock.unlock();
 					CreatePending(*job, true);
 					lock.lock();
+					pool.upgrading -= upgrade ? 1 : 0;
 					pool.running--;
 					job->state.store(2, std::memory_order_release);
 					pool.done.notify_all();
+					if (upgrade) pool.work.notify_one(); // a replacement slot is free again
 				}
 			});
 		}
@@ -1077,6 +1092,14 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
 		m_async           = async != nullptr && async[0] == '1';
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
+		const char* fast_first = std::getenv("KYTY_PIPELINE_FAST_FIRST");
+		m_fast_first           = fast_first != nullptr && fast_first[0] == '1';
+		m_pool->upgrade_cap    = std::max(1u, workers / 2);
+		if (m_fast_first) {
+			PipelineCacheLog("Pipeline fast first: misses built unoptimised, replaced on up to {} workers "
+			                 "(KYTY_PIPELINE_FAST_FIRST){}", m_pool->upgrade_cap,
+			                 graphics.pipeline_creation_cache_control ? "" : ": off, no cache control");
+		}
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
@@ -1116,6 +1139,10 @@ PipelineCache::~PipelineCache() {
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
+			// A replacement not swapped in yet (the workers stopped); its layouts are the entry's.
+			if (pipeline.upgrade != nullptr && pipeline.upgrade->state.load(std::memory_order_acquire) == 2) {
+				m_graphics.device.destroyPipeline(pipeline.upgrade->pipeline.pipeline, nullptr);
+			}
 			m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 			m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
@@ -1564,7 +1591,13 @@ void PipelineCache::Save() {
 		std::unique_lock lock(m_pool->mutex);
 		m_pool->queue.clear();
 		m_pool->skipped.clear();
+		const auto upgrades_left = m_pool->upgrades.size();
+		m_pool->upgrades.clear(); // their pipelines stay unoptimised
 		m_pool->done.wait(lock, [this] { return m_pool->running == 0; });
+		if (m_fast_first) {
+			PipelineCacheLog("Pipeline fast first: {} built unoptimised, {} replaced, {} still queued",
+			                 m_pool->upgrades_started, m_pool->upgrades_swapped, upgrades_left);
+		}
 		size_t unused = 0;
 		for (const auto& [key, job]: m_pending) {
 			(void)key;
@@ -2180,6 +2213,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		if (pipeline.store_id != 0 && m_store != nullptr) [[unlikely]] {
 			m_store->NoteUsedPipeline(std::exchange(pipeline.store_id, 0));
 		}
+		if (pipeline.upgrade != nullptr) [[unlikely]] {
+			SwapUpgrade(pipeline);
+		}
 		return pipeline;
 	}
 	// KYTY_PIPELINE_PARALLEL: a worker may have it already; meanwhile the queued draws behind this
@@ -2214,17 +2250,24 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		PerfStats::ScopedTimer perf_timer(PerfStats::Counter::GfxPipelineNs,
 		                                  PerfStats::Counter::GfxPipelineCount);
+		std::array<const ShaderModule*, 3> vertex_stages {};
+		for (uint32_t i = 0; i < vertex_info.size(); i++) {
+			vertex_stages[i] = vertex_info[i].stage.module;
+		}
+		const auto stages = std::span(vertex_stages).first(vertex_info.size());
+		const auto* pixel = ps_active ? ps_input_info.stage.module : nullptr;
+		bool unoptimised  = false;
 		if (pending != nullptr) {
 			TakePending(*pending);
-			pipeline = pending->pipeline;
+			pipeline    = pending->pipeline;
+			unoptimised = pending->unoptimised;
 		} else {
-			std::array<const ShaderModule*, 3> vertex_stages {};
-			for (uint32_t i = 0; i < vertex_info.size(); i++) {
-				vertex_stages[i] = vertex_info[i].stage.module;
-			}
-			CreatePipelineInternal(m_graphics, pipeline, rendering, key.vertex_input, static_params,
-			                       std::span(vertex_stages).first(vertex_info.size()),
-			                       ps_active ? ps_input_info.stage.module : nullptr, m_driver_cache);
+			unoptimised = CreatePipelineInternal(
+			    m_graphics, pipeline, rendering, key.vertex_input, static_params, stages, pixel,
+			    m_driver_cache, m_fast_first ? PipelineBuild::FastFirst : PipelineBuild::Optimised);
+		}
+		if (unoptimised) {
+			StartUpgrade(key, stages, pixel, pipeline);
 		}
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -2299,6 +2342,9 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 	}
 	if (found->second.store_id != 0 && m_store != nullptr) [[unlikely]] {
 		m_store->NoteUsedPipeline(std::exchange(found->second.store_id, 0));
+	}
+	if (found->second.upgrade != nullptr) [[unlikely]] {
+		SwapUpgrade(found->second);
 	}
 	return &found->second;
 }
@@ -2408,20 +2454,60 @@ void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
 	}
 	LoadStoredModule(job.pixel);
 	const auto begin = PerfStats::CompileLogEnabled() ? PerfStats::SteadyUs() : 0;
-	CreatePipelineInternal(m_graphics, job.pipeline, job.key.rendering, job.key.vertex_input,
-	                       job.key.static_params, std::span(job.stages).first(job.stage_count),
-	                       job.pixel, m_driver_cache);
+	job.unoptimised  = CreatePipelineInternal(
+        m_graphics, job.pipeline, job.key.rendering, job.key.vertex_input, job.key.static_params,
+        std::span(job.stages).first(job.stage_count), job.pixel, m_driver_cache,
+        m_fast_first && !job.upgrade ? PipelineBuild::FastFirst : PipelineBuild::Optimised);
 	job.feedback = LastPipelineCacheFeedback();
 	EXIT_NOT_IMPLEMENTED(job.pipeline.pipeline == nullptr || job.pipeline.pipeline_layout == nullptr);
 	if (PerfStats::CompileLogEnabled()) {
-		// J time driver_hit us vs_id ps_id worker(1/0) skip_miss(1/0) key_hash: a pipeline handed out
-		// ahead of its draw.
-		PerfStats::CompileLogLine("J %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %d %d %zx", begin,
+		// J time driver_hit us vs_id ps_id worker(1/0) skip_miss(1/0) key_hash build: a pipeline
+		// handed out ahead of its draw; build 0 optimised, 1 unoptimised, 2 optimised replacement.
+		PerfStats::CompileLogLine("J %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %d %d %zx %d", begin,
 		                          job.feedback.valid ? (job.feedback.hit ? 1 : 0) : -1,
 		                          PerfStats::SteadyUs() - begin, job.key.vertex_shader_ids[0],
 		                          job.key.ps_shader_id, worker ? 1 : 0, job.skip_miss ? 1 : 0,
-		                          GraphicsPipelineKeyHash {}(job.key));
+		                          GraphicsPipelineKeyHash {}(job.key),
+		                          job.upgrade ? 2 : job.unoptimised ? 1 : 0);
 	}
+}
+
+void PipelineCache::StartUpgrade(const GraphicsPipelineKey& key, std::span<const ShaderModule* const> stages,
+                                 const ShaderModule* pixel, Pipeline& pipeline) {
+	if (m_retire_scheduler == nullptr) return; // nowhere to retire it: stays unoptimised
+	auto job         = std::make_shared<PendingPipeline>();
+	job->key         = key;
+	job->stage_count = static_cast<uint32_t>(stages.size());
+	std::copy(stages.begin(), stages.end(), job->stages.begin());
+	job->pixel             = pixel;
+	job->upgrade           = true;
+	job->pipeline          = pipeline; // the layouts; the replacement shares them
+	job->pipeline.pipeline = nullptr;
+	job->pipeline.upgrade  = nullptr;
+	pipeline.upgrade       = job;
+	{
+		std::scoped_lock lock(m_pool->mutex);
+		m_pool->upgrades.push_back(std::move(job));
+		m_pool->upgrades_started++;
+	}
+	m_pool->work.notify_one();
+}
+
+void PipelineCache::SwapUpgrade(Pipeline& pipeline) {
+	auto&      job     = *pipeline.upgrade;
+	const auto retired = PipelineSwapReplacement(pipeline.pipeline, job.pipeline.pipeline,
+	                                             job.state.load(std::memory_order_acquire) == 2);
+	if (!retired) return;
+	if (PerfStats::CompileLogEnabled()) {
+		// U time key_hash: an optimised replacement swapped in.
+		PerfStats::CompileLogLine("U %" PRIu64 " %zx", PerfStats::SteadyUs(), GraphicsPipelineKeyHash {}(job.key));
+	}
+	const auto feedback = job.feedback;
+	pipeline.upgrade.reset(); // `job` is gone
+	m_pool->upgrades_swapped++; // the owning thread only
+	m_retire_scheduler->DeferRelease(
+	    [device = m_graphics.device, retired] { device.destroyPipeline(retired, nullptr); });
+	CheckpointDriverCache(feedback);
 }
 
 void PipelineCache::TakePending(PendingPipeline& job) {

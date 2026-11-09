@@ -800,6 +800,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
+	graphics.pipeline_creation_cache_control = supported_features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",

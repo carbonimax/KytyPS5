@@ -330,12 +330,13 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&        rendering,
                             const PipelineVertexInputState&      vertex_input,
                             const PipelineStaticParameters&      static_params,
                             std::span<const ShaderModule* const> vertex_stages,
-                            const ShaderModule* pixel, vk::PipelineCache driver_cache) {
+                            const ShaderModule* pixel, vk::PipelineCache driver_cache,
+                            PipelineBuild build) {
 	EXIT_IF(vertex_stages.size() != 1 && vertex_stages.size() != 3);
 	const auto& vertex         = *vertex_stages.front();
 	const auto& vertex_program = vertex.handle;
@@ -500,7 +501,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		AddLayoutBindings(descriptor_bindings, pixel->program, vk::ShaderStageFlagBits::eFragment);
 		pipeline.uses_image_heap |= pixel->program.info.uses_image_heap;
 	}
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
+	// A KYTY_PIPELINE_FAST_FIRST replacement keeps the layouts of the pipeline it replaces.
+	if (pipeline.pipeline_layout == nullptr) {
+		CreateLayouts(graphics, pipeline, descriptor_bindings);
+	}
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
@@ -571,8 +575,25 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
+	const auto create = [&] {
+		return graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                               &pipeline.pipeline);
+	};
+	bool unoptimised = false;
+	auto result      = vk::Result::eSuccess;
+	if (build == PipelineBuild::FastFirst && graphics.pipeline_creation_cache_control) {
+		// In the driver cache: optimised at no cost. Else unoptimised now, replaced later.
+		const auto flags    = pipeline_info.flags;
+		pipeline_info.flags = flags | vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+		result              = create();
+		unoptimised         = result == vk::Result::ePipelineCompileRequired;
+		if (unoptimised) {
+			pipeline_info.flags = flags | vk::PipelineCreateFlagBits::eDisableOptimization;
+			result              = create();
+		}
+	} else {
+		result = create();
+	}
 	NoteCreationFeedback(result, creation_feedback, true);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
@@ -587,6 +608,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (task_module) {
 		graphics.device.destroyShaderModule(task_module, nullptr);
 	}
+	return unoptimised;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

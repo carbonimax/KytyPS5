@@ -33,6 +33,7 @@ namespace Libs::Graphics {
 struct AliasedColorTargets;
 struct GraphicContext;
 class CommandBuffer;
+class CommandScheduler;
 class ShaderStore;
 
 namespace ShaderRecompiler::IR {
@@ -173,6 +174,7 @@ struct PipelineCacheFeedback {
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 	friend struct PipelineCacheTestAccess;
+	struct PendingPipeline;
 
 public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
@@ -192,6 +194,9 @@ public:
 		bool                    uses_image_heap       = false;
 		// Prewarmed from the shader store and not used yet in this launch: its record id.
 		uint64_t                store_id              = 0;
+		// KYTY_PIPELINE_FAST_FIRST: built unoptimised; a worker creates its optimised replacement,
+		// swapped in at a later lookup of the key (SwapUpgrade).
+		std::shared_ptr<PendingPipeline> upgrade;
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -243,9 +248,12 @@ public:
 	void Prefetch(const HW::Context& ctx, const HW::UserConfig& ucfg, const DrawRenderState& state,
 	              std::span<const RenderColorInfo> colors);
 
+	// KYTY_PIPELINE_FAST_FIRST: a replaced pipeline is destroyed once the command buffers recorded
+	// so far on `scheduler` completed (the one that records the draws). No replacement without it.
+	void SetRetireScheduler(CommandScheduler* scheduler) { m_retire_scheduler = scheduler; }
+
 private:
 	struct ProgramCache;
-	struct PendingPipeline;
 	struct ParallelPool;
 
 	struct GraphicsPipelineKey {
@@ -308,6 +316,10 @@ private:
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
 	bool                          m_async = false;
+	// KYTY_PIPELINE_FAST_FIRST=1 (default 0, experiment; needs the workers): a missing graphics
+	// pipeline not in the driver cache is built unoptimised, then replaced (StartUpgrade).
+	bool                          m_fast_first       = false;
+	CommandScheduler*             m_retire_scheduler = nullptr;
 	std::atomic<uint64_t>         m_frame {0};
 	PrefetchHook                  m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
@@ -328,6 +340,12 @@ private:
 	void LogSkip(PendingPipeline& job, bool may_skip);
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
 	void TakePending(PendingPipeline& job);
+	// KYTY_PIPELINE_FAST_FIRST: queues the optimised replacement of `pipeline`, built unoptimised,
+	// behind every miss (the thread that owns m_graphics_pipelines).
+	void StartUpgrade(const GraphicsPipelineKey& key, std::span<const ShaderModule* const> stages,
+	                  const ShaderModule* pixel, Pipeline& pipeline);
+	// At a lookup: swaps in a created replacement and retires the unoptimised pipeline.
+	void SwapUpgrade(Pipeline& pipeline);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
 	void WarmUp(const std::filesystem::path& path);
 	void WaitWarmUp() {
@@ -346,13 +364,22 @@ void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pi
 [[nodiscard]] PipelineCacheFeedback LastPipelineCacheFeedback() noexcept;
 // Pipelines created by this thread are left out of the performance counters (shader store warm-up).
 void SetPipelineCreationQuiet(bool quiet) noexcept;
-// `vertex_stages`: VS, mesh or LS/HS/TES; `pixel` is null without a pixel stage.
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+enum class PipelineBuild : uint8_t {
+	Optimised,
+	// KYTY_PIPELINE_FAST_FIRST: optimised when the driver cache has it (a cheap probe), else built
+	// with DISABLE_OPTIMIZATION (~0.6x the driver time) for an optimised replacement later.
+	FastFirst,
+};
+
+// `vertex_stages`: VS, mesh or LS/HS/TES; `pixel` is null without a pixel stage. A pipeline that
+// has its layouts keeps them (an optimised replacement). True when it was built unoptimised.
+bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&        rendering,
                             const PipelineVertexInputState&      vertex_input,
                             const PipelineStaticParameters&      static_params,
                             std::span<const ShaderModule* const> vertex_stages,
-                            const ShaderModule* pixel, vk::PipelineCache driver_cache);
+                            const ShaderModule* pixel, vk::PipelineCache driver_cache,
+                            PipelineBuild build = PipelineBuild::Optimised);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderModule& compute, vk::PipelineCache driver_cache);
 // The host format of each vertex input attribute of a VS or LS program.
