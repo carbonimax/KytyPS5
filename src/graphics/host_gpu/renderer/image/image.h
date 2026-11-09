@@ -109,6 +109,7 @@ public:
 	// shared counter is never touched (the front and back CP threads would bounce its cache line).
 	void               MarkGpuModified(bool stamp) noexcept {
 		m_gpu_modified = true;
+		refresh_note.hash_valid = false;
 		if (stamp) [[unlikely]] {
 			// Load and store, not a locked add: callers hold the texture cache lock, and a duplicate value
 			// would only tie two images in the publish order.
@@ -186,6 +187,19 @@ public:
 		bool     operator==(const ColorClearCheck&) const = default;
 	} color_clear_check;
 	size_t           lru_id             = 0;
+	// KYTY_REFRESH_PROF / KYTY_REFRESH_SKIP_SAME (cache/refreshProf.h): dirty marks since the last
+	// upload (span image-relative), and the guest bytes' hash at the last guest-sourced upload while
+	// the native image still holds exactly those bytes.
+	struct RefreshNote {
+		uint64_t lo         = UINT64_MAX;
+		uint64_t hi         = 0;
+		uint64_t hash       = 0;
+		uint32_t marks      = 0;
+		uint32_t reasons    = 0;
+		uint32_t uploads    = 0;
+		uint8_t  reason     = 0;
+		bool     hash_valid = false;
+	} refresh_note;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 
