@@ -4636,6 +4636,8 @@ public:
     // rewrite after a CPU write beside the image is not copied. Without it, a
     // GL2 writeback copies nothing and a download blocks no access.
     {
+      // The fork keeps its RELEASE_MEM label test elsewhere: this block names its own label.
+      constexpr uint64_t label_value = 0x0123456789abcdefull;
       constexpr uint64_t storage_address = fault_base + 0x10000;
       constexpr uint64_t storage_off_address = fault_base + 0x20000;
       std::memset(reinterpret_cast<void *>(storage_address), 0x11, 0x30000);
@@ -59496,11 +59498,6 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 
 namespace Libs::Graphics {
 struct PipelineCacheTestAccess {
-  static const ShaderModule *GetProgram(PipelineCache &cache, const ShaderParams &params,
-                                        ShaderVertexInputInfo &input) {
-    uint32_t push_data_cursor = 0;
-    return cache.GetProgram(params, input, push_data_cursor);
-  }
   // Gives the cache an empty driver cache saved to `path`.
   static void UseDriverCache(PipelineCache &cache, const std::filesystem::path &path) {
     const vk::PipelineCacheCreateInfo create{};
@@ -59566,8 +59563,17 @@ void CheckDriverCacheWriter(VulkanHarness &vulkan) {
 void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler;
   constexpr const char *name = "TessellationWaveSizes";
-  const std::vector<u32> local{EncodeSop1(0x20, 0, 6), 0xffffffffu};
-  const std::vector<u32> control{EncodeSopp(0x01)};
+  // The fork reflects the LS and HS strides while preparing the stages: give each one store
+  // with a 16-byte stride (LS ds_write at v3 * 16, HS buffer store at control point * 16).
+  const std::vector<u32> local{EncodeVop2(0x0b, 21, 255u, 3), 16u, EncodeDs0(0x0e, (3u << 8u) | 1u),
+                               EncodeDs1Ex(0, 5, 2, 21), EncodeSop1(0x20, 0, 6), 0xffffffffu};
+  std::vector<u32> control;
+  AppendVop3(&control, 0x148, 34, Vgpr(1), InlineU32(8), InlineU32(5));
+  control.push_back(EncodeVop2(0x0b, 35, 255u, 34));
+  control.push_back(16u);
+  control.push_back(EncodeMubuf0(0x1c));
+  control.push_back(EncodeMubuf1(0, 2, 35, 2));
+  control.push_back(EncodeSopp(0x01));
   const std::vector<u32> evaluation{
       0x93ebff03u, 0x00040018u, 0x8f6a856bu, 0xd7650001u, 0x0000d4c1u, // v1: wave lane id
       0x9381ff02u, 0x0009000cu, 0x7da80201u, // v_cmpx_gt_u32 s1 = GS_TG_INFO[20:12], v1
@@ -59590,18 +59596,18 @@ void CheckTessellationWaveSizes(VulkanHarness &vulkan) {
   HW::Context context;
   context.SetLsHsConfig(0x0001062au); // 42 patches, 6 input and 4 output control points
   context.SetTfParam(0x00040042u);    // quads
-  PipelineCache cache(vulkan.RuntimeContext(), nullptr);
+  (void)vulkan;
   // The captured draw sets HS_W32 (bit 21) and GS_W32 (bit 22).
   for (const auto [stages, hs_wave, gs_wave] :
        {std::tuple{0x0260210du, 32u, 32u}, {0x0020210du, 32u, 64u}, {0x0040210du, 64u, 32u}}) {
     context.SetShaderStages(stages);
     std::array<ShaderVertexInputInfo, 3> info;
     const auto params = PrepareTessellationPrograms(regs, context, info);
+    (void)params;
+    // The fork's program cache compiles each non-mesh stage with its input info's wave size.
     for (u32 i = 0; i < 3; i++) {
       info[i].tess.ls_stride = info[i].tess.hs_stride = 16;
-      Require(name, "stage wave size",
-              PipelineCacheTestAccess::GetProgram(cache, params[i], info[i])->info.wave_size ==
-                  (i < 2 ? hs_wave : gs_wave),
+      Require(name, "stage wave size", info[i].wave_size == (i < 2 ? hs_wave : gs_wave),
               "a tessellation stage did not run in its HS or GS wave size");
     }
     CompileOptions options{.stage = ShaderType::TessellationEvaluation, .wave_size = gs_wave};
