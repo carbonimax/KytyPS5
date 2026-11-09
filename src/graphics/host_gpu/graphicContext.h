@@ -28,6 +28,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_device_fault deviceFault (KYTY_DEVICE_FAULT, default on when offered).
+	bool                               device_fault_enabled                  = false;
 	bool                               null_descriptor_enabled               = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -138,6 +140,8 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateStorageBoundsVerify();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// On the first eErrorDeviceLost of the process, logs the driver's fault record; no-op otherwise.
+	void               ReportDeviceLost(vk::Result result, const char* site) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

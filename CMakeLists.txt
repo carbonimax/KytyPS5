@@ -453,6 +453,15 @@ if(APPLE)
 	target_link_libraries(device_address_lifetime_gpu_tests Vulkan::Headers)
 endif()
 
+add_executable(device_fault_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DeviceFaultTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/deviceFault.cpp"
+)
+target_include_directories(device_fault_tests PRIVATE ${inc_headers})
+target_link_libraries(device_fault_tests Vulkan::Headers)
+# Loses the GPU device on purpose (the driver resets the context), so it is opt-in.
+option(KYTY_DEVICE_FAULT_GPU_TEST "Register the forced device-loss test of VK_EXT_device_fault" OFF)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -796,6 +805,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_mad_rounding_product COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=2 $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only product)
 	add_test(NAME shader_mad_rounding_invalid COMMAND ${CMAKE_COMMAND} -E env KYTY_MAD_SEPARATE_ROUNDING=invalid $<TARGET_FILE:shader_cfg_tests> --mad-rounding-only ${mad_default_rounding})
 	add_test(NAME push_descriptor_policy COMMAND $<TARGET_FILE:push_descriptor_policy_tests>)
+	add_test(NAME device_fault COMMAND $<TARGET_FILE:device_fault_tests>)
+	if(KYTY_DEVICE_FAULT_GPU_TEST)
+		add_test(NAME device_fault_gpu COMMAND $<TARGET_FILE:device_fault_tests> --force-device-lost)
+		set_tests_properties(device_fault_gpu PROPERTIES SKIP_RETURN_CODE 2)
+	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -978,6 +992,7 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		push_descriptor_policy_tests
+		device_fault_tests
 		lru_cache_tests
 		common_tests
 		shader_vertex_metadata_tests

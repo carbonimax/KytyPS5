@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/stagingMemoryPolicy.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -120,6 +121,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		if (graphics.device_fault_enabled) {
+			static constexpr const char* KINDS[] = {"device-local buffer", "upload buffer",
+			                                        "download buffer", "stream buffer"};
+			DeviceFault::Registry().Add(
+			    {m_device_address, size, cpu_address, KINDS[static_cast<int>(usage)]});
+		}
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -141,6 +148,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
+	if (m_device_address != 0 && m_graphics->device_fault_enabled) {
+		DeviceFault::Registry().Remove(m_device_address);
+	}
 	if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}

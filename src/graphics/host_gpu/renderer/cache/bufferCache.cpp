@@ -171,6 +171,7 @@ public:
 		} else {
 			result = m_graphics.readback_queue.submit(1, &submit, nullptr);
 		}
+		m_graphics.ReportDeviceLost(result, "readback vkQueueSubmit");
 		EXIT_IF(result != vk::Result::eSuccess);
 		m_commands[m_current].second = tick;
 		return tick;
@@ -183,7 +184,9 @@ public:
 		wait.semaphoreCount = 1;
 		wait.pSemaphores    = &m_semaphore;
 		wait.pValues        = &tick;
-		EXIT_IF(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+		const auto result = m_graphics.device.waitSemaphores(&wait, UINT64_MAX);
+		m_graphics.ReportDeviceLost(result, "readback vkWaitSemaphores");
+		EXIT_IF(result != vk::Result::eSuccess);
 	}
 
 private:

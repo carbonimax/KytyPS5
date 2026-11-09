@@ -52,6 +52,7 @@ struct DeferredSubmit {
 			result = d.graphics->queue.submit(1, &submit_info, nullptr);
 		}
 		if (result != vk::Result::eSuccess) {
+			d.graphics->ReportDeviceLost(result, "vkQueueSubmit");
 			EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(),
 			     d.tick);
 		}
@@ -379,6 +380,7 @@ uint64_t CommandScheduler::RetireFences(uint64_t wait_tick) {
 		if (result == vk::Result::eNotReady) {
 			break;
 		}
+		m_graphics.ReportDeviceLost(result, "vkWaitForFences");
 		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 		m_retired_tick = front.tick;
 		EXIT_NOT_IMPLEMENTED(m_graphics.device.resetFences(1, &front.fence) != vk::Result::eSuccess);
@@ -584,6 +586,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	PerfStats::Add(PerfStats::Counter::Submits, 1);
 
 	if (result != vk::Result::eSuccess) {
+		graphics.ReportDeviceLost(result, "vkQueueSubmit");
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 
