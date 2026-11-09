@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -302,6 +303,14 @@ void MaybeReport() noexcept {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
 		            bounds[0], bounds[1], bounds[2], bounds[3]);
+	}
+	if (const auto& opt = ShaderRecompiler::Spirv::GetSpirvOptStats(); opt.modules != 0) {
+		// Totals since launch (KYTY_SPIRV_OPT).
+		std::printf("PERF spirvopt: modules=%" PRIu64 " words=%" PRIu64 "->%" PRIu64 " time=%.0fms"
+		            " optimizer_failures=%" PRIu64 " validation_failures=%" PRIu64 "\n",
+		            opt.modules.load(), opt.words_in.load(), opt.words_out.load(),
+		            static_cast<double>(opt.optimize_us.load()) / 1e3, opt.optimizer_failures.load(),
+		            opt.validation_failures.load());
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

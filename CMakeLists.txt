@@ -593,6 +593,13 @@ add_executable(shader_optimization_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Sha
 target_link_libraries(shader_optimization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(shader_optimization_tests PRIVATE ${inc_headers})
 
+# KYTY_SPIRV_OPT wiring; with .shaders store paths as arguments it measures the pass on their SPIR-V.
+add_executable(spirv_optimizer_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SpirvOptimizerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvOptimizer.cpp"
+)
+target_link_libraries(spirv_optimizer_tests spirv-tools-opt spirv-tools libzstd_static)
+target_include_directories(spirv_optimizer_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -813,6 +820,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME shader_optimization COMMAND $<TARGET_FILE:shader_optimization_tests>)
+	add_test(NAME spirv_optimizer COMMAND $<TARGET_FILE:spirv_optimizer_tests>)
 	# These count the walker's guest reads: KYTY_SRT_WALK_REUSE validation would add reads.
 	set_tests_properties(shader_cfg resource_materialization resource_tracking PROPERTIES
 	                     ENVIRONMENT "KYTY_SRT_WALK_REUSE=0")
@@ -994,6 +1002,7 @@ if(BUILD_TESTING)
 		resource_materialization_tests
 		resource_tracking_tests
 		shader_optimization_tests
+		spirv_optimizer_tests
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		async_pipeline_policy_tests
