@@ -2416,6 +2416,8 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
 	}
 	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	// The per-level hashes of the last refresh no longer describe the image (DeferRefresh).
+	image.refresh_note.native_is_guest = false;
 	return true;
 }
 
