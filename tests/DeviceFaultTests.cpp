@@ -2,14 +2,16 @@
 //
 // Default run: the device-address registry lookup and the record formatting, no GPU (exit 0, 1 on
 // failure).
-// --force-device-lost: a compute shader writes through a device address 64 GiB past a small buffer,
-// which loses the device; the driver's fault record must name an address range holding that write
-// (exit 0 found, 1 not found, 2 inconclusive: no driver with deviceFault, or the write did not fault).
-// It resets the GPU context, so it is opt-in (KYTY_DEVICE_FAULT_GPU_TEST) and never runs by default.
+// --force-device-lost [TARGET_HEX]: a compute shader writes through a device address (default 64 GiB
+// past a small buffer); if that loses the device, the driver's fault record must name an address
+// range holding the write (exit 0 found, 1 not found, 2 inconclusive: no driver with deviceFault, or
+// the write did not fault). The AMD Windows driver drops such writes without a loss (exit 2).
+// A loss resets the GPU context, so it is opt-in (KYTY_DEVICE_FAULT_GPU_TEST) and never runs by default.
 #include "graphics/host_gpu/deviceFault.h"
 
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -142,7 +144,7 @@ int Inconclusive(const char* why) {
 	return 2;
 }
 
-int ForceDeviceLost() {
+int ForceDeviceLost(uint64_t forced_target) {
 	static vk::detail::DynamicLoader loader;
 	const auto get_instance_proc_addr =
 	    loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
@@ -263,7 +265,8 @@ int ForceDeviceLost() {
 	vk::BufferDeviceAddressInfo address_info {};
 	address_info.buffer          = buffer;
 	const uint64_t buffer_address = device.getBufferAddress(&address_info);
-	const uint64_t target         = buffer_address + (uint64_t {1} << 36u);
+	const uint64_t target =
+	    forced_target != 0 ? forced_target : buffer_address + (uint64_t {1} << 36u);
 	AddressRegistry registry;
 	registry.Add({buffer_address, 4096, 0, "test buffer"});
 	std::printf("Buffer at 0x%016" PRIx64 ", writing 256 bytes at 0x%016" PRIx64 "\n", buffer_address,
@@ -351,7 +354,7 @@ int ForceDeviceLost() {
 
 int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "--force-device-lost") == 0) {
-		return ForceDeviceLost();
+		return ForceDeviceLost(argc > 2 ? std::strtoull(argv[2], nullptr, 16) : 0);
 	}
 	TestRegistry();
 	TestFormat();
