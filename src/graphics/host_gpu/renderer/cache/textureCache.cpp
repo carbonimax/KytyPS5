@@ -1607,7 +1607,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (RefreshProf::Enabled()) [[unlikely]] {
 		RefreshProf::NoteView(desc.view_info.base_level, desc.view_info.level_count,
-		                      desc.view_info.base_layer, desc.view_info.layer_count);
+		                      desc.view_info.base_layer, desc.view_info.layer_count, desc.view_info.min_lod);
 	}
 	RefreshImage(id);
 	if (RefreshProf::Enabled()) [[unlikely]] {

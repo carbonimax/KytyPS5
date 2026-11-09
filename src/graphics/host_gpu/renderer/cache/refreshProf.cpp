@@ -42,7 +42,8 @@ struct ImageEntry {
 	uint32_t serials     = 0;
 	uint64_t span_lo = UINT64_MAX, span_hi = 0;
 	MipLayer lo_at, hi_at;
-	uint32_t view_levels = 0, view_layers = 0, view_base_level = 0, view_base_layer = 0;
+	uint32_t view_levels = 0, view_layers = 0, view_base_level = 0, view_base_layer = 0, view_min_lod = 0;
+	uint32_t unsampled = 0; // uploads whose dirty span lies only in mips the view does not sample
 	uint32_t partial_views = 0;
 };
 
@@ -66,7 +67,7 @@ State& GetState() {
 }
 
 struct View {
-	uint32_t base_level = 0, levels = 0, base_layer = 0, layers = 0;
+	uint32_t base_level = 0, levels = 0, base_layer = 0, layers = 0, min_lod = 0;
 	bool     valid      = false;
 };
 thread_local View t_view;
@@ -117,8 +118,8 @@ void Report(State& s, double seconds) {
 			std::printf(" span=0x%" PRIx64 "..0x%" PRIx64 " mip%u/l%u..mip%u/l%u", e.span_lo, e.span_hi, e.lo_at.mip,
 			            e.lo_at.layer, e.hi_at.mip, e.hi_at.layer);
 		}
-		std::printf(" view=m%u+%u/l%u+%u partial_views=%u\n", e.view_base_level, e.view_levels, e.view_base_layer,
-		            e.view_layers, e.partial_views);
+		std::printf(" view=m%u+%u/l%u+%u min_lod=%u partial_views=%u unsampled=%u\n", e.view_base_level,
+		            e.view_levels, e.view_base_layer, e.view_layers, e.view_min_lod, e.partial_views, e.unsampled);
 	}
 	std::fflush(stdout);
 	s.all = s.fresh = s.refresh = s.gpu_src = s.same = s.diff = s.unknown = s.skipped = {};
@@ -169,8 +170,8 @@ void NoteDirty(Image& image, uint8_t reason, uint64_t address, uint64_t size) no
 	s.marks[reason]++;
 }
 
-void NoteView(uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers) noexcept {
-	t_view = {base_level, levels, base_layer, layers, true};
+void NoteView(uint32_t base_level, uint32_t levels, uint32_t base_layer, uint32_t layers, uint32_t min_lod) noexcept {
+	t_view = {base_level, levels, base_layer, layers, min_lod, true};
 }
 
 void ClearView() noexcept {
@@ -249,12 +250,23 @@ void NoteUpload(Image& image, bool gpu_source, uint64_t record_ns, int same, boo
 			e.span_hi = note.hi;
 			e.hi_at   = Locate(offsets.data(), sizes.data(), levels, info.resources.layers, note.hi - 1);
 		}
+		// Highest mip the span touches; the view never samples levels below base + floor(min_lod).
+		uint32_t top_mip = 0;
+		for (uint32_t m = 0; m < levels; m++) {
+			if (offsets[m] < note.hi && note.lo < offsets[m] + sizes[m]) {
+				top_mip = m;
+			}
+		}
+		if (t_view.valid && top_mip < t_view.base_level + t_view.min_lod / 256u) {
+			e.unsampled++;
+		}
 	}
 	if (t_view.valid) {
 		e.view_base_level = t_view.base_level;
 		e.view_levels     = t_view.levels;
 		e.view_base_layer = t_view.base_layer;
 		e.view_layers     = t_view.layers;
+		e.view_min_lod    = t_view.min_lod;
 		if (t_view.levels < info.resources.levels || t_view.layers < info.resources.layers) {
 			e.partial_views++;
 			s.partial_view++;
