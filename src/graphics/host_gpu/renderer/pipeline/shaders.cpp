@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <vector>
@@ -46,6 +47,15 @@ void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback&
 	if (graphics_pipeline && !t_quiet_creation) {
 		PerfStats::NoteGraphicsPipelineFeedback(t_last_feedback.hit, feedback.duration);
 	}
+}
+
+// Measurement: KYTY_MEAS_NOOPT=1 creates every pipeline with DISABLE_OPTIMIZATION (never replaced).
+bool MeasNoopt() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_MEAS_NOOPT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
 }
 
 } // namespace
@@ -557,6 +567,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (rendering.depth_feedback && !graphics.attachment_feedback_loop_dynamic) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
 	}
+	if (MeasNoopt()) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
@@ -613,6 +626,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	feedback_info.pPipelineCreationFeedback = &creation_feedback;
 	feedback_info.pNext                     = info.pNext;
 	info.pNext                              = &feedback_info;
+	if (MeasNoopt()) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	const auto result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
