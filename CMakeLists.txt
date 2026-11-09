@@ -877,6 +877,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
 	add_test(NAME shader_recompiler_storage_bounds
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-bounds-only)
+	add_test(NAME shader_recompiler_relaxed_float
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --relaxed-float-only)
 	add_test(NAME shader_recompiler_vop3_conversions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
 	add_test(NAME shader_recompiler_f16_rounding

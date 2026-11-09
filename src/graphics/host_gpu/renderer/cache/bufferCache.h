@@ -135,6 +135,7 @@ public:
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
 	}
+	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so

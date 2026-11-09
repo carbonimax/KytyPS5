@@ -590,8 +590,9 @@ struct PipelineCache::ProgramCache {
 			if (options.stage == ShaderType::Mesh ||
 			    options.stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
-				options.wave_size =
-				    options.stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
+			}
+			if (options.stage == ShaderType::Mesh) {
+				options.wave_size = input_info.mesh.wave_size;
 			}
 		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
 			options.stage            = ShaderType::Pixel;
@@ -950,7 +951,8 @@ struct PipelineCache::ProgramCache {
 		           .storage_bounds_verify_address =
 		               graphics.storage_bounds_verify ? graphics.storage_bounds_verify_address : 0u,
 		           .r8_srgb_views   = graphics.r8_srgb_views,
-		           .r8g8_srgb_views = graphics.r8g8_srgb_views} {
+		           .r8g8_srgb_views = graphics.r8g8_srgb_views,
+		           .relaxed_float   = Config::RelaxedShaderFloatEnabled()} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {

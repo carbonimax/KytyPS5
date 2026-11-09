@@ -1619,7 +1619,8 @@ void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size)
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
-                                  uint64_t data, uint32_t interrupt_context_id) {
+                                  uint64_t data, uint32_t interrupt_context_id,
+                                  bool gl2_writeback) {
 	GpuCapture::Touch(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
@@ -1639,6 +1640,10 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	if (address == nullptr || interrupt_selector == 4 ||
 	    (interrupt_selector == 1 && !IsAsyncComputeQueue())) {
 		data_sel = 0;
+	}
+	// A GL2 writeback makes GPU writes CPU-visible even without a signal.
+	if (gl2_writeback) {
+		WriteBackImages();
 	}
 	if (data_sel == 0 && !interrupt) {
 		return;
@@ -1857,6 +1862,14 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 		}
 	});
 	if (deferred && EopFlushEnabled()) {
+		GetScheduler().Flush();
+	}
+}
+
+void CommandProcessor::WriteBackImages() {
+	// GPU-written images are copied back without holding any signal: a held signal exposes the host
+	// GPU's speed. Guest accesses to them wait for the copies.
+	if (m_renderer.GetTextureCache().WriteBackImages()) {
 		GetScheduler().Flush();
 	}
 }
