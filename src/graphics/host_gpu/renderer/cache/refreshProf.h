@@ -30,8 +30,15 @@ enum Reason : uint8_t {
 };
 
 [[nodiscard]] bool Enabled() noexcept;
-// Verify/skip mode of KYTY_REFRESH_SKIP_SAME (0 off, 1 skip, 2 verify).
+// KYTY_REFRESH_PROF=2: also hash the guest bytes of every upload ("dirty but same bytes").
+[[nodiscard]] bool HashEnabled() noexcept;
+// KYTY_REFRESH_SKIP_SAME: 0 off; 1 a texture lookup keeps the native image while every byte that
+// may have changed since its last upload lies in mips its view cannot sample (below base_level +
+// floor(min_lod)); 2 verify: decide the same, upload anyway, and count a mismatch when a sampled
+// mip's guest bytes differ from that upload.
 [[nodiscard]] uint32_t SkipSameMode() noexcept;
+// A deferred refresh (first of the dirty cycle: `first`), or one mode 2 checked.
+void NoteDefer(uint64_t bytes, bool first) noexcept;
 
 void NoteDirty(Image& image, uint8_t reason, uint64_t address, uint64_t size) noexcept;
 // The view a texture lookup asks for, kept until the next upload.
@@ -65,6 +72,24 @@ struct MipLayer {
 		}
 	}
 	return result;
+}
+
+// True when every level whose bytes intersect [dirty_from, size) is below `first_sampled`, and at
+// least one level is sampled. Tail levels sharing a block intersect together.
+[[nodiscard]] inline bool DirtyBelow(const uint64_t* mip_offsets, const uint64_t* mip_sizes, uint32_t levels,
+                                     uint64_t dirty_from, uint64_t size, uint32_t first_sampled) noexcept {
+	if (first_sampled == 0 || first_sampled >= levels || dirty_from >= size) {
+		return false;
+	}
+	for (uint32_t m = 0; m < levels; m++) {
+		if (mip_sizes[m] == 0 || mip_offsets[m] + mip_sizes[m] > size) {
+			return false;
+		}
+		if (m >= first_sampled && mip_offsets[m] + mip_sizes[m] > dirty_from) {
+			return false;
+		}
+	}
+	return true;
 }
 
 } // namespace RefreshProf

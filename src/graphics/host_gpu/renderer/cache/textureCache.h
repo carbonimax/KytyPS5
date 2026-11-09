@@ -139,6 +139,8 @@ private:
 	void                      TrackImageHead(ImageId id);
 	void                      TrackImageTail(ImageId id);
 	void                      UntrackImage(ImageId id);
+	// Stops watching [address, track_addr_end): the watch keeps its prefix below address.
+	void                      UntrackImageFrom(ImageId id, uint64_t address);
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
@@ -165,7 +167,9 @@ private:
 	// KYTY_IMAGE_CHURN_OPT=2: compares image's native contents with its guest bytes on the GPU.
 	void                        VerifyGuestMirror(Image& image, const char* where);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
+	// `view` (texture lookups): KYTY_REFRESH_SKIP_SAME may keep the native image (DeferRefresh).
+	void                        RefreshImage(ImageId id, const ImageViewInfo* view = nullptr);
+	[[nodiscard]] bool          DeferRefresh(Image& image, const ImageViewInfo& view);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);

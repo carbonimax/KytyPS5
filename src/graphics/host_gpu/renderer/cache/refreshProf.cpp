@@ -58,6 +58,7 @@ struct State {
 	uint64_t                                   partial_view = 0;
 	uint64_t                                   mismatches   = 0;
 	uint64_t                                   mismatches_total = 0;
+	uint64_t                                   defer_checks     = 0;
 	std::unordered_map<uint64_t, ImageEntry>   images;
 };
 
@@ -87,6 +88,10 @@ void Report(State& s, double seconds) {
 	            s.gpu_src.n, mb(s.gpu_src.bytes), s.same.n, mb(s.same.bytes), s.diff.n, mb(s.diff.bytes), s.unknown.n,
 	            mb(s.unknown.bytes), s.skipped.n, mb(s.skipped.bytes), static_cast<double>(s.record_ns) / 1e6,
 	            mb(s.span_bytes), s.partial_view, s.mismatches, s.mismatches_total);
+	if (SkipSameMode() != 0) {
+		std::printf("REFRESH defer %.1fs: deferred=%" PRIu64 "/%.1fMB checks=%" PRIu64 " mismatches=%" PRIu64 "\n", seconds,
+		            s.skipped.n, mb(s.skipped.bytes), s.defer_checks, s.mismatches);
+	}
 	std::printf("REFRESH reasons %.1fs:", seconds);
 	for (uint32_t r = 0; r < ReasonCount; r++) {
 		std::printf(" %s=%" PRIu64 "/%.1fMB(marks %" PRIu64 ")", ReasonNames[r], s.by_reason[r].n,
@@ -129,6 +134,7 @@ void Report(State& s, double seconds) {
 	s.span_bytes = 0;
 	s.partial_view = 0;
 	s.mismatches   = 0;
+	s.defer_checks = 0;
 	s.images.clear();
 }
 
@@ -145,6 +151,21 @@ void MaybeReport(State& s) {
 bool Enabled() noexcept {
 	static const bool enabled = EnvU32("KYTY_REFRESH_PROF", 0) != 0;
 	return enabled;
+}
+
+bool HashEnabled() noexcept {
+	static const bool enabled = EnvU32("KYTY_REFRESH_PROF", 0) >= 2;
+	return enabled;
+}
+
+void NoteDefer(uint64_t bytes, bool first) noexcept {
+	auto&           s = GetState();
+	std::scoped_lock lock {s.mutex};
+	s.defer_checks++;
+	if (first) {
+		s.skipped.Add(bytes);
+	}
+	MaybeReport(s);
 }
 
 uint32_t SkipSameMode() noexcept {
