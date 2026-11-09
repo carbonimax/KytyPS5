@@ -386,7 +386,6 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.address_bases.clear();
-		m_info.uses_dma = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -4264,10 +4263,6 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
-		if (op == ValueOpcode::BvhIntersect || op == ValueOpcode::Bvh8Intersect) {
-			m_info.uses_dma = true;
-			return;
-		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -4305,7 +4300,6 @@ private:
 					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
@@ -4356,7 +4350,6 @@ private:
 			if (std::ranges::max(base) != UINT32_MAX &&
 			    std::ranges::find(bases, base) == bases.end())
 				bases.push_back(base);
-			m_info.uses_dma = true;
 			return;
 		}
 

@@ -1483,7 +1483,7 @@ static bool IsAnyLaneCondition(Value condition, Value& guard) {
 }
 
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
