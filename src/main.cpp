@@ -66,7 +66,7 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
-	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
+	::printf("  --no-tessellation                    Skip tessellation patch draws. Default: drawn.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --lod-stats                          Report bound textures in mip statistics.\n");
 	::printf("  --shader-log-direction <value>       Silent, Console, or File.\n");
@@ -196,7 +196,8 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
-    {"--tessellation", &ConfigOptions::tessellation_enabled},
+    {"--tessellation", &ConfigOptions::tessellation_enabled}, // the default; kept for old command lines
+    {"--no-tessellation", &ConfigOptions::tessellation_enabled, false},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--lod-stats", &ConfigOptions::lod_stats_enabled},
     {"--command-buffer-dump", &ConfigOptions::command_buffer_dump_enabled},

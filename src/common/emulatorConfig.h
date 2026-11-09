@@ -89,7 +89,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
 	bool                   sync_raw_image_buffers      = false;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = false;
 	bool                   lod_stats_enabled           = false;
 	bool                   trophy_enabled              = true;
