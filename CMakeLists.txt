@@ -963,6 +963,16 @@ if(BUILD_TESTING)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
+	# MoltenVK lacks 64-bit atomics, fragment barycentrics, null descriptors and more. With this
+	# variable (set on every test, only the GPU harness reads it) the Full harness asks for what the
+	# device has and skips the cases that need the rest.
+	if(APPLE)
+		get_property(kyty_all_tests DIRECTORY PROPERTY TESTS)
+		foreach(kyty_test IN LISTS kyty_all_tests)
+			set_property(TEST ${kyty_test} APPEND PROPERTY ENVIRONMENT KYTY_HARNESS_RELAXED_FULL=1)
+		endforeach()
+	endif()
+
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests

@@ -2630,6 +2630,32 @@ public:
     return m_rasterization_supported;
   }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  // Relaxed Full mode only: true when a case's SPIR-V needs a capability the device lacks, so the
+  // case is reported as skipped. Strict modes never skip: such a case must fail there.
+  [[nodiscard]] bool SkipForMissingCapability(const char *name, const std::vector<u32> &spirv) {
+    if (!m_relaxed) return false;
+    for (size_t i = 5; i < spirv.size() && (spirv[i] & 0xffffu) == spv::OpCapability; i += spirv[i] >> 16u) {
+      const char *missing = nullptr;
+      switch (spirv[i + 1]) {
+      case spv::CapabilityFloat64: if (!m_has_float64) missing = "Float64"; break;
+      case spv::CapabilityInt64Atomics: if (!m_has_int64_atomics) missing = "Int64Atomics"; break;
+      case spv::CapabilityInt64ImageEXT: if (!m_image_int64_atomics_enabled) missing = "Int64ImageEXT"; break;
+      case spv::CapabilityWorkgroupMemoryExplicitLayoutKHR: if (!m_has_workgroup_layout) missing = "WorkgroupMemoryExplicitLayoutKHR"; break;
+      case spv::CapabilityShaderClockKHR: if (!m_has_device_clock) missing = "ShaderClockKHR"; break;
+      case spv::CapabilityFragmentBarycentricKHR: if (!m_has_barycentric) missing = "FragmentBarycentricKHR"; break;
+      case spv::CapabilityComputeDerivativeGroupQuadsKHR:
+      case spv::CapabilityComputeDerivativeGroupLinearKHR: if (!m_has_derivative_quads) missing = "ComputeDerivativeGroup"; break;
+      default: break;
+      }
+      if (missing != nullptr) {
+        std::printf("[compute] %-32s skipped (device lacks SPIR-V capability %s)\n", name, missing);
+        m_capability_skipped++;
+        return true;
+      }
+    }
+    return false;
+  }
+  [[nodiscard]] u32 CapabilitySkippedCount() const { return m_capability_skipped; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
@@ -25294,6 +25320,11 @@ private:
   bool m_null_descriptor_enabled = false;
   bool m_image_int64_atomics_enabled = false;
   bool m_image_view_min_lod_enabled = false;
+  // Relaxed Full mode: what the device really has, for SkipForMissingCapability.
+  bool m_relaxed = false;
+  bool m_has_float64 = false, m_has_int64_atomics = false, m_has_workgroup_layout = false;
+  bool m_has_device_clock = false, m_has_barycentric = false, m_has_derivative_quads = false;
+  u32 m_capability_skipped = 0;
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
   // Full rasterization mode with VK_EXT_mesh_shader mesh and task shaders.
   bool m_mesh_task_enabled = false;
@@ -25664,6 +25695,13 @@ private:
       m_maintenance8_enabled = want_maintenance8;
       m_image_view_min_lod_enabled = want_maintenance8 && want_min_lod;
     }
+    m_relaxed = relaxed;
+    m_has_float64 = available_features.shaderFloat64;
+    m_has_int64_atomics = want_buffer_int64_atomics && want_shared_int64_atomics;
+    m_has_workgroup_layout = want_workgroup_layout;
+    m_has_device_clock = want_device_clock;
+    m_has_barycentric = want_barycentric;
+    m_has_derivative_quads = want_derivative_quads;
     if (relaxed) {
       std::printf("[host]    RelaxedFull               absent and switched off:%s%s%s%s%s%s%s%s%s%s%s\n",
                   want_barycentric ? "" : " fragmentShaderBarycentric",
@@ -26253,6 +26291,9 @@ void CompareGraphicsWords(const GraphicsCase &test, const char *stage,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+  if (vulkan != nullptr && !test.compile_only && vulkan->SkipForMissingCapability(test.name, compiled.spirv)) {
+    return;
+  }
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -60479,6 +60520,10 @@ int main(int argc, char **argv) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
         "device does not support the production rasterization features\n");
+  }
+  if (vulkan.CapabilitySkippedCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u compute cases skipped, the device lacks a SPIR-V capability they need\n",
+                vulkan.CapabilitySkippedCount());
   }
   if (vulkan.SkippedCaseCount() > 0) {
     std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
