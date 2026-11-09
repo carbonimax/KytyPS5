@@ -30986,6 +30986,100 @@ TestCase BufferNegativeDynamicOffsetReadsZero() {
   return test;
 }
 
+// The compiler's IEEE f32 division: v_div_scale_f32 x2 (denominator, then numerator with VCC),
+// v_rcp_f32, Newton steps, v_div_fmas_f32 and v_div_fixup_f32, between s_denorm_mode 15 / 12.
+// Expected: the correctly rounded quotient. Special rows: x/0 and inf/y give inf, x/inf and 0/y
+// give 0, 0/0 and inf/inf give 0xffc00000, a NaN operand comes back quieted (numerator first).
+TestCase DivideF32Precise() {
+  using O = ShaderOpcode;
+  constexpr u32 vcc_lo = 106;
+  constexpr u32 one = 242; // Inline 1.0.
+  constexpr std::array<std::array<u32, 3>, 46> rows{{
+      // Normal operands and quotients.
+      {0x3f800000u, 0x40400000u, 0x3eaaaaabu},
+      {0x40000000u, 0x40400000u, 0x3f2aaaabu},
+      {0x41200000u, 0x40e00000u, 0x3fb6db6eu},
+      {0x40490fdbu, 0x402df854u, 0x3f93eee0u},
+      {0xc0b00000u, 0x40100000u, 0xc01c71c7u},
+      {0x501502f9u, 0x37fba882u, 0x5797951cu},
+      {0xc0e00000u, 0xbdcccccdu, 0x428c0000u},
+      {0x40c00000u, 0x40400000u, 0x40000000u},
+      {0x3f800000u, 0x3f800000u, 0x3f800000u},
+      {0xc1000000u, 0x40000000u, 0xc0800000u},
+      {0x47f12065u, 0x39a84be4u, 0x4db76450u},
+      {0x3f7fffffu, 0x3f800001u, 0x3f7ffffdu},
+      {0x4b7fffffu, 0x3f7fffffu, 0x4b800000u},
+      {0x00800000u, 0x3f000000u, 0x01000000u},
+      // Exponent differences of 96 or more, huge or tiny operands: div_scale scales.
+      {0x7f61b1e6u, 0x40e00000u, 0x7e00f7f1u},
+      {0x7e967699u, 0x3a83126fu, 0x7f800000u}, // Overflow.
+      {0x7f7fffffu, 0x3f000000u, 0x7f800000u}, // Overflow.
+      {0x7f167699u, 0x7f61b1e6u, 0x3f2aaaaau},
+      {0x3f800000u, 0x7f61b1e6u, 0x00244bfau}, // Denormal reciprocal.
+      {0x0a4fb11fu, 0x40e00000u, 0x08ed5cb6u},
+      {0x1e3ce508u, 0x69045951u, 0x00000001u},
+      {0x69045951u, 0x1e3ce508u, 0x7f800000u},
+      // Denormal numerator, denominator or quotient.
+      {0x006ce3eeu, 0x47c35000u, 0x00000047u},
+      {0x0df36390u, 0x509502f9u, 0x0000d112u},
+      {0x0da24260u, 0x4d8f0d18u, 0x00244bfau},
+      {0x00365c0bu, 0x40400000u, 0x00121eaeu},
+      {0x3f800000u, 0x00365c0bu, 0x7f16b348u},
+      {0x000116c2u, 0x000116c2u, 0x3f800000u},
+      {0x00000001u, 0x00000003u, 0x3eaaaaabu},
+      // IEEE and RDNA2: 0x80555555. Our div_fmas rounds before its 2^-64 scale (one ulp).
+      {0x807fffffu, 0x3fc00000u, 0x80555554u},
+      {0xc0400000u, 0x80000005u, 0x7f800000u},
+      // Zeros, infinities, NaNs.
+      {0x00000000u, 0x40a00000u, 0x00000000u},
+      {0x80000000u, 0x40a00000u, 0x80000000u},
+      {0x00000000u, 0xc0a00000u, 0x80000000u},
+      {0x40a00000u, 0x00000000u, 0x7f800000u},
+      {0xc0a00000u, 0x00000000u, 0xff800000u},
+      {0x00000000u, 0x80000000u, 0xffc00000u},
+      {0x7f800000u, 0x40a00000u, 0x7f800000u},
+      {0x40a00000u, 0x7f800000u, 0x00000000u},
+      {0xc0a00000u, 0x7f800000u, 0x80000000u},
+      {0x7f800000u, 0xff800000u, 0xffc00000u},
+      {0xff800000u, 0x00000000u, 0xff800000u},
+      {0x00000000u, 0x7f800000u, 0x00000000u},
+      {0x7fc00001u, 0x40400000u, 0x7fc00001u},
+      {0x40400000u, 0x7f800001u, 0x7fc00001u},
+      {0x7fc00002u, 0xffc00003u, 0x7fc00002u},
+  }};
+  TestCase test;
+  test.name = "DivideF32Precise";
+  for (const auto &row : rows) test.initial.insert(test.initial.end(), {row[0], row[1]});
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < rows.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 2 * sizeof(u32));
+    AppendBufferLoadDword(&code, 4, 30); // Numerator.
+    AppendVMovU32(&code, 30, (i * 2 + 1) * sizeof(u32));
+    AppendBufferLoadDword(&code, 5, 30); // Denominator.
+    code.push_back(0xbfa5000fu);         // s_denorm_mode 15
+    AppendVop3B(&code, 0x16d, 8, 20, Vgpr(5), Vgpr(5), Vgpr(4));
+    AppendVop3B(&code, 0x16d, 9, vcc_lo, Vgpr(4), Vgpr(5), Vgpr(4));
+    code.push_back(EncodeVop1(0x2a, 10, Vgpr(8)));                       // v_rcp_f32
+    AppendVop3(&code, 0x14b, 11, Vgpr(8), Vgpr(10), one, 0, 0, false, 0, 1); // 1 - d * r
+    code.push_back(EncodeVop2(0x2b, 10, Vgpr(11), 10));                 // v_fmac_f32
+    code.push_back(EncodeVop2(0x08, 11, Vgpr(9), 10));                  // v_mul_f32
+    AppendVop3(&code, 0x14b, 12, Vgpr(8), Vgpr(11), Vgpr(9), 0, 0, false, 0, 1);
+    code.push_back(EncodeVop2(0x2b, 11, Vgpr(12), 10));
+    AppendVop3(&code, 0x14b, 8, Vgpr(8), Vgpr(11), Vgpr(9), 0, 0, false, 0, 1);
+    code.push_back(0xbfa5000cu); // s_denorm_mode 12
+    AppendVop3(&code, 0x16f, 8, Vgpr(8), Vgpr(10), Vgpr(11));
+    AppendVop3(&code, 0x15f, 10, Vgpr(8), Vgpr(5), Vgpr(4));
+    AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(rows[i][2]);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32,      O::BUFFER_LOAD_DWORD, O::S_DENORM_MODE,  O::V_DIV_SCALE_F32,
+                  O::V_RCP_F32,      O::V_FMA_F32,         O::V_FMAC_F32,     O::V_MUL_F32,
+                  O::V_DIV_FMAS_F32, O::V_DIV_FIXUP_F32,   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   using O = ShaderOpcode;
   struct MadCase {
@@ -51731,6 +51825,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Mad32x16);
   AddCase(BufferNegativeDynamicOffsetReadsZero);
+  AddCase(DivideF32Precise);
   AddCase(Vop3F32ClampFlushesNaN);
   cases.push_back(Vop3Integer16Ternary(32));
   cases.push_back(Vop3Integer16Ternary(64));
@@ -58783,6 +58878,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     if (name == "mad32x16") RunCase(&vulkan, Vop3Mad32x16());
     else if (name == "negative-offset") RunCase(&vulkan, BufferNegativeDynamicOffsetReadsZero());
+    else if (name == "div-f32") RunCase(&vulkan, DivideF32Precise());
     else if (name == "ds-minmax") {
       RunCase(&vulkan, DsFloatMinMaxClasses(false));
       RunCase(&vulkan, DsFloatMinMaxClasses(true));

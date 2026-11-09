@@ -268,6 +268,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SETPRIO:
 		case O::S_TRAP: EmitControlNop(); return;
 		case O::S_WAITCNT_DEPCTR:
+		// Float modes are not modelled (s_setreg of MODE is a no-op too).
+		case O::S_DENORM_MODE:
 		case O::S_CLAUSE: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;

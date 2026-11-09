@@ -444,6 +444,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MED3_F16: return Float16Ternary(inst, IR::ValueOpcode::FPMedTri32, false, false);
 
 		case O::V_FREXP_MANT_F32: return V_FREXP_MANT_F32(inst);
+		case O::V_DIV_SCALE_F32: return V_DIV_SCALE_F32(inst);
+		case O::V_DIV_FMAS_F32: return V_DIV_FMAS_F32(inst);
+		case O::V_DIV_FIXUP_F32: return V_DIV_FIXUP_F32(inst);
 		case O::V_RCP_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecip32);
 		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_RCP_IFLAG_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecipIFlag32);

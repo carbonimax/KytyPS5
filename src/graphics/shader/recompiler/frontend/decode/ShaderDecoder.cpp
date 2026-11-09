@@ -497,6 +497,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
+		case Opcode::S_DENORM_MODE:
 		case Opcode::S_SLEEP:
 		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:

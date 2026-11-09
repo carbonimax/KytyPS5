@@ -126,6 +126,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x21u, Opcode::S_CLAUSE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
+    {0x25u, Opcode::S_DENORM_MODE},
 };
 
 constexpr auto SOP1_OPS = Detail::MakeOpcodeTable<0x100>(SOP1_OPCODE_LIST);
@@ -339,6 +340,7 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                           : static_cast<int32_t>(static_cast<int16_t>(simm));
 	inst.src_count = (inst.opcode == Opcode::S_NOP || inst.opcode == Opcode::S_WAITCNT ||
 	                  inst.opcode == Opcode::S_WAITCNT_DEPCTR || inst.opcode == Opcode::S_SLEEP ||
+	                  inst.opcode == Opcode::S_DENORM_MODE ||
 	                  inst.opcode == Opcode::S_SETPRIO ||
 	                  inst.opcode == Opcode::S_SENDMSG || inst.opcode == Opcode::S_TRAP ||
 	                  inst.opcode == Opcode::S_TTRACEDATA || inst.opcode == Opcode::S_INST_PREFETCH)

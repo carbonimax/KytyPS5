@@ -258,6 +258,9 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x146u, Opcode::V_CUBETC_F32},
     {0x147u, Opcode::V_CUBEMA_F32},
     {0x14bu, Opcode::V_FMA_F32},
+    {0x15fu, Opcode::V_DIV_FIXUP_F32},
+    {0x16du, Opcode::V_DIV_SCALE_F32},
+    {0x16fu, Opcode::V_DIV_FMAS_F32},
     {0x14cu, Opcode::V_FMA_F64},
     {0x164u, Opcode::V_ADD_F64},
     {0x165u, Opcode::V_MUL_F64},
@@ -1360,6 +1363,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAX_F64:
 		case Opcode::V_FMA_F64:
 		case Opcode::V_FMA_F32:
+		case Opcode::V_DIV_FMAS_F32:
+		case Opcode::V_DIV_FIXUP_F32:
 		case Opcode::V_PACK_B32_F16:
 		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CUBESC_F32:
@@ -1710,7 +1715,8 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                             (inst.opcode == Opcode::V_SUBREV_CO_CI_U32 && opcode == 0x12au);
 	const bool vop3b_carry_out = IsVop3BCarryOutOpcode(inst.opcode);
 	const bool vop3b_mad_u64   = IsVop3BMadU64Opcode(inst.opcode);
-	const bool vop3b_uses_sdst = carry_in_out || vop3b_carry_out || vop3b_mad_u64;
+	const bool div_scale       = inst.opcode == Opcode::V_DIV_SCALE_F32;
+	const bool vop3b_uses_sdst = carry_in_out || vop3b_carry_out || vop3b_mad_u64 || div_scale;
 	const bool mad_mix         = false;
 	const bool f16_ternary     = IsNativeVop3F16TernaryOpcode(inst.opcode);
 	const bool b16_ternary     = IsNativeVop3B16TernaryOpcode(inst.opcode);
@@ -1724,9 +1730,11 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const bool native_source_modifiers = SupportsNativeVop3SourceModifiers(inst.opcode);
 	const bool native_result_modifiers = SupportsNativeVop3ResultModifiers(inst.opcode);
 	const bool native_clamp_modifier   = SupportsNativeVop3Clamp(inst.opcode);
-	const bool modifiers =
-	    HasUnsupportedNativeVop3Modifiers(inst.opcode, permlane, mad_mix, vop3b_uses_sdst,
-	                                      scalar_modifier_limits, abs, op_sel, clamp, omod, neg);
+	// VOP3B div_scale keeps its neg source modifiers (bits 8-14 are SDST, there is no abs).
+	const bool modifiers = div_scale ? clamp != 0u || omod != 0u
+	                                 : HasUnsupportedNativeVop3Modifiers(
+	                                       inst.opcode, permlane, mad_mix, vop3b_uses_sdst,
+	                                       scalar_modifier_limits, abs, op_sel, clamp, omod, neg);
 	if (modifiers) {
 		const char* reason = "VOP3 source modifiers are not implemented";
 		if (permlane && (op_sel & ~0x3u) != 0) {
@@ -1802,11 +1810,14 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		ReadLiteralOperands(code, word_index, inst);
 		return;
 	}
-	if (vop3b_mad_u64) {
+	if (vop3b_mad_u64 || div_scale) {
 		DecodeScalarDestination(sdst, pc, inst.dst2);
 		DecodeScalarSource(src1, pc, inst.src1);
 		DecodeScalarSource(src2, pc, inst.src2);
 		inst.src_count = 3;
+		if (div_scale) {
+			ApplyNativeVop3SourceModifiers(inst, 0u, neg);
+		}
 		ReadLiteralOperands(code, word_index, inst);
 		return;
 	}
