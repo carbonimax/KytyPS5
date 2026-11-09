@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_ASYNCPIPELINEPOLICY_H_
 
 #include <cstdint>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -18,6 +19,17 @@ inline constexpr uint64_t ASYNC_PIPELINE_NOT_SKIPPED = UINT64_MAX;
 		first_skip = frame;
 	}
 	return frame - first_skip < ASYNC_PIPELINE_SKIP_FRAMES;
+}
+
+// The next job for a pipeline worker: the skipped keys first, in first-skip order (the nearest cap
+// first), then the predicted ones. LIFO among skipped keys left the oldest queued until their cap,
+// and the draw then created it inline. One of the queues is not empty.
+template <class Queue>
+[[nodiscard]] typename Queue::value_type AsyncPipelinePop(Queue& skipped, Queue& predicted) {
+	auto& from = skipped.empty() ? predicted : skipped;
+	auto  job  = std::move(from.front());
+	from.pop_front();
+	return job;
 }
 
 } // namespace Libs::Graphics

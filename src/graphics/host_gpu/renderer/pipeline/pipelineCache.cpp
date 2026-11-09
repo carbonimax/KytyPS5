@@ -1002,6 +1002,9 @@ struct PipelineCache::PendingPipeline {
 	std::atomic<uint32_t>              state {0};
 	// KYTY_ASYNC_PIPELINE: guest frame of the first skipped draw (the thread that owns m_pending).
 	uint64_t                           first_skip = ASYNC_PIPELINE_NOT_SKIPPED;
+	// KYTY_COMPILE_LOG: handed out by a skip miss (set before it is queued), last skip log frame (CP).
+	bool                               skip_miss = false;
+	uint64_t                           log_frame = ASYNC_PIPELINE_NOT_SKIPPED;
 };
 
 struct PipelineCache::ParallelPool {
@@ -1009,6 +1012,9 @@ struct PipelineCache::ParallelPool {
 	std::condition_variable                      work;
 	std::condition_variable                      done;
 	std::deque<std::shared_ptr<PendingPipeline>> queue;
+	// KYTY_ASYNC_PIPELINE: keys whose draws are skipped, in first-skip order (AsyncPipelinePop). A
+	// job may sit in both queues; the second pop finds it taken.
+	std::deque<std::shared_ptr<PendingPipeline>> skipped;
 	uint32_t                                     running = 0;
 	bool                                         stop    = false;
 	std::vector<std::thread>                     threads;
@@ -1050,10 +1056,11 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 				auto&             pool = *m_pool;
 				std::unique_lock lock(pool.mutex);
 				for (;;) {
-					pool.work.wait(lock, [&pool] { return pool.stop || !pool.queue.empty(); });
+					pool.work.wait(lock, [&pool] {
+						return pool.stop || !pool.skipped.empty() || !pool.queue.empty();
+					});
 					if (pool.stop) return;
-					auto job = std::move(pool.queue.front());
-					pool.queue.pop_front();
+					auto job = AsyncPipelinePop(pool.skipped, pool.queue);
 					uint32_t queued = 0;
 					if (!job->state.compare_exchange_strong(queued, 1)) continue; // taken inline
 					pool.running++;
@@ -1556,6 +1563,7 @@ void PipelineCache::Save() {
 		// queued jobs stay pending (a lookup creates them inline) and running ones finish first.
 		std::unique_lock lock(m_pool->mutex);
 		m_pool->queue.clear();
+		m_pool->skipped.clear();
 		m_pool->done.wait(lock, [this] { return m_pool->running == 0; });
 		size_t unused = 0;
 		for (const auto& [key, job]: m_pending) {
@@ -2306,6 +2314,14 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 		if (job->state.load(std::memory_order_acquire) == 2) {
 			return false;
 		}
+		if (job->first_skip == ASYNC_PIPELINE_NOT_SKIPPED && !job->skip_miss) {
+			// A predicted key now skipped: its turn comes in first-skip order, not after the predictions.
+			std::scoped_lock lock(m_pool->mutex);
+			if (job->state.load(std::memory_order_relaxed) == 0) {
+				m_pool->skipped.push_back(pending->second);
+				m_pool->work.notify_one();
+			}
+		}
 	} else {
 		job = StartPending(key, state, true);
 		if (job == nullptr) {
@@ -2315,8 +2331,14 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 			m_prefetch_hook(m_prefetch_context);
 		}
 	}
-	// Past the cap the draw waits; a job still queued is then created inline (TakePending).
-	if (!AsyncPipelineMaySkip(job->first_skip, Frame())) {
+	// Past the cap the draw waits; a job still queued is then created inline (TakePending). One a
+	// worker is creating stays skipped: waiting would block the CP for the rest of its creation,
+	// and the hole lasts at most one creation longer.
+	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame());
+	if (PerfStats::CompileLogEnabled()) [[unlikely]] {
+		LogSkip(*job, may_skip);
+	}
+	if (!may_skip && job->state.load(std::memory_order_acquire) == 0) {
 		PerfStats::Add(PerfStats::Counter::AsyncBlockCap, 1);
 		return false;
 	}
@@ -2337,11 +2359,12 @@ PipelineCache::PendingPipeline* PipelineCache::StartPending(const GraphicsPipeli
 	job->pixel = state.ps_active ? state.ps_input_info.stage.module : nullptr;
 	if (state.ps_active && job->pixel == nullptr) return nullptr;
 	auto* started = job.get();
+	job->skip_miss = first;
 	m_pending.emplace(key, job);
 	{
 		std::scoped_lock lock(m_pool->mutex);
 		if (first) {
-			m_pool->queue.push_front(std::move(job));
+			m_pool->skipped.push_back(std::move(job));
 		} else {
 			m_pool->queue.push_back(std::move(job));
 			m_pool->prefetched++;
@@ -2349,6 +2372,34 @@ PipelineCache::PendingPipeline* PipelineCache::StartPending(const GraphicsPipeli
 	}
 	m_pool->work.notify_one();
 	return started;
+}
+
+void PipelineCache::LogSkip(PendingPipeline& job, bool may_skip) {
+	const auto frame = Frame();
+	const auto age   = frame - job.first_skip;
+	const bool first = job.log_frame == ASYNC_PIPELINE_NOT_SKIPPED;
+	if (!first && (frame == job.log_frame || (may_skip && age % 5 != 0))) return;
+	job.log_frame = frame;
+	int64_t pos   = -1;
+	size_t  len   = 0;
+	{
+		std::scoped_lock lock(m_pool->mutex);
+		// Position in the workers' order: the skipped queue, then the predicted one.
+		const auto& skipped = m_pool->skipped;
+		const auto& queue   = m_pool->queue;
+		len                 = skipped.size() + queue.size();
+		for (size_t i = 0; i < len && pos < 0; i++) {
+			if ((i < skipped.size() ? skipped[i] : queue[i - skipped.size()]).get() == &job) {
+				pos = static_cast<int64_t>(i);
+			}
+		}
+	}
+	// A (first skip) / Q (every 5 guest frames) / X (past the cap, once a frame): time key_hash
+	//   age_frames queue_pos(-1: not queued) queue_len state skip_miss
+	PerfStats::CompileLogLine("%c %" PRIu64 " %zx %" PRIu64 " %" PRId64 " %zu %u %d",
+	                          !may_skip ? 'X' : first ? 'A' : 'Q', PerfStats::SteadyUs(),
+	                          GraphicsPipelineKeyHash {}(job.key), age, pos, len,
+	                          job.state.load(std::memory_order_acquire), job.skip_miss ? 1 : 0);
 }
 
 void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
@@ -2363,11 +2414,13 @@ void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
 	job.feedback = LastPipelineCacheFeedback();
 	EXIT_NOT_IMPLEMENTED(job.pipeline.pipeline == nullptr || job.pipeline.pipeline_layout == nullptr);
 	if (PerfStats::CompileLogEnabled()) {
-		// J time driver_hit us vs_id ps_id worker(1/0): a pipeline handed out ahead of its draw.
-		PerfStats::CompileLogLine("J %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %d", begin,
+		// J time driver_hit us vs_id ps_id worker(1/0) skip_miss(1/0) key_hash: a pipeline handed out
+		// ahead of its draw.
+		PerfStats::CompileLogLine("J %" PRIu64 " %d %" PRIu64 " %" PRIu64 " %" PRIu64 " %d %d %zx", begin,
 		                          job.feedback.valid ? (job.feedback.hit ? 1 : 0) : -1,
 		                          PerfStats::SteadyUs() - begin, job.key.vertex_shader_ids[0],
-		                          job.key.ps_shader_id, worker ? 1 : 0);
+		                          job.key.ps_shader_id, worker ? 1 : 0, job.skip_miss ? 1 : 0,
+		                          GraphicsPipelineKeyHash {}(job.key));
 	}
 }
 

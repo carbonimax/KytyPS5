@@ -217,8 +217,10 @@ public:
 	// The created pipeline, or nullptr (missing: SkipMissing or GetGraphicsPipeline).
 	Pipeline* FindGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
-	// A missing pipeline: hands it to the workers (first in line) and returns true while the draw
-	// may still be skipped; false once it is created or its skip cap is reached (the draw waits).
+	// A missing pipeline: hands it to the workers (ahead of the predicted ones, in first-skip order;
+	// a predicted key moves there at its first skip) and returns true while the draw
+	// may still be skipped; false once it is created, or once its skip cap is reached while it is
+	// still queued (the draw waits and creates it).
 	[[nodiscard]] bool SkipMissing(const CommandBuffer& command, const DrawRenderState& state,
 	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
 	// Guest frames so far (the skip cap's clock).
@@ -319,9 +321,11 @@ private:
 	void WriteDriverCache();
 	// Worker or the thread that needs it: creates a pending pipeline.
 	void CreatePending(PendingPipeline& job, bool worker);
-	// Hands a missing key to the workers (`first`: ahead of the predicted ones); nullptr if a stage
+	// Hands a missing key to the workers (`first`: a skip miss, AsyncPipelinePop); nullptr if a stage
 	// has no module.
 	PendingPipeline* StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state, bool first);
+	// KYTY_COMPILE_LOG: a skipped key's age and queue position (A/Q/X lines).
+	void LogSkip(PendingPipeline& job, bool may_skip);
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.
 	void TakePending(PendingPipeline& job);
 	// Loads the shader store: its modules, then its pipelines, created on several threads.
