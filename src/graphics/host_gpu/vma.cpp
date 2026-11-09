@@ -17,9 +17,11 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -210,6 +212,24 @@ void GraphicContext::DestroyAllocator() {
 	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
+}
+
+void GraphicContext::ReportDeviceLost(vk::Result result, const char* site) const {
+	static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+	if (result != vk::Result::eErrorDeviceLost || reported.test_and_set()) {
+		return;
+	}
+	if (!device_fault_enabled) {
+		LOGF("Device lost at %s: no fault record (VK_EXT_device_fault off or not offered)\n", site);
+		return;
+	}
+	DeviceFault::Record record;
+	if (!DeviceFault::Query(VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT,
+	                        static_cast<VkDevice>(device), record)) {
+		LOGF("Device lost at %s: the driver recorded no readable fault\n", site);
+		return;
+	}
+	LOGF("Device lost at %s\n%s", site, DeviceFault::Format(record, DeviceFault::Registry()).c_str());
 }
 
 void GraphicContext::LogMemoryBudget() const {

@@ -62,6 +62,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	    gpu_thread ? PerfStats::Counter::WaitGpuThreadNs : PerfStats::Counter::WaitOtherNs,
 	    gpu_thread ? PerfStats::Counter::WaitGpuThreadCount : PerfStats::Counter::WaitOtherCount);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	m_graphics.ReportDeviceLost(result, "vkWaitSemaphores");
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
 }
