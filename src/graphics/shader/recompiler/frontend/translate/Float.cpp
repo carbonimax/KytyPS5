@@ -236,6 +236,157 @@ void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
 }
 
+// The IEEE f32 division helpers (v_div_scale/fmas/fixup_f32) work on the bits. The rules match
+// the RDNA2 results published by the rps5e emulator (GPL-2.0): 263 helper rows and 256 divisions.
+// Float modes are not modelled: f32 denormals are kept, and the 2^+-64 scales are done on the
+// bits because host drivers flush f32 denormals by default (AMD on Windows does).
+namespace {
+
+struct F32Bits {
+	IR::IREmitter& ir;
+
+	IR::U32 Constant(uint32_t value) const { return IR::U32(IR::Value(value)); }
+	IR::U32 Exponent(IR::U32 bits) const {
+		return ir.BitwiseAnd(ir.ShiftRightLogical(bits, Constant(23u)), Constant(0xffu));
+	}
+	IR::U32 Magnitude(IR::U32 bits) const { return ir.BitwiseAnd(bits, Constant(0x7fffffffu)); }
+	IR::U1  IsNan(IR::U32 bits) const {
+		return ir.UGreaterThan(Magnitude(bits), Constant(0x7f800000u));
+	}
+	IR::U1 IsInf(IR::U32 bits) const { return ir.IEqual(Magnitude(bits), Constant(0x7f800000u)); }
+	IR::U1 IsZero(IR::U32 bits) const { return ir.IEqual(Magnitude(bits), Constant(0u)); }
+	IR::U1 Signed(IR::ValueOpcode compare, IR::U32 lhs, int32_t rhs) const {
+		return IR::U1(ir.Emit(compare, {lhs, Constant(static_cast<uint32_t>(rhs))}));
+	}
+	// bits * 2^64 or * 2^-64, rounded to nearest even: overflow gives infinity, a denormal
+	// input or result keeps its bits. Zeros, infinities and NaNs are unchanged.
+	IR::U32 Scale(IR::U32 bits, bool up) const {
+		const auto sign     = ir.BitwiseAnd(bits, Constant(0x80000000u));
+		const auto exponent = Exponent(bits);
+		const auto mantissa = ir.BitwiseAnd(bits, Constant(0x007fffffu));
+		// A denormal input is normalized: shift its leading one to bit 23.
+		const auto normalize =
+		    ir.ISub(Constant(23u), IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {mantissa})));
+		const auto denormal = ir.IEqual(exponent, Constant(0u));
+		const auto full     = ir.Select(denormal, ir.ShiftLeftLogical(mantissa, normalize),
+		                                ir.BitwiseOr(mantissa, Constant(0x00800000u)));
+		const auto scaled = ir.IAdd(ir.Select(denormal, ir.ISub(Constant(1u), normalize), exponent),
+		                            Constant(up ? 64u : static_cast<uint32_t>(-64)));
+		const auto normal =
+		    ir.BitwiseOr(sign, ir.BitwiseOr(ir.ShiftLeftLogical(scaled, Constant(23u)),
+		                                    ir.BitwiseAnd(full, Constant(0x007fffffu))));
+		// Denormal result: shift right by 1 - exponent (25 already rounds every value to 0).
+		const auto shift =
+		    ir.ISub(Constant(1u), ir.Select(Signed(IR::ValueOpcode::SLessThan32, scaled, -24),
+		                                    Constant(static_cast<uint32_t>(-24)), scaled));
+		const auto kept = ir.ShiftRightLogical(full, shift);
+		const auto remainder =
+		    ir.BitwiseAnd(full, ir.ISub(ir.ShiftLeftLogical(Constant(1u), shift), Constant(1u)));
+		const auto half     = ir.ShiftLeftLogical(Constant(1u), ir.ISub(shift, Constant(1u)));
+		const auto round_up = ir.LogicalOr(
+		    ir.UGreaterThan(remainder, half),
+		    ir.LogicalAnd(ir.IEqual(remainder, half),
+		                  ir.INotEqual(ir.BitwiseAnd(kept, Constant(1u)), Constant(0u))));
+		// Rounding up to 2^23 gives the smallest normal number, as it should.
+		const auto tiny =
+		    ir.BitwiseOr(sign, ir.IAdd(kept, ir.Select(round_up, Constant(1u), Constant(0u))));
+		auto result =
+		    ir.Select(Signed(IR::ValueOpcode::SGreaterThanEqual32, scaled, 1), normal, tiny);
+		result = ir.Select(Signed(IR::ValueOpcode::SGreaterThanEqual32, scaled, 255),
+		                   ir.BitwiseOr(sign, Constant(0x7f800000u)), result);
+		return ir.Select(ir.LogicalOr(ir.IEqual(exponent, Constant(0xffu)), IsZero(bits)), bits,
+		                 result);
+	}
+};
+
+} // namespace
+
+void Translator::V_DIV_SCALE_F32(const Decoder::Instruction& inst) {
+	const F32Bits f {ir};
+	const auto    value       = ReadU32(inst.src0);
+	const auto    denominator = ReadU32(inst.src1);
+	const auto    numerator   = ReadU32(inst.src2);
+	const auto    difference  = ir.ISub(f.Exponent(numerator), f.Exponent(denominator));
+	const auto    near_max =
+	    IR::U1(ir.Emit(IR::ValueOpcode::SGreaterThanEqual32, {difference, f.Constant(96u)}));
+	const auto near_min = IR::U1(ir.Emit(IR::ValueOpcode::SLessThanEqual32,
+	                                     {difference, f.Constant(static_cast<uint32_t>(-96))}));
+	// Denominator exponent 0 (denormal), >= 253 (its reciprocal is denormal); numerator <= 24.
+	const auto denormal = ir.IEqual(f.Exponent(denominator), f.Constant(0u));
+	const auto huge     = ir.UGreaterThan(f.Exponent(denominator), f.Constant(252u));
+	const auto tiny     = ir.ULessThan(f.Exponent(numerator), f.Constant(25u));
+	const auto is_den   = ir.IEqual(value, denominator);
+	// Quotient near the maximum: scale the denominator up. Denominator denormal: scale up.
+	// Reciprocal denormal: scale down, unless only the numerator is in range. Quotient near
+	// the minimum: scale the numerator up. Numerator tiny: scale up.
+	const auto up = ir.LogicalOr(
+	    ir.LogicalAnd(near_max, is_den),
+	    ir.LogicalAnd(
+	        ir.LogicalNot(near_max),
+	        ir.LogicalOr(
+	            denormal,
+	            ir.LogicalAnd(ir.LogicalNot(huge),
+	                          ir.LogicalOr(ir.LogicalAnd(near_min, ir.LogicalNot(is_den)),
+	                                       ir.LogicalAnd(ir.LogicalNot(near_min), tiny))))));
+	const auto down =
+	    ir.LogicalAnd(ir.LogicalAnd(ir.LogicalNot(near_max), ir.LogicalNot(denormal)),
+	                  ir.LogicalAnd(huge, ir.LogicalOr(ir.LogicalNot(near_min), is_den)));
+	auto result =
+	    ir.Select(up, f.Scale(value, true), ir.Select(down, f.Scale(value, false), value));
+	result = ir.Select(f.IsNan(value), value, result);
+	result = ir.Select(ir.LogicalOr(f.IsZero(denominator), f.IsZero(numerator)),
+	                   f.Constant(0xffc00000u), result);
+	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
+	if (inst.dst2.kind != Decoder::OperandKind::Null &&
+	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
+		// VCC tells div_fmas to undo a scale the quotient itself carries.
+		WriteVectorMask(inst.dst2,
+		                ir.LogicalOr(near_max, ir.LogicalAnd(ir.LogicalNot(denormal), near_min)));
+	}
+}
+
+void Translator::V_DIV_FMAS_F32(const Decoder::Instruction& inst) {
+	const F32Bits f {ir};
+	const auto    addend = ReadU32(inst.src2);
+	const auto    fused  = ir.BitCastU32(IR::F32(ir.Emit(
+	    IR::ValueOpcode::FPFma32, {ir.BitCastF32(ReadU32(inst.src0)),
+	                               ir.BitCastF32(ReadU32(inst.src1)), ir.BitCastF32(addend)})));
+	// With VCC set: times 2^64 when |src2| >= 2, else 2^-64.
+	// shortcut: the scale rounds a second time (a denormal result can be 1 ulp off, and a sum
+	// that overflows before a 2^-64 scale stays infinite); the division macro reaches neither
+	// in normal ranges. Upgrade if a game divides into the denormal range.
+	const auto up     = ir.UGreaterThan(f.Exponent(addend), f.Constant(127u));
+	const auto scaled = ir.Select(up, f.Scale(fused, true), f.Scale(fused, false));
+	const auto vcc    = ReadMask(ConditionOperand(Decoder::OperandKind::VccLo));
+	WriteOperand(DestinationOperand(inst), ir.BitCastF32(ir.Select(vcc, scaled, fused)));
+}
+
+void Translator::V_DIV_FIXUP_F32(const Decoder::Instruction& inst) {
+	const F32Bits f {ir};
+	const auto    quotient    = ReadU32(inst.src0);
+	const auto    denominator = ReadU32(inst.src1);
+	const auto    numerator   = ReadU32(inst.src2);
+	const auto sign = ir.BitwiseAnd(ir.BitwiseXor(denominator, numerator), f.Constant(0x80000000u));
+	const auto infinity  = ir.BitwiseOr(sign, f.Constant(0x7f800000u));
+	const auto underflow = IR::U1(ir.Emit(IR::ValueOpcode::SLessThan32,
+	                                      {ir.ISub(f.Exponent(numerator), f.Exponent(denominator)),
+	                                       f.Constant(static_cast<uint32_t>(-150))}));
+	// Later checks take priority, from the quotient's magnitude up to a NaN numerator.
+	auto result = ir.BitwiseOr(sign, f.Magnitude(quotient));
+	result      = ir.Select(f.IsNan(quotient), infinity, result);
+	result      = ir.Select(underflow, sign, result);
+	result      = ir.Select(ir.LogicalOr(f.IsInf(denominator), f.IsZero(numerator)), sign, result);
+	result = ir.Select(ir.LogicalOr(f.IsZero(denominator), f.IsInf(numerator)), infinity, result);
+	result = ir.Select(ir.LogicalOr(ir.LogicalAnd(f.IsZero(denominator), f.IsZero(numerator)),
+	                                ir.LogicalAnd(f.IsInf(denominator), f.IsInf(numerator))),
+	                   f.Constant(0xffc00000u), result);
+	result =
+	    ir.Select(f.IsNan(denominator), ir.BitwiseOr(denominator, f.Constant(0x00400000u)), result);
+	result =
+	    ir.Select(f.IsNan(numerator), ir.BitwiseOr(numerator, f.Constant(0x00400000u)), result);
+	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
+}
+
 void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	auto a          = inst.src0;
 	a.op_sel        = false;
