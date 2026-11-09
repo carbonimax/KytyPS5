@@ -721,6 +721,11 @@ add_executable(image_page_table_tests EXCLUDE_FROM_ALL
 target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
+add_executable(refresh_prof_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RefreshProfTests.cpp"
+)
+target_include_directories(refresh_prof_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
 
 set(gpu_test_generated_dir "${PROJECT_BINARY_DIR}/gpu_test_shaders")
@@ -812,6 +817,7 @@ if(BUILD_TESTING)
 	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
+	add_test(NAME refresh_prof COMMAND $<TARGET_FILE:refresh_prof_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
@@ -994,6 +1000,7 @@ if(BUILD_TESTING)
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests
+		refresh_prof_tests
 		memory_tracker_tests
 		page_manager_tests
 		build_flags_tests
