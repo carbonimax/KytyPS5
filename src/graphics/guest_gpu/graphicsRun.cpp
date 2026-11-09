@@ -727,7 +727,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		GpuCapture::Touch(address, bytes);
 		if (m_renderer.GetBufferCache().WriteGpuOwned(
 		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
-			m_renderer.GetTextureCache().InvalidateMemory(address, bytes);
+			m_renderer.GetTextureCache().InvalidateMemory(address, bytes, RefreshProf::Label);
 			return;
 		}
 	}
@@ -1612,7 +1612,7 @@ void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size)
 	const auto address = reinterpret_cast<uint64_t>(dst);
 	if (GpuOwnedEopLabelEnabled() &&
 	    m_renderer.GetBufferCache().WriteGpuOwned(address, data, size)) {
-		m_renderer.GetTextureCache().InvalidateMemory(address, size);
+		m_renderer.GetTextureCache().InvalidateMemory(address, size, RefreshProf::Label);
 		return;
 	}
 	std::memcpy(dst, data, size);
@@ -1782,7 +1782,7 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 		// label to these bytes is pending: that one would land after this one.
 		if (GpuOwnedEopLabelEnabled() && !g_pending_labels.HasPending(address_value, label_size) &&
 		    m_renderer.GetBufferCache().WriteGpuOwned(address_value, &value, label_size)) {
-			m_renderer.GetTextureCache().InvalidateMemory(address_value, label_size);
+			m_renderer.GetTextureCache().InvalidateMemory(address_value, label_size, RefreshProf::Label);
 			seq = g_pending_labels.Add(address_value, label_size, value, false);
 			st.gpu_owned.fetch_add(1, std::memory_order_relaxed);
 		} else {
@@ -1834,7 +1834,7 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 						const auto* bytes = reinterpret_cast<const uint8_t*>(&label) + begin;
 						if (GpuOwnedEopLabelEnabled() &&
 						    renderer.GetBufferCache().WriteGpuOwned(target, bytes, size)) {
-							renderer.GetTextureCache().InvalidateMemory(target, size);
+							renderer.GetTextureCache().InvalidateMemory(target, size, RefreshProf::Label);
 						} else {
 							std::memcpy(reinterpret_cast<void*>(target), bytes, size);
 						}

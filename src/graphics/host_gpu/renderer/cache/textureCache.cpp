@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cinttypes>
 #include <cstring>
@@ -303,6 +304,9 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteDirty(image, RefreshProf::Edge, 0, 0);
+	}
 	image.MarkMaybeCpuDirty();
 	UntrackImage(id);
 }
@@ -587,12 +591,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	destination.refresh_note.hash_valid = false;
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
 	destination.RefreshComplete();
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(destination, RefreshProf::ImageCopy, destination.info.data.address,
+				                       destination.info.data.size);
+			}
 			destination.MarkBufferModified();
 		}
 		return;
@@ -629,6 +638,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	destination.refresh_note.hash_valid = false;
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
@@ -770,6 +780,9 @@ bool Publish(TextureCache& cache, Image& image) {
 	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteDirty(image, RefreshProf::BcAlias, image.info.data.address, image.info.data.size);
+	}
 	image.MarkBufferModified();
 	return true;
 }
@@ -787,6 +800,10 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 			return;
 		}
 		if (merged) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(*merged, RefreshProf::BcAlias, merged->info.data.address,
+				                       merged->info.data.size);
+			}
 			merged->MarkBufferModified();
 		}
 	}
@@ -1043,6 +1060,20 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		const bool prof       = RefreshProf::Enabled();
+		const bool gpu_source = image.IsBufferModified();
+		uint64_t   hash       = 0;
+		int        same       = -1;
+		auto       start      = std::chrono::steady_clock::time_point {};
+		if (prof) [[unlikely]] {
+			if (!gpu_source) {
+				hash = RefreshProf::HashGuest(image.info.data.address, image.info.data.size);
+				if (image.refresh_note.hash_valid && hash != 0) {
+					same = hash == image.refresh_note.hash ? 1 : 0;
+				}
+			}
+			start = std::chrono::steady_clock::now();
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1050,6 +1081,14 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		if (prof) [[unlikely]] {
+			const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                    std::chrono::steady_clock::now() - start)
+			                    .count();
+			RefreshProf::NoteUpload(image, gpu_source, static_cast<uint64_t>(ns), same, false);
+			image.refresh_note.hash       = hash;
+			image.refresh_note.hash_valid = hash != 0;
+		}
 	}
 	image.RefreshComplete();
 }
@@ -1481,6 +1520,10 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
+				if (RefreshProf::Enabled()) [[unlikely]] {
+					RefreshProf::NoteDirty(inserted, RefreshProf::NewGpu, inserted.info.data.address,
+					                       inserted.info.data.size);
+				}
 				inserted.MarkBufferModified();
 			}
 			for (const auto id: candidates) {
@@ -1573,7 +1616,14 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteView(desc.view_info.base_level, desc.view_info.level_count,
+		                      desc.view_info.base_layer, desc.view_info.layer_count);
+	}
 	RefreshImage(id);
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::ClearView();
+	}
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
@@ -2218,12 +2268,15 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	return tick;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, uint8_t reason) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;
+		}
+		if (RefreshProf::Enabled()) [[unlikely]] {
+			RefreshProf::NoteDirty(image, reason, address, size);
 		}
 		image.ClearGpuModified();
 		image.MarkBufferModified();
@@ -2295,13 +2348,16 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 	return true;
 }
 
-void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemory(uint64_t address, uint64_t size, uint8_t reason) {
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(owner, reason, address, size);
+			}
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;
