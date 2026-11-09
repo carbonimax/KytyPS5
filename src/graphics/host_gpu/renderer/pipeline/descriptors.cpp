@@ -437,15 +437,16 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
-                                  uint32_t view_levels, uint32_t& base_level) {
+static bool ResolveTextureMipViewIn(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                                    uint32_t view_levels, uint32_t& base_level,
+                                    bool rebase_past_max) {
 	if (!info.IsTiled()) {
 		return false;
 	}
 	ImageInfo physical = info;
 	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
 	// compresses mip 1 through a T# that declares one level).
-	if (base_level >= physical_levels) {
+	if (rebase_past_max && base_level >= physical_levels) {
 		const auto mip  = info.MipExtent(base_level);
 		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
 		physical_levels = view_levels;
@@ -497,6 +498,24 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 		}
 	}
 	return false;
+}
+
+// Fork: a view past MAX_MIP first keeps the pre-rebase resolution (a mip-tail view, e.g. base 6 of
+// a 6-level 1920x1080 chain, matches a stored mip of the declared chain); only a view that matches
+// nothing there is rebased onto its own chain.
+static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                                  uint32_t view_levels, uint32_t& base_level) {
+	if (base_level >= physical_levels) {
+		ImageInfo kept      = info;
+		uint32_t  kept_base = base_level;
+		if (ResolveTextureMipViewIn(kept, physical_levels, metadata, view_levels, kept_base,
+		                            false)) {
+			info       = std::move(kept);
+			base_level = kept_base;
+			return true;
+		}
+	}
+	return ResolveTextureMipViewIn(info, physical_levels, metadata, view_levels, base_level, true);
 }
 
 namespace {
