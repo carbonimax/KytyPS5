@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/stubStageShader.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -30,6 +31,15 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#undef min
+#undef max
+#endif
 
 namespace Libs::Graphics {
 
@@ -226,6 +236,154 @@ void MeasureOne(GraphicContext& graphics, MeasJob& job, uint32_t index, uint32_t
 	std::fflush(out);
 }
 
+#if defined(_WIN32)
+// Step 5.20 (KYTY_MEAS_CCAP=1): cold creation throughput. Each config creates `count` cold pipelines
+// (variant a: new VS + new PS, salted) with `workers` threads at normal or above-normal priority while
+// `spinners` threads spin on pause (guest job threads in a stall). Per creation: wall and thread CPU;
+// per config: process CPU over the config and over a 3 s idle baseline before it.
+long long ThreadCpuUs() {
+	FILETIME c, e, k, u;
+	GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u);
+	return static_cast<long long>(((static_cast<uint64_t>(k.dwHighDateTime) << 32u) | k.dwLowDateTime) +
+	                              ((static_cast<uint64_t>(u.dwHighDateTime) << 32u) | u.dwLowDateTime)) /
+	       10;
+}
+
+long long ProcessCpuUs() {
+	FILETIME c, e, k, u;
+	GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+	return static_cast<long long>(((static_cast<uint64_t>(k.dwHighDateTime) << 32u) | k.dwLowDateTime) +
+	                              ((static_cast<uint64_t>(u.dwHighDateTime) << 32u) | u.dwLowDateTime)) /
+	       10;
+}
+
+struct CapConfig {
+	uint32_t workers;
+	uint32_t spinners;
+	bool     above;
+};
+
+long long Percentile(std::vector<long long> v, double p) {
+	std::sort(v.begin(), v.end());
+	return v.empty() ? -1 : v[std::min(v.size() - 1, static_cast<size_t>(p * static_cast<double>(v.size())))];
+}
+
+void RunCapConfig(GraphicContext& graphics, std::vector<MeasJob>& jobs, const CapConfig& cfg, uint32_t count,
+                  uint32_t round, FILE* out) {
+	auto p0 = ProcessCpuUs();
+	auto t0 = std::chrono::steady_clock::now();
+	std::this_thread::sleep_for(std::chrono::seconds(3));
+	const double base_cores = static_cast<double>(ProcessCpuUs() - p0) / static_cast<double>(Since(t0));
+
+	std::atomic<bool>        stop {false};
+	std::vector<std::thread> spinners;
+	for (uint32_t i = 0; i < cfg.spinners; i++) {
+		spinners.emplace_back([&stop] {
+			while (!stop.load(std::memory_order_relaxed)) {
+				YieldProcessor();
+			}
+		});
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+	std::vector<long long>   wall(count), cpu(count);
+	std::vector<uint32_t>    owner(count);
+	std::atomic<uint32_t>    next {0};
+	std::vector<std::thread> workers;
+	p0 = ProcessCpuUs();
+	t0 = std::chrono::steady_clock::now();
+	for (uint32_t w = 0; w < cfg.workers; w++) {
+		workers.emplace_back([&, w] {
+			t_meas_thread = true;
+			SetPipelineCreationQuiet(true);
+			if (cfg.above) {
+				SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+			}
+			for (uint32_t k = next.fetch_add(1); k < count; k = next.fetch_add(1)) {
+				auto& job = jobs[static_cast<size_t>(k) * jobs.size() / count];
+				ShaderModule vertex = job.vertex;
+				ShaderModule pixel  = job.pixel;
+				// Module creation stays outside the timed region, as in 5.19.
+				vertex.handle.module = Unique(graphics, job.vertex_spirv);
+				pixel.handle.module  = Unique(graphics, job.pixel_spirv);
+				const ShaderModule*     stages[1] = {&vertex};
+				PipelineCache::Pipeline pipeline {};
+				const auto              c0    = ThreadCpuUs();
+				const auto              begin = std::chrono::steady_clock::now();
+				CreatePipelineInternal(graphics, pipeline, job.rendering, job.vertex_input, job.static_params, stages,
+				                       &pixel, nullptr);
+				wall[k]  = Since(begin);
+				cpu[k]   = ThreadCpuUs() - c0;
+				owner[k] = w;
+				graphics.device.destroyPipeline(pipeline.pipeline);
+				graphics.device.destroyPipelineLayout(pipeline.pipeline_layout);
+				graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout);
+				graphics.device.destroyShaderModule(vertex.handle.module);
+				graphics.device.destroyShaderModule(pixel.handle.module);
+			}
+		});
+	}
+	for (auto& t: workers) {
+		t.join();
+	}
+	const auto   span_us = Since(t0);
+	const double cores   = static_cast<double>(ProcessCpuUs() - p0) / static_cast<double>(span_us);
+	stop = true;
+	for (auto& t: spinners) {
+		t.join();
+	}
+	char name[32];
+	std::snprintf(name, sizeof(name), "w%us%u%s", cfg.workers, cfg.spinners, cfg.above ? "a" : "n");
+	long long              sum_wall = 0, sum_cpu = 0;
+	std::vector<long long> ratio_permille(count);
+	for (uint32_t k = 0; k < count; k++) {
+		std::fprintf(out, "CCAPJ cfg=%s round=%u k=%u w=%u wall=%lld cpu=%lld\n", name, round, k, owner[k], wall[k],
+		             cpu[k]);
+		sum_wall += wall[k];
+		sum_cpu += cpu[k];
+		ratio_permille[k] = wall[k] > 0 ? cpu[k] * 1000 / wall[k] : 0;
+	}
+	std::fprintf(out,
+	             "CCAP cfg=%s round=%u workers=%u spinners=%u above=%d count=%u span_ms=%lld per_s=%.2f wall_med=%lld"
+	             " wall_p10=%lld wall_p90=%lld wall_mean=%lld cpu_med=%lld cpu_mean=%lld cpu_wall=%.3f"
+	             " ratio_med=%.3f proc_cores=%.2f base_cores=%.2f\n",
+	             name, round, cfg.workers, cfg.spinners, cfg.above ? 1 : 0, count, span_us / 1000,
+	             static_cast<double>(count) * 1e6 / static_cast<double>(span_us), Percentile(wall, 0.5) / 1000,
+	             Percentile(wall, 0.1) / 1000, Percentile(wall, 0.9) / 1000, sum_wall / count / 1000,
+	             Percentile(cpu, 0.5) / 1000, sum_cpu / count / 1000,
+	             static_cast<double>(sum_cpu) / static_cast<double>(std::max(1LL, sum_wall)),
+	             static_cast<double>(Percentile(ratio_permille, 0.5)) / 1000.0, cores, base_cores);
+	std::fflush(out);
+}
+
+void RunCap(GraphicContext& graphics, std::vector<MeasJob>& jobs, FILE* out) {
+	// KYTY_MEAS_CCAP_LIST: workers:spinners:n|a,... (default below), run in order then reversed.
+	std::vector<CapConfig> list;
+	const char*            text = std::getenv("KYTY_MEAS_CCAP_LIST");
+	std::string            spec = text != nullptr && *text != '\0'
+	                                  ? text
+	                                  : "1:0:n,2:0:n,4:0:n,8:0:n,12:0:n,1:6:n,8:6:n,8:6:a,8:3:n,12:6:n,12:6:a";
+	for (size_t at = 0; at < spec.size();) {
+		size_t   end = spec.find(',', at);
+		unsigned w = 0, s = 0;
+		char     p = 'n';
+		if (std::sscanf(spec.substr(at, end - at).c_str(), "%u:%u:%c", &w, &s, &p) == 3 && w > 0) {
+			list.push_back({w, s, p == 'a'});
+		}
+		at = end == std::string::npos ? spec.size() : end + 1;
+	}
+	const char*    count_text = std::getenv("KYTY_MEAS_CCAP_COUNT");
+	const uint32_t count      = count_text != nullptr ? static_cast<uint32_t>(std::atoi(count_text)) : 96u;
+	std::fprintf(out, "# ccap keys=%zu count=%u configs=%zu\n", jobs.size(), count, list.size());
+	std::fflush(out);
+	for (uint32_t round = 0; round < 2; round++) {
+		for (size_t i = 0; i < list.size(); i++) {
+			RunCapConfig(graphics, jobs, list[round == 0 ? i : list.size() - 1 - i], count, round, out);
+		}
+	}
+}
+#endif
+
 void Run(GraphicContext* graphics) {
 	t_meas_thread = true;
 	SetPipelineCreationQuiet(true);
@@ -237,6 +395,19 @@ void Run(GraphicContext* graphics) {
 		std::lock_guard lock(g_mutex);
 		jobs.swap(g_jobs);
 	}
+#if defined(_WIN32)
+	if (const char* cap = std::getenv("KYTY_MEAS_CCAP"); cap != nullptr && *cap == '1' && !jobs.empty()) {
+		FILE* out = std::fopen((Dir() / "meas.txt").string().c_str(), "w");
+		EXIT_IF(out == nullptr);
+		RunCap(*graphics, jobs, out);
+		std::fprintf(out, "END\n");
+		std::fclose(out);
+		if (FILE* done = std::fopen((Dir() / "done").string().c_str(), "w")) {
+			std::fclose(done);
+		}
+		return;
+	}
+#endif
 	const char*    max_text = std::getenv("KYTY_MEAS_STAGE_WARM_MAX");
 	const uint32_t max      = max_text != nullptr ? static_cast<uint32_t>(std::atoi(max_text)) : 200u;
 	const auto     total    = static_cast<uint32_t>(std::min<size_t>(jobs.size(), max));
