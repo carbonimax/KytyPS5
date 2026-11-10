@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/videoTrace.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -23,6 +24,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cinttypes>
 #include <cstring>
@@ -1091,11 +1093,14 @@ void TextureCache::InitializeImage(ImageId id) {
 			}
 			start = std::chrono::steady_clock::now();
 		}
+		const auto trace = Common::VideoTrace::BeginRead(image.info.data.address, image.info.data.size);
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
+		Common::VideoTrace::EndRead(trace, 'T', image.info.data.address, image.info.data.size,
+		                            gpu_source ? "gpu_source" : "guest");
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
 		if (prof) [[unlikely]] {
@@ -1339,6 +1344,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 
 void TextureCache::RefreshImage(ImageId id, const ImageViewInfo* view) {
 	auto& image = m_slot_images[id];
+	if (Common::VideoTrace::Enabled()) [[unlikely]] {
+		if (const auto mark = Common::VideoTrace::BeginRead(image.info.data.address, image.info.data.size);
+		    mark.slot >= 0) {
+			char extra[96];
+			std::snprintf(extra, sizeof(extra), "cpu=%d maybe=%d buf=%d gpu=%d tracked=%d view=%d",
+			              image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+			              image.IsBufferModified() ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			              image.IsTracked() ? 1 : 0, view != nullptr ? 1 : 0);
+			Common::VideoTrace::EndRead(mark, 'S', image.info.data.address, image.info.data.size, extra);
+		}
+	}
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {

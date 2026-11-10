@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -215,9 +216,22 @@ void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept {
 	g_bounds_counters.store(counters, std::memory_order_relaxed);
 }
 
+// KYTY_PACE_LOG=1 (with KYTY_PERF_STATS=1): a "PERF pace" line with the audio underruns, audio queue
+// flushes, late vblanks and dropped presents of the interval. It keeps the overlay counters counting.
+static bool PaceLogEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PACE_LOG");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 void MaybeReport() noexcept {
 	if (!Enabled()) {
 		return;
+	}
+	if (PaceLogEnabled()) [[unlikely]] {
+		Common::DebugCounters::SetEnabled(true);
 	}
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
@@ -253,6 +267,17 @@ void MaybeReport() noexcept {
 	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
 	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
 	            n(Counter::StagingWriteCount));
+	if (PaceLogEnabled()) {
+		using Common::DebugCounters::Counter;
+		static std::array<uint64_t, 4> last {};
+		const std::array<uint64_t, 4>  now_v {
+            Common::DebugCounters::Get(Counter::AudioUnderruns), Common::DebugCounters::Get(Counter::AudioQueueFlushes),
+            Common::DebugCounters::Get(Counter::LateVblanks), Common::DebugCounters::Get(Counter::DroppedPresents)};
+		std::printf("PERF pace %.1fs: audio_underruns=%" PRIu64 " audio_flushes=%" PRIu64 " late_vblanks=%" PRIu64
+		            " dropped_presents=%" PRIu64 "\n",
+		            seconds, now_v[0] - last[0], now_v[1] - last[1], now_v[2] - last[2], now_v[3] - last[3]);
+		last = now_v;
+	}
 	if (BindProfEnabled()) {
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64

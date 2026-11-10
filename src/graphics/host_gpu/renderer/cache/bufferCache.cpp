@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/videoTrace.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -1232,6 +1233,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	const auto                  trace = Common::VideoTrace::BeginRead(vaddr, size);
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
@@ -1239,6 +1241,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, !is_written); });
+	if (source && trace.slot >= 0) [[unlikely]] {
+		char extra[48];
+		std::snprintf(extra, sizeof(extra), "bytes=0x%" PRIx64, total_size);
+		Common::VideoTrace::EndRead(trace, 'B', vaddr, size, extra);
+	}
 	if (source) {
 		NoteBufferWrite(vaddr, size, true);
 		auto& command = m_scheduler.Current();
