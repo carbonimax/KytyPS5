@@ -223,6 +223,10 @@ bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
 
+uint32_t GetFlushDraws() {
+	return g_config->flush_draws;
+}
+
 bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
