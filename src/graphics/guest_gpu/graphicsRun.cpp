@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/gpuCapture.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssrProf.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1563,6 +1564,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	Pssr::Prof::Note(request);
 	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
 	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
 }
