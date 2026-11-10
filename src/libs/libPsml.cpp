@@ -8,9 +8,11 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -186,6 +188,43 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 	}
 	request.flags = flags;
 	return request;
+}
+
+// KYTY_PSSR_PROF=1: the raw motion parameters of runs of 8 consecutive dispatches every 300, and of
+// the first 16 dispatches with a zero motion_offset ("PSSRPARAM" lines).
+template <typename Parameters>
+void SampleMotion(const void* context, const Parameters& params, const char* api) {
+	if (!Prof::Enabled()) {
+		return;
+	}
+	static std::atomic<uint64_t> dispatches {}, zero_logged {};
+	const uint64_t index = dispatches.fetch_add(1, std::memory_order_relaxed);
+	const bool     zero  = params.motion_offset[0] == 0.0f && params.motion_offset[1] == 0.0f;
+	if (index % 300 >= 8 && !(zero && zero_logged.fetch_add(1, std::memory_order_relaxed) < 16)) {
+		return;
+	}
+	Graphics::ShaderTextureResource color {}, motion {}, depth {}, output {};
+	CopyDescriptor(color.fields, params.color);
+	CopyDescriptor(motion.fields, params.motion);
+	CopyDescriptor(depth.fields, params.depth);
+	CopyDescriptor(output.fields, params.output);
+	uint32_t raw[6];
+	std::memcpy(raw, params.jitter, sizeof(raw)); // jitter, motion_scale, motion_offset: contiguous floats
+	std::printf("PSSRPARAM %s i=%llu ctx=%llx in=%ux%u render=%ux%u at=%u,%u out=%ux%u jitter=%g,%g "
+	            "mscale=%g,%g moff=%g,%g raw=%08x,%08x,%08x,%08x,%08x,%08x reset=%u flags=0x%x pre=%g "
+	            "motion=fmt%u,%ux%u,tile%u,type%u,dst%03x,base%llx depth=fmt%u,%ux%u exposure=%d\n",
+	            api, static_cast<unsigned long long>(index),
+	            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(context)), color.Width5() + 1u,
+	            color.Height5() + 1u, params.width, params.height, params.x, params.y, output.Width5() + 1u,
+	            output.Height5() + 1u, params.jitter[0], params.jitter[1], params.motion_scale[0],
+	            params.motion_scale[1], params.motion_offset[0], params.motion_offset[1], raw[0], raw[1], raw[2],
+	            raw[3], raw[4], raw[5], unsigned {params.reset}, params.flags, params.pre_exposure,
+	            static_cast<uint32_t>(motion.Format()), motion.Width5() + 1u, motion.Height5() + 1u,
+	            static_cast<uint32_t>(motion.TileMode()), static_cast<uint32_t>(motion.Type()),
+	            motion.DstSelXYZW(), static_cast<unsigned long long>(motion.Base40()),
+	            static_cast<uint32_t>(depth.Format()), depth.Width5() + 1u, depth.Height5() + 1u,
+	            params.exposure != nullptr ? 1 : 0);
+	std::fflush(stdout);
 }
 
 void WritePacket(const CommandSpace& space, const Pssr::Request& request) {
@@ -427,6 +466,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 		flags |= Pssr::kSpatialOnly;
 	}
 	Prof::Call(Entry::DispatchOk);
+	SampleMotion(context, *params, "psml");
 	WritePacket(*space, MakeRequest(context, *params, flags,
 	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
@@ -434,6 +474,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 
 int KYTY_SYSV_ABI LegacyDispatch(const void* context, const CommandSpace* space,
                                  const LegacyDispatchParameters* legacy) {
+	Prof::Call(Entry::LegacyDispatch);
 	if (legacy == nullptr) {
 		return Dispatch(context, space, nullptr);
 	}
@@ -745,6 +786,7 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 		flags |= Pssr::kSpatialOnly;
 	}
 	Prof::Call(Entry::Mfsr2DispatchOk);
+	SampleMotion(context, *params, "mfsr2");
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
 }
