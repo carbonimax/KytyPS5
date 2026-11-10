@@ -270,13 +270,16 @@ void MaybeReport() noexcept {
 	            n(Counter::StagingWriteCount));
 	if (PaceLogEnabled()) {
 		using Common::DebugCounters::Counter;
-		static std::array<uint64_t, 4> last {};
-		const std::array<uint64_t, 4>  now_v {
+		static std::array<uint64_t, 7> last {};
+		const std::array<uint64_t, 7>  now_v {
             Common::DebugCounters::Get(Counter::AudioUnderruns), Common::DebugCounters::Get(Counter::AudioQueueFlushes),
-            Common::DebugCounters::Get(Counter::LateVblanks), Common::DebugCounters::Get(Counter::DroppedPresents)};
+            Common::DebugCounters::Get(Counter::LateVblanks), Common::DebugCounters::Get(Counter::DroppedPresents),
+            Common::DebugCounters::Get(Counter::AudioPuts), Common::DebugCounters::Get(Counter::AudioPutsBlocking),
+            Common::DebugCounters::Get(Counter::AudioDrained)};
 		std::printf("PERF pace %.1fs: audio_underruns=%" PRIu64 " audio_flushes=%" PRIu64 " late_vblanks=%" PRIu64
-		            " dropped_presents=%" PRIu64 "\n",
-		            seconds, now_v[0] - last[0], now_v[1] - last[1], now_v[2] - last[2], now_v[3] - last[3]);
+		            " dropped_presents=%" PRIu64 " audio_puts=%" PRIu64 "(blocking %" PRIu64 ") audio_drained=%" PRIu64 "\n",
+		            seconds, now_v[0] - last[0], now_v[1] - last[1], now_v[2] - last[2], now_v[3] - last[3],
+		            now_v[4] - last[4], now_v[5] - last[5], now_v[6] - last[6]);
 		last = now_v;
 	}
 	if (BindProfEnabled()) {

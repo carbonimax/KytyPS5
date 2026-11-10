@@ -48,6 +48,9 @@ enum class Counter {
 	GuestFileWriteBytes,
 	AudioUnderruns,
 	AudioQueueFlushes, // Output queue stayed over target for 200 ms and was dropped.
+	AudioPuts,         // Blocks queued to an SDL output stream (blocking or not).
+	AudioPutsBlocking,
+	AudioDrained, // A block found the SDL output queue empty after earlier blocks (any mode).
 	// Overlapping host elapsed timings, including waits.
 	GpuThreadBusyNs,
 	PresentNs, // Includes image acquire and overlay preparation.
@@ -77,8 +80,12 @@ inline void SetCounting(bool counting) noexcept {
 	Detail::g_counting.store(counting, std::memory_order_relaxed);
 }
 
+[[nodiscard]] inline bool Counting() noexcept {
+	return Enabled() || Detail::g_counting.load(std::memory_order_relaxed);
+}
+
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (!Enabled() && !Detail::g_counting.load(std::memory_order_relaxed)) {
+	if (!Counting()) {
 		return;
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
