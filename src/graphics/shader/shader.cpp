@@ -123,6 +123,41 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	(*g_shader_map)[addr] = {mapped, hash};
 }
 
+void ShaderLogInterpolantMapping(int variant, const Shader* gs, const Shader* ps) {
+	if (!PerfStats::CompileLogEnabled()) {
+		return;
+	}
+	const auto gs_addr = gs != nullptr ? reinterpret_cast<uint64_t>(gs->code) : 0;
+	const auto ps_addr = ps != nullptr ? reinterpret_cast<uint64_t>(ps->code) : 0;
+	static std::mutex                                 mutex;
+	static std::unordered_map<uint64_t, uint64_t>     seen;
+	static uint64_t                                   calls = 0;
+	uint64_t gs_hash = 0;
+	uint64_t ps_hash = 0;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		if (const auto it = g_shader_map->find(gs_addr); it != g_shader_map->end()) gs_hash = it->second.hash;
+		if (const auto it = g_shader_map->find(ps_addr); it != g_shader_map->end()) ps_hash = it->second.hash;
+	}
+	std::scoped_lock lock(mutex);
+	calls++;
+	// One line per distinct (gs code, ps code, their hashes) seen; a code address reused by
+	// another binary gets a new line. Every 4096 calls, the call count.
+	const uint64_t pair_key[4] = {gs_addr, ps_addr, gs_hash, ps_hash};
+	const auto     key         = XXH3_64bits(pair_key, sizeof(pair_key));
+	if (seen.try_emplace(key, calls).second) {
+		// A time variant gs_hash ps_hash gs_addr ps_addr ps_inputs calls (hash 0: code not registered)
+		PerfStats::CompileLogLine("A %" PRIu64 " %d %016" PRIx64 " %016" PRIx64 " %" PRIx64 " %" PRIx64
+		                          " %u %" PRIu64,
+		                          PerfStats::SteadyUs(), variant, gs_hash, ps_hash, gs_addr, ps_addr,
+		                          ps != nullptr ? static_cast<uint32_t>(ps->num_input_semantics) : 0u,
+		                          calls);
+	} else if ((calls & 4095u) == 0) {
+		PerfStats::CompileLogLine("a %" PRIu64 " %" PRIu64 " %zu", PerfStats::SteadyUs(), calls,
+		                          seen.size());
+	}
+}
+
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 

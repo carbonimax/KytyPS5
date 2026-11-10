@@ -1306,6 +1306,7 @@ static void set_identity_interpolant_registers(ShaderRegister* regs, uint32_t fi
 int KYTY_SYSV_ABI AgcCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs,
                                               const Shader* ps) {
 	PRINT_NAME();
+	ShaderLogInterpolantMapping(1, gs, ps);
 
 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
 	     "\t gs   = 0x%016" PRIx64 "\n"
@@ -1362,6 +1363,7 @@ static uint32_t apply_interpolant_final_mask(uint32_t flags, uint32_t source,
 int KYTY_SYSV_ABI AgcCreateInterpolantMapping2(ShaderRegister* regs, const Shader* gs,
                                                const Shader* ps) {
 	PRINT_NAME();
+	ShaderLogInterpolantMapping(2, gs, ps);
 
 	AgcTrace("\t regs = 0x%016" PRIx64 "\n"
 	     "\t gs   = 0x%016" PRIx64 "\n"

@@ -376,6 +376,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// KYTY_COMPILE_LOG: an A line per distinct VS/PS pair the game links (AgcCreateInterpolantMapping).
+void ShaderLogInterpolantMapping(int variant, const Shader* gs, const Shader* ps);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
