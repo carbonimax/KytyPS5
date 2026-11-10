@@ -16,6 +16,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -1042,8 +1043,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
+		// KYTY_RFAULT_PROF: the written range's last writer (thread-local, no cost otherwise).
+		if (resource.written) BufferCache::SetWriteOrigin(program.shader_hash, static_cast<uint32_t>(program.stage));
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
+		if (resource.written) BufferCache::SetWriteOrigin(0, 0);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =

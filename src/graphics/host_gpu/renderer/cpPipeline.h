@@ -115,6 +115,16 @@ enum class Stat : uint32_t {
 void Note(Stat stat) noexcept;
 void Report(double seconds) noexcept;
 
+// KYTY_CP_REC_PROF=1 (measurement, default 0; reported with KYTY_PERF_STATS=1 as "PERF cprec"): front
+// time of each queued record outside its program lookup (acquire, state reset, register copy, snapshot
+// copy, publish) and the snapshot bytes copied.
+[[nodiscard]] bool RecProfEnabled() noexcept;
+struct RecordCost {
+	uint64_t acquire_ns = 0, reset_ns = 0, regs_ns = 0, snaps_ns = 0, publish_ns = 0, lookup_ns = 0;
+	uint64_t snap_bytes = 0, snap_vectors = 0, snap_grows = 0;
+};
+void NoteRecordCost(const RecordCost& cost) noexcept;
+
 } // namespace Libs::Graphics::CpPipeline
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CPPIPELINE_H_

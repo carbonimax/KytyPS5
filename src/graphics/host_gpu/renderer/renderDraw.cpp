@@ -42,6 +42,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1959,6 +1960,37 @@ static void CopySnapshots(CpPipeline::DrawRecord& record) {
 	}
 }
 
+// KYTY_CP_REC_PROF: summed vector capacity of the record's snapshots (a change means the copy
+// allocated); with `cost`, also the bytes and non-empty vectors of the snapshots the draw uses.
+static uint64_t SnapshotSizes(const CpPipeline::DrawRecord& record, CpPipeline::RecordCost* cost) {
+	uint64_t capacity = 0;
+	for (size_t i = 0; i < record.snapshots.size(); i++) {
+		const auto& s    = record.snapshots[i];
+		const bool  used = i < 3 ? record.state.vertex_info[i].stage.resources == &s
+		                         : record.state.ps_input_info.stage.resources == &s;
+		const auto  add  = [&](const auto& v) {
+            capacity += v.capacity();
+            if (cost != nullptr && used) {
+                cost->snap_bytes += v.size() * sizeof(v[0]);
+                cost->snap_vectors += v.empty() ? 0 : 1;
+            }
+		};
+		add(s.buffers);
+		add(s.images);
+		add(s.samplers);
+		add(s.flattened_srt);
+		add(s.user_data);
+		add(s.specialization_reads);
+	}
+	return capacity;
+}
+
+static uint64_t RecNowNs() noexcept {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 static bool DrawWritesMemory(const DrawRenderState& state) {
 	return std::ranges::any_of(state.VertexStages(),
 	                           [](const auto& vs) { return HasShaderBufferWrites(vs.stage); }) ||
@@ -2006,9 +2038,19 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	}();
 	(void)initialized;
 
-	auto& record          = CpPipeline::Acquire();
+	static const bool      rec_prof = CpPipeline::RecProfEnabled();
+	CpPipeline::RecordCost cost;
+	uint64_t               t0     = rec_prof ? RecNowNs() : 0;
+	auto&                  record = CpPipeline::Acquire();
+	uint64_t               t1     = rec_prof ? RecNowNs() : 0;
 	record.state          = {};
 	record.state.topology = topology;
+	if (rec_prof) {
+		const auto t2  = RecNowNs();
+		cost.acquire_ns = t1 - t0;
+		cost.reset_ns   = t2 - t1;
+		t1              = t2;
+	}
 	const bool guessed    = GuessSingleSample(buffer.GetShaders().GetPs().ps_regs.data_addr);
 	CpPipeline::SetInLookup(true);
 	{
@@ -2016,6 +2058,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		RefreshShaders(buffer, record.state, guessed);
 	}
 	CpPipeline::SetInLookup(false);
+	if (rec_prof) cost.lookup_ns = RecNowNs() - t1;
 	const bool heap = CpPipeline::TakeHeapInline();
 	// A draw without a compiled vertex program is skipped inline, like the unqueued path does.
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
@@ -2030,6 +2073,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		}
 		return true;
 	}
+	t0 = rec_prof ? RecNowNs() : 0;
 	record.indexed   = indexed;
 	if (indexed) {
 		record.index_args = *index_args;
@@ -2040,9 +2084,25 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	record.user_config           = buffer.GetUserConfig();
 	record.shaders               = buffer.GetShaders();
 	record.guessed_single_sample = guessed;
+	if (!rec_prof) {
+		CopySnapshots(record);
+		CpPipeline::Note(CpPipeline::Stat::Queued);
+		CpPipeline::Publish();
+		return true;
+	}
+	t1                    = RecNowNs();
+	const auto capacity   = SnapshotSizes(record, nullptr);
+	const auto t2         = RecNowNs();
 	CopySnapshots(record);
+	const auto t3         = RecNowNs();
+	cost.snap_grows       = SnapshotSizes(record, &cost) != capacity ? 1 : 0;
+	const auto t4         = RecNowNs();
 	CpPipeline::Note(CpPipeline::Stat::Queued);
 	CpPipeline::Publish();
+	cost.regs_ns    = t1 - t0;
+	cost.snaps_ns   = t3 - t2;
+	cost.publish_ns = RecNowNs() - t4;
+	CpPipeline::NoteRecordCost(cost);
 	return true;
 }
 

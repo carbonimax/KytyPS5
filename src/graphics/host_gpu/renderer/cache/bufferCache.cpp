@@ -17,7 +17,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +27,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -868,7 +871,180 @@ uint64_t ReadbackWindowBytes() {
 	return bytes;
 }
 
+// KYTY_RFAULT_PROF / KYTY_RFAULT_DELAY_US (see bufferCache.h).
+bool RfaultProfEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RFAULT_PROF");
+		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
+uint64_t RfaultDelayNs() {
+	static const uint64_t ns = [] {
+		const char* value = std::getenv("KYTY_RFAULT_DELAY_US");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000ull : 0ull;
+	}();
+	return ns;
+}
+
+uint64_t RfaultNowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+struct RfaultOrigin {
+	uint64_t hash  = 0;
+	uint32_t stage = 0;
+};
+thread_local RfaultOrigin t_rfault_origin;
+
+struct RfaultWindow {
+	uint64_t last_fault_frame = UINT64_MAX;
+	uint64_t last_write_ns    = 0;
+	uint64_t writer           = 0;
+	uint32_t stage            = 0;
+	// Since the last report.
+	uint64_t faults = 0, wall_ns = 0, complete = 0, recurrent = 0;
+};
+
+struct RfaultProf {
+	std::mutex                                 mutex;
+	std::unordered_map<uint64_t, RfaultWindow> windows; // by window base
+	// Since the last report.
+	uint64_t faults = 0, wall_ns = 0, delay_ns = 0, joined = 0, empty = 0, own_side = 0, noop = 0;
+	uint64_t complete = 0, complete_ns = 0;
+	uint64_t recur1 = 0, recur2 = 0, recur_older = 0, first = 0;
+	// Complete at the fault and faulted one or two frames before: a publication ahead could serve it.
+	uint64_t recoverable = 0, recoverable_ns = 0;
+	// Age of the window's last recorded GPU write: <1, <4, <16, <50, >=50 ms, none recorded.
+	std::array<uint64_t, 6> age {};
+	uint64_t                last_frames = 0;
+};
+
+RfaultProf& Rfault() {
+	static RfaultProf prof;
+	return prof;
+}
+
+// A shader, fill, copy or CP write recorded a GPU write over [vaddr, vaddr + size): windows that
+// already faulted keep its writer and time.
+void RfaultNoteWrite(uint64_t vaddr, uint64_t size, uint64_t hash, uint32_t stage) {
+	const auto window = ReadbackWindowBytes();
+	const auto now    = RfaultNowNs();
+	auto&      prof   = Rfault();
+	std::lock_guard lock(prof.mutex);
+	if (prof.windows.empty() || size == 0) return;
+	for (auto base = Common::AlignDown(vaddr, window); base < vaddr + size; base += window) {
+		if (auto it = prof.windows.find(base); it != prof.windows.end()) {
+			it->second.last_write_ns = now;
+			it->second.writer        = hash;
+			it->second.stage         = stage;
+		}
+	}
+}
+
+struct RfaultSample {
+	uint64_t base     = 0;
+	bool     window   = false; // the command found a window to publish
+	bool     complete = false; // every GPU write to it had completed
+	bool     joined   = false; // waited for a readback already queued
+};
+
+void RfaultNoteFault(const RfaultSample& sample, uint64_t wall_ns, uint64_t delay_ns, bool own_side,
+                     bool published) {
+	auto&      prof  = Rfault();
+	const auto frame = PerfStats::PresentedFrames();
+	const auto now   = RfaultNowNs();
+	std::lock_guard lock(prof.mutex);
+	prof.faults++;
+	prof.wall_ns += wall_ns;
+	prof.delay_ns += delay_ns;
+	prof.joined += sample.joined ? 1 : 0;
+	prof.own_side += own_side ? 1 : 0;
+	prof.noop += published ? 0 : 1;
+	if (!sample.window) {
+		prof.empty++;
+		return;
+	}
+	auto& w = prof.windows[sample.base];
+	if (sample.complete) {
+		prof.complete++;
+		prof.complete_ns += wall_ns;
+	}
+	bool recent = false;
+	if (w.last_fault_frame == UINT64_MAX) {
+		prof.first++;
+	} else if (frame - w.last_fault_frame == 0) {
+		// Same frame: counted with its first fault of the frame.
+	} else if (frame - w.last_fault_frame == 1) {
+		prof.recur1++;
+		recent = true;
+	} else if (frame - w.last_fault_frame == 2) {
+		prof.recur2++;
+		recent = true;
+	} else {
+		prof.recur_older++;
+	}
+	if (recent && sample.complete) {
+		prof.recoverable++;
+		prof.recoverable_ns += wall_ns;
+	}
+	const auto age_ms = w.last_write_ns == 0 ? -1.0 : static_cast<double>(now - w.last_write_ns) / 1e6;
+	prof.age[age_ms < 0 ? 5 : age_ms < 1 ? 0 : age_ms < 4 ? 1 : age_ms < 16 ? 2 : age_ms < 50 ? 3 : 4]++;
+	w.last_fault_frame = frame;
+	w.faults++;
+	w.wall_ns += wall_ns;
+	w.complete += sample.complete ? 1 : 0;
+	w.recurrent += recent ? 1 : 0;
+}
+
 } // namespace
+
+void BufferCache::SetWriteOrigin(uint64_t hash, uint32_t stage) noexcept {
+	t_rfault_origin = {hash, stage};
+}
+
+void BufferCache::ReportReadFaults(double seconds) noexcept {
+	if (!RfaultProfEnabled() && RfaultDelayNs() == 0) return;
+	auto&           prof = Rfault();
+	std::lock_guard lock(prof.mutex);
+	const auto      frames_now = PerfStats::PresentedFrames();
+	const auto      frames     = frames_now - std::exchange(prof.last_frames, frames_now);
+	const auto      ms         = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	std::printf("PERF rfault %.1fs: frames=%" PRIu64 " faults=%" PRIu64 " wall=%.1fms delay=%.1fms joined=%" PRIu64
+	            " empty=%" PRIu64 " own_side=%" PRIu64 " noop=%" PRIu64 " complete=%" PRIu64 "(%.1fms) first=%" PRIu64
+	            " recur1=%" PRIu64 " recur2=%" PRIu64 " recur_older=%" PRIu64 " recoverable=%" PRIu64
+	            "(%.1fms) age_lt1=%" PRIu64 " age_lt4=%" PRIu64 " age_lt16=%" PRIu64 " age_lt50=%" PRIu64
+	            " age_ge50=%" PRIu64 " age_none=%" PRIu64 " windows=%zu\n",
+	            seconds, frames, prof.faults, ms(prof.wall_ns), ms(prof.delay_ns), prof.joined, prof.empty,
+	            prof.own_side, prof.noop, prof.complete, ms(prof.complete_ns), prof.first, prof.recur1,
+	            prof.recur2, prof.recur_older, prof.recoverable, ms(prof.recoverable_ns), prof.age[0],
+	            prof.age[1], prof.age[2], prof.age[3], prof.age[4], prof.age[5], prof.windows.size());
+	// The 8 windows with the most faults since the last report.
+	std::vector<std::pair<uint64_t, const RfaultWindow*>> top;
+	for (const auto& [base, w]: prof.windows) {
+		if (w.faults != 0) top.emplace_back(base, &w);
+	}
+	const auto n = std::min<size_t>(top.size(), 8);
+	std::partial_sort(top.begin(), top.begin() + static_cast<ptrdiff_t>(n), top.end(),
+	                  [](const auto& a, const auto& b) { return a.second->faults > b.second->faults; });
+	for (size_t i = 0; i < n; i++) {
+		const auto& [base, w] = top[i];
+		std::printf("PERF rfaultwin base=0x%010" PRIx64 " faults=%" PRIu64 " wall=%.1fms complete=%" PRIu64
+		            " recurrent=%" PRIu64 " writer=0x%016" PRIx64 " stage=%u\n",
+		            base, w->faults, ms(w->wall_ns), w->complete, w->recurrent, w->writer, w->stage);
+	}
+	for (auto& [base, w]: prof.windows) {
+		(void)base;
+		w.faults = w.wall_ns = w.complete = w.recurrent = 0;
+	}
+	prof.faults = prof.wall_ns = prof.delay_ns = prof.joined = prof.empty = prof.own_side = prof.noop = 0;
+	prof.complete = prof.complete_ns = prof.recur1 = prof.recur2 = prof.recur_older = prof.first = 0;
+	prof.recoverable = prof.recoverable_ns = 0;
+	prof.age.fill(0);
+}
 
 void BufferCache::ReadFaultMemory(uint64_t vaddr) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -927,8 +1103,17 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		// publication, so other GPU work is not stalled behind the readback.
 		std::shared_ptr<ReadbackCompletion> wait_for;
 		bool                                own_side = false;
+		const bool                          prof     = !is_write && RfaultProfEnabled();
+		const uint64_t                      start    = prof ? RfaultNowNs() : 0;
+		uint64_t                            delayed  = 0;
+		if (!is_write && RfaultDelayNs() != 0) {
+			const auto spin_start = RfaultNowNs();
+			while ((delayed = RfaultNowNs() - spin_start) < RfaultDelayNs()) {
+			}
+		}
+		RfaultSample sample;
 		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, is_write, &wait_for,
-		                                                &own_side] {
+		                                                &own_side, prof, &sample] {
 			if (is_write && !IsRegionRegistered(vaddr, 1)) {
 				// Cache buffers cover whole tracker pages, so this page has nothing to download.
 				m_gpu_modified_ranges.Subtract(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
@@ -945,8 +1130,14 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 			if (begin >= last) {
 				return;
 			}
+			if (prof) {
+				sample.window   = true;
+				sample.base     = Common::AlignDown(vaddr, window);
+				sample.complete = WritesComplete(begin, last - begin);
+			}
 			// A readback of the same window is already queued: wait for it instead.
 			if ((wait_for = FindPendingPublish(begin, last - begin)) != nullptr) {
+				sample.joined = prof;
 				return;
 			}
 			// Every GPU write to the window already completed: the readback queue copies it
@@ -972,6 +1163,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		} else if (wait_for != nullptr) {
 			wait_for->Wait();
 		}
+		if (prof) RfaultNoteFault(sample, RfaultNowNs() - start - delayed, delayed, own_side, wait_for != nullptr);
 		// A write retries against the now write-protected page and takes the CPU-dirty path.
 		return;
 	}
@@ -1038,6 +1230,7 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	// these bytes in command-stream order with the GPU writes around them.
 	WriteDataBuffer(buffer, vaddr, data, size);
 	NoteBufferWrite(vaddr, size);
+	if (RfaultProfEnabled()) RfaultNoteWrite(vaddr, size, 3, 0);
 	return true;
 }
 
@@ -1497,6 +1690,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
+		if (RfaultProfEnabled()) RfaultNoteWrite(vaddr, size, t_rfault_origin.hash, t_rfault_origin.stage);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -1547,7 +1741,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, RefreshProf::GpuFill);
+	SetWriteOrigin(1, 0);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	SetWriteOrigin(0, 0);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -1585,8 +1781,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	SetWriteOrigin(2, 0);
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	SetWriteOrigin(0, 0);
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

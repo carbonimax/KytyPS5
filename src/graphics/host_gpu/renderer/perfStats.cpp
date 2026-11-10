@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -161,7 +162,14 @@ uint64_t RecentFrameUs() noexcept {
 	return g_recent_frame_us.load(std::memory_order_relaxed);
 }
 
+static std::atomic<uint64_t> g_presented_frames {0};
+
+uint64_t PresentedFrames() noexcept {
+	return g_presented_frames.load(std::memory_order_relaxed);
+}
+
 void NotePresentedFrame() noexcept {
+	g_presented_frames.fetch_add(1, std::memory_order_relaxed);
 	{
 		// Smoothed presentation interval (1/8 of each new interval), always kept: the GPU thread reads
 		// it (KYTY_CP_RECORD_MIN_FRAME_MS, KYTY_IDLE_SUBMIT_MIN_FRAME_MS). Presentation runs on one thread.
@@ -307,6 +315,7 @@ void MaybeReport() noexcept {
 	EopAtGpu::Report(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
+	BufferCache::ReportReadFaults(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();

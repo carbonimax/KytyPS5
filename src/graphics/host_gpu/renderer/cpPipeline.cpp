@@ -48,6 +48,19 @@ struct State {
 	std::atomic<uint64_t> full_wait_ns {0};
 	std::atomic<uint64_t> relookups {0};
 	std::atomic<uint64_t> back_busy_ns {0};
+	// KYTY_CP_REC_PROF (front only, read by the report thread).
+	std::atomic<uint64_t> rec_count {0};
+	std::atomic<uint64_t> rec_acquire_ns {0};
+	std::atomic<uint64_t> rec_reset_ns {0};
+	std::atomic<uint64_t> rec_regs_ns {0};
+	std::atomic<uint64_t> rec_snaps_ns {0};
+	std::atomic<uint64_t> rec_publish_ns {0};
+	std::atomic<uint64_t> rec_lookup_ns {0};
+	std::atomic<uint64_t> rec_snap_bytes {0};
+	std::atomic<uint64_t> rec_snap_vectors {0};
+	std::atomic<uint64_t> rec_snap_grows {0};
+	std::atomic<uint64_t> back_records {0};
+	uint64_t              last_frames = 0;
 };
 
 uint64_t NowNs() noexcept {
@@ -146,6 +159,7 @@ void BackThread() {
 		const auto start = NowNs();
 		s.execute(s.context, Slot(tail));
 		s.back_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		s.back_records.fetch_add(1, std::memory_order_relaxed);
 		s.tail.store(tail + 1, std::memory_order_seq_cst);
 		NotifyFront();
 	}
@@ -327,6 +341,44 @@ void Report(double seconds) noexcept {
 	            " back_busy=%.0fms\n",
 	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], drains, ms(drain), fulls, ms(full),
 	            take(s.relookups), ms(take(s.back_busy_ns)));
+	if (!RecProfEnabled()) return;
+	const auto frames_now = PerfStats::PresentedFrames();
+	const auto frames     = frames_now - std::exchange(s.last_frames, frames_now);
+	const auto recs       = take(s.rec_count);
+	const auto back_recs  = take(s.back_records);
+	std::printf("PERF cprec %.1fs: frames=%" PRIu64 " records=%" PRIu64 " acquire=%.1fms reset=%.1fms regs=%.1fms"
+	            " snaps=%.1fms publish=%.1fms lookup=%.1fms snap_bytes=%" PRIu64 " snap_vectors=%" PRIu64
+	            " snap_grows=%" PRIu64 " back_records=%" PRIu64 " sizeof_record=%zu sizeof_regs=%zu"
+	            " sizeof_user_config=%zu sizeof_shaders=%zu sizeof_state=%zu sizeof_snapshot=%zu\n",
+	            seconds, frames, recs, ms(take(s.rec_acquire_ns)), ms(take(s.rec_reset_ns)),
+	            ms(take(s.rec_regs_ns)), ms(take(s.rec_snaps_ns)), ms(take(s.rec_publish_ns)),
+	            ms(take(s.rec_lookup_ns)), take(s.rec_snap_bytes), take(s.rec_snap_vectors),
+	            take(s.rec_snap_grows), back_recs, sizeof(DrawRecord), sizeof(HW::Context),
+	            sizeof(HW::UserConfig), sizeof(HW::Shader), sizeof(DrawRenderState),
+	            sizeof(ShaderRecompiler::IR::ResourceSnapshot));
+}
+
+bool RecProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CP_REC_PROF");
+		return value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+void NoteRecordCost(const RecordCost& cost) noexcept {
+	auto&      s   = S();
+	const auto add = [](std::atomic<uint64_t>& v, uint64_t x) { v.fetch_add(x, std::memory_order_relaxed); };
+	add(s.rec_count, 1);
+	add(s.rec_acquire_ns, cost.acquire_ns);
+	add(s.rec_reset_ns, cost.reset_ns);
+	add(s.rec_regs_ns, cost.regs_ns);
+	add(s.rec_snaps_ns, cost.snaps_ns);
+	add(s.rec_publish_ns, cost.publish_ns);
+	add(s.rec_lookup_ns, cost.lookup_ns);
+	add(s.rec_snap_bytes, cost.snap_bytes);
+	add(s.rec_snap_vectors, cost.snap_vectors);
+	add(s.rec_snap_grows, cost.snap_grows);
 }
 
 } // namespace Libs::Graphics::CpPipeline

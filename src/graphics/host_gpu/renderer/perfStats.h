@@ -130,6 +130,8 @@ void NotePresentedFrame() noexcept;
 void NoteFlipArg(int64_t arg) noexcept;
 // Smoothed interval between presented frames in microseconds (0 before the second frame).
 [[nodiscard]] uint64_t RecentFrameUs() noexcept;
+// Frames presented since launch (monotonic, any thread).
+[[nodiscard]] uint64_t PresentedFrames() noexcept;
 
 // KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
 // translation miss and pipeline creation, each starting with a kind letter and its steady-clock time

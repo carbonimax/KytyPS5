@@ -67,6 +67,13 @@ public:
 	// (KYTY_READBACK_WINDOW_KIB, clamped to the faulting buffer) are published in one sync.
 	void                   ReadFaultMemory(uint64_t vaddr);
 	void                   InvalidateFaultMemory(uint64_t vaddr);
+	// KYTY_RFAULT_PROF=1 (measurement, default 0; "PERF rfault" lines with KYTY_PERF_STATS=1): guest
+	// read faults that publish a window, their wall time, recurrence per window, last writer and age
+	// of its last recorded GPU write. KYTY_RFAULT_DELAY_US=N (measurement, default 0): each such fault
+	// first spins N us (slope test). SetWriteOrigin: the calling thread's next written ranges come
+	// from this program (hash; 1 fill, 2 copy, 3 CP data write).
+	static void SetWriteOrigin(uint64_t hash, uint32_t stage) noexcept;
+	static void ReportReadFaults(double seconds) noexcept;
 	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
 	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
 	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
