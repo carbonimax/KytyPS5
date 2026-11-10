@@ -1117,6 +1117,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (!state.vertex_info[0].stage) {
 		return false;
 	}
+	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
+	// writes would remain (a mip reduction can end with a 0x0 pass past the last level).
+	const auto& vp = buffer.GetRegisters().GetScreenViewport();
+	if ((vp.screen_scissor_right <= vp.screen_scissor_left ||
+	     vp.screen_scissor_bottom <= vp.screen_scissor_top) &&
+	    std::ranges::none_of(state.VertexStages(), HasShaderBufferWrites,
+	                         &ShaderVertexInputInfo::stage)) {
+		return false;
+	}
 	const bool remember = m_context.GetPipelineCache().ParallelEnabled() && CpPipeline::Mode() != 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((state.mrt_mask & (1u << slot)) != 0) {
