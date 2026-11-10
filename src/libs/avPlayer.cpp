@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -688,6 +689,15 @@ private:
 	AVIOContext*            ctx    = nullptr;
 };
 
+// Games copy a delivered frame (CP DMA) after the next Video() call, so a replaced buffer stays away from the
+// decoder for this many more deliveries: 1 is enough on PC, 2 leaves margin for a slower CP. KYTY_AVPLAYER_HOLD
+// overrides it (0 = give the buffer back at once). Never allocates: with fewer than hold + 2 buffers the hold
+// shrinks so the decoder keeps at least one buffer.
+static int HeldVideoBuffers(int buffers) {
+	const char* value = std::getenv("KYTY_AVPLAYER_HOLD");
+	return std::clamp(value != nullptr && value[0] != '\0' ? std::atoi(value) : 2, 0, buffers - 2);
+}
+
 class Source {
 public:
 	Source(AvPlayerMemAllocator m, AvPlayerFileReplacement f, AvPlayerEventReplacement e,
@@ -1017,8 +1027,12 @@ public:
 		}
 		uint64_t released = 0;
 		if (current_video) {
-			released = reinterpret_cast<uint64_t>(current_video->buffer->Get());
-			video_buffers.Push(std::move(current_video->buffer));
+			held_video.push_back(std::move(current_video->buffer));
+			if (held_video.size() > static_cast<size_t>(video_hold)) {
+				released = reinterpret_cast<uint64_t>(held_video.front()->Get());
+				video_buffers.Push(std::move(held_video.front()));
+				held_video.pop_front();
+			}
 		}
 		current_video = std::move(*frame);
 		Common::VideoTrace::Deliver(reinterpret_cast<uint64_t>(current_video->buffer->Get()), head,
@@ -1104,6 +1118,7 @@ private:
 		audio_buffers.Clear();
 		if (!retain_output_buffers) {
 			current_video.reset();
+			held_video.clear();
 			current_audio.reset();
 		}
 		if (sws != nullptr) {
@@ -1196,7 +1211,7 @@ private:
 	bool AllocateBuffers() {
 		if (video_id) {
 			auto size     = VideoBufferSize(fmt->streams[video_id.value()]);
-			auto retained = current_video ? 1u : 0u;
+			auto retained = (current_video ? 1u : 0u) + held_video.size();
 			for (size_t i = retained; i < static_cast<size_t>(max_video_buffers); i++) {
 				auto buffer = std::make_unique<GuestBuffer>(mem, 0x100, size, true);
 				if (!buffer->Valid()) {
@@ -1700,6 +1715,7 @@ private:
 	AvPlayerFileReplacement                  file;
 	AvPlayerEventReplacement                 event;
 	int                                      max_video_buffers = 2;
+	int                                      video_hold        = HeldVideoBuffers(max_video_buffers);
 	bool                                     use_vdec2         = false;
 	AvPlayerSourceType                       source_type       = AvPlayerSourceUnknown;
 	std::string                              path;
@@ -1721,6 +1737,7 @@ private:
 	WorkQueue<ReadyFrame>                    video_frames;
 	WorkQueue<ReadyFrame>                    audio_frames;
 	std::optional<ReadyFrame>                current_video;
+	std::deque<std::unique_ptr<GuestBuffer>> held_video;
 	std::optional<ReadyFrame>                current_audio;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;
