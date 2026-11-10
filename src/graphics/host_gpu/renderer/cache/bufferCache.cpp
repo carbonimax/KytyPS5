@@ -1054,14 +1054,14 @@ bool BufferCache::InvalidateCompletedWrite(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
-void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
+uint64_t BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BACKING_READ_WINDOW");
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
 	}();
 	if (!enabled || !GuestGpu::IsGpuThread()) {
 		ReadMemory(vaddr, size);
-		return;
+		return size;
 	}
 	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	const auto base   = buffer.CpuAddress();
@@ -1069,11 +1069,12 @@ void BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
 	const auto last   = std::min(base + buffer.Size(), Common::AlignUp(vaddr + size, window));
 	if (begin < last && ReadWindowOnSideQueue(buffer, begin, last - begin)) {
-		return;
+		return last - begin;
 	}
 	if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 	}
+	return begin < last ? last - begin : 0;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

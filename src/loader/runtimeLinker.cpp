@@ -661,7 +661,7 @@ static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
 	    WalkStatsEnabled() && Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, sizeof(*value))
 	        ? ProtectedLoadSynced
 	        : 0u;
-	return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value))
+	return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value), true)
 	            ? ProtectedLoadValue | ProtectedLoadKeep
 	            : ProtectedLoadKeep) |
 	       synced;
@@ -720,7 +720,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				uint32_t value = 0;
 				if (Libs::LibKernel::Memory::TryReadBufferBacking(
 				        Loader::X64InstructionEmulator::LoadBaseR10(info->native_context), &value,
-				        sizeof(value))) {
+				        sizeof(value), true)) {
 					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
 					Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(true);
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);

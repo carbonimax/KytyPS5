@@ -62,6 +62,7 @@ State& S() noexcept {
 }
 
 thread_local bool t_back        = false;
+thread_local bool t_back_same   = false;
 thread_local bool t_in_lookup   = false;
 thread_local bool t_heap_inline = false;
 HeapFn            g_heap_hook   = nullptr;
@@ -143,9 +144,27 @@ void BackThread() {
 				s.back_sleeping.store(false, std::memory_order_seq_cst);
 			}
 		}
+		static const bool same_stats = PerfStats::BackSameEnabled();
+		const auto        staged     = same_stats ? PerfStats::Peek(PerfStats::Counter::StagingWriteCount) : 0;
+		t_back_same                  = false;
 		const auto start = NowNs();
 		s.execute(s.context, Slot(tail));
-		s.back_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		const auto busy = NowNs() - start;
+		s.back_busy_ns.fetch_add(busy, std::memory_order_relaxed);
+		if (same_stats) {
+			using PerfStats::Counter;
+			PerfStats::Add(Counter::BackRecords, 1);
+			PerfStats::Add(Counter::BackRecordNs, busy);
+			if (t_back_same) {
+				PerfStats::Add(Counter::BackSame, 1);
+				PerfStats::Add(Counter::BackSameNs, busy);
+				// shortcut: staging copies of other threads during the record also count, so "clean" is a lower bound.
+				if (PerfStats::Peek(Counter::StagingWriteCount) == staged) {
+					PerfStats::Add(Counter::BackSameClean, 1);
+					PerfStats::Add(Counter::BackSameCleanNs, busy);
+				}
+			}
+		}
 		s.tail.store(tail + 1, std::memory_order_seq_cst);
 		NotifyFront();
 	}
@@ -304,6 +323,10 @@ void NoteHeapAcquire() noexcept {
 
 bool TakeHeapInline() noexcept {
 	return std::exchange(t_heap_inline, false);
+}
+
+void NoteBackSame() noexcept {
+	t_back_same = true;
 }
 
 void Note(Stat stat) noexcept {

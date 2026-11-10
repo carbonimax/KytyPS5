@@ -69,8 +69,8 @@ public:
 	void                   InvalidateFaultMemory(uint64_t vaddr);
 	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
 	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
-	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
-	void                   ReadMemoryWindow(uint64_t vaddr, uint64_t size);
+	// KYTY_BACKING_READ_WINDOW=0 reads only the range. Returns the window size in bytes.
+	uint64_t               ReadMemoryWindow(uint64_t vaddr, uint64_t size);
 	// GPU thread, between submissions (GPU capture): ReadMemory of every GPU-modified buffer.
 	void                   ReadGpuModified();
 	// GPU thread: a command-processor write (WRITE_DATA) into GPU-owned memory. Instead of

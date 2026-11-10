@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "libs/errno.h"
@@ -19,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -896,16 +898,50 @@ bool MaybeGpuModifiedPage(uint64_t vaddr) {
 	       GetGpuResources().GetBufferCache().MaybeGpuModifiedPage(vaddr);
 }
 
-bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+// KYTY_SYNC_CMP: the backing bytes of a synchronized read (and of its 4 KiB page) before and after
+// the synchronization, with the time and window bytes it cost.
+static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::BufferCache& buffers) {
+	using Graphics::PerfStats::Counter;
+	constexpr uint64_t Page = 4096;
+	thread_local std::vector<uint8_t> before, before_page, after;
+	const auto page    = vaddr & ~(Page - 1);
+	before.resize(size);
+	before_page.resize(Page);
+	after.resize(std::max(size, Page));
+	const bool have      = TryReadBacking(vaddr, before.data(), size);
+	const bool have_page = TryReadBacking(page, before_page.data(), Page);
+	const auto start     = std::chrono::steady_clock::now();
+	Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
+	Graphics::CpPipeline::Drain();
+	const auto window = buffers.ReadMemoryWindow(vaddr, size);
+	const auto ns     = static_cast<uint64_t>(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start).count());
+	if (!have || !TryReadBacking(vaddr, after.data(), size)) {
+		return;
+	}
+	const bool same      = std::memcmp(before.data(), after.data(), size) == 0;
+	const bool page_same = have_page && TryReadBacking(page, after.data(), Page) &&
+	                       std::memcmp(before_page.data(), after.data(), Page) == 0;
+	const auto base = static_cast<uint32_t>(Counter::SyncCmpBase) + (walker ? 0u : 8u) + (same ? 0u : 4u);
+	Graphics::PerfStats::Add(static_cast<Counter>(base), 1);
+	Graphics::PerfStats::Add(static_cast<Counter>(base + 1), ns);
+	Graphics::PerfStats::Add(static_cast<Counter>(base + 2), window);
+	Graphics::PerfStats::Add(static_cast<Counter>(base + 3), page_same ? 1 : 0);
+}
+
+bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size, bool walker) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
-			Graphics::CpPipeline::Drain();
-			buffers.ReadMemoryWindow(vaddr, size);
+			if (Graphics::PerfStats::SyncCmpEnabled()) {
+				SyncCompared(vaddr, size, walker, buffers);
+			} else {
+				Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);
+				Graphics::CpPipeline::Drain();
+				buffers.ReadMemoryWindow(vaddr, size);
+			}
 		}
 	}
 	return TryReadBacking(vaddr, data, size);

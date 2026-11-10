@@ -1392,6 +1392,99 @@ static bool DrawWritesAnything(const DrawRenderState& state) {
 	       (state.ps_active && writes(state.ps_input_info.stage));
 }
 
+// KYTY_BACK_SAME (measurement): what the CP back resolved for the previous single-pass draw it ran,
+// to count the records whose pipeline, targets, bindings and dynamic state all repeat.
+namespace {
+struct BackStageShape {
+	ShaderRecompiler::IR::ResourceSnapshot                   resources;
+	std::vector<vk::DescriptorBufferInfo>                    buffers;
+	std::vector<std::pair<vk::ImageView, vk::ImageLayout>> images;
+	std::vector<vk::Sampler>                                 samplers;
+	std::vector<uint32_t>                                    shader_data;
+};
+struct BackShape {
+	uint64_t                       record   = UINT64_MAX;
+	const PipelineCache::Pipeline* pipeline = nullptr;
+	RenderState                    rendering;
+	PreparedVertexBuffers          vertex;
+	PreparedIndexBuffer            index;
+	uint32_t                       stage_count = 0;
+	std::array<BackStageShape, 4>  stages;
+};
+} // namespace
+
+static bool SameResources(const ShaderRecompiler::IR::ResourceSnapshot& a,
+                          const ShaderRecompiler::IR::ResourceSnapshot& b) {
+	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
+	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
+}
+
+static bool SameStage(const BackStageShape& shape, const PreparedBindings& bindings) {
+	if (bindings.runtime == nullptr || bindings.runtime->resources == nullptr ||
+	    !SameResources(shape.resources, *bindings.runtime->resources) || shape.buffers != bindings.buffers ||
+	    shape.samplers != bindings.samplers || shape.shader_data != bindings.shader_data ||
+	    shape.images.size() != bindings.images.size()) {
+		return false;
+	}
+	for (size_t i = 0; i < shape.images.size(); i++) {
+		if (shape.images[i] != std::pair {bindings.images[i].image_view, bindings.images[i].layout}) return false;
+	}
+	return true;
+}
+
+static void SaveStage(BackStageShape& shape, const PreparedBindings& bindings) {
+	if (bindings.runtime != nullptr && bindings.runtime->resources != nullptr) {
+		shape.resources = *bindings.runtime->resources;
+	}
+	shape.buffers     = bindings.buffers;
+	shape.samplers    = bindings.samplers;
+	shape.shader_data = bindings.shader_data;
+	shape.images.clear();
+	for (const auto& image: bindings.images) shape.images.emplace_back(image.image_view, image.layout);
+}
+
+static bool NoDynamicChange(const DynamicState& d) {
+	const auto& s = d.dirty_state;
+	return !(s.viewports || s.scissors || s.depth_test_enabled || s.depth_write_enabled || s.depth_compare_op ||
+	         s.depth_bounds_test_enabled || s.depth_bounds || s.depth_bias_enabled || s.depth_bias ||
+	         s.stencil_test_enabled || s.stencil_front_ops || s.stencil_front_reference ||
+	         s.stencil_front_write_mask || s.stencil_front_compare_mask || s.stencil_back_ops ||
+	         s.stencil_back_reference || s.stencil_back_write_mask || s.stencil_back_compare_mask || s.cull_mode ||
+	         s.front_face || s.blend_constants || s.line_width || s.feedback_loop_aspects);
+}
+
+// CP back thread, single-pass draw: compares with the previous record's draw and keeps this one.
+static void NoteBackShape(const PipelineCache::Pipeline* pipeline, const RenderState& rendering,
+                          const PreparedVertexBuffers& vertex, const PreparedIndexBuffer& index,
+                          std::span<PreparedBindings* const> stages, bool dynamic_same) {
+	using PerfStats::Counter;
+	static BackShape prev;
+	const auto       record   = CpPipeline::Finished();
+	const bool       adjacent = prev.record + 1 == record;
+	const bool       pipe     = adjacent && prev.pipeline == pipeline;
+	const bool       rt       = adjacent && prev.rendering == rendering;
+	const bool       vtx      = adjacent && prev.vertex.count == vertex.count && prev.vertex.buffers == vertex.buffers &&
+	                 prev.vertex.offsets == vertex.offsets && prev.vertex.sizes == vertex.sizes &&
+	                 prev.index.buffer == index.buffer && prev.index.offset == index.offset && prev.index.type == index.type;
+	bool bind = adjacent && prev.stage_count == stages.size();
+	for (size_t i = 0; bind && i < stages.size(); i++) bind = SameStage(prev.stages[i], *stages[i]);
+	const bool dyn = adjacent && dynamic_same;
+	PerfStats::Add(Counter::BackShaped, 1);
+	PerfStats::Add(Counter::BackSamePipe, pipe ? 1 : 0);
+	PerfStats::Add(Counter::BackSameRt, rt ? 1 : 0);
+	PerfStats::Add(Counter::BackSameBind, bind ? 1 : 0);
+	PerfStats::Add(Counter::BackSameVtx, vtx ? 1 : 0);
+	PerfStats::Add(Counter::BackSameDyn, dyn ? 1 : 0);
+	if (pipe && rt && bind && vtx && dyn) CpPipeline::NoteBackSame();
+	prev.record      = record;
+	prev.pipeline    = pipeline;
+	prev.rendering   = rendering;
+	prev.vertex      = vertex;
+	prev.index       = index;
+	prev.stage_count = static_cast<uint32_t>(stages.size());
+	for (size_t i = 0; i < stages.size(); i++) SaveStage(prev.stages[i], *stages[i]);
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          const DrawEmitInfo&          emit,
@@ -1645,6 +1738,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
 		                           renderings[pass]);
 		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
+		static const bool back_same = PerfStats::BackSameEnabled();
+		if (back_same && pass_count == 1 && CpPipeline::IsBackThread()) {
+			NoteBackShape(&pipeline, renderings[pass], vertex_bindings, index_binding, stages,
+			              NoDynamicChange(dynamic_state));
+		}
 		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
 		if (pass != 0) {

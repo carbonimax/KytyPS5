@@ -101,6 +101,23 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	// KYTY_SYNC_CMP: synchronized buffer-backing reads, [caller walk/other][bytes unchanged/changed] x
+	// {reads, sync ns, window bytes downloaded, reads whose 4 KiB page is unchanged too}.
+	SyncCmpBase,
+	SyncCmpEnd = SyncCmpBase + 16,
+	// KYTY_BACK_SAME: CP back records, and those whose resolved draw state equals the previous one.
+	BackRecords,
+	BackRecordNs,
+	BackShaped,    // single-pass draws compared with the previous one
+	BackSamePipe,  // same pipeline
+	BackSameRt,    // same render targets
+	BackSameBind,  // same descriptors and buffers of every stage
+	BackSameVtx,   // same vertex and index buffers
+	BackSameDyn,   // dynamic state unchanged
+	BackSame,      // all of the above
+	BackSameNs,
+	BackSameClean, // ... with no staging copy during the record
+	BackSameCleanNs,
 	Count
 };
 
@@ -111,7 +128,13 @@ enum class Counter : uint32_t {
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
+// KYTY_SYNC_CMP=1 / KYTY_BACK_SAME=1 (measurement, default off; need KYTY_PERF_STATS=1): "PERF synccmp"
+// (backing bytes before and after each synchronized read) and "PERF backsame" (CP back records equal to
+// the previous one) lines.
+[[nodiscard]] bool SyncCmpEnabled() noexcept;
+[[nodiscard]] bool BackSameEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
+[[nodiscard]] uint64_t Peek(Counter counter) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;
 [[nodiscard]] bool IsGpuThread() noexcept;

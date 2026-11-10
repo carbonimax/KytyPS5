@@ -81,6 +81,26 @@ bool SrtProfEnabled() noexcept {
 	return enabled;
 }
 
+bool SyncCmpEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SYNC_CMP");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+bool BackSameEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BACK_SAME");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+uint64_t Peek(Counter counter) noexcept {
+	return g_counters[static_cast<size_t>(counter)].load(std::memory_order_relaxed);
+}
+
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
@@ -302,6 +322,25 @@ void MaybeReport() noexcept {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
 		            bounds[0], bounds[1], bounds[2], bounds[3]);
+	}
+	if (SyncCmpEnabled()) {
+		for (size_t c = 0; c < 2; c++) {
+			const auto* b = &v[static_cast<size_t>(Counter::SyncCmpBase) + c * 8];
+			std::printf("PERF synccmp %s %.1fs: unchanged=%" PRIu64 "(%.1fms,%.1fMB,page_same=%" PRIu64
+			            ") changed=%" PRIu64 "(%.1fms,%.1fMB,page_same=%" PRIu64 ")\n",
+			            c == 0 ? "walk" : "other", seconds, b[0], static_cast<double>(b[1]) / 1e6,
+			            static_cast<double>(b[2]) / 1048576.0, b[3], b[4], static_cast<double>(b[5]) / 1e6,
+			            static_cast<double>(b[6]) / 1048576.0, b[7]);
+		}
+	}
+	if (BackSameEnabled()) {
+		std::printf("PERF backsame %.1fs: records=%" PRIu64 "(%.0fms) shaped=%" PRIu64 " pipe=%" PRIu64 " rt=%" PRIu64
+		            " bind=%" PRIu64 " vtx=%" PRIu64 " dyn=%" PRIu64 " same=%" PRIu64 "(%.1fms) same_clean=%" PRIu64
+		            "(%.1fms)\n",
+		            seconds, n(Counter::BackRecords), ms(Counter::BackRecordNs), n(Counter::BackShaped),
+		            n(Counter::BackSamePipe), n(Counter::BackSameRt), n(Counter::BackSameBind),
+		            n(Counter::BackSameVtx), n(Counter::BackSameDyn), n(Counter::BackSame), ms(Counter::BackSameNs),
+		            n(Counter::BackSameClean), ms(Counter::BackSameCleanNs));
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

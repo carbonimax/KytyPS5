@@ -114,6 +114,8 @@ enum class Stat : uint32_t {
 };
 void Note(Stat stat) noexcept;
 void Report(double seconds) noexcept;
+// Back thread, KYTY_BACK_SAME: the running record's draw resolved the same state as the previous record.
+void NoteBackSame() noexcept;
 
 } // namespace Libs::Graphics::CpPipeline
 
