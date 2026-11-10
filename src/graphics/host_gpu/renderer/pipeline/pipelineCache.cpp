@@ -57,6 +57,8 @@ namespace Libs::Graphics {
 
 // Local measurement (stageWarmMeas.cpp).
 void MeasNoteSpirv(vk::ShaderModule module, uint64_t hash, const std::vector<uint32_t>& spirv);
+bool MeasShapeAltOn();
+void MeasSetAltSpirv(std::vector<uint32_t> spirv);
 
 namespace {
 
@@ -774,6 +776,22 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		// Step 5.21 measurement: the same vertex program translated without the optional IR passes.
+		std::optional<ShaderRecompiler::TranslateResult> meas_alt;
+		std::optional<ShaderRecompiler::CompileOptions>  meas_alt_options;
+		if (options.stage == ShaderType::Vertex && !pretranslated && MeasShapeAltOn()) {
+			meas_alt_options.emplace(options);
+			meas_alt_options->optimizations = 0;
+			meas_alt_options->dump_ir       = false;
+			if (current == nullptr) {
+				meas_alt = ShaderRecompiler::TranslateProgram(params.code, *meas_alt_options);
+			} else if (!current->calls.empty()) {
+				meas_alt = ShaderRecompiler::TranslateProgram(current->linked->decoded, *meas_alt_options);
+				meas_alt->program.source_reads = current->reads;
+			} else {
+				meas_alt = ShaderRecompiler::TranslateProgram(current->decoded, *meas_alt_options);
+			}
+		}
 		const auto diag_translated = diag_log ? PerfStats::SteadyUs() : 0;
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
@@ -797,6 +815,12 @@ struct PipelineCache::ProgramCache {
 		}
 		// Programs with GPU-selected calls depend on their callees' current code: not stored.
 		const bool store_module = store != nullptr && entry->second.call_source == nullptr;
+		if (meas_alt) {
+			// Picked up by MeasNoteSpirv for the module CompilePermutation creates next on this thread.
+			MeasSetAltSpirv(ShaderRecompiler::CompileProgram(std::move(*meas_alt), *meas_alt_options,
+			                                                 entry->second.specialization, push_data_cursor)
+			                    .spirv);
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, lookup_key, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode(), store_module ? &store_spirv : nullptr));
