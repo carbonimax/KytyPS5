@@ -235,12 +235,18 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.registered || image.info.data.Empty()) {
+	const auto& data  = image.info.data;
+	if (image.registered || data.Empty()) {
 		EXIT("TextureCache: invalid image registration\n");
 	}
 	m_image_index_epoch++;
-	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
-		m_image_page_table[page].push_back(id);
+	if (data.size > UINT32_MAX) {
+		EXIT("TextureCache: image larger than 4 GiB\n");
+	}
+	const BucketEntry entry {
+	    .address = data.address, .size = static_cast<uint32_t>(data.size), .id = id};
+	ForEachPage(data.address, data.size, [this, &entry](uint64_t page) {
+		m_image_page_table[page].entries.push_back(entry);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -253,10 +259,16 @@ void TextureCache::UnregisterImage(ImageId id) {
 	UntrackImage(id);
 	m_image_index_epoch++;
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
-		auto* owners = m_image_page_table.Find(page);
-		if (owners == nullptr || !owners->Erase(id)) {
+		auto* bucket = m_image_page_table.Find(page);
+		if (bucket == nullptr) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		auto&      entries = bucket->entries;
+		const auto entry   = std::ranges::find(entries, id, &BucketEntry::id);
+		if (entry == entries.end()) {
+			EXIT("TextureCache: image missing from page owner index\n");
+		}
+		entries.erase(entry);
 	});
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
@@ -449,29 +461,25 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 }
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size) const {
+	ImageIds                  result;
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
-		return {};
+		return result;
 	}
-
-	ImageIds result;
+	// An image is listed once: from the first page it shares with the region.
+	const uint64_t first_page = address >> ImagePageTable::kPageBits;
 	ForEachPage(address, size, [&](uint64_t page) {
-		const auto* owners = m_image_page_table.Find(page);
-		if (owners == nullptr) {
+		const auto* bucket = m_image_page_table.Find(page);
+		if (bucket == nullptr) {
 			return;
 		}
-		owners->ForEach([&](ImageId id) {
-			const auto& image = m_slot_images[id];
-			if (image.picked || !image.Overlaps(address, size)) {
-				return;
+		for (const auto& entry: bucket->entries) {
+			if (page == std::max(first_page, entry.address >> ImagePageTable::kPageBits) &&
+			    entry.Overlaps(address, size)) {
+				result.push_back(entry.id);
 			}
-			image.picked = true;
-			result.push_back(id);
-		});
+		}
 	});
-	for (const auto id: result) {
-		m_slot_images[id].picked = false;
-	}
 	return result;
 }
 
@@ -1375,12 +1383,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 
 	ImageId association {};
-	for (const auto id: FindImagesInRegion(stencil.address, stencil.size)) {
-		const auto& owner = m_slot_images[id];
+	ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
 		if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
 			association = id;
 		}
-	}
+	});
 	if (!association) {
 		ImageInfo info {};
 		info.data   = stencil;
@@ -1636,20 +1643,17 @@ void TextureCache::UpdateImage(ImageId id) {
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
 	std::scoped_lock lock {m_lock};
-	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size)) {
-		const auto* owner = &m_slot_images[id];
-		if (owner->info.data.address != address) {
-			continue;
-		}
+	Common::SmallVector<ImageId, 4> matches;
+	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
+		const auto* owner = &image;
 		if (ensure_valid && owner->depth_id) {
 			owner = &m_slot_images[owner->depth_id];
 		}
 		if (ensure_valid && !owner->SafeToDownload()) {
-			continue;
+			return;
 		}
 		matches.push_back(id);
-	}
+	});
 	ImageId selected {};
 	if (matches.size() == 1) {
 		selected = matches.front();
@@ -1698,13 +1702,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
-		for (const auto stencil_id:
-		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size)) {
-			const auto& stencil = m_slot_images[stencil_id];
-			if (stencil.depth_id == id && stencil.info.data == image.info.stencil) {
-				RefreshImage(stencil_id);
-				break;
+		const auto& range = image.info.stencil;
+		ImageId     stencil_id {};
+		ForEachImageWithAddress(range.address, [&](ImageId candidate, Image& stencil) {
+			if (!stencil_id && stencil.depth_id == id && stencil.info.data == range) {
+				stencil_id = candidate;
 			}
+		});
+		if (stencil_id) {
+			RefreshImage(stencil_id);
 		}
 	}
 	switch (desc.type) {
@@ -1909,7 +1915,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	ImageId               stencil_id {};
 	vk::ImageAspectFlags  aspect {};
 	ImageSubresourceRange subresources;
-	for (const auto id: FindImagesInRegion(address, size)) {
+	Common::SmallVector<ImageId, 8> image_ids;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { image_ids.push_back(id); });
+	for (const auto id: image_ids) {
 		const auto&          owner = m_slot_images[id];
 		vk::ImageAspectFlags candidate {};
 		ImageId              candidate_id = id;
@@ -2341,32 +2349,35 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, uint8_t reason) {
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size)) {
-		auto& image = m_slot_images[id];
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
 		if (image.info.data.address != address) {
-			continue;
+			return;
 		}
 		if (RefreshProf::Enabled()) [[unlikely]] {
 			RefreshProf::NoteDirty(image, reason, address, size);
 		}
 		image.ClearGpuModified();
 		image.MarkBufferModified();
-	}
+	});
 }
 
 bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
 	std::scoped_lock lock {m_lock};
-	const auto       targets = FindImagesInRegion(address, size);
+	Common::SmallVector<ImageId, 8> targets;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { targets.push_back(id); });
 	if (targets.size() != 1) {
 		return false;
 	}
-	auto&       image   = m_slot_images[targets.front()];
-	const auto& info    = image.info;
-	const auto  sources = FindImagesInRegion(source, size);
+	auto&       image           = m_slot_images[targets.front()];
+	const auto& info            = image.info;
+	bool        source_modified = false;
+	ForEachImageInRegion(source, size, [&](ImageId, Image& owner) {
+		source_modified = owner.IsGpuModified();
+		return source_modified;
+	});
 	if (image.depth_id || !image.SafeToDownload() || !CanDownload(image) || !info.IsTiled() ||
 	    info.IsVolume() || info.IsDepth() || info.HasMetadata() || address < info.data.address ||
-	    std::any_of(sources.begin(), sources.end(),
-	                [&](ImageId id) { return m_slot_images[id].IsGpuModified(); })) {
+	    source_modified) {
 		return false;
 	}
 	// Each layer holds its levels from the smallest up, and the tail levels share one block.
@@ -2425,7 +2436,10 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size, uint8_t rea
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
-	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
+	Common::SmallVector<ImageId, 8> image_ids;
+	ForEachImageInRegion(page_begin, page_end - page_begin,
+	                     [&](ImageId id, Image&) { image_ids.push_back(id); });
+	for (const auto id: image_ids) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
 			if (RefreshProf::Enabled()) [[unlikely]] {
@@ -2494,15 +2508,21 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
-	return !FindImagesInRegion(address, size).empty();
+	bool             registered = false;
+	ForEachImageInRegion(address, size, [&](ImageId, Image&) {
+		registered = true;
+		return true;
+	});
+	return registered;
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
-	auto images = FindImagesInRegion(address, size);
-	for (const auto id: images) {
+	Common::SmallVector<ImageId, 16> deleted_images;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+	for (const auto id: deleted_images) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
