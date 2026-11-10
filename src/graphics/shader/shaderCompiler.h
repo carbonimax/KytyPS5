@@ -43,6 +43,7 @@ void AppendProgramTranslationKey(std::vector<uint32_t>& key, ShaderType stage,
 bool ShaderPredictPixelProgram(const ShaderMappedData& data, ShaderPixelInputInfo& info,
                                uint32_t& user_data_count);
 
+// The preparers below fill an input info the caller value-initializes.
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
 // Whether PrepareProgram selects the host mesh stage for these registers (merged or native NGG).
