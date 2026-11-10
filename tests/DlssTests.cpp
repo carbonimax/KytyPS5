@@ -323,6 +323,28 @@ TEST(DlssTest, LoadsOnlyInProModeWithAFolder) {
 	Config::Shutdown();
 }
 
+// Without Pro mode or a model folder DLSS loads nothing and adds no instance or device extension.
+// Unlike the test above this needs no NVIDIA driver, so it runs on every host.
+TEST(DlssTest, StaysOffWithoutProModeOrAFolder) {
+	vk::ExtensionProperties properties2;
+	properties2.extensionName = std::string(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+	Config::Initialize();
+	for (const auto& [pro, folder]: {std::pair {false, "dlss"}, {true, ""}}) {
+		Config::ConfigOptions options;
+		options.pro_enabled = pro;
+		options.dlss_folder = folder;
+		Config::Load(options);
+		Dlss::Load();
+		std::vector<const char*> extensions;
+		Dlss::AppendExtensions(extensions, {properties2}, false);
+		Dlss::AppendExtensions(extensions, {properties2}, true);
+		EXPECT_TRUE(extensions.empty()) << pro << folder;
+		EXPECT_EQ(Dlss::Capabilities(), nullptr) << pro << folder;
+		Dlss::Shutdown();
+	}
+	Config::Shutdown();
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
