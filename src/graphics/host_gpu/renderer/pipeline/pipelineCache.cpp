@@ -2410,13 +2410,15 @@ void PipelineCache::StartStub(PendingPipeline& job, const DrawRenderState& state
 	bool        merged    = false;
 	for (const auto mask: ps.target_merge_mask) merged |= mask != 0;
 	const auto formats = std::span(rendering.color_formats).first(count);
+	std::array<uint32_t, RENDER_COLOR_ATTACHMENTS_MAX> color_mask {}; // the packed key's are unaligned
+	std::copy(std::begin(params.color_mask), std::end(params.color_mask), color_mask.begin());
 	if (!AsyncStubEligible({.pixel_kill        = ps.ps_pixel_kill_enable,
 	                        .depth_export      = ps.ps_depth_export_enable,
 	                        .sample_mask       = ps.ps_sample_mask_export_enable,
 	                        .alpha_to_coverage = params.alpha_to_coverage_enable,
 	                        .merged_targets    = merged,
 	                        .formats           = formats,
-	                        .color_mask        = std::span(params.color_mask).first(count),
+	                        .color_mask        = std::span(color_mask).first(count),
 	                        .blend             = std::span(params.blend_enable).first(count)})) {
 		return;
 	}
