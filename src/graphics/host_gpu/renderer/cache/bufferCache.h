@@ -67,6 +67,9 @@ public:
 	// (KYTY_READBACK_WINDOW_KIB, clamped to the faulting buffer) are published in one sync.
 	void                   ReadFaultMemory(uint64_t vaddr);
 	void                   InvalidateFaultMemory(uint64_t vaddr);
+	// KYTY_LATE_READ_PROF (see LateRead): queues the check of the ranges bound since the last seal,
+	// to run once the GPU completed the work recorded so far, before any label released later.
+	void                   SealLateReads();
 	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
 	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
 	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
@@ -335,6 +338,35 @@ private:
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 };
+
+// KYTY_LATE_READ_PROF=N (measurement, default 0): late-read detector for a static guest-memory
+// mapping. Guest ranges that a draw or dispatch reads (vertex, index, descriptor buffers, indirect
+// arguments) are hashed when the command processor binds them, then again in a priority operation once
+// the host GPU completed that work, ahead of any label released after them. A range whose bytes
+// changed with no emulator-side backing write overlapping it in between (label delivery, readback
+// publication, CP write) was rewritten by the guest while the GPU could still read it. One batch in N
+// is checked. "PERF lateread" lines (KYTY_PERF_STATS=1).
+// KYTY_WFAULT_DELAY_US=N (measurement, default 0): every guest-thread write fault spins N us before it
+// is resolved (slope test, "PERF wfault" lines).
+namespace LateRead {
+enum class Site : uint8_t { None, Vertex, Index, Descriptor, Indirect, Count };
+[[nodiscard]] bool Enabled() noexcept;
+// The ObtainBuffer reads inside the scope come from `site`.
+class Scope {
+public:
+	explicit Scope(Site site) noexcept;
+	~Scope();
+	KYTY_CLASS_NO_COPY(Scope);
+
+private:
+	Site m_previous;
+};
+// Any thread, before and after the write: the emulator writes guest bytes through the backing
+// (kernel/memory.cpp TryWriteBacking) or the command processor writes them directly (WRITE_DATA,
+// end-of-pipe labels written at release).
+void NoteBackingWrite(uint64_t vaddr, uint64_t size) noexcept;
+void Report(double seconds, uint64_t frames);
+} // namespace LateRead
 
 } // namespace Libs::Graphics
 

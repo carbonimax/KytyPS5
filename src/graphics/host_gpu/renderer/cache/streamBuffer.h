@@ -74,6 +74,7 @@ public:
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
+	bool   leaped       = false; // created or grown by a stream leap (KYTY_LATE_READ_PROF class)
 	size_t lru_id       = 0;
 
 protected:

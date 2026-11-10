@@ -732,12 +732,16 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		}
 	}
 
+	// KYTY_LATE_READ_PROF: a command-processor write, not a guest one.
+	const auto bytes = write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t);
+	LateRead::NoteBackingWrite(reinterpret_cast<uint64_t>(dst), bytes);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
 	}
+	LateRead::NoteBackingWrite(reinterpret_cast<uint64_t>(dst), bytes);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -1615,7 +1619,9 @@ void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size)
 		m_renderer.GetTextureCache().InvalidateMemory(address, size, RefreshProf::Label);
 		return;
 	}
+	LateRead::NoteBackingWrite(address, size); // KYTY_LATE_READ_PROF: a command-processor write
 	std::memcpy(dst, data, size);
+	LateRead::NoteBackingWrite(address, size);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
@@ -1651,6 +1657,8 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 
 	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
 	m_renderer.GetOcclusionQueries().Publish();
+	// KYTY_LATE_READ_PROF: checked before this signal reaches the guest.
+	m_renderer.GetBufferCache().SealLateReads();
 
 	const int eop_mode = EopAtGpuMode();
 	if (eop_mode == 1) {

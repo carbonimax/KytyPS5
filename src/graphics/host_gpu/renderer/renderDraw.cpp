@@ -781,7 +781,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
 	}
 
-	auto& cache = buffer.GetContext().GetBufferCache();
+	auto&                 cache = buffer.GetContext().GetBufferCache();
+	const LateRead::Scope late_read(LateRead::Site::Vertex);
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
@@ -1231,6 +1232,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
 	} else {
+		const LateRead::Scope late_read(LateRead::Site::Index);
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
@@ -1469,6 +1471,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			args_size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 			            (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 			                              : sizeof(vk::DrawIndirectCommand));
+			const LateRead::Scope late_read(LateRead::Site::Indirect);
 			args_buffer =
 			    m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
 			EXIT_IF((args_buffer.second & 3u) != 0);
