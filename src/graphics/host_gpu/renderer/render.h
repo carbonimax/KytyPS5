@@ -316,8 +316,11 @@ private:
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slot, bool ignore_target_mask = false,
-	                              bool exact_format = false);
-	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	                              bool exact_format = false,
+	                              TextureCache::FindImageMemo* memo = nullptr);
+	// memo (KYTY_TARGET_REUSE, KYTY_BIND_PROF): pass an empty one; FindImage fills it when its search may be kept.
+	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
+	                              TextureCache::FindImageMemo* memo = nullptr);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);

@@ -42,6 +42,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +52,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -1071,6 +1073,94 @@ static void RememberTarget(std::unordered_map<uint64_t, Info>& targets, uint64_t
 	targets[key] = info;
 }
 
+// The registers target resolution reads (ResolveRenderColorTarget for the mrt_mask slots,
+// ResolveRenderDepthTarget), as bytes: equal bytes resolve to equal descriptions.
+struct TargetInputs {
+	uint32_t                                                   mrt_mask = 0;
+	uint32_t                                                   rt_mask  = 0;
+	std::array<HW::RenderTarget, RENDER_COLOR_ATTACHMENTS_MAX> rt {};
+	HW::DepthRenderTarget                                      z {};
+	HW::RenderControl                                          rc {};
+	HW::DepthControl                                           dc {};
+	HW::StencilControl                                         sc {};
+	HW::StencilMask                                            sm {};
+	float                                                      depth_clear   = 0.0f;
+	uint8_t                                                    stencil_clear = 0;
+};
+
+template <typename T>
+static bool SameBytes(const T& kept, const T& current) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	return std::memcmp(&kept, &current, sizeof(T)) == 0;
+}
+
+template <typename T>
+static void CopyBytes(T& kept, const T& current) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	std::memcpy(&kept, &current, sizeof(T));
+}
+
+static bool SameTargetInputs(const TargetInputs& in, const HW::Context& hw, uint32_t mrt_mask) {
+	if (in.mrt_mask != mrt_mask || in.rt_mask != hw.GetRenderTargetMask()) return false;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((mrt_mask & (1u << slot)) != 0 && !SameBytes(in.rt[slot], hw.GetRenderTarget(slot))) return false;
+	}
+	const float   depth_clear   = hw.GetDepthClearValue();
+	const uint8_t stencil_clear = hw.GetStencilClearValue();
+	return SameBytes(in.z, hw.GetDepthRenderTarget()) && SameBytes(in.rc, hw.GetRenderControl()) &&
+	       SameBytes(in.dc, hw.GetDepthControl()) && SameBytes(in.sc, hw.GetStencilControl()) &&
+	       SameBytes(in.sm, hw.GetStencilMask()) && SameBytes(in.depth_clear, depth_clear) &&
+	       in.stencil_clear == stencil_clear;
+}
+
+static void CaptureTargetInputs(TargetInputs& in, const HW::Context& hw, uint32_t mrt_mask) {
+	in.mrt_mask = mrt_mask;
+	in.rt_mask  = hw.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((mrt_mask & (1u << slot)) != 0) CopyBytes(in.rt[slot], hw.GetRenderTarget(slot));
+	}
+	CopyBytes(in.z, hw.GetDepthRenderTarget());
+	CopyBytes(in.rc, hw.GetRenderControl());
+	CopyBytes(in.dc, hw.GetDepthControl());
+	CopyBytes(in.sc, hw.GetStencilControl());
+	CopyBytes(in.sm, hw.GetStencilMask());
+	CopyBytes(in.depth_clear, hw.GetDepthClearValue());
+	in.stencil_clear = hw.GetStencilClearValue();
+}
+
+// The last target resolution of the CP back thread (KYTY_BIND_PROF counts its repeats).
+struct PreviousTargets {
+	bool         valid = false;
+	TargetInputs inputs;
+	// Every search of the record may be kept (FindImageMemo), all at this image epoch.
+	bool     kept  = false;
+	uint64_t epoch = 0;
+	uint32_t meta  = 0; // targets with DCC/CMASK metadata (FindImage materializes their clears)
+	std::array<uint64_t, RENDER_COLOR_ATTACHMENTS_MAX + 1> hash {}; // prediction keys, depth last
+};
+
+static thread_local PreviousTargets t_previous_targets;
+
+// One target of a resolution: whether its search may be kept, at which epoch.
+static void NoteTargetFind(PreviousTargets& next, const TextureCache::ImageDesc& desc, ImageId id,
+                           const TextureCache::FindImageMemo& memo) {
+	if (!id) {
+		// Nothing bound: no search (decided by the registers alone), or a heap wait (not kept).
+		if (desc.info.data.address != 0) next.kept = false;
+		return;
+	}
+	PerfStats::Add(PerfStats::Counter::TgtFindCount, 1);
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc || desc.info.metadata.kind == ImageMetadataKind::Cmask) {
+		next.meta++;
+	}
+	if (memo.id != id || (next.epoch != 0 && memo.epoch != next.epoch)) {
+		next.kept = false;
+		return;
+	}
+	next.epoch = memo.epoch;
+	PerfStats::Add(PerfStats::Counter::TgtFindKept, 1);
+}
+
 // The targets of a queued draw from the remembered ones; false when one is unknown or the draw would
 // take another path (aliased targets, mixed sample counts, nothing to draw, another pixel permutation).
 static bool PredictTargets(const CpPipeline::DrawRecord& record, DrawRenderState& state) {
@@ -1135,19 +1225,46 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	const bool remember = m_context.GetPipelineCache().ParallelEnabled() && CpPipeline::Mode() != 0;
 	{ // KYTY_BIND_PROF: target resolution
-		PerfStats::ScopedTimer resolve_timer(PerfStats::Counter::BackResolveNs, PerfStats::BackProfEnabled());
+		using Clock = std::chrono::steady_clock;
+		const bool  prof  = PerfStats::BackProfEnabled();
+		const auto& hw    = buffer.GetRegisters();
+		auto&       cache = m_context.GetTextureCache();
+		// Repeats are counted for records that start with no target (all do today).
+		const bool track    = prof && state.color_count == 0 && !state.depth_info.image_id;
+		auto&      previous = t_previous_targets;
+		PreviousTargets next {.valid = track, .kept = true};
+		if (track) { // the prediction keys (registers hashed), outside the resolve bucket
+			PerfStats::ScopedTimer hash_timer(PerfStats::Counter::TgtHashNs, true);
+			for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+				if ((state.mrt_mask & (1u << slot)) != 0) next.hash[slot] = ColorTargetKey(hw, slot);
+			}
+			next.hash[RENDER_COLOR_ATTACHMENTS_MAX] = DepthTargetKey(hw);
+		}
+		const auto start    = prof ? Clock::now() : Clock::time_point {};
+		bool       same     = false;
+		bool       reusable = false;
+		if (track) {
+			PerfStats::ScopedTimer key_timer(PerfStats::Counter::TgtKeyNs, true);
+			same     = previous.valid && SameTargetInputs(previous.inputs, hw, state.mrt_mask);
+			reusable = same && previous.kept && previous.epoch == cache.ImageIndexEpoch();
+		}
+		std::array<TextureCache::FindImageMemo, RENDER_COLOR_ATTACHMENTS_MAX + 1> memos {};
+		PerfStats::t_target_prof = prof;
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 			if ((state.mrt_mask & (1u << slot)) != 0) {
-				ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
+				auto& color = state.color_info[state.color_count];
+				ResolveRenderColorTarget(buffer, color, slot, false, false, track ? &memos[slot] : nullptr);
+				if (track) NoteTargetFind(next, color.desc, color.image_id, memos[slot]);
 				if (remember) {
-					RememberTarget(g_color_targets, ColorTargetKey(buffer.GetRegisters(), slot),
-					               state.color_info[state.color_count]);
+					PerfStats::ScopedTimer remember_timer(PerfStats::Counter::TgtRememberNs, prof);
+					RememberTarget(g_color_targets, ColorTargetKey(hw, slot), color);
 				}
-				if (state.color_info[state.color_count].image_id) {
+				if (color.image_id) {
 					state.color_count++;
 				}
 			}
 		}
+		const auto merge_start = prof ? Clock::now() : Clock::time_point {};
 		MergeAliasedColorTargets(state);
 		if (state.aliased_passes != 0) {
 			uint32_t resolved = 0;
@@ -1160,9 +1277,49 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				     resolved, state.aliased_passes);
 			}
 		}
-		ResolveRenderDepthTarget(buffer, state.depth_info);
+		if (prof) {
+			PerfStats::Add(PerfStats::Counter::TgtMergeNs,
+			               static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                         Clock::now() - merge_start)
+			                                         .count()));
+		}
+		ResolveRenderDepthTarget(buffer, state.depth_info, track ? &memos[RENDER_COLOR_ATTACHMENTS_MAX] : nullptr);
+		PerfStats::t_target_prof = false;
+		if (track) {
+			NoteTargetFind(next, state.depth_info.desc, state.depth_info.image_id,
+			               memos[RENDER_COLOR_ATTACHMENTS_MAX]);
+		}
 		if (remember) {
-			RememberTarget(g_depth_targets, DepthTargetKey(buffer.GetRegisters()), state.depth_info);
+			PerfStats::ScopedTimer remember_timer(PerfStats::Counter::TgtRememberNs, prof);
+			RememberTarget(g_depth_targets, DepthTargetKey(hw), state.depth_info);
+		}
+		if (track) {
+			PerfStats::ScopedTimer key_timer(PerfStats::Counter::TgtKeyNs, true);
+			CaptureTargetInputs(next.inputs, hw, state.mrt_mask);
+		}
+		if (prof) {
+			const auto ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+			PerfStats::Add(PerfStats::Counter::BackResolveNs, ns);
+			PerfStats::Add(PerfStats::Counter::TgtRecords, 1);
+			if (track && previous.valid && previous.inputs.mrt_mask == state.mrt_mask && previous.hash == next.hash) {
+				PerfStats::Add(PerfStats::Counter::TgtSameHash, 1);
+				PerfStats::Add(PerfStats::Counter::TgtSameHashNs, ns);
+			}
+			if (same) {
+				PerfStats::Add(PerfStats::Counter::TgtSameExact, 1);
+				PerfStats::Add(PerfStats::Counter::TgtSameExactNs, ns);
+				if (!previous.kept) {
+					PerfStats::Add(PerfStats::Counter::TgtUnkept, 1);
+				} else if (!reusable) {
+					PerfStats::Add(PerfStats::Counter::TgtEpochMoved, 1);
+				} else {
+					PerfStats::Add(PerfStats::Counter::TgtReusable, 1);
+					PerfStats::Add(PerfStats::Counter::TgtReusableNs, ns);
+					PerfStats::Add(PerfStats::Counter::TgtReusableMeta, previous.meta);
+				}
+			}
+			previous = next;
 		}
 	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,

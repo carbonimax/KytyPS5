@@ -62,6 +62,11 @@ public:
 	// KYTY_FIND_IMAGE_MEMO: 1 (default) reuse a FindImageMemo, 0 off, 2 search anyway and exit if
 	// the search does not give the kept image.
 	[[nodiscard]] static uint32_t FindImageMemoMode() noexcept;
+	// The epoch FindImageMemo entries are kept at (bumped when an image is (un)registered).
+	[[nodiscard]] uint64_t ImageIndexEpoch() {
+		std::scoped_lock lock {m_lock};
+		return m_image_index_epoch;
+	}
 
 	// memo: kept for a description identical to desc (or empty); FindImage fills it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
