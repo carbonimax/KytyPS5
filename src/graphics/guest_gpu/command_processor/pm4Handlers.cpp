@@ -14,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 
 #define KYTY_HW_SH_PARSER_ARGS                                                                     \
@@ -38,6 +39,32 @@ constexpr uint32_t RegisterSelectorMask = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// KYTY_SRT_PREFETCH=N (experiment, default 0, N <= 16): when user-data SGPRs are written, prefetch N
+// cache lines at each even pair that looks like a guest pointer (high DWORD in 1..0xffff), so the SRT
+// walk of the coming draw finds its root tables cached. A prefetch has no architectural effect: on an
+// unmapped or protected page it does nothing.
+uint32_t SrtPrefetchLines() {
+	static const uint32_t lines = [] {
+		const char* value = std::getenv("KYTY_SRT_PREFETCH");
+		return value != nullptr ? static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16)) : 0u;
+	}();
+	return lines;
+}
+
+// Pairs of sgprs[0, size) that overlap the written range [first, end).
+void PrefetchUserPointers(const uint32_t* sgprs, uint32_t first, uint32_t end, uint32_t size) {
+	const uint32_t lines = SrtPrefetchLines();
+	if (lines == 0) return;
+	for (uint32_t i = first & ~1u; i < end && i + 1 < size; i += 2) {
+		const uint32_t high = sgprs[i + 1];
+		if (high == 0 || high > 0xffffu) continue;
+		const uint64_t address = ((uint64_t {high} << 32) | sgprs[i]) & ~uint64_t {63};
+		for (uint32_t line = 0; line < lines; line++) {
+			__builtin_prefetch(reinterpret_cast<const void*>(address + uint64_t {line} * 64u), 0, 3);
+		}
+	}
 }
 
 } // namespace
@@ -369,6 +396,7 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i]);
 	}
+	PrefetchUserPointers(cp.GetShCtx().GetCs().cs_user_sgpr.value, slot, slot + reg_num, HW::UserSgprInfo::SGPRS_MAX);
 
 	return reg_num;
 }
@@ -382,6 +410,7 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i]);
 	}
+	PrefetchUserPointers(cp.GetShCtx().GetPs().ps_user_sgpr.value, slot, slot + reg_num, HW::UserSgprInfo::SGPRS_MAX);
 
 	return reg_num;
 }
@@ -395,6 +424,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i]);
 	}
+	PrefetchUserPointers(cp.GetShCtx().GetVs().gs_user_sgpr.value, slot, slot + reg_num, HW::UserSgprInfo::SGPRS_MAX);
 
 	return reg_num;
 }
@@ -408,6 +438,7 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	for (uint32_t i = 0; i < reg_num; i++) {
 		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i]);
 	}
+	PrefetchUserPointers(cp.GetShCtx().GetVs().hs_user_sgpr.value, slot, slot + reg_num, HW::UserSgprInfo::SGPRS_MAX);
 
 	return reg_num;
 }
@@ -2191,17 +2222,25 @@ static constexpr auto MakeShaderIndirectTable() {
 	for (uint32_t slot = 0; slot < 16; slot++) {
 		table[Pm4::COMPUTE_USER_DATA_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetCsUserSgpr(cmd_offset - Pm4::COMPUTE_USER_DATA_0, value);
+			PrefetchUserPointers(cp.GetShCtx().GetCs().cs_user_sgpr.value, cmd_offset - Pm4::COMPUTE_USER_DATA_0,
+			                     cmd_offset - Pm4::COMPUTE_USER_DATA_0 + 1, HW::UserSgprInfo::SGPRS_MAX);
 		};
 	}
 	for (uint32_t slot = 0; slot < 32; slot++) {
 		table[Pm4::SPI_SHADER_USER_DATA_PS_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetPsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0, value);
+			PrefetchUserPointers(cp.GetShCtx().GetPs().ps_user_sgpr.value, cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0,
+			                     cmd_offset - Pm4::SPI_SHADER_USER_DATA_PS_0 + 1, HW::UserSgprInfo::SGPRS_MAX);
 		};
 		table[Pm4::SPI_SHADER_USER_DATA_GS_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetGsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, value);
+			PrefetchUserPointers(cp.GetShCtx().GetVs().gs_user_sgpr.value, cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0,
+			                     cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0 + 1, HW::UserSgprInfo::SGPRS_MAX);
 		};
 		table[Pm4::SPI_SHADER_USER_DATA_HS_0 + slot] = [](KYTY_HW_REG_ARGS) {
 			cp.GetShCtx().SetHsUserSgpr(cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0, value);
+			PrefetchUserPointers(cp.GetShCtx().GetVs().hs_user_sgpr.value, cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0,
+			                     cmd_offset - Pm4::SPI_SHADER_USER_DATA_HS_0 + 1, HW::UserSgprInfo::SGPRS_MAX);
 		};
 	}
 	for (const auto base: {Pm4::SPI_SHADER_USER_ACCUM_PS_0, Pm4::SPI_SHADER_USER_ACCUM_ESGS_0,
