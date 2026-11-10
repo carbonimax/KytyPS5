@@ -9,9 +9,10 @@
 //   V t base pts clock prev     Video() delivered a frame; `prev` went back to the decoder
 //   v t clock head              Video() delivered nothing (`head`: next ready frame, -1 none)
 //   A t pts before after        Audio() re-synced the video clock from `before` to `after` (ms)
-//   S|T|B t0 t1 base off size content delivered dgen gen0 gen1 w0 w1 held [extra]
+//   S|T|B|D t0 t1 base off size content delivered dgen gen0 gen1 w0 w1 held [extra]
 //                               GPU-side read of guest bytes inside a video buffer: texture lookup
-//                               (S), texture upload (T) or buffer cache upload (B). `content` is the
+//                               (S), texture upload (T), buffer cache sync (B, bytes=0: the tracker
+//                               found the range clean) or CP DMA copy source (D). `content` is the
 //                               pts last written into the buffer, `delivered` the pts it had when last
 //                               handed to the game, dgen the write generation at that delivery
 //                               (gen1 != dgen: rewritten since), gen0/gen1 the generation at t0/t1,

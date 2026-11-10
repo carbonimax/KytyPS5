@@ -217,7 +217,8 @@ void SetStorageBoundsCounters(const volatile uint32_t* counters) noexcept {
 }
 
 // KYTY_PACE_LOG=1 (with KYTY_PERF_STATS=1): a "PERF pace" line with the audio underruns, audio queue
-// flushes, late vblanks and dropped presents of the interval. It keeps the overlay counters counting.
+// flushes, late vblanks and dropped presents of the interval. Those counters then count with the
+// overlay hidden.
 static bool PaceLogEnabled() noexcept {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_PACE_LOG");
@@ -231,7 +232,7 @@ void MaybeReport() noexcept {
 		return;
 	}
 	if (PaceLogEnabled()) [[unlikely]] {
-		Common::DebugCounters::SetEnabled(true);
+		Common::DebugCounters::SetCounting(true);
 	}
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
