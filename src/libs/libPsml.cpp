@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
+#include "graphics/guest_gpu/pssrProf.h"
 #include "graphics/shader/shaderBindings.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -24,6 +25,8 @@ namespace {
 
 namespace Pm4  = Graphics::Pm4;
 namespace Pssr = Graphics::Pssr;
+namespace Prof = Graphics::Pssr::Prof;
+using Entry    = Prof::Entry;
 
 constexpr int      NOT_INITIALIZED           = static_cast<int>(0x8a810001u);
 constexpr int      ALREADY_INITIALIZED       = static_cast<int>(0x8a810002u);
@@ -191,6 +194,7 @@ void WritePacket(const CommandSpace& space, const Pssr::Request& request) {
 }
 
 int KYTY_SYSV_ABI Initialize() {
+	Prof::Call(Entry::Initialize);
 	std::lock_guard lock(g_mutex);
 	if (!Loader::SystemContentIsTrinityMode()) {
 		return NOT_TRINITY_MODE;
@@ -203,6 +207,7 @@ int KYTY_SYSV_ABI Initialize() {
 }
 
 int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const MemoryParameters* params) {
+	Prof::Call(Entry::GetSharedRequirements);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -219,6 +224,7 @@ int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const MemoryPar
 }
 
 int KYTY_SYSV_ABI CreateSharedResources(void** out, const SharedParameters* params) {
+	Prof::Call(Entry::CreateSharedResources);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -257,6 +263,7 @@ int KYTY_SYSV_ABI ReleaseSharedResources(void* resources) {
 }
 
 int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const void* params) {
+	Prof::Call(Entry::GetContextRequirements);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -270,6 +277,7 @@ int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const void* pa
 
 int CreateContext(void** out, const MemoryParameters* memory, uint32_t width, uint32_t height,
                   void* shared, bool use_shared) {
+	Prof::Call(Entry::CreateContext);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -321,6 +329,7 @@ int KYTY_SYSV_ABI CreateSharedContext(void** out, const ContextParameters* param
 }
 
 int KYTY_SYSV_ABI ReleaseContext(void* context) {
+	Prof::Call(Entry::ReleaseContext);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -334,6 +343,7 @@ int KYTY_SYSV_ABI ReleaseContext(void* context) {
 }
 
 int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
+	Prof::Call(Entry::GetPacketSize);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -347,6 +357,7 @@ int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
 
 int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
                            const DispatchParameters* params) {
+	Prof::Call(Entry::Dispatch);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -402,6 +413,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
 		flags |= Pssr::kSpatialOnly;
 	}
+	Prof::Call(Entry::DispatchOk);
 	WritePacket(*space, MakeRequest(context, *params, flags,
 	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
@@ -422,6 +434,7 @@ int KYTY_SYSV_ABI LegacyDispatch(const void* context, const CommandSpace* space,
 }
 
 int KYTY_SYSV_ABI GetMipmapBias(const void* context, float* bias, uint32_t width, uint32_t height) {
+	Prof::Call(Entry::GetMipmapBias);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -592,6 +605,7 @@ int CheckDispatch(const Context* context, const DispatchParameters* params) {
 }
 
 int KYTY_SYSV_ABI Initialize() {
+	Prof::Call(Entry::Mfsr2Initialize);
 	std::lock_guard lock(g_mutex);
 	if (g_initialized) {
 		return ALREADY_INITIALIZED;
@@ -656,6 +670,7 @@ int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const ContextP
 }
 
 int KYTY_SYSV_ABI CreateContext(Context** out, const ContextParameters* params) {
+	Prof::Call(Entry::Mfsr2CreateContext);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -695,6 +710,7 @@ int KYTY_SYSV_ABI GetDispatchDwords(const Context* /*context*/, uint32_t* out) {
 
 int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace* space,
                                      const DispatchParameters* params) {
+	Prof::Call(Entry::Mfsr2Dispatch);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -709,6 +725,7 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
 	}
+	Prof::Call(Entry::Mfsr2DispatchOk);
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
 }
