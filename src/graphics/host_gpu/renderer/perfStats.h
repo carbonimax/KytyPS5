@@ -109,6 +109,28 @@ enum class Counter : uint32_t {
 	SyncNoDownloadOther,
 	SyncStillDirtyWalk, // ... after which the read range was still GPU-dirty
 	SyncStillDirtyOther,
+	// KYTY_WDWORD: synchronized walker reads seen by the probe after a program lookup's walk, and
+	// those outside it; per read: changed by the synchronization (backing before != after), first of
+	// its (program, lookup in the frame, read in the walk) key, different from that key's previous value.
+	WdwordReads,
+	WdwordOutside,
+	WdwordChanged,
+	WdwordFirst,
+	WdwordDiffPrev,
+	// Re-walks with the read dword replaced (value + 1, then 0): override applied, walk failed, and
+	// what differed from the unperturbed re-walk: flattened SRT, descriptor dwords, resource or image
+	// activity, walked outputs (indirect keys, uniform fill), guest load addresses. Baseline: the
+	// unperturbed re-walk did not reproduce the lookup's flattened SRT (must stay 0).
+	WdwordProbes,
+	WdwordApplied,
+	WdwordFailed,
+	WdwordFlat,
+	WdwordDesc,
+	WdwordActive,
+	WdwordOutputs,
+	WdwordAddrs,
+	WdwordNone,
+	WdwordBaseline,
 	// KYTY_BACK_SAME: CP back records, and those whose resolved draw state equals the previous one.
 	BackRecords,
 	BackRecordNs,
@@ -151,6 +173,9 @@ enum class Counter : uint32_t {
 // (backing bytes before and after each synchronized read) and "PERF backsame" (CP back records equal to
 // the previous one) lines.
 [[nodiscard]] bool SyncCmpEnabled() noexcept;
+// KYTY_WDWORD=1 (step 2.13 measurement, default off; needs KYTY_SYNC_CMP=1): "PERF wdword" line and
+// "WDWORD0" log lines (pipelineCache.cpp ProbeWalkerReads).
+[[nodiscard]] bool WdwordEnabled() noexcept;
 [[nodiscard]] bool BackSameEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 [[nodiscard]] uint64_t Peek(Counter counter) noexcept;

@@ -654,6 +654,9 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // pages the tracker protects against reads); other pages leave the list and are loaded directly.
 static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
 	using namespace Libs::Graphics::ShaderRecompiler::IR;
+	if (Libs::LibKernel::Memory::TryWalkerOverride(address, value)) {
+		return ProtectedLoadValue | ProtectedLoadKeep;
+	}
 	if (!Libs::LibKernel::Memory::MaybeGpuModifiedPage(address)) {
 		return 0;
 	}

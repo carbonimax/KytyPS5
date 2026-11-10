@@ -40,7 +40,9 @@
 #include <cstring>
 #include <deque>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -48,6 +50,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -146,6 +150,160 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+// KYTY_WDWORD: synchronized walker reads left from walks outside a program lookup's walk.
+void ClearWalkerReads() {
+	if (!PerfStats::WdwordEnabled()) return;
+	auto& reads = Libs::LibKernel::Memory::GetWalkerProbe().reads;
+	PerfStats::Add(PerfStats::Counter::WdwordOutside, reads.size());
+	reads.clear();
+}
+
+// KYTY_WDWORD (step 2.13 measurement): the synchronized walker reads of this lookup's walk. Each is
+// compared with the previous value of its (program, lookup in the frame, read in the walk) key; then
+// the walk is redone with that dword replaced (value + 1, then 0) and compared with an unperturbed
+// re-walk. The plan's walk state (scratch, memo) is restored afterwards.
+void ProbeWalkerReads(const ShaderRecompiler::IR::ResourcePlan& plan,
+                      const ShaderRecompiler::IR::SrtRuntime& runtime, const std::vector<uint32_t>& flattened) {
+	namespace IR = ShaderRecompiler::IR;
+	using PerfStats::Counter;
+	auto& probe = Libs::LibKernel::Memory::GetWalkerProbe();
+	if (probe.reads.empty()) return;
+	const auto reads = std::exchange(probe.reads, {});
+	thread_local uint64_t                                                         frames = UINT64_MAX;
+	thread_local std::unordered_map<const void*, uint32_t>                        lookups;
+	thread_local std::map<std::tuple<const void*, uint32_t, uint32_t>, uint32_t> previous;
+	thread_local std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, uint64_t> logged;
+	if (const auto now = PerfStats::Peek(Counter::Frames); now != frames) {
+		frames = now;
+		lookups.clear();
+	}
+	const auto lookup = lookups[&plan]++;
+
+	struct Walked {
+		bool                             ok = false;
+		std::vector<uint32_t>            flat;
+		std::vector<IR::DescriptorValue> descriptors;
+		std::vector<uint8_t>             active;
+		std::vector<uint64_t>            outputs, loads;
+	};
+	const auto walk = [&](Walked& result) {
+		plan.srt_memo_loads = UINT32_MAX; // a full walk, not the memo
+		std::vector<std::pair<uint64_t, uint64_t>> loads;
+		result.ok = IR::WalkSrt(plan, runtime, result.flat, &loads);
+		for (const auto& load: loads) result.loads.push_back(load.first);
+		for (uint32_t source = 0; source < plan.descriptor_sources.size(); ++source) {
+			result.active.push_back(IR::WalkedActive(plan, source) ? 1 : 0);
+			auto& value = result.descriptors.emplace_back();
+			if (!IR::WalkedDescriptor(plan, source, value)) value = {};
+		}
+		for (uint32_t image = 0; image < plan.info.images.size(); ++image)
+			result.active.push_back(IR::WalkedImageActive(plan, image) ? 1 : 0);
+		const auto output = [&](IR::Value value) {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst == nullptr || inst->WalkOutput() == UINT32_MAX) return;
+			uint32_t walked = 0;
+			result.outputs.push_back(IR::WalkedValue(plan, value, walked) ? walked : UINT64_MAX);
+		};
+		for (const auto& source: plan.descriptor_sources) {
+			if (!source.indirect_descriptor) continue;
+			output(source.indirect_descriptor->key_count);
+			output(source.indirect_descriptor->selector_first);
+			output(source.indirect_descriptor->selector_mask);
+		}
+		output(plan.uniform_fill.pattern_size);
+		output(plan.uniform_fill.element_count);
+		for (const auto value: plan.uniform_fill.values) output(value);
+	};
+
+	const auto scratch      = plan.srt_scratch;
+	const auto memo_user    = plan.srt_memo_user_data;
+	const auto memo_flat    = plan.srt_memo_flat;
+	const auto memo_base    = plan.srt_memo_shader_base;
+	const auto memo_loads   = plan.srt_memo_loads;
+	probe.busy              = true;
+	Walked base;
+	walk(base);
+	const bool reproduced = base.ok && base.flat.size() <= flattened.size() &&
+	                        std::equal(base.flat.begin(), base.flat.end(), flattened.begin());
+	PerfStats::Add(Counter::WdwordBaseline, reproduced ? 0 : 1);
+	for (uint32_t index = 0; index < reads.size(); ++index) {
+		const auto& read = reads[index];
+		PerfStats::Add(Counter::WdwordReads, 1);
+		PerfStats::Add(Counter::WdwordChanged, read.before != read.after ? 1 : 0);
+		const auto [last, first] = previous.try_emplace({&plan, lookup, index}, read.after);
+		PerfStats::Add(Counter::WdwordFirst, first ? 1 : 0);
+		PerfStats::Add(Counter::WdwordDiffPrev, !first && last->second != read.after ? 1 : 0);
+		const auto prior = first ? read.after : last->second;
+		last->second     = read.after;
+		if (index >= 4u || !reproduced) continue;
+		for (const uint32_t alternative: {read.after + 1u, read.after != 0u ? 0u : 1u}) {
+			probe.override_vaddr = read.vaddr;
+			probe.override_value = alternative;
+			probe.used           = false;
+			Walked changed;
+			walk(changed);
+			probe.override_vaddr = 0;
+			PerfStats::Add(Counter::WdwordProbes, 1);
+			if (!probe.used) continue;
+			PerfStats::Add(Counter::WdwordApplied, 1);
+			uint32_t flat_diffs = 0, first_flat = UINT32_MAX, desc_diffs = 0, first_desc = UINT32_MAX;
+			for (uint32_t i = 0; i < std::min(changed.flat.size(), base.flat.size()); ++i) {
+				if (changed.flat[i] == base.flat[i]) continue;
+				flat_diffs++;
+				first_flat = std::min(first_flat, i);
+			}
+			for (uint32_t i = 0; i < std::min(changed.descriptors.size(), base.descriptors.size()); ++i) {
+				if (changed.descriptors[i] == base.descriptors[i]) continue;
+				desc_diffs++;
+				first_desc = std::min(first_desc, i);
+			}
+			const bool active  = changed.active != base.active;
+			const bool outputs = changed.outputs != base.outputs;
+			const bool addrs   = changed.loads != base.loads;
+			PerfStats::Add(Counter::WdwordFailed, changed.ok ? 0 : 1);
+			PerfStats::Add(Counter::WdwordFlat, changed.ok && flat_diffs != 0 ? 1 : 0);
+			PerfStats::Add(Counter::WdwordDesc, changed.ok && desc_diffs != 0 ? 1 : 0);
+			PerfStats::Add(Counter::WdwordActive, changed.ok && active ? 1 : 0);
+			PerfStats::Add(Counter::WdwordOutputs, changed.ok && outputs ? 1 : 0);
+			PerfStats::Add(Counter::WdwordAddrs, changed.ok && addrs ? 1 : 0);
+			const bool none = changed.ok && flat_diffs == 0 && desc_diffs == 0 && !active && !outputs && !addrs;
+			PerfStats::Add(Counter::WdwordNone, none ? 1 : 0);
+			const auto count = ++logged[{plan.shader_hash, index, alternative == read.after + 1u ? 1u : 0u,
+			                             (changed.ok ? 1u : 0u) | (flat_diffs != 0 ? 2u : 0u) |
+			                                 (desc_diffs != 0 ? 4u : 0u) | (active ? 8u : 0u) |
+			                                 (outputs ? 16u : 0u) | (addrs ? 32u : 0u)}];
+			if (count == 1 || count == 100 || count == 10000) {
+				const auto flat_at = first_flat < base.flat.size() ? first_flat : 0u;
+				const auto desc_at = first_desc < base.descriptors.size() ? first_desc : 0u;
+				PipelineCacheLog(
+				    "WDWORD0 probe count={} shader=0x{:016x} stage={} lookup={} read={} vaddr=0x{:x} before=0x{:x} "
+				    "after=0x{:x} prior=0x{:x} alt=0x{:x} ok={} flat={}/{}@{}(0x{:x}->0x{:x}) desc={}/{}@{} "
+				    "active={} outputs={}/{} loads={}->{} addrs={}",
+				    count, plan.shader_hash, static_cast<uint32_t>(plan.stage), lookup, index, read.vaddr,
+				    read.before, read.after, prior, alternative, changed.ok ? 1 : 0, flat_diffs, base.flat.size(),
+				    first_flat == UINT32_MAX ? -1 : static_cast<int64_t>(first_flat),
+				    base.flat.empty() ? 0u : base.flat[flat_at],
+				    flat_at < changed.flat.size() ? changed.flat[flat_at] : 0u, desc_diffs,
+				    base.descriptors.size(), first_desc == UINT32_MAX ? -1 : static_cast<int64_t>(first_desc),
+				    active ? 1 : 0, outputs ? 1 : 0, base.outputs.size(), base.loads.size(), changed.loads.size(),
+				    addrs ? 1 : 0);
+				if (desc_diffs != 0 && desc_at < changed.descriptors.size()) {
+					const auto& b = base.descriptors[desc_at].dwords;
+					const auto& c = changed.descriptors[desc_at].dwords;
+					PipelineCacheLog("WDWORD0 desc shader=0x{:016x} source={} base={:08x} changed={:08x}",
+					                 plan.shader_hash, desc_at, fmt::join(b, ","), fmt::join(c, ","));
+				}
+			}
+		}
+	}
+	probe.busy                = false;
+	plan.srt_scratch          = scratch;
+	plan.srt_memo_user_data   = memo_user;
+	plan.srt_memo_flat        = memo_flat;
+	plan.srt_memo_shader_base = memo_base;
+	plan.srt_memo_loads       = memo_loads;
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -305,8 +463,10 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor, bool emulate_image_min_lod) {
+			ClearWalkerReads();
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization, emulate_image_min_lod));
+			if (PerfStats::WdwordEnabled()) ProbeWalkerReads(resource_plan, runtime, resources.flattened_srt);
 			CaptureSrtReads(resource_plan, runtime, resources);
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
@@ -793,9 +953,12 @@ struct PipelineCache::ProgramCache {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
+			ClearWalkerReads();
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization, !graphics.image_view_min_lod_enabled));
+			if (PerfStats::WdwordEnabled())
+				ProbeWalkerReads(entry->second.resource_plan, runtime, entry->second.resources.flattened_srt);
 			CaptureSrtReads(entry->second.resource_plan, runtime, entry->second.resources);
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);

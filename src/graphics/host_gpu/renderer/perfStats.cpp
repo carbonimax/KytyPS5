@@ -89,6 +89,14 @@ bool SyncCmpEnabled() noexcept {
 	return enabled;
 }
 
+bool WdwordEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WDWORD");
+		return SyncCmpEnabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 bool BackSameEnabled() noexcept {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_BACK_SAME");
@@ -335,6 +343,17 @@ void MaybeReport() noexcept {
 			            n(c == 0 ? Counter::SyncNoDownloadWalk : Counter::SyncNoDownloadOther),
 			            n(c == 0 ? Counter::SyncStillDirtyWalk : Counter::SyncStillDirtyOther));
 		}
+	}
+	if (WdwordEnabled()) {
+		std::printf("PERF wdword %.1fs: reads=%" PRIu64 " outside=%" PRIu64 " changed=%" PRIu64 " first=%" PRIu64
+		            " diff_prev=%" PRIu64 " probes=%" PRIu64 " applied=%" PRIu64 " failed=%" PRIu64 " flat=%" PRIu64
+		            " desc=%" PRIu64 " active=%" PRIu64 " outputs=%" PRIu64 " addrs=%" PRIu64 " none=%" PRIu64
+		            " baseline=%" PRIu64 "\n",
+		            seconds, n(Counter::WdwordReads), n(Counter::WdwordOutside), n(Counter::WdwordChanged),
+		            n(Counter::WdwordFirst), n(Counter::WdwordDiffPrev), n(Counter::WdwordProbes),
+		            n(Counter::WdwordApplied), n(Counter::WdwordFailed), n(Counter::WdwordFlat),
+		            n(Counter::WdwordDesc), n(Counter::WdwordActive), n(Counter::WdwordOutputs),
+		            n(Counter::WdwordAddrs), n(Counter::WdwordNone), n(Counter::WdwordBaseline));
 	}
 	if (BackSameEnabled()) {
 		std::printf("PERF backsame %.1fs: records=%" PRIu64 "(%.0fms) shaped=%" PRIu64 " pipe=%" PRIu64 " rt=%" PRIu64

@@ -899,6 +899,19 @@ bool MaybeGpuModifiedPage(uint64_t vaddr) {
 	       GetGpuResources().GetBufferCache().MaybeGpuModifiedPage(vaddr);
 }
 
+WalkerProbe& GetWalkerProbe() {
+	thread_local WalkerProbe probe;
+	return probe;
+}
+
+bool TryWalkerOverride(uint64_t vaddr, uint32_t* value) {
+	auto& probe = GetWalkerProbe();
+	if (probe.override_vaddr == 0 || probe.override_vaddr != vaddr) return false;
+	*value     = probe.override_value;
+	probe.used = true;
+	return true;
+}
+
 // KYTY_SYNC_CMP: the backing bytes of a synchronized read (and of its 4 KiB page) before and after
 // the synchronization, with the time and the GPU-written bytes it downloaded.
 static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::BufferCache& buffers) {
@@ -925,6 +938,12 @@ static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::B
 	const bool same      = std::memcmp(before.data(), after.data(), size) == 0;
 	const bool page_same = have_page && TryReadBacking(page, after.data(), Page) &&
 	                       std::memcmp(before_page.data(), after.data(), Page) == 0;
+	if (walker && Graphics::PerfStats::WdwordEnabled() && size == sizeof(uint32_t)) {
+		uint32_t before_value = 0, after_value = 0;
+		std::memcpy(&before_value, before.data(), sizeof(before_value));
+		std::memcpy(&after_value, after.data(), sizeof(after_value));
+		GetWalkerProbe().reads.push_back({vaddr, before_value, after_value});
+	}
 	if (walker) {
 		// Step 2.12 step 0: which written range made this read wait, and where in it the read falls.
 		Graphics::BufferCache::WriteOrigin origin;
@@ -953,13 +972,16 @@ static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::B
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size, bool walker) {
+	if (walker && size == sizeof(uint32_t) && TryWalkerOverride(vaddr, static_cast<uint32_t*>(data))) {
+		return true;
+	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			if (Graphics::PerfStats::SyncCmpEnabled()) {
+			if (Graphics::PerfStats::SyncCmpEnabled() && !GetWalkerProbe().busy) {
 				SyncCompared(vaddr, size, walker, buffers);
 			} else {
 				Graphics::CpSplitProf::Drain(Graphics::CpSplitProf::Cause::SyncRead);

@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <vector>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -134,6 +136,23 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 // walker: an SRT walker load (KYTY_SYNC_CMP counts it apart).
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size, bool walker = false);
+// KYTY_WDWORD=1 (step 2.13 measurement, with KYTY_SYNC_CMP=1; GPU thread): the synchronized walker
+// reads since the last clear (backing dword before and after the synchronization), and a dword
+// override that walker loads of that address return instead (`used` set when one did); `busy`
+// keeps the probe's own walks out of the synchronized-read counters.
+struct WalkerSyncedRead {
+	uint64_t vaddr;
+	uint32_t before, after;
+};
+struct WalkerProbe {
+	std::vector<WalkerSyncedRead> reads;
+	uint64_t                      override_vaddr = 0;
+	uint32_t                      override_value = 0;
+	bool                          used = false, busy = false;
+};
+WalkerProbe&           GetWalkerProbe();
+// True (value set) when the walker load of vaddr is the probe's override.
+bool                   TryWalkerOverride(uint64_t vaddr, uint32_t* value);
 // GPU thread: the tracker page of vaddr may hold GPU-written bytes (the tracker protects such pages
 // against guest reads). False on other threads and outside GPU-tracked memory.
 bool                   MaybeGpuModifiedPage(uint64_t vaddr);
