@@ -131,6 +131,14 @@ void NoteFlipArg(int64_t arg) noexcept;
 // Smoothed interval between presented frames in microseconds (0 before the second frame).
 [[nodiscard]] uint64_t RecentFrameUs() noexcept;
 
+// KYTY_AB_PERIOD_FRAMES=N (measurement, default 0 = off): both arms of an A/B in one session. The
+// arm changes every N presented frames in the order 0 1 1 0 (cancels a linear drift), and each
+// KYTY_FRAME_TIMES line gets the arm of its frame as a third column. KYTY_AB_FLAG=<name> picks the
+// option the arm drives (arm 0 = forced off, arm 1 = as configured); any other name only tags the
+// frames (A/A). A driven option must be safe to change between two frames (no pipeline, shader or
+// cache-key effect). True when `flag` is driven and the current arm is 0.
+[[nodiscard]] bool AbOff(const char* flag) noexcept;
+
 // KYTY_COMPILE_LOG=<file> (diagnostic, default off): one line per shader registration, program
 // translation miss and pipeline creation, each starting with a kind letter and its steady-clock time
 // in microseconds (same clock and "# start" header as KYTY_FRAME_TIMES). Safe on any host thread.

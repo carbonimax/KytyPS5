@@ -12,8 +12,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <mutex>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -161,6 +163,20 @@ uint64_t RecentFrameUs() noexcept {
 	return g_recent_frame_us.load(std::memory_order_relaxed);
 }
 
+namespace {
+const uint32_t g_ab_period = [] {
+	const char* value = std::getenv("KYTY_AB_PERIOD_FRAMES");
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+}();
+std::atomic<uint32_t> g_ab_arm {0};
+} // namespace
+
+bool AbOff(const char* flag) noexcept {
+	static const char* driven = std::getenv("KYTY_AB_FLAG");
+	return g_ab_period != 0 && g_ab_arm.load(std::memory_order_relaxed) == 0 && driven != nullptr &&
+	       std::strcmp(driven, flag) == 0;
+}
+
 void NotePresentedFrame() noexcept {
 	{
 		// Smoothed presentation interval (1/8 of each new interval), always kept: the GPU thread reads
@@ -175,9 +191,16 @@ void NotePresentedFrame() noexcept {
 		}
 		last_us = now_us;
 	}
+	// The arm of this frame; the next one starts the following block when this one ends it.
+	static uint64_t ab_frames = 0;
+	const uint32_t  arm       = g_ab_arm.load(std::memory_order_relaxed);
+	if (g_ab_period != 0) {
+		constexpr uint32_t Pattern[4] = {0, 1, 1, 0};
+		g_ab_arm.store(Pattern[(++ab_frames / g_ab_period) % 4], std::memory_order_relaxed);
+	}
 	struct Recorder {
-		std::FILE*                                file = nullptr;
-		std::vector<std::pair<uint64_t, int64_t>> pending;
+		std::FILE*                                                file = nullptr;
+		std::vector<std::tuple<uint64_t, int64_t, uint32_t>> pending;
 	};
 	static Recorder* recorder = [] {
 		auto*       r    = new Recorder;
@@ -197,10 +220,14 @@ void NotePresentedFrame() noexcept {
 		return;
 	}
 	// Presentation runs on one thread.
-	recorder->pending.emplace_back(NowUs(), g_last_flip_arg.load(std::memory_order_relaxed));
+	recorder->pending.emplace_back(NowUs(), g_last_flip_arg.load(std::memory_order_relaxed), arm);
 	if (recorder->pending.size() >= 32) {
-		for (const auto& [us, arg]: recorder->pending) {
-			std::fprintf(recorder->file, "%" PRIu64 " %" PRId64 "\n", us, arg);
+		for (const auto& [us, arg, frame_arm]: recorder->pending) {
+			if (g_ab_period != 0) {
+				std::fprintf(recorder->file, "%" PRIu64 " %" PRId64 " %u\n", us, arg, frame_arm);
+			} else {
+				std::fprintf(recorder->file, "%" PRIu64 " %" PRId64 "\n", us, arg);
+			}
 		}
 		std::fflush(recorder->file);
 		recorder->pending.clear();

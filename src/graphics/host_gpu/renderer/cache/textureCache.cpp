@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -1141,6 +1142,10 @@ bool TextureCache::DeferRefresh(Image& image, const ImageViewInfo& view) {
 	const auto first_sampled = view.base_level + view.min_lod / 256u;
 	if (!RefreshProf::DirtyBelow(offsets.data(), sizes.data(), info.resources.levels,
 	                             dirty_end - info.data.address, info.data.size, first_sampled)) {
+		return false;
+	}
+	// In-session A/B: arm 0 refreshes as mode 0 would; the fault-side tracking of mode 1 stays on.
+	if (PerfStats::AbOff("refresh_skip_same")) [[unlikely]] {
 		return false;
 	}
 	const bool first = !note.deferred;
