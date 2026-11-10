@@ -59996,6 +59996,13 @@ int main(int argc, char **argv) {
 #else
   if (setenv("KYTY_MESH_INDIRECT_GPU", "1", 1) != 0) return 1;
 #endif
+  // Every test draw expects its pixels, so turn off the async pipelines (default on): a draw
+  // skipped while its pipeline is created would not land.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (_putenv_s("KYTY_ASYNC_PIPELINE", "0") != 0) return 1;
+#else
+  if (setenv("KYTY_ASYNC_PIPELINE", "0", 1) != 0) return 1;
+#endif
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
