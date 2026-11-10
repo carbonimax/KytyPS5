@@ -1244,10 +1244,15 @@ constexpr std::array<const char*, PathCount> PathNames {"stream", "ring", "fixed
 constexpr std::array<const char*, static_cast<size_t>(Site::Count)> SiteNames {"-", "vtx", "idx", "desc",
                                                                                "ind"};
 
+// Ranges up to this size keep a copy of their bytes: a change is then split into differing runs, each
+// attributed to the logged writes covering it. Larger ones keep a hash only.
+constexpr uint64_t MaxCopy = 1ull << 20u;
+
 struct Entry {
-	uint64_t vaddr = 0, size = 0, hash = 0, seq = 0;
-	Path     path = PathFixed;
-	Site     site = Site::None;
+	uint64_t             vaddr = 0, size = 0, hash = 0, seq = 0; // hash 0: unreadable
+	Path                 path = PathFixed;
+	Site                 site = Site::None;
+	std::vector<uint8_t> bytes; // size <= MaxCopy
 };
 
 struct Key {
@@ -1260,18 +1265,23 @@ struct KeyHash {
 	}
 };
 
+// guest: some changed byte is covered by no logged write. cp: every changed byte is covered, some by
+// a command-processor write. backing: covered by backing writes only. big: a hashed-only range changed
+// under a logged write (not split).
 struct Cell {
-	uint64_t n = 0, bytes = 0, cpu = 0, cpu_bytes = 0, gpu = 0, unread = 0;
+	uint64_t n = 0, bytes = 0, guest = 0, guest_bytes = 0, guest_diff = 0, cp = 0, cp_bytes = 0,
+	         backing = 0, big = 0, unread = 0;
 };
 
 struct Changed {
-	uint64_t count = 0;
-	Path     path  = PathFixed;
-	Site     site  = Site::None;
+	uint64_t guest = 0, cp = 0;
+	Path     path = PathFixed;
+	Site     site = Site::None;
 };
 
 struct Write {
 	uint64_t seq = 0, vaddr = 0, size = 0;
+	bool     cp = false;
 };
 
 struct State {
@@ -1281,7 +1291,7 @@ struct State {
 	uint64_t                         batch_index = 0;
 	bool                             sampled     = true;
 	std::array<std::array<Cell, static_cast<size_t>(Site::Count)>, PathCount> cells {};
-	std::unordered_map<Key, Changed, KeyHash> changed; // guest-rewritten ranges
+	std::unordered_map<Key, Changed, KeyHash> changed;
 	uint64_t batches = 0, checked = 0, bind_ns = 0, check_ns = 0, lost = 0, latency_ns = 0;
 
 	std::mutex            log_mutex;
@@ -1330,45 +1340,107 @@ void Bind(uint64_t vaddr, uint64_t size, Path path) {
 			return;
 		}
 	}
-	// Taken before hashing: a backing write racing with the hash counts as an emulator write.
-	const auto      seq   = st.seq.load(std::memory_order_acquire);
-	const auto      start = NowNs();
-	const auto      hash  = Hash(vaddr, size, EopAtGpu::Enabled());
+	// Taken before reading: a logged write racing with the read is attributed to its writer.
+	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}};
+	const auto start = NowNs();
+	if (size <= MaxCopy) {
+		entry.bytes.resize(size);
+		if (LibKernel::Memory::TryReadBacking(vaddr, entry.bytes.data(), size)) {
+			if (EopAtGpu::Enabled()) {
+				(void)EopAtGpu::OverlayPending(vaddr, entry.bytes.data(), size);
+			}
+			entry.hash = 1;
+		}
+	} else {
+		entry.hash = Hash(vaddr, size, EopAtGpu::Enabled());
+	}
 	std::lock_guard lock(st.mutex);
 	st.bind_ns += NowNs() - start;
-	st.pending.push_back({vaddr, size, hash, seq, path, t_site});
+	st.pending.push_back(std::move(entry));
 }
 
-// An emulator-side backing write overlapping the entry happened after its bind hash started.
-bool WrittenSince(const Entry& entry, bool& lost) {
+// The logged writes overlapping the entry since its bind read started; false when the log lost some.
+bool WritesSince(const Entry& entry, std::vector<Write>& writes) {
 	auto&           st = S();
 	std::lock_guard lock(st.log_mutex);
-	if (entry.seq < st.dropped_seq) {
-		lost = true;
-		return true;
-	}
+	writes.clear();
 	for (auto it = st.log.rbegin(); it != st.log.rend() && it->seq > entry.seq; ++it) {
 		if (it->vaddr < entry.vaddr + entry.size && entry.vaddr < it->vaddr + it->size) {
-			return true;
+			writes.push_back(*it);
 		}
 	}
-	return false;
+	return entry.seq >= st.dropped_seq;
+}
+
+enum Kind : uint8_t { Same, Guest, Cp, Backing, Big, Unreadable };
+
+// A copied entry whose bytes changed: runs of differing bytes (closer than 16 bytes are merged) not
+// covered by a logged write are guest writes.
+Kind Attribute(const Entry& entry, const uint8_t* now, uint64_t& guest_diff, bool& lost) {
+	thread_local std::vector<Write> writes;
+	lost       = !WritesSince(entry, writes);
+	bool cp    = false;
+	guest_diff = 0;
+	for (uint64_t i = 0; i < entry.size;) {
+		if (now[i] == entry.bytes[i]) {
+			i++;
+			continue;
+		}
+		auto end = i + 1;
+		for (auto gap = end; gap < entry.size && gap < end + 16; gap++) {
+			if (now[gap] != entry.bytes[gap]) {
+				end = gap + 1;
+			}
+		}
+		const auto a       = entry.vaddr + i;
+		const auto b       = entry.vaddr + end;
+		bool       covered = false;
+		for (const auto& w : writes) {
+			if (w.vaddr < b && a < w.vaddr + w.size) {
+				covered = true;
+				cp |= w.cp;
+			}
+		}
+		guest_diff += covered ? 0 : end - i;
+		i = end;
+	}
+	return guest_diff != 0 || lost ? Guest : cp ? Cp : Backing;
 }
 
 // Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
 void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
-	enum Kind : uint8_t { Same, Guest, Emulator, Unreadable };
-	const auto           start = NowNs();
-	std::vector<uint8_t> kinds(batch.size());
-	uint64_t             lost_count = 0;
+	thread_local std::vector<uint8_t> now;
+	thread_local std::vector<Write>   writes;
+	const auto                        start = NowNs();
+	std::vector<Kind>                 kinds(batch.size());
+	std::vector<uint64_t>             diffs(batch.size());
+	uint64_t                          lost_count = 0;
 	for (size_t i = 0; i < batch.size(); i++) {
 		const auto& entry = batch[i];
-		const auto  hash  = entry.hash != 0 ? Hash(entry.vaddr, entry.size, false) : 0;
 		bool        lost  = false;
-		kinds[i]          = hash == 0                    ? Unreadable
-		                    : hash == entry.hash         ? Same
-		                    : WrittenSince(entry, lost) ? Emulator
-		                                                : Guest;
+		if (entry.hash == 0) {
+			kinds[i] = Unreadable;
+		} else if (entry.bytes.empty()) {
+			const auto hash = Hash(entry.vaddr, entry.size, false);
+			if (hash == 0) {
+				kinds[i] = Unreadable;
+			} else if (hash == entry.hash) {
+				kinds[i] = Same;
+			} else {
+				lost     = !WritesSince(entry, writes);
+				kinds[i] = !lost && !writes.empty() ? Big : Guest;
+				diffs[i] = kinds[i] == Guest ? entry.size : 0;
+			}
+		} else {
+			now.resize(entry.size);
+			if (!LibKernel::Memory::TryReadBacking(entry.vaddr, now.data(), entry.size)) {
+				kinds[i] = Unreadable;
+			} else if (std::memcmp(now.data(), entry.bytes.data(), entry.size) == 0) {
+				kinds[i] = Same;
+			} else {
+				kinds[i] = Attribute(entry, now.data(), diffs[i], lost);
+			}
+		}
 		lost_count += lost ? 1 : 0;
 	}
 	auto&           st = S();
@@ -1381,17 +1453,26 @@ void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
 		auto&       cell  = st.cells[entry.path][static_cast<size_t>(entry.site)];
 		cell.n++;
 		cell.bytes += entry.size;
-		if (kinds[i] == Guest) {
-			cell.cpu++;
-			cell.cpu_bytes += entry.size;
+		switch (kinds[i]) {
+			case Guest:
+				cell.guest++;
+				cell.guest_bytes += entry.size;
+				cell.guest_diff += diffs[i];
+				break;
+			case Cp:
+				cell.cp++;
+				cell.cp_bytes += entry.size;
+				break;
+			case Backing: cell.backing++; break;
+			case Big: cell.big++; break;
+			case Unreadable: cell.unread++; break;
+			default: break;
+		}
+		if (kinds[i] == Guest || kinds[i] == Cp) {
 			auto& changed = st.changed[{entry.vaddr, entry.size}];
-			changed.count++;
+			(kinds[i] == Guest ? changed.guest : changed.cp)++;
 			changed.path = entry.path;
 			changed.site = entry.site;
-		} else if (kinds[i] == Emulator) {
-			cell.gpu++;
-		} else if (kinds[i] == Unreadable) {
-			cell.unread++;
 		}
 	}
 	st.check_ns += NowNs() - start;
@@ -1421,7 +1502,7 @@ Scope::~Scope() {
 	t_site = m_previous;
 }
 
-void NoteBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
+void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp) noexcept {
 	if (!Enabled() || size == 0) {
 		return;
 	}
@@ -1429,7 +1510,7 @@ void NoteBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
 	auto&                   st     = S();
 	std::lock_guard         lock(st.log_mutex);
 	const auto              seq = st.seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-	st.log.push_back({seq, vaddr, size});
+	st.log.push_back({seq, vaddr, size, cp});
 	if (st.log.size() > MaxLog) {
 		st.dropped_seq = st.log.front().seq;
 		st.log.pop_front();
@@ -1468,17 +1549,23 @@ void Report(double seconds, uint64_t frames) {
 				continue;
 			}
 			std::printf("PERF lateread_cell %s/%s: n=%" PRIu64 " bytes=%" PRIu64 " guest=%" PRIu64
-			            " guest_bytes=%" PRIu64 " emu=%" PRIu64 " unread=%" PRIu64 "\n",
-			            PathNames[p], SiteNames[s], c.n, c.bytes, c.cpu, c.cpu_bytes, c.gpu, c.unread);
+			            " guest_bytes=%" PRIu64 " guest_diff=%" PRIu64 " cp=%" PRIu64 " cp_bytes=%" PRIu64
+			            " backing=%" PRIu64 " big=%" PRIu64 " unread=%" PRIu64 "\n",
+			            PathNames[p], SiteNames[s], c.n, c.bytes, c.guest, c.guest_bytes, c.guest_diff, c.cp,
+			            c.cp_bytes, c.backing, c.big, c.unread);
 		}
 	}
 	std::vector<std::pair<Key, Changed>> top(st.changed.begin(), st.changed.end());
-	std::sort(top.begin(), top.end(),
-	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
-	for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
-		std::printf("PERF lateread_top 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s count=%" PRIu64 "\n",
-		            top[i].first.vaddr, top[i].first.size, PathNames[top[i].second.path],
-		            SiteNames[static_cast<size_t>(top[i].second.site)], top[i].second.count);
+	for (const bool by_guest : {true, false}) {
+		const auto count = [by_guest](const Changed& c) { return by_guest ? c.guest : c.cp; };
+		std::sort(top.begin(), top.end(),
+		          [&](const auto& a, const auto& b) { return count(a.second) > count(b.second); });
+		for (size_t i = 0; i < std::min<size_t>(top.size(), 8) && count(top[i].second) != 0; i++) {
+			std::printf("PERF lateread_top %s 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s count=%" PRIu64 "\n",
+			            by_guest ? "guest" : "cp", top[i].first.vaddr, top[i].first.size,
+			            PathNames[top[i].second.path], SiteNames[static_cast<size_t>(top[i].second.site)],
+			            count(top[i].second));
+		}
 	}
 	std::fflush(stdout);
 	st.cells = {};
@@ -1713,6 +1800,7 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		return false;
 	}
+	LateRead::NoteBackingWrite(vaddr, size, true); // a command-processor write (before and after)
 	if (buffer.IsImported()) {
 		// The buffer is the guest memory: the bytes land there at this point of the stream, and
 		// guest readers wait for it (PublishImported).
@@ -1721,7 +1809,9 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 		g_import_stats.owned_labels.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
-	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+	const bool written = Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size);
+	LateRead::NoteBackingWrite(vaddr, size, true);
+	if (!written) {
 		return false;
 	}
 	// The pages stay GPU-modified: a later readback copies the cached buffer, which then holds
