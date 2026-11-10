@@ -719,29 +719,27 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	const auto bytes =
+	    write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t);
+	// KYTY_LATE_READ_PROF: a command-processor write, not a guest one (logged before and after).
+	LateRead::NoteBackingWrite(address, bytes, true);
 	// Destinations whose bytes the GPU owns: write through the command stream.
-	{
-		const auto address = reinterpret_cast<uint64_t>(dst);
-		const auto bytes   = write_one_address ? uint64_t {sizeof(uint32_t)}
-		                                       : uint64_t {dw_num} * sizeof(uint32_t);
-		GpuCapture::Touch(address, bytes);
-		if (m_renderer.GetBufferCache().WriteGpuOwned(
-		        address, write_one_address ? &src[dw_num - 1] : src, bytes)) {
-			m_renderer.GetTextureCache().InvalidateMemory(address, bytes, RefreshProf::Label);
-			return;
-		}
+	GpuCapture::Touch(address, bytes);
+	if (m_renderer.GetBufferCache().WriteGpuOwned(address, write_one_address ? &src[dw_num - 1] : src,
+	                                              bytes)) {
+		m_renderer.GetTextureCache().InvalidateMemory(address, bytes, RefreshProf::Label);
+		LateRead::NoteBackingWrite(address, bytes, true);
+		return;
 	}
 
-	// KYTY_LATE_READ_PROF: a command-processor write, not a guest one.
-	const auto bytes = write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t);
-	LateRead::NoteBackingWrite(reinterpret_cast<uint64_t>(dst), bytes);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = static_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
 		*output = src[i];
 		output += !write_one_address;
 	}
-	LateRead::NoteBackingWrite(reinterpret_cast<uint64_t>(dst), bytes);
+	LateRead::NoteBackingWrite(address, bytes, true);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -1614,14 +1612,14 @@ static bool GpuOwnedEopLabelEnabled() {
 
 void CommandProcessor::WriteEopLabel(void* dst, const void* data, uint64_t size) {
 	const auto address = reinterpret_cast<uint64_t>(dst);
+	LateRead::NoteBackingWrite(address, size, true); // KYTY_LATE_READ_PROF: a command-processor write
 	if (GpuOwnedEopLabelEnabled() &&
 	    m_renderer.GetBufferCache().WriteGpuOwned(address, data, size)) {
 		m_renderer.GetTextureCache().InvalidateMemory(address, size, RefreshProf::Label);
-		return;
+	} else {
+		std::memcpy(dst, data, size);
 	}
-	LateRead::NoteBackingWrite(address, size); // KYTY_LATE_READ_PROF: a command-processor write
-	std::memcpy(dst, data, size);
-	LateRead::NoteBackingWrite(address, size);
+	LateRead::NoteBackingWrite(address, size, true);
 }
 
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,

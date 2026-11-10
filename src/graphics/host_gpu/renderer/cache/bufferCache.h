@@ -364,7 +364,7 @@ private:
 // Any thread, before and after the write: the emulator writes guest bytes through the backing
 // (kernel/memory.cpp TryWriteBacking) or the command processor writes them directly (WRITE_DATA,
 // end-of-pipe labels written at release).
-void NoteBackingWrite(uint64_t vaddr, uint64_t size) noexcept;
+void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp = false) noexcept;
 void Report(double seconds, uint64_t frames);
 } // namespace LateRead
 
