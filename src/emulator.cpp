@@ -30,6 +30,10 @@
 #include <filesystem>
 #include <thread>
 
+#ifdef KYTY_PGO_INSTRUMENT
+extern "C" int __llvm_profile_write_file(void); // NOLINT
+#endif
+
 namespace Emulator {
 
 static void PrintSystemInfo() {
@@ -136,6 +140,10 @@ static void Execute(const std::filesystem::path& game_patch) {
 		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
 	}).detach();
 	Libs::Graphics::WindowRun();
+#ifdef KYTY_PGO_INSTRUMENT
+	// quick_exit skips the profile runtime's atexit writer.
+	__llvm_profile_write_file();
+#endif
 	std::quick_exit(0);
 }
 

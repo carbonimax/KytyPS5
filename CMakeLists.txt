@@ -202,6 +202,33 @@ if(KYTY_THIN_LTO)
 	set_source_files_properties("${KYTY_SOURCE_DIR}/kernel/macosGuestAddressSpace.cpp" PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()
 
+# Profile-guided optimisation of Kyty's own code (clang / clang-cl). instrument: the emulator writes
+# LLVM_PROFILE_FILE (default default_<id>.profraw in its working dir) when its window closes;
+# merge with `llvm-profdata merge -o kyty.profdata *.profraw`. use: optimise with that file.
+# The flags enter the shader store key, so each mode starts with its own store.
+set(KYTY_PGO "OFF" CACHE STRING "Profile-guided optimisation: OFF, instrument or use")
+set(KYTY_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata read by KYTY_PGO=use")
+if(KYTY_PGO STREQUAL "instrument")
+	add_compile_options(-fprofile-generate)
+	add_compile_definitions(KYTY_PGO_INSTRUMENT=1)
+	if(MSVC)
+		# lld-link is not told where clang keeps clang_rt.profile (the objects name it in /DEFAULTLIB).
+		execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
+		                OUTPUT_VARIABLE kyty_clang_resource OUTPUT_STRIP_TRAILING_WHITESPACE)
+		add_link_options("/LIBPATH:${kyty_clang_resource}/lib/windows")
+	else()
+		add_link_options(-fprofile-generate)
+	endif()
+elseif(KYTY_PGO STREQUAL "use")
+	if(NOT EXISTS "${KYTY_PGO_PROFILE}")
+		message(FATAL_ERROR "KYTY_PGO=use needs KYTY_PGO_PROFILE=<merged .profdata>")
+	endif()
+	# Code changed since the training run only loses its counts (a "hash mismatch" warning); it still builds.
+	add_compile_options("-fprofile-use=${KYTY_PGO_PROFILE}" -Wno-profile-instr-unprofiled)
+elseif(NOT KYTY_PGO STREQUAL "OFF")
+	message(FATAL_ERROR "KYTY_PGO must be OFF, instrument or use (got ${KYTY_PGO})")
+endif()
+
 # GPU frame capture recording (KYTY_GPU_CAPTURE=<dir> at run time). Off, its hooks compile away: they
 # measurably slowed the CP even when idle. Capture replay (ctest gpu_capture_replay*) is built either way.
 option(KYTY_GPU_CAPTURE "Build the GPU frame capture recording hooks into the emulator" OFF)
