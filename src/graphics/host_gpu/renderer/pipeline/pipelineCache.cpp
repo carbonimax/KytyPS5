@@ -521,13 +521,17 @@ struct PipelineCache::ProgramCache {
 		permutation.handle.id = ModuleId(key, permutation.program.bindings.push_data_start_dword,
 		                                 permutation.specialization, function_code);
 		if (diag_log) {
-			// M time module_id stage hash push_start function_words static=<words> B=<buffers>
-			//   I=<images> S=<samplers>: what the module id hashes, to diff variants across launches.
+			// M time module_id stage hash push_start function_words spv=<SPIR-V hash> static=<words>
+			//   B=<buffers> I=<images> S=<samplers>: what the module id hashes, to diff variants across
+			//   launches; the SPIR-V hash is what the driver cache sees.
 			const auto& spec = permutation.specialization;
-			std::string line = fmt::format("M {} {:016x} {} {:016x} {} {} static=", PerfStats::SteadyUs(),
-			                               permutation.handle.id, static_cast<int>(key.stage), key.hash,
+			std::string line = fmt::format("M {} {:016x} {} {:016x} {} {} spv={:016x} static=",
+			                               PerfStats::SteadyUs(), permutation.handle.id,
+			                               static_cast<int>(key.stage), key.hash,
 			                               permutation.program.bindings.push_data_start_dword,
-			                               function_code.size());
+			                               function_code.size(),
+			                               XXH3_64bits(result.spirv.data(),
+			                                           result.spirv.size() * sizeof(uint32_t)));
 			for (const auto word: key.static_state) line += fmt::format("{:x},", word);
 			line += " B=";
 			for (const auto& b: spec.buffers) {
@@ -2240,8 +2244,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			PerfStats::CompileLogLine("W %" PRIu64, diag_begin);
 		}
 		// K time hit vs0 vs1 vs2 ps | color_count formats depth stencil feedback | bindings
-		//   (stride:instance) attributes (offset:binding) | static parameters (packed bytes):
-		//   the whole key, to diff variants across launches.
+		//   (stride:instance) attributes (offset:binding) | static parameters (packed bytes) | key
+		//   hash (joins the J line of a pipeline created ahead): the whole key, to diff variants
+		//   across launches.
 		std::string line = fmt::format("K {} {} {:x} {:x} {:x} {:x} | {}", diag_begin,
 		                               feedback.valid ? (feedback.hit ? 1 : 0) : -1,
 		                               key.vertex_shader_ids[0], key.vertex_shader_ids[1],
@@ -2260,6 +2265,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		line += " | ";
 		const auto* sp = reinterpret_cast<const uint8_t*>(&static_params);
 		for (size_t i = 0; i < sizeof(static_params); i++) line += fmt::format("{:02x}", sp[i]);
+		line += fmt::format(" | {:x}", GraphicsPipelineKeyHash {}(key));
 		PerfStats::CompileLogLine("%s", line.c_str());
 	}
 
