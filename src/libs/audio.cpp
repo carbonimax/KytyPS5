@@ -396,6 +396,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioQueueFlushes);
 				SDL_ClearAudioStream(port->stream);
 				port->queue_primed = false;
 				break;

@@ -47,6 +47,7 @@ enum class Counter {
 	GuestFileReadBytes,
 	GuestFileWriteBytes,
 	AudioUnderruns,
+	AudioQueueFlushes, // Output queue stayed over target for 200 ms and was dropped.
 	// Overlapping host elapsed timings, including waits.
 	GpuThreadBusyNs,
 	PresentNs, // Includes image acquire and overlay preparation.

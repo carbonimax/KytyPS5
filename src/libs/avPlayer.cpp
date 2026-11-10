@@ -1,6 +1,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/videoTrace.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cinttypes>
 #include <cerrno>
 #include <condition_variable>
 #include <cstddef>
@@ -479,6 +481,9 @@ public:
 		m_data =
 		    static_cast<uint8_t*>(texture ? mem.allocate_texture(mem.object_pointer, align, size)
 		                                  : mem.allocate(mem.object_pointer, align, size));
+		if (texture) {
+			Common::VideoTrace::Register(reinterpret_cast<uint64_t>(m_data), size);
+		}
 	}
 	~GuestBuffer() { Reset(); }
 	GuestBuffer(const GuestBuffer&)            = delete;
@@ -507,6 +512,7 @@ private:
 	void Reset() {
 		if (m_data != nullptr) {
 			if (m_texture) {
+				Common::VideoTrace::Unregister(reinterpret_cast<uint64_t>(m_data));
 				m_mem.deallocate_texture(m_mem.object_pointer, m_data);
 			} else {
 				m_mem.deallocate(m_mem.object_pointer, m_data);
@@ -993,7 +999,9 @@ public:
 		if (paused && !deliver_seek_frame) {
 			return false;
 		}
-		auto frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+		int64_t head  = -1;
+		auto    frame = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+			head = static_cast<int64_t>(candidate.info.time_stamp + candidate.timestamp_offset);
 			if (deliver_seek_frame || sync_mode != 0) {
 				return true;
 			}
@@ -1001,12 +1009,20 @@ public:
 			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
 		});
 		if (!frame) {
+			if (Common::VideoTrace::Enabled()) {
+				Common::VideoTrace::Line("v %" PRIu64 " %" PRIu64 " %" PRId64, Common::VideoTrace::NowUs(),
+				                         CurrentTimeNoLock(), head);
+			}
 			return false;
 		}
+		uint64_t released = 0;
 		if (current_video) {
+			released = reinterpret_cast<uint64_t>(current_video->buffer->Get());
 			video_buffers.Push(std::move(current_video->buffer));
 		}
 		current_video = std::move(*frame);
+		Common::VideoTrace::Deliver(reinterpret_cast<uint64_t>(current_video->buffer->Get()), head,
+		                            static_cast<int64_t>(CurrentTimeNoLock()), released);
 		*out          = current_video->info;
 		RecordLoopBoundary(*current_video);
 		if (deliver_seek_frame) {
@@ -1039,8 +1055,13 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
-		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
-		clock_start   = std::chrono::steady_clock::now();
+		const auto clock_before = CurrentTimeNoLock();
+		start_time_ms           = current_audio->info.time_stamp + current_audio->timestamp_offset;
+		clock_start             = std::chrono::steady_clock::now();
+		if (Common::VideoTrace::Enabled()) {
+			Common::VideoTrace::Line("A %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64, Common::VideoTrace::NowUs(),
+			                         start_time_ms, clock_before, start_time_ms);
+		}
 		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
 		return true;
@@ -1580,8 +1601,10 @@ private:
 			}
 			return false;
 		}
-		auto* dst = buffer->Get();
-		auto* c   = dst + pitch * h;
+		auto*      dst      = buffer->Get();
+		auto*      c        = dst + pitch * h;
+		const auto trace_t0 = Common::VideoTrace::Enabled() ? Common::VideoTrace::NowUs() : 0;
+		Common::VideoTrace::BeginWrite(reinterpret_cast<uint64_t>(dst));
 		// PPSA02433 samples the padded columns; zero chroma would turn them green.
 		std::memset(dst, s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
 		            static_cast<size_t>(pitch) * h);
@@ -1597,6 +1620,7 @@ private:
 		info->time_stamp = to_ms(
 		    src->best_effort_timestamp != AV_NOPTS_VALUE ? src->best_effort_timestamp : src->pts,
 		    s->time_base);
+		Common::VideoTrace::EndWrite(reinterpret_cast<uint64_t>(dst), static_cast<int64_t>(info->time_stamp), trace_t0);
 		FillVideoEx(s, &info->details.video, src->sample_aspect_ratio);
 		info->details.video.crop_left_offset = static_cast<uint32_t>(src->crop_left);
 		info->details.video.crop_right_offset =
