@@ -22,6 +22,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cinttypes>
 #include <cstring>
@@ -303,6 +304,9 @@ void TextureCache::TouchImage(Image& image) {
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteDirty(image, RefreshProf::Edge, 0, 0);
+	}
 	image.MarkMaybeCpuDirty();
 	UntrackImage(id);
 }
@@ -378,6 +382,21 @@ void TextureCache::UntrackImage(ImageId id) {
 	if (size != 0) {
 		m_page_manager.UpdatePageWatchers<false>(address, size);
 	}
+}
+
+void TextureCache::UntrackImageFrom(ImageId id, uint64_t address) {
+	auto&      image = m_slot_images[id];
+	const auto from  = std::max(address, image.track_addr);
+	if (!image.IsTracked() || from >= image.track_addr_end) {
+		return;
+	}
+	m_page_manager.UpdatePageWatchers<false>(from, image.track_addr_end - from);
+	image.track_addr_end = from;
+	if (image.track_addr_end == image.track_addr) {
+		image.track_addr     = 0;
+		image.track_addr_end = 0;
+	}
+	image.HeapChanged();
 }
 
 void TextureCache::UntrackImageHead(ImageId id) {
@@ -587,12 +606,18 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	destination.refresh_note.hash_valid      = false;
+	destination.refresh_note.native_is_guest = false;
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
 	destination.RefreshComplete();
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(destination, RefreshProf::ImageCopy, destination.info.data.address,
+				                       destination.info.data.size);
+			}
 			destination.MarkBufferModified();
 		}
 		return;
@@ -629,6 +654,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
+	destination.refresh_note.hash_valid      = false;
+	destination.refresh_note.native_is_guest = false;
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
@@ -770,6 +797,9 @@ bool Publish(TextureCache& cache, Image& image) {
 	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteDirty(image, RefreshProf::BcAlias, image.info.data.address, image.info.data.size);
+	}
 	image.MarkBufferModified();
 	return true;
 }
@@ -787,6 +817,10 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 			return;
 		}
 		if (merged) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(*merged, RefreshProf::BcAlias, merged->info.data.address,
+				                       merged->info.data.size);
+			}
 			merged->MarkBufferModified();
 		}
 	}
@@ -1043,6 +1077,20 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		const bool prof       = RefreshProf::Enabled();
+		const bool gpu_source = image.IsBufferModified();
+		uint64_t   hash       = 0;
+		int        same       = -1;
+		auto       start      = std::chrono::steady_clock::time_point {};
+		if (prof) [[unlikely]] {
+			if (!gpu_source && RefreshProf::HashEnabled()) {
+				hash = RefreshProf::HashGuest(image.info.data.address, image.info.data.size);
+				if (image.refresh_note.hash_valid && hash != 0) {
+					same = hash == image.refresh_note.hash ? 1 : 0;
+				}
+			}
+			start = std::chrono::steady_clock::now();
+		}
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -1050,8 +1098,66 @@ void TextureCache::InitializeImage(ImageId id) {
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();
+		if (prof) [[unlikely]] {
+			const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                    std::chrono::steady_clock::now() - start)
+			                    .count();
+			RefreshProf::NoteUpload(image, gpu_source, static_cast<uint64_t>(ns), same, false);
+			image.refresh_note.hash       = hash;
+			image.refresh_note.hash_valid = hash != 0;
+		}
+		image.refresh_note.native_is_guest = !gpu_source;
+		if (RefreshProf::SkipSameMode() == 2 && !gpu_source) [[unlikely]] {
+			const auto& info = image.info;
+			for (uint32_t m = 0; m < std::min<uint32_t>(info.resources.levels, 16); m++) {
+				image.refresh_note.level_hash[m] =
+				    RefreshProf::HashGuest(info.data.address + info.mip_layout[m].offset, info.mip_layout[m].size);
+			}
+		}
 	}
 	image.RefreshComplete();
+}
+
+bool TextureCache::DeferRefresh(Image& image, const ImageViewInfo& view) {
+	const auto  mode = RefreshProf::SkipSameMode();
+	const auto& info = image.info;
+	const auto& note = image.refresh_note;
+	if (mode == 0 || view.min_lod < 256 || !note.fault_only || !note.native_is_guest ||
+	    !image.IsDefinitelyCpuDirty() || image.IsMaybeCpuDirty() || image.IsBufferModified() ||
+	    image.IsGpuModified() || !image.IsTracked() || image.track_addr != info.data.address ||
+	    image.depth_id || info.IsDepth() || info.samples != 1 || info.resources.levels > 16 ||
+	    info.metadata.compression != VideoOutCompression::Uncompressed) {
+		return false;
+	}
+	std::array<uint64_t, 16> offsets {};
+	std::array<uint64_t, 16> sizes {};
+	for (uint32_t m = 0; m < info.resources.levels; m++) {
+		offsets[m] = info.mip_layout[m].offset;
+		sizes[m]   = info.mip_layout[m].size;
+	}
+	// Every byte past track_addr_end (or past the lowest fault, if a TrackImage re-armed the watch)
+	// may have changed unseen.
+	const auto dirty_end     = std::min(image.track_addr_end, std::max(note.fault_from, info.data.address));
+	const auto first_sampled = view.base_level + view.min_lod / 256u;
+	if (!RefreshProf::DirtyBelow(offsets.data(), sizes.data(), info.resources.levels,
+	                             dirty_end - info.data.address, info.data.size, first_sampled)) {
+		return false;
+	}
+	const bool first = !note.deferred;
+	image.refresh_note.deferred = true;
+	if (mode == 2) {
+		for (uint32_t m = first_sampled; m < info.resources.levels; m++) {
+			if (RefreshProf::HashGuest(info.data.address + offsets[m], sizes[m]) != note.level_hash[m]) {
+				RefreshProf::NoteMismatch();
+				break;
+			}
+		}
+	}
+	// A deferred image is checked again at every lookup until its refresh: count only when reporting.
+	if (mode == 2 || RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteDefer(info.data.size, first);
+	}
+	return mode == 1;
 }
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
@@ -1231,11 +1337,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, const ImageViewInfo* view) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
 	     m_slot_images[image.depth_id].info.samples != 1)) {
+		return;
+	}
+	// Keeps the shortened watch: writes past it stay unseen until a refresh re-reads them.
+	if (view != nullptr && DeferRefresh(image, *view)) {
 		return;
 	}
 	TrackImage(id);
@@ -1481,6 +1591,10 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
+				if (RefreshProf::Enabled()) [[unlikely]] {
+					RefreshProf::NoteDirty(inserted, RefreshProf::NewGpu, inserted.info.data.address,
+					                       inserted.info.data.size);
+				}
 				inserted.MarkBufferModified();
 			}
 			for (const auto id: candidates) {
@@ -1573,7 +1687,14 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	const bool first_write =
 	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
 	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
-	RefreshImage(id);
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::NoteView(desc.view_info.base_level, desc.view_info.level_count,
+		                      desc.view_info.base_layer, desc.view_info.layer_count, desc.view_info.min_lod);
+	}
+	RefreshImage(id, desc.type == BindingType::Texture ? &desc.view_info : nullptr);
+	if (RefreshProf::Enabled()) [[unlikely]] {
+		RefreshProf::ClearView();
+	}
 	if (image.info.HasStencil() &&
 	    desc.info.data.address >= image.info.stencil.address &&
 	    desc.info.data.End() <= image.info.stencil.End()) {
@@ -2218,12 +2339,15 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	return tick;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, uint8_t reason) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;
+		}
+		if (RefreshProf::Enabled()) [[unlikely]] {
+			RefreshProf::NoteDirty(image, reason, address, size);
 		}
 		image.ClearGpuModified();
 		image.MarkBufferModified();
@@ -2292,16 +2416,31 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
 	}
 	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	// The per-level hashes of the last refresh no longer describe the image (DeferRefresh).
+	image.refresh_note.native_is_guest = false;
 	return true;
 }
 
-void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemory(uint64_t address, uint64_t size, uint8_t reason) {
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
 	for (const auto id: FindImagesInRegion(page_begin, page_end - page_begin)) {
 		auto& owner = m_slot_images[id];
 		if (owner.Overlaps(address, size)) {
+			if (RefreshProf::Enabled()) [[unlikely]] {
+				RefreshProf::NoteDirty(owner, reason, address, size);
+			}
+			// KYTY_REFRESH_SKIP_SAME: a fault keeps the watch below its page, so a later refresh knows
+			// that only bytes from there on may have changed (DeferRefresh).
+			if (reason == RefreshProf::CpuFault && RefreshProf::SkipSameMode() != 0 && owner.IsTracked() &&
+			    owner.track_addr == owner.info.data.address) [[unlikely]] {
+				const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+				owner.MarkCpuFaultDirty();
+				owner.refresh_note.fault_from = std::min(owner.refresh_note.fault_from, page);
+				UntrackImageFrom(id, page);
+				continue;
+			}
 			owner.MarkCpuDirty();
 			UntrackImage(id);
 			continue;

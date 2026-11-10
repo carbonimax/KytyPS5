@@ -79,7 +79,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateFaultMemory(fault_vaddr);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size, RefreshProf::CpuFault);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadFaultMemory(fault_vaddr);
@@ -128,7 +128,7 @@ RenderContext::CompletedWrite RenderContext::WriteCompletedLabel(uint64_t vaddr,
 	if (!m_buffer_cache.InvalidateCompletedWrite(vaddr, size)) {
 		return CompletedWrite::GpuOwned;
 	}
-	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size, RefreshProf::Label);
 	m_image_heap.InvalidateMemory(vaddr, size);
 	return CompletedWrite::Done;
 }

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <array>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -81,6 +82,17 @@ public:
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
+		refresh_note.fault_only = false;
+		HeapChanged();
+	}
+	// A guest CPU write fault on the tracked range (KYTY_REFRESH_SKIP_SAME): the caller stops watching
+	// the range from the fault page on, so every byte that may have changed lies past track_addr_end.
+	void MarkCpuFaultDirty() {
+		if (!IsCpuDirty() && !m_buffer_modified) {
+			refresh_note.fault_only = true;
+		}
+		m_cpu_dirty       = true;
+		m_maybe_cpu_dirty = false;
 		HeapChanged();
 	}
 
@@ -91,6 +103,7 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			refresh_note.fault_only = false;
 			HeapChanged();
 		}
 	}
@@ -102,6 +115,9 @@ public:
 	void RefreshComplete() {
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
+		refresh_note.fault_only = false;
+		refresh_note.deferred   = false;
+		refresh_note.fault_from = UINT64_MAX;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -109,6 +125,8 @@ public:
 	// shared counter is never touched (the front and back CP threads would bounce its cache line).
 	void               MarkGpuModified(bool stamp) noexcept {
 		m_gpu_modified = true;
+		refresh_note.hash_valid      = false;
+		refresh_note.native_is_guest = false;
 		if (stamp) [[unlikely]] {
 			// Load and store, not a locked add: callers hold the texture cache lock, and a duplicate value
 			// would only tie two images in the publish order.
@@ -121,6 +139,7 @@ public:
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified = true;
+		refresh_note.fault_only = false;
 		HeapChanged();
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
@@ -186,6 +205,29 @@ public:
 		bool     operator==(const ColorClearCheck&) const = default;
 	} color_clear_check;
 	size_t           lru_id             = 0;
+	// KYTY_REFRESH_PROF / KYTY_REFRESH_SKIP_SAME (cache/refreshProf.h): dirty marks since the last
+	// upload (span image-relative), and the guest bytes' hash at the last guest-sourced upload while
+	// the native image still holds exactly those bytes.
+	struct RefreshNote {
+		uint64_t lo         = UINT64_MAX;
+		uint64_t hi         = 0;
+		uint64_t hash       = 0;
+		uint32_t marks      = 0;
+		uint32_t reasons    = 0;
+		uint32_t uploads    = 0;
+		uint8_t  reason     = 0;
+		bool     hash_valid = false;
+		// The native image holds the guest bytes of its last upload from guest memory (no GPU write since).
+		bool native_is_guest = false;
+		// Every dirty mark since that upload was a CPU write fault handled by MarkCpuFaultDirty.
+		bool fault_only = false;
+		// A refresh was already deferred in this dirty cycle (profiler counts it once).
+		bool deferred = false;
+		// Lowest fault page since that upload: a TrackImage in between must not hide earlier writes.
+		uint64_t fault_from = UINT64_MAX;
+		// KYTY_REFRESH_SKIP_SAME=2: per-level guest hashes at the last guest-sourced upload.
+		std::array<uint64_t, 16> level_hash {};
+	} refresh_note;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 
