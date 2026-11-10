@@ -657,6 +657,13 @@ static uint32_t ReadWalkerBacking(uint64_t address, uint32_t* value) {
 	if (Libs::LibKernel::Memory::TryWalkerOverride(address, value)) {
 		return ProtectedLoadValue | ProtectedLoadKeep;
 	}
+	// KYTY_WDWORD probe walks keep the page listed, so that their overridden loads still come here.
+	if (Libs::LibKernel::Memory::GetWalkerProbe().busy) {
+		return (Libs::LibKernel::Memory::TryReadBufferBacking(address, value, sizeof(*value), true)
+		            ? ProtectedLoadValue
+		            : 0u) |
+		       ProtectedLoadKeep;
+	}
 	if (!Libs::LibKernel::Memory::MaybeGpuModifiedPage(address)) {
 		return 0;
 	}

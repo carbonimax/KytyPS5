@@ -222,6 +222,8 @@ void ProbeWalkerReads(const ShaderRecompiler::IR::ResourcePlan& plan,
 	const auto memo_flat    = plan.srt_memo_flat;
 	const auto memo_base    = plan.srt_memo_shader_base;
 	const auto memo_loads   = plan.srt_memo_loads;
+	// The walk's later loads may have unlisted these pages: list them so the override is reached.
+	for (const auto& read: reads) IR::NoteProtectedLoad(read.vaddr);
 	probe.busy              = true;
 	Walked base;
 	walk(base);

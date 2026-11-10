@@ -941,7 +941,7 @@ static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::B
 	if (walker && Graphics::PerfStats::WdwordEnabled() && size == sizeof(uint32_t)) {
 		uint32_t before_value = 0, after_value = 0;
 		std::memcpy(&before_value, before.data(), sizeof(before_value));
-		std::memcpy(&after_value, after.data(), sizeof(after_value));
+		(void)TryReadBacking(vaddr, &after_value, sizeof(after_value)); // `after` now holds the page
 		GetWalkerProbe().reads.push_back({vaddr, before_value, after_value});
 	}
 	if (walker) {
