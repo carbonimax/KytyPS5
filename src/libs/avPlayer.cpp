@@ -692,6 +692,13 @@ static int HeldVideoBuffers(int buffers) {
 	return std::clamp(value != nullptr && value[0] != '\0' ? std::atoi(value) : 2, 0, buffers - 2);
 }
 
+// KYTY_AVPLAYER_SKIP_LATE=1: in clock-synced playback, Video() drops ready frames that are already past due so a
+// game polling slower than the video frame rate stays on time instead of playing it in slow motion.
+static bool SkipLateVideo() {
+	const char* value = std::getenv("KYTY_AVPLAYER_SKIP_LATE");
+	return value != nullptr && value[0] == '1';
+}
+
 class Source {
 public:
 	Source(AvPlayerMemAllocator m, AvPlayerFileReplacement f, AvPlayerEventReplacement e,
@@ -1012,6 +1019,16 @@ public:
 		});
 		if (!frame) {
 			return false;
+		}
+		if (skip_late_video && !deliver_seek_frame && sync_mode == 0) {
+			// A game slower than the video gets the newest due frame; the skipped ones were never delivered.
+			const auto now = CurrentTimeNoLock();
+			while (auto later = video_frames.TryPopIf([&](const ReadyFrame& candidate) {
+				       return now != 0 && candidate.info.time_stamp + candidate.timestamp_offset <= now;
+			       })) {
+				video_buffers.Push(std::move(frame->buffer));
+				frame = std::move(later);
+			}
 		}
 		if (current_video) {
 			held_video.push_back(std::move(current_video->buffer));
@@ -1692,6 +1709,7 @@ private:
 	AvPlayerEventReplacement                 event;
 	int                                      max_video_buffers = 2;
 	int                                      video_hold        = HeldVideoBuffers(max_video_buffers);
+	bool                                     skip_late_video   = SkipLateVideo();
 	bool                                     use_vdec2         = false;
 	AvPlayerSourceType                       source_type       = AvPlayerSourceUnknown;
 	std::string                              path;
