@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -516,6 +517,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute) {
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
+	WhatIf::Spin(WhatIf::SpinClass::Dispatch);
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -757,6 +759,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
                                       uint64_t args_addr, uint32_t mode, bool async_compute) {
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DispatchNs, PerfStats::Counter::DispatchCount);
 	PerfStats::NoteWork();
+	WhatIf::Spin(WhatIf::SpinClass::Dispatch);
 	CpSplitProf::ItemScope split_item(CpSplitProf::ItemKind::Dispatch);
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);

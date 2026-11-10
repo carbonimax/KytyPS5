@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
+#include "graphics/host_gpu/renderer/whatIf.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -1737,6 +1738,7 @@ bool RenderExecutor::DrawIndexBody(CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
+	if (record == nullptr) WhatIf::Spin(WhatIf::SpinClass::Inline);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1848,6 +1850,7 @@ bool RenderExecutor::DrawAutoBody(CommandBuffer& buffer,
 	KYTY_PROFILER_FUNCTION();
 	PerfStats::ScopedTimer perf_timer(PerfStats::Counter::DrawNs, PerfStats::Counter::DrawCount);
 	PerfStats::NoteWork();
+	if (record == nullptr) WhatIf::Spin(WhatIf::SpinClass::Inline);
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -2043,6 +2046,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	CopySnapshots(record);
 	CpPipeline::Note(CpPipeline::Stat::Queued);
 	CpPipeline::Publish();
+	WhatIf::Spin(WhatIf::SpinClass::Queued);
 	return true;
 }
 
