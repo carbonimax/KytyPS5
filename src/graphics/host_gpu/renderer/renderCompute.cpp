@@ -629,6 +629,19 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		RebindBuffers(bindings);
 	}
+	if (PerfStats::SyncCmpEnabled() && HasShaderBufferWrites(input_info.stage)) {
+		// Step 2.12 step 0: the extent of a thread-indexed store depends on the dispatch size.
+		// Per hash: the last group counts and how many distinct sizes were logged (at most 16).
+		thread_local std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> logged;
+		const uint64_t key = (uint64_t {thread_group_x} << 42u) ^ (uint64_t {thread_group_y} << 21u) ^ thread_group_z;
+		auto [it, fresh]   = logged.try_emplace(program.shader_hash, key, 0u);
+		if ((fresh || it->second.first != key) && it->second.second < 16) {
+			it->second = {key, it->second.second + 1};
+			LOGF("WEXT0 dispatch hash=0x%016" PRIx64 " groups=%u,%u,%u wg=%u,%u,%u\n", program.shader_hash,
+			     thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+			     input_info.threads_num[1], input_info.threads_num[2]);
+		}
+	}
 
 	// From here on, only this dispatch's own bindings, image layout transitions (ordered by their
 	// own tracked accesses), its barrier and the dispatch are recorded: a dispatch chain stays open.

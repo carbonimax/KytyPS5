@@ -26,6 +26,7 @@
 #include <cstring>
 #include <magic_enum.hpp>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -924,6 +925,26 @@ static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::B
 	const bool same      = std::memcmp(before.data(), after.data(), size) == 0;
 	const bool page_same = have_page && TryReadBacking(page, after.data(), Page) &&
 	                       std::memcmp(before_page.data(), after.data(), Page) == 0;
+	if (walker) {
+		// Step 2.12 step 0: which written range made this read wait, and where in it the read falls.
+		Graphics::BufferCache::WriteOrigin origin;
+		uint32_t                           covering = 0;
+		std::array<uint64_t, 4>            others {};
+		const bool found = buffers.FindWriteOrigin(vaddr, origin, covering, others);
+		using Key        = std::tuple<uint64_t, uint32_t, uint64_t, uint64_t, bool>;
+		thread_local std::map<Key, uint64_t> seen;
+		const auto rel   = found ? vaddr - origin.vaddr : vaddr;
+		const auto count = ++seen[Key {origin.hash, origin.resource, rel, origin.size, same}];
+		if (count == 1 || count == 100 || count == 10000) {
+			uint32_t value = 0;
+			(void)TryReadBacking(vaddr, &value, std::min<uint64_t>(size, sizeof(value)));
+			LOGF("WEXT0 read same=%d count=%" PRIu64 " writer=0x%016" PRIx64 " res=%u stage=%u base=0x%016" PRIx64
+			     " vsize=0x%" PRIx64 " rel=0x%" PRIx64 " size=%" PRIu64 " covering=%u value=0x%08x found=%d others=%" PRIx64 ",%" PRIx64
+			     ",%" PRIx64 ",%" PRIx64 "\n",
+			     same ? 1 : 0, count, origin.hash, origin.resource, origin.stage, origin.vaddr, origin.size,
+			     rel, size, covering, value, found ? 1 : 0, others[0], others[1], others[2], others[3]);
+		}
+	}
 	const auto base = static_cast<uint32_t>(Counter::SyncCmpBase) + (walker ? 0u : 8u) + (same ? 0u : 4u);
 	Graphics::PerfStats::Add(static_cast<Counter>(base), 1);
 	Graphics::PerfStats::Add(static_cast<Counter>(base + 1), ns);

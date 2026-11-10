@@ -225,6 +225,23 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// KYTY_WEXT_DUMP=<hex>,<hex>: log the decoded code and IR of these shaders (step 2.12 step 0).
+static bool WextDumpHash(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		if (const char* value = std::getenv("KYTY_WEXT_DUMP"); value != nullptr) {
+			for (const char* p = value; *p != 0;) {
+				char* end = nullptr;
+				list.push_back(std::strtoull(p, &end, 16));
+				if (end == p) break;
+				p = *end == ',' ? end + 1 : end;
+			}
+		}
+		return list;
+	}();
+	return std::find(hashes.begin(), hashes.end(), hash) != hashes.end();
+}
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -637,7 +654,8 @@ struct PipelineCache::ProgramCache {
 			options.shader_hash = params.hash;
 			options.user_data   = user_data;
 			options.back_code      = params.back_code;
-			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+			                      WextDumpHash(params.hash);
 			options.early_dump  = options.dump_ir;
 			options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 			options.dump_label  = label;

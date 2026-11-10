@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -766,8 +767,10 @@ bool Publish(TextureCache& cache, Image& image) {
 		return false;
 	}
 	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
+	if (PerfStats::SyncCmpEnabled()) BufferCache::SetWriteOrigin(3, 0, 0); // origin kind: image write-back
 	auto [buffer, offset] =
 	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	if (PerfStats::SyncCmpEnabled()) BufferCache::SetWriteOrigin(0, 0, 0);
 	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();

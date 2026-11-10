@@ -1462,6 +1462,34 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	return source.first->Handle();
 }
 
+static thread_local BufferCache::WriteOrigin t_write_origin;
+
+void BufferCache::SetWriteOrigin(uint64_t hash, uint32_t resource, uint32_t stage) noexcept {
+	t_write_origin.hash     = hash;
+	t_write_origin.resource = resource;
+	t_write_origin.stage    = stage;
+}
+
+bool BufferCache::FindWriteOrigin(uint64_t vaddr, WriteOrigin& origin, uint32_t& covering,
+                                  std::array<uint64_t, 4>& others) {
+	std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+	covering         = 0;
+	others.fill(0);
+	uint32_t     distinct = 0;
+	const size_t n        = std::min(m_write_origin_next, m_write_origins.size());
+	for (size_t i = 0; i < n; i++) {
+		const auto& o = m_write_origins[(m_write_origin_next - 1 - i) % m_write_origins.size()];
+		if (vaddr - o.vaddr >= o.size) continue;
+		if (covering++ == 0) {
+			origin = o;
+		} else if (o.hash != origin.hash && distinct < others.size() &&
+		           std::find(others.begin(), others.end(), o.hash) == others.end()) {
+			others[distinct++] = o.hash;
+		}
+	}
+	return covering != 0;
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
@@ -1500,6 +1528,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		{
 			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
+			if (PerfStats::SyncCmpEnabled()) {
+				constexpr size_t Ring = size_t {1} << 16u;
+				if (m_write_origins.size() < Ring) m_write_origins.resize(Ring);
+				auto& origin = m_write_origins[m_write_origin_next++ % Ring];
+				origin       = t_write_origin;
+				origin.vaddr = vaddr;
+				origin.size  = size;
+			}
 		}
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
@@ -1553,7 +1589,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	}
 
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	if (PerfStats::SyncCmpEnabled()) SetWriteOrigin(1, 0, 0); // origin kind: fill
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	if (PerfStats::SyncCmpEnabled()) SetWriteOrigin(0, 0, 0);
 	dst->Fill(dst_offset, size, value);
 }
 
@@ -1591,8 +1629,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
 	auto [src, src_offset] = src_memory ? ObtainBuffer(src_vaddr, size, false, true, src_id)
 	                                    : std::pair {&m_gds_buffer, src_vaddr};
+	if (PerfStats::SyncCmpEnabled()) SetWriteOrigin(2, 0, 0); // origin kind: copy
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
+	if (PerfStats::SyncCmpEnabled()) SetWriteOrigin(0, 0, 0);
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 

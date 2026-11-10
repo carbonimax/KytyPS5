@@ -1042,8 +1042,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
 		PerfStats::ScopedTimer obtain_timer(PerfStats::Counter::BindObtainNs, PerfStats::SrtProfEnabled());
+		const bool origin = resource.written && PerfStats::SyncCmpEnabled();
+		if (origin) {
+			BufferCache::SetWriteOrigin(program.shader_hash,
+			                            static_cast<uint32_t>(&resource - program.info.buffers.data()),
+			                            static_cast<uint32_t>(program.stage));
+		}
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
+		if (origin) BufferCache::SetWriteOrigin(0, 0, 0);
 		pack_memory_offset(index, buffer_offset);
 		// Null bindings allow 0 bytes, not the shared null buffer's 16, so no store reaches it.
 		prepared.shader_data[layout.MemorySizeDword() + index] =

@@ -131,6 +131,17 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_SYNC_CMP: who declared a GPU-written range (hash 0: not a shader buffer binding).
+	struct WriteOrigin {
+		uint64_t vaddr = 0, size = 0, hash = 0;
+		uint32_t resource = 0, stage = 0;
+	};
+	// The calling thread's next written ranges come from this shader buffer.
+	static void SetWriteOrigin(uint64_t hash, uint32_t resource, uint32_t stage) noexcept;
+	// The newest recorded written range holding vaddr, how many recorded ranges (64 Ki ring) hold
+	// it, and up to 4 other writer hashes among them. Hash 1: fill, 2: copy, 3: image write-back.
+	[[nodiscard]] bool FindWriteOrigin(uint64_t vaddr, WriteOrigin& origin, uint32_t& covering,
+	                                   std::array<uint64_t, 4>& others);
 	// GPU thread: the tracker page of vaddr may hold GPU-written bytes (page bits only).
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
@@ -294,6 +305,8 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
 	std::mutex                                        m_gpu_ranges_mutex;
+	std::vector<WriteOrigin>                          m_write_origins; // ring, KYTY_SYNC_CMP only
+	size_t                                            m_write_origin_next = 0;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
