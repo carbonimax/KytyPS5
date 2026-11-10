@@ -10,9 +10,9 @@ struct FpEnv {
 	uint16_t control;
 };
 
-// x87 control word 0x037F (64-bit precision, all exceptions masked, round to nearest). MXCSR stays
-// at the host default 0x1F80 (all exceptions masked, round to nearest, no FTZ/DAZ).
-inline constexpr FpEnv GuestFpEnv {0x1f80, 0x037f};
+// x87 control word 0x037F (64-bit precision, all exceptions masked, round to nearest). MXCSR 0x9FC0:
+// all exceptions masked, round to nearest, flush-to-zero and denormals-are-zero, as on the console.
+inline constexpr FpEnv GuestFpEnv {0x9fc0, 0x037f};
 
 inline FpEnv ReadFpEnv() {
 	FpEnv env {};
