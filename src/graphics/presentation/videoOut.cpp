@@ -29,6 +29,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -788,6 +790,19 @@ void VideoOutDriver::Impl::VblankEnd() {
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	using Clock = std::chrono::steady_clock;
 
+	// KYTY_WHATIF_FLIP_ASAP=N (measurement experiment, default 0 = off): the loop runs N times per
+	// vblank so a ready flip completes within 1/N vblank instead of at the next tick; guest vblank
+	// events stay at the configured rate. Not console behaviour. KYTY_WHATIF_FLIP_ASAP_GATE=<file>:
+	// only while that file exists (checked about 4 times per second).
+	static const uint32_t flip_asap = [] {
+		const char* v = std::getenv("KYTY_WHATIF_FLIP_ASAP");
+		return std::min(v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : 0u, 16u);
+	}();
+	static const char* asap_gate = std::getenv("KYTY_WHATIF_FLIP_ASAP_GATE");
+	uint32_t           asap      = asap_gate == nullptr ? flip_asap : 1u;
+	uint64_t           sub_step  = 0;
+	uint64_t           vblanks   = 0;
+
 	std::chrono::nanoseconds total_wait {};
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
@@ -801,8 +816,24 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		total_wait -= frame_begin - sleep_begin;
 
 		// The refresh rate is re-read every vblank: it can change while the thread runs.
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		if (flip_asap > 1 && asap_gate != nullptr && sub_step % asap == 0 && vblanks++ % 15 == 0) {
+			std::FILE* g = std::fopen(asap_gate, "rb");
+			asap         = g != nullptr ? flip_asap : 1u;
+			if (g != nullptr) {
+				std::fclose(g);
+			}
+			sub_step = 0;
+		}
+		const bool vblank = asap <= 1 || sub_step++ % asap == 0;
+
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u) * std::max(asap, 1u);
 		const auto period  = std::chrono::nanoseconds(std::chrono::seconds(1)) / refresh;
+
+		if (!vblank) {
+			(void)m_flip_queue.Flip();
+			total_wait += period - (Clock::now() - frame_begin);
+			continue;
+		}
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip();
