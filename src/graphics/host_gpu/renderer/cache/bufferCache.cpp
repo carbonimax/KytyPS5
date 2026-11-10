@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cinttypes>
@@ -30,8 +32,11 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -1207,6 +1212,304 @@ uint64_t ReadbackWindowBytes() {
 
 } // namespace
 
+namespace LateRead {
+namespace {
+
+int SamplePeriod() {
+	static const int period = [] {
+		const char* value = std::getenv("KYTY_LATE_READ_PROF");
+		return value != nullptr ? std::max(0, static_cast<int>(std::strtol(value, nullptr, 10))) : 0;
+	}();
+	return period;
+}
+
+uint64_t WfaultDelayNs() {
+	static const uint64_t ns = [] {
+		const char* value = std::getenv("KYTY_WFAULT_DELAY_US");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) * 1000ull : 0ull;
+	}();
+	return ns;
+}
+
+uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// Stream: small CPU-modified read copied into the stream buffer. Ring: cache buffer created or grown
+// by a stream leap (the CPU-written rings of 13.90). Fixed: any other cache buffer.
+enum Path : uint8_t { PathStream, PathRing, PathFixed, PathCount };
+constexpr std::array<const char*, PathCount> PathNames {"stream", "ring", "fixed"};
+constexpr std::array<const char*, static_cast<size_t>(Site::Count)> SiteNames {"-", "vtx", "idx", "desc",
+                                                                               "ind"};
+
+struct Entry {
+	uint64_t vaddr = 0, size = 0, hash = 0, seq = 0;
+	Path     path = PathFixed;
+	Site     site = Site::None;
+};
+
+struct Key {
+	uint64_t vaddr = 0, size = 0;
+	bool     operator==(const Key&) const = default;
+};
+struct KeyHash {
+	size_t operator()(const Key& key) const noexcept {
+		return std::hash<uint64_t> {}(key.vaddr * 0x9E3779B97F4A7C15ull ^ key.size);
+	}
+};
+
+struct Cell {
+	uint64_t n = 0, bytes = 0, cpu = 0, cpu_bytes = 0, gpu = 0, unread = 0;
+};
+
+struct Changed {
+	uint64_t count = 0;
+	Path     path  = PathFixed;
+	Site     site  = Site::None;
+};
+
+struct Write {
+	uint64_t seq = 0, vaddr = 0, size = 0;
+};
+
+struct State {
+	std::mutex                       mutex; // everything but the write log
+	std::vector<Entry>               pending;
+	std::unordered_set<Key, KeyHash> seen; // ranges of the open batch
+	uint64_t                         batch_index = 0;
+	bool                             sampled     = true;
+	std::array<std::array<Cell, static_cast<size_t>(Site::Count)>, PathCount> cells {};
+	std::unordered_map<Key, Changed, KeyHash> changed; // guest-rewritten ranges
+	uint64_t batches = 0, checked = 0, bind_ns = 0, check_ns = 0, lost = 0, latency_ns = 0;
+
+	std::mutex            log_mutex;
+	std::deque<Write>     log;
+	std::atomic<uint64_t> seq {0};
+	uint64_t              dropped_seq = 0; // writes up to it left the log
+};
+
+State& S() {
+	static State state;
+	return state;
+}
+
+thread_local Site     t_site = Site::None;
+std::atomic<uint64_t> g_wfault_delayed {0};
+
+// XXH3 of guest bytes read from the backing (never faults); `overlay`: with the pending labels, as an
+// upload recorded now sees them. 0 when unreadable.
+uint64_t Hash(uint64_t vaddr, uint64_t size, bool overlay) {
+	thread_local std::vector<uint8_t> chunk(1u << 20u);
+	thread_local XXH3_state_t*        state = XXH3_createState();
+	XXH3_64bits_reset(state);
+	for (uint64_t done = 0; done < size;) {
+		const auto part = std::min<uint64_t>(size - done, chunk.size());
+		if (!LibKernel::Memory::TryReadBacking(vaddr + done, chunk.data(), part)) {
+			return 0;
+		}
+		if (overlay) {
+			(void)EopAtGpu::OverlayPending(vaddr + done, chunk.data(), part);
+		}
+		XXH3_64bits_update(state, chunk.data(), static_cast<size_t>(part));
+		done += part;
+	}
+	return XXH3_64bits_digest(state) | 1u;
+}
+
+// GPU thread or CP back thread, inside ObtainBuffer of a read.
+void Bind(uint64_t vaddr, uint64_t size, Path path) {
+	if (t_site == Site::None) {
+		return;
+	}
+	auto& st = S();
+	{
+		std::lock_guard lock(st.mutex);
+		if (!st.sampled || !st.seen.insert({vaddr, size}).second) {
+			return;
+		}
+	}
+	// Taken before hashing: a backing write racing with the hash counts as an emulator write.
+	const auto      seq   = st.seq.load(std::memory_order_acquire);
+	const auto      start = NowNs();
+	const auto      hash  = Hash(vaddr, size, EopAtGpu::Enabled());
+	std::lock_guard lock(st.mutex);
+	st.bind_ns += NowNs() - start;
+	st.pending.push_back({vaddr, size, hash, seq, path, t_site});
+}
+
+// An emulator-side backing write overlapping the entry happened after its bind hash started.
+bool WrittenSince(const Entry& entry, bool& lost) {
+	auto&           st = S();
+	std::lock_guard lock(st.log_mutex);
+	if (entry.seq < st.dropped_seq) {
+		lost = true;
+		return true;
+	}
+	for (auto it = st.log.rbegin(); it != st.log.rend() && it->seq > entry.seq; ++it) {
+		if (it->vaddr < entry.vaddr + entry.size && entry.vaddr < it->vaddr + it->size) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
+void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
+	enum Kind : uint8_t { Same, Guest, Emulator, Unreadable };
+	const auto           start = NowNs();
+	std::vector<uint8_t> kinds(batch.size());
+	uint64_t             lost_count = 0;
+	for (size_t i = 0; i < batch.size(); i++) {
+		const auto& entry = batch[i];
+		const auto  hash  = entry.hash != 0 ? Hash(entry.vaddr, entry.size, false) : 0;
+		bool        lost  = false;
+		kinds[i]          = hash == 0                    ? Unreadable
+		                    : hash == entry.hash         ? Same
+		                    : WrittenSince(entry, lost) ? Emulator
+		                                                : Guest;
+		lost_count += lost ? 1 : 0;
+	}
+	auto&           st = S();
+	std::lock_guard lock(st.mutex);
+	st.checked++;
+	st.lost += lost_count;
+	st.latency_ns += start - sealed_ns;
+	for (size_t i = 0; i < batch.size(); i++) {
+		const auto& entry = batch[i];
+		auto&       cell  = st.cells[entry.path][static_cast<size_t>(entry.site)];
+		cell.n++;
+		cell.bytes += entry.size;
+		if (kinds[i] == Guest) {
+			cell.cpu++;
+			cell.cpu_bytes += entry.size;
+			auto& changed = st.changed[{entry.vaddr, entry.size}];
+			changed.count++;
+			changed.path = entry.path;
+			changed.site = entry.site;
+		} else if (kinds[i] == Emulator) {
+			cell.gpu++;
+		} else if (kinds[i] == Unreadable) {
+			cell.unread++;
+		}
+	}
+	st.check_ns += NowNs() - start;
+}
+
+void DelayWriteFault() {
+	const auto ns = WfaultDelayNs();
+	if (ns == 0) {
+		return;
+	}
+	for (const auto end = NowNs() + ns; NowNs() < end;) {
+	}
+	g_wfault_delayed.fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace
+
+bool Enabled() noexcept {
+	return SamplePeriod() != 0;
+}
+
+Scope::Scope(Site site) noexcept: m_previous(t_site) {
+	t_site = site;
+}
+
+Scope::~Scope() {
+	t_site = m_previous;
+}
+
+void NoteBackingWrite(uint64_t vaddr, uint64_t size) noexcept {
+	if (!Enabled() || size == 0) {
+		return;
+	}
+	static constexpr size_t MaxLog = 1u << 20u;
+	auto&                   st     = S();
+	std::lock_guard         lock(st.log_mutex);
+	const auto              seq = st.seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+	st.log.push_back({seq, vaddr, size});
+	if (st.log.size() > MaxLog) {
+		st.dropped_seq = st.log.front().seq;
+		st.log.pop_front();
+	}
+}
+
+void Report(double seconds, uint64_t frames) {
+	if (seconds <= 0.0) {
+		return;
+	}
+	const double f       = static_cast<double>(std::max<uint64_t>(frames, 1));
+	const auto   delayed = g_wfault_delayed.exchange(0, std::memory_order_relaxed);
+	if (WfaultDelayNs() != 0) {
+		std::printf("PERF wfault %.1fs: delay=%" PRIu64 "us delayed=%.0f/frame (%.2f ms/frame) frames=%" PRIu64
+		            "\n",
+		            seconds, WfaultDelayNs() / 1000, static_cast<double>(delayed) / f,
+		            static_cast<double>(delayed * WfaultDelayNs()) / 1e6 / f, frames);
+	}
+	if (!Enabled()) {
+		return;
+	}
+	auto&           st  = S();
+	std::lock_guard lock(st.mutex);
+	const char*     eop = std::getenv("KYTY_EOP_AT_GPU");
+	std::printf("PERF lateread %.1fs period=%d eop=%s: frames=%" PRIu64 " batches=%" PRIu64 " checked=%" PRIu64
+	            " bind=%.2fms/frame check=%.2fms/frame latency=%.2fms lost=%" PRIu64 "\n",
+	            seconds, SamplePeriod(), eop != nullptr ? eop : "0", frames, st.batches, st.checked,
+	            static_cast<double>(st.bind_ns) / 1e6 / f, static_cast<double>(st.check_ns) / 1e6 / f,
+	            st.checked != 0 ? static_cast<double>(st.latency_ns) / 1e6 / static_cast<double>(st.checked)
+	                            : 0.0,
+	            st.lost);
+	for (size_t p = 0; p < PathCount; p++) {
+		for (size_t s = 0; s < SiteNames.size(); s++) {
+			const auto& c = st.cells[p][s];
+			if (c.n == 0) {
+				continue;
+			}
+			std::printf("PERF lateread_cell %s/%s: n=%" PRIu64 " bytes=%" PRIu64 " guest=%" PRIu64
+			            " guest_bytes=%" PRIu64 " emu=%" PRIu64 " unread=%" PRIu64 "\n",
+			            PathNames[p], SiteNames[s], c.n, c.bytes, c.cpu, c.cpu_bytes, c.gpu, c.unread);
+		}
+	}
+	std::vector<std::pair<Key, Changed>> top(st.changed.begin(), st.changed.end());
+	std::sort(top.begin(), top.end(),
+	          [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 8); i++) {
+		std::printf("PERF lateread_top 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s count=%" PRIu64 "\n",
+		            top[i].first.vaddr, top[i].first.size, PathNames[top[i].second.path],
+		            SiteNames[static_cast<size_t>(top[i].second.site)], top[i].second.count);
+	}
+	std::fflush(stdout);
+	st.cells = {};
+	st.changed.clear();
+	st.batches = st.checked = st.bind_ns = st.check_ns = st.lost = st.latency_ns = 0;
+}
+
+} // namespace LateRead
+
+void BufferCache::SealLateReads() {
+	if (!LateRead::Enabled()) {
+		return;
+	}
+	// Draws queued on the CP back before this point bind their ranges first (measurement only).
+	CpPipeline::Drain();
+	auto&                        st = LateRead::S();
+	std::vector<LateRead::Entry> batch;
+	{
+		std::lock_guard lock(st.mutex);
+		batch.swap(st.pending);
+		st.seen.clear();
+		st.batches++;
+		st.sampled = ++st.batch_index % static_cast<uint64_t>(LateRead::SamplePeriod()) == 0;
+	}
+	if (batch.empty()) {
+		return;
+	}
+	m_scheduler.DeferPriorityOperation(
+	    [batch = std::move(batch), sealed = LateRead::NowNs()] { LateRead::Check(batch, sealed); });
+}
+
 void BufferCache::ReadFaultMemory(uint64_t vaddr) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		ReadMemory(vaddr, 1);
@@ -1220,6 +1523,9 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	if (!gpu_thread && CommandScheduler::InDeferredOperation()) {
 		InvalidateMemory(vaddr, 1);
 		return;
+	}
+	if (!gpu_thread) {
+		LateRead::DelayWriteFault();
 	}
 	if (!GuestRange {vaddr, 1}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
@@ -1644,7 +1950,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
 	             : m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal,
 	                                     overlap.begin, flags, bytes);
-	const auto& buffer = m_slot_buffers[id];
+	auto& buffer  = m_slot_buffers[id];
+	buffer.leaped = overlap.has_stream_leap;
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer{}[guest=0x{:016x} size=0x{:x}]",
 	                     buffer.IsImported() ? ".Imported" : "", overlap.begin, bytes);
@@ -1653,6 +1960,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
+		buffer.leaped |= m_slot_buffers[old_id].leaped;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
@@ -1988,6 +2296,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
 			m_stream_buffer.Commit();
+			if (LateRead::Enabled()) [[unlikely]] {
+				LateRead::Bind(vaddr, size, LateRead::PathStream);
+			}
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -1997,6 +2308,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	if (!is_written && LateRead::Enabled()) [[unlikely]] {
+		LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed);
+	}
 	if (is_written) {
 		WaitPendingPublishes(vaddr, size);
 	}

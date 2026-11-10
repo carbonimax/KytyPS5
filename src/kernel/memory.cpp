@@ -860,7 +860,20 @@ static uint64_t FindGuestFreeRange(uint64_t search_addr, uint64_t size, uint64_t
 	return addr;
 }
 
+static bool TryWriteBackingTracked(uint64_t vaddr, const void* data, uint64_t size);
+
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+	if (Graphics::LateRead::Enabled()) [[unlikely]] {
+		// Logged before and after: a late-read bind hash racing with the write sees one of them.
+		Graphics::LateRead::NoteBackingWrite(vaddr, size);
+		const bool written = TryWriteBackingTracked(vaddr, data, size);
+		Graphics::LateRead::NoteBackingWrite(vaddr, size);
+		return written;
+	}
+	return TryWriteBackingTracked(vaddr, data, size);
+}
+
+static bool TryWriteBackingTracked(uint64_t vaddr, const void* data, uint64_t size) {
 	if (!Graphics::GpuCapture::Recording()) [[likely]] {
 		return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 	}
