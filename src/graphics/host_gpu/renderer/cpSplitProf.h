@@ -33,6 +33,13 @@
 //   resolved on the front with the value the packet carries;
 // - s24c: s24w with the coarse hazard (any lookup or wait after a queued writer drains);
 // - s24x: s24w where front reads never drain (ceiling, incorrect).
+// - s3k1/s3k2/s3k3: s21r with a third stage between the front and the back: the program lookup of
+//   a queued draw runs on one of K lookup servers (FIFO each, the server chosen by a hash of all the
+//   draw's programs), the back takes the records in order once looked up. The front keeps the PM4
+//   work, the lookups of draws it runs itself (inline, fallback) and the lookups that drained (read
+//   GPU-written memory: the record goes back to the front, "aborts");
+// - s3k2v/s3k3v: the same, server chosen by the vertex program alone;
+// - s3inf: unlimited servers without affinity (ceiling of the stage).
 // In s21 and full, a lookup after an item that writes memory from shaders drains first (the front
 // may read what the queued item writes). GPU thread only; nothing changes when off.
 namespace Libs::Graphics::CpSplitProf {
@@ -81,6 +88,8 @@ void Drain(Cause cause) noexcept;
 void ItemBegin(ItemKind kind) noexcept;
 void ItemEnd() noexcept;
 void NoteItemWrites() noexcept;
+// s3 models: the item's programs (server affinity), all stages and vertex program alone.
+void NoteItemProgram(uint64_t key, uint64_t vs_key) noexcept;
 // s21r/s24: the item runs on the front after its lookup (writes or accesses a queue cannot describe,
 // image heap, consumed fill/clear, no compiled vertex program).
 void NoteItemInline() noexcept;

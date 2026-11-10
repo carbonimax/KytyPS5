@@ -65,12 +65,21 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
-bool BindProfEnabled() noexcept {
-	static const bool enabled = [] {
+static int BindProfMode() noexcept {
+	static const int mode = [] {
 		const char* value = std::getenv("KYTY_BIND_PROF");
-		return Enabled() && value != nullptr && std::atoi(value) != 0;
+		return Enabled() && value != nullptr ? std::atoi(value) : 0;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool BindProfEnabled() noexcept {
+	const int mode = BindProfMode();
+	return mode != 0 && (mode != 2 || CpPipeline::IsBackThread());
+}
+
+bool BackProfEnabled() noexcept {
+	return BindProfMode() != 0 && CpPipeline::IsBackThread();
 }
 
 bool SrtProfEnabled() noexcept {
@@ -253,7 +262,12 @@ void MaybeReport() noexcept {
 	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
 	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
 	            n(Counter::StagingWriteCount));
-	if (BindProfEnabled()) {
+	if (BindProfMode() != 0) {
+		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
+		            " dynamic=%.0fms record=%.0fms flush=%.0fms(%" PRIu64 ")\n",
+		            seconds, ms(Counter::BackResolveNs), ms(Counter::BackTargetsNs), ms(Counter::BackPipelineNs),
+		            ms(Counter::BackVertexNs), ms(Counter::BackDynamicNs), ms(Counter::BackRecordNs),
+		            ms(Counter::BackFlushNs), n(Counter::BackFlushCount));
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
 		            " descriptors=%" PRIu64 "\n",

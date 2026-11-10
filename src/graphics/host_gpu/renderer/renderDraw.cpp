@@ -1108,6 +1108,12 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		m_context.GetImageHeap().BeginDraw();
 	}
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	if (CpSplitProf::Enabled()) {
+		const auto& vs = buffer.GetShaders().GetVs();
+		CpSplitProf::NoteItemProgram(
+		    vs.es_regs.data_addr ^ (vs.gs_regs.data_addr * 0xff51afd7ed558ccdull) ^ (ps_address * 0xc4ceb9fe1a85ec53ull),
+		    vs.es_regs.data_addr);
+	}
 	if (prepared == DrawPrepared::No) {
 		CpSplitProf::LookupScope lookup;
 		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
@@ -1128,33 +1134,36 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	const bool remember = m_context.GetPipelineCache().ParallelEnabled() && CpPipeline::Mode() != 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
-			if (remember) {
-				RememberTarget(g_color_targets, ColorTargetKey(buffer.GetRegisters(), slot),
-				               state.color_info[state.color_count]);
+	{ // KYTY_BIND_PROF: target resolution
+		PerfStats::ScopedTimer resolve_timer(PerfStats::Counter::BackResolveNs, PerfStats::BackProfEnabled());
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((state.mrt_mask & (1u << slot)) != 0) {
+				ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
+				if (remember) {
+					RememberTarget(g_color_targets, ColorTargetKey(buffer.GetRegisters(), slot),
+					               state.color_info[state.color_count]);
+				}
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				}
 			}
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+		}
+		MergeAliasedColorTargets(state);
+		if (state.aliased_passes != 0) {
+			uint32_t resolved = 0;
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				resolved |= 1u << state.color_info[i].target_slot;
+				state.color_info[i].pass_slots = state.aliased_passes;
+			}
+			if (resolved != state.aliased_passes) {
+				EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
+				     resolved, state.aliased_passes);
 			}
 		}
-	}
-	MergeAliasedColorTargets(state);
-	if (state.aliased_passes != 0) {
-		uint32_t resolved = 0;
-		for (uint32_t i = 0; i < state.color_count; i++) {
-			resolved |= 1u << state.color_info[i].target_slot;
-			state.color_info[i].pass_slots = state.aliased_passes;
+		ResolveRenderDepthTarget(buffer, state.depth_info);
+		if (remember) {
+			RememberTarget(g_depth_targets, DepthTargetKey(buffer.GetRegisters()), state.depth_info);
 		}
-		if (resolved != state.aliased_passes) {
-			EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
-			     resolved, state.aliased_passes);
-		}
-	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
-	if (remember) {
-		RememberTarget(g_depth_targets, DepthTargetKey(buffer.GetRegisters()), state.depth_info);
 	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
@@ -1461,6 +1470,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	uint64_t                     args_size = 0;
 	{
+		PerfStats::ScopedTimer   back_timer(PerfStats::Counter::BackVertexNs, PerfStats::BackProfEnabled());
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		if (!mesh_active) {
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
@@ -1524,9 +1534,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	std::array<RenderState, RENDER_COLOR_ATTACHMENTS_MAX>              renderings {};
 	std::array<vk::ImageAspectFlags, RENDER_COLOR_ATTACHMENTS_MAX>     feedback {};
 	auto& pipeline_cache = m_context.GetPipelineCache();
+	const bool back_prof  = PerfStats::BackProfEnabled();
 	if (pipeline_cache.AsyncEnabled()) {
 		const auto colors = std::span {state.color_info, passes ? 1u : state.color_count};
-		pipelines[0]      = pipeline_cache.FindGraphicsPipeline(buffer, state, colors, depth_feedback);
+		{
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackPipelineNs, back_prof);
+			pipelines[0] = pipeline_cache.FindGraphicsPipeline(buffer, state, colors, depth_feedback);
+		}
 		if (pipelines[0] == nullptr) {
 			// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
 			// its pipeline is created; any other miss waits (below), counted by reason.
@@ -1553,9 +1567,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		auto* colors = passes ? state.color_info + pass : state.color_info;
 		const auto count = passes ? 1u : state.color_count;
 		if (pipelines[pass] == nullptr) {
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackPipelineNs, back_prof);
 			pipelines[pass] = &pipeline_cache.GetGraphicsPipeline(buffer, state, std::span {colors, count},
 			                                                      depth_feedback);
 		}
+		PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackTargetsNs, back_prof);
 		renderings[pass] = AcquireRenderTargets(buffer, colors, count, state.depth_info, feedback[pass], stages);
 	}
 	vk::DeviceAddress task_params = 0;
@@ -1606,6 +1622,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	if (buffer.DrawWritesStale(sync_epoch)) {
 		m_context.GetCommandScheduler().EndRendering();
 	}
+	PerfStats::ScopedTimer record_timer(PerfStats::Counter::BackRecordNs, back_prof);
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto& pipeline = *pipelines[pass];
 		if (!mesh_active) {
@@ -1642,11 +1659,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			                        buffer.GetRegisters().GetUserClipPlanes().data());
 		}
 
-		auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-		                           renderings[pass]);
-		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
-		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		{
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackDynamicNs, back_prof);
+			auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+			UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+			                           renderings[pass]);
+			dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
+			dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		}
 
 		if (pass != 0) {
 			m_context.GetCommandScheduler().EndRendering();

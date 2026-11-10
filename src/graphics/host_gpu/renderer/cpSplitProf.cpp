@@ -55,7 +55,7 @@ bool RealPipelinedPacket(uint32_t opcode, uint32_t custom) noexcept {
 		case Pm4::IT_NUM_INSTANCES:
 		case Pm4::IT_DRAW_INDEX_2:
 		case Pm4::IT_DRAW_INDEX_OFFSET_2:
-		case Pm4::IT_DISPATCH_DRAW_PREAMBLE:
+		case Pm4::IT_DRAW_INDEX_MULTI_INST:
 		case Pm4::IT_DRAW_INDEX_AUTO:
 		case Pm4::IT_INDIRECT_BUFFER:
 		case Pm4::IT_SET_CONTEXT_REG:
@@ -108,9 +108,14 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_ranges;
 };
 
-enum class Kind : uint32_t { S21, Full, S21R, S24D, S24R, S24W, S24C, S24X, Count };
+// S3*: s21r with the lookup of queued draws moved to a third stage (see the header).
+enum class Kind : uint32_t {
+	S21, Full, S21R, S24D, S24R, S24W, S24C, S24X, S3K1, S3K2, S3K3, S3K2V, S3K3V, S3Inf, Count
+};
 constexpr auto    KindCount            = static_cast<size_t>(Kind::Count);
-const char* const g_kind_names[KindCount] = {"s21", "full", "s21r", "s24d", "s24r", "s24w", "s24c", "s24x"};
+const char* const g_kind_names[KindCount] = {"s21",  "full", "s21r", "s24d",  "s24r",  "s24w", "s24c",
+                                             "s24x", "s3k1", "s3k2", "s3k3", "s3k2v", "s3k3v", "s3inf"};
+constexpr uint32_t MaxServers = 3;
 
 enum class Rule : uint32_t { Coarse, Fine, None };
 enum class Mode : uint32_t { Queue, Inline, Fallback };
@@ -132,6 +137,11 @@ Cause HazardCause(ReadSource source) noexcept {
 // One drain model: which items it pipelines, the current segment and the report totals.
 struct Model {
 	Kind kind = Kind::S21;
+	// Three-stage models: lookup servers (0 = two stages, the lookup stays on the front), unlimited
+	// servers without contention, server chosen by the vertex program alone instead of all stages.
+	uint32_t servers   = 0;
+	bool     unlimited = false;
+	bool     vs_key    = false;
 
 	// Current segment (times relative to its start are not needed: the flow shop only adds).
 	uint64_t last_mark   = 0; // front accounting resumes here
@@ -139,6 +149,9 @@ struct Model {
 	uint64_t b_end       = 0; // simulated end of the back stage
 	uint64_t seg_front   = 0;
 	uint64_t seg_back    = 0;
+	uint64_t seg_look    = 0;                  // lookups on the servers
+	std::array<uint64_t, MaxServers> l_end {}; // simulated end of each lookup server
+	bool     item_drained = false;             // a drain cut the open item: its lookup stays on the front
 	uint32_t seg_items   = 0;
 	bool     open        = false;
 	uint64_t item_start  = 0;
@@ -149,6 +162,8 @@ struct Model {
 
 	// Report totals.
 	uint64_t segments = 0, items = 0, front_ns = 0, back_ns = 0, saved_ns = 0, minsum_ns = 0;
+	uint64_t look_ns = 0, aborts = 0, served = 0;
+	std::array<uint64_t, MaxServers> server_ns {};
 	uint64_t inline_items = 0, fallback_items = 0, queued_writers = 0, queued_syncs = 0;
 	uint64_t waits_label = 0, waits_memory = 0; // memory waits resolved on the front
 	std::array<uint64_t, CauseCount>  causes {};
@@ -157,7 +172,9 @@ struct Model {
 	std::array<uint64_t, BucketCount> saved_hist {};
 
 	[[nodiscard]] bool Real() const noexcept { return kind >= Kind::S21R; }
-	[[nodiscard]] bool QueuesSync() const noexcept { return kind >= Kind::S24R; }
+	[[nodiscard]] bool S24() const noexcept { return kind >= Kind::S24D && kind <= Kind::S24X; }
+	[[nodiscard]] bool QueuesSync() const noexcept { return kind >= Kind::S24R && kind <= Kind::S24X; }
+	[[nodiscard]] bool ThreeStage() const noexcept { return servers != 0 || unlimited; }
 	[[nodiscard]] Rule HazardRule() const noexcept {
 		switch (kind) {
 			case Kind::S24D:
@@ -172,7 +189,7 @@ struct Model {
 		switch (item) {
 			case ItemKind::Draw: return true;
 			case ItemKind::Indirect: return kind == Kind::Full;
-			case ItemKind::Dispatch: return kind == Kind::Full || kind >= Kind::S24D;
+			case ItemKind::Dispatch: return kind == Kind::Full || S24();
 			case ItemKind::Sync: return QueuesSync();
 		}
 		return false;
@@ -190,33 +207,55 @@ struct Model {
 		writes.Clear();
 		labels.Clear();
 		if (seg_items == 0) {
-			f_end = b_end = seg_front = seg_back = 0;
+			f_end = b_end = seg_front = seg_back = seg_look = 0;
+			l_end = {};
 			return;
 		}
 		seg_front += tail;
 		f_end += tail;
-		const uint64_t serial   = seg_front + seg_back;
-		const uint64_t pipeline = std::max(f_end, b_end);
+		const uint64_t serial   = seg_front + seg_look + seg_back;
+		const uint64_t pipeline = std::max({f_end, b_end, *std::max_element(l_end.begin(), l_end.end())});
 		const uint64_t saved    = serial > pipeline ? serial - pipeline : 0;
 		const uint32_t bucket   = Bucket(seg_items);
 		segments++;
 		items += seg_items;
 		front_ns += seg_front;
 		back_ns += seg_back;
+		look_ns += seg_look;
 		saved_ns += saved;
 		minsum_ns += std::min(seg_front, seg_back);
 		causes[static_cast<size_t>(cause)]++;
 		seg_hist[bucket]++;
 		back_hist[bucket] += seg_back;
 		saved_hist[bucket] += saved;
-		f_end = b_end = seg_front = seg_back = 0;
+		f_end = b_end = seg_front = seg_back = seg_look = 0;
+		l_end     = {};
 		seg_items = 0;
 	}
 
-	void AddItem(uint64_t front, uint64_t back) noexcept {
+	// `look`: the item's lookup, on a server in three-stage models (front work otherwise); `key`: its
+	// programs, for the server affinity.
+	void AddItem(uint64_t front, uint64_t look, uint64_t back, uint64_t key = 0) noexcept {
+		if (!ThreeStage() || look == 0) {
+			front += look;
+			look = 0;
+		}
 		f_end += front;
-		b_end = std::max(b_end, f_end) + back;
+		uint64_t ready = f_end;
+		if (look != 0) {
+			if (unlimited) {
+				ready = f_end + look;
+			} else {
+				const auto server = static_cast<uint32_t>(((key * 0x9E3779B97F4A7C15ull) >> 32u) % servers);
+				l_end[server]     = std::max(l_end[server], f_end) + look;
+				ready             = l_end[server];
+				server_ns[server] += look;
+			}
+			served++;
+		}
+		b_end = std::max(b_end, ready) + back;
 		seg_front += front;
+		seg_look += look;
 		seg_back += back;
 		seg_items++;
 	}
@@ -224,7 +263,10 @@ struct Model {
 	void Drain(uint64_t now, Cause cause) noexcept {
 		// A drain inside an open item happens before its back part: cut at the item start.
 		EndSegment(open ? std::max(item_start, last_mark) : now, cause);
-		if (open) item_start = last_mark;
+		if (open) {
+			item_start   = last_mark;
+			item_drained = true;
+		}
 		hazard = false;
 	}
 };
@@ -239,6 +281,8 @@ struct State {
 	Cause                        fallback_cause = Cause::Fallback;
 	bool                         indirect      = false;
 	ItemKind                     item_kind     = ItemKind::Draw;
+	uint64_t                     item_key      = 0; // all stages' programs
+	uint64_t                     item_vs_key   = 0; // vertex program alone
 	std::vector<std::pair<uint64_t, uint64_t>> item_ranges; // [begin, end) written by the item
 	std::vector<std::pair<uint64_t, uint64_t>> item_labels;
 	std::vector<Read>                          pending_reads; // front reads of the current lookup
@@ -259,6 +303,17 @@ State& S() noexcept {
 	static State state = [] {
 		State s;
 		for (size_t i = 0; i < s.models.size(); i++) s.models[i].kind = static_cast<Kind>(i);
+		const auto three = [&](Kind kind, uint32_t servers, bool vs_key) {
+			auto& m   = s.models[static_cast<size_t>(kind)];
+			m.servers = servers;
+			m.vs_key  = vs_key;
+		};
+		three(Kind::S3K1, 1, false);
+		three(Kind::S3K2, 2, false);
+		three(Kind::S3K3, 3, false);
+		three(Kind::S3K2V, 2, true);
+		three(Kind::S3K3V, 3, true);
+		s.models[static_cast<size_t>(Kind::S3Inf)].unlimited = true;
 		s.pending_reads.reserve(4096);
 		return s;
 	}();
@@ -399,6 +454,8 @@ void ItemBegin(ItemKind kind) noexcept {
 	s.item_writes   = false;
 	s.item_inline   = false;
 	s.item_fallback = false;
+	s.item_key      = 0;
+	s.item_vs_key   = 0;
 	s.fallback_cause = Cause::Fallback;
 	s.item_ranges.clear();
 	s.item_labels.clear();
@@ -408,9 +465,10 @@ void ItemBegin(ItemKind kind) noexcept {
 	s.kind_items[static_cast<size_t>(kind)]++;
 	for (auto& m: s.models) {
 		if (m.Pipelines(kind)) {
-			m.open        = true;
-			m.item_start  = now;
-			m.item_lookup = 0;
+			m.open         = true;
+			m.item_start   = now;
+			m.item_lookup  = 0;
+			m.item_drained = false;
 		} else {
 			m.Drain(now, kind == ItemKind::Dispatch ? Cause::Dispatch
 			             : kind == ItemKind::Sync   ? Cause::ReleaseMem
@@ -443,7 +501,7 @@ void ItemEnd() noexcept {
 		if (mode == Mode::Inline) {
 			// Front part up to the end of the lookup, then a drain, then the rest runs serially.
 			const uint64_t cut = std::clamp(s.lookup_end, m.item_start, now);
-			m.AddItem(lead + (cut - m.item_start), 0);
+			m.AddItem(lead + (cut - m.item_start), 0, 0);
 			m.last_mark = cut;
 			m.EndSegment(cut, Cause::Inline);
 			m.hazard    = false;
@@ -454,7 +512,13 @@ void ItemEnd() noexcept {
 		uint64_t whole = now > m.item_start ? now - m.item_start : 0;
 		whole -= std::min(whole, s.item_overhead);
 		const uint64_t look = std::min(m.item_lookup, whole);
-		m.AddItem(lead + look, whole - look);
+		if (m.ThreeStage() && m.item_drained) {
+			// The lookup read GPU-written memory: the record goes back to the front for it.
+			m.aborts++;
+			m.AddItem(lead + look, 0, whole - look);
+		} else {
+			m.AddItem(lead, look, whole - look, m.vs_key ? s.item_vs_key : s.item_key);
+		}
 		m.last_mark = now;
 		if (s.item_writes) {
 			m.hazard = true;
@@ -468,11 +532,24 @@ void ItemEnd() noexcept {
 			for (const auto& [b, e]: s.item_labels) m.labels.Add(b, e);
 		}
 	}
+	// The bookkeeping above is profiler time, not the next item's front part.
+	const auto after = NowNs();
+	for (auto& m: s.models) {
+		if (m.last_mark == now) m.last_mark = after;
+	}
 }
 
 void NoteItemWrites() noexcept {
 	if (!Active()) return;
 	S().item_writes = true;
+}
+
+void NoteItemProgram(uint64_t key, uint64_t vs_key) noexcept {
+	if (!Active()) return;
+	auto& s = S();
+	if (!s.in_item) return;
+	s.item_key    = key;
+	s.item_vs_key = vs_key;
 }
 
 void NoteItemInline() noexcept {
@@ -670,6 +747,12 @@ void Report(double seconds) noexcept {
 		            g_kind_names[static_cast<size_t>(m.kind)], m.segments, m.items, ms(m.front_ns),
 		            ms(m.back_ns), ms(m.saved_ns), ms(m.minsum_ns), m.inline_items, m.fallback_items,
 		            m.queued_writers, m.queued_syncs, m.waits_label, m.waits_memory);
+		std::printf(" serial=%.0fms", ms(m.front_ns + m.look_ns + m.back_ns));
+		if (m.ThreeStage()) {
+			const auto busiest = *std::max_element(m.server_ns.begin(), m.server_ns.end());
+			std::printf(" look=%.0fms served=%" PRIu64 " aborts=%" PRIu64 " busiest=%.0fms", ms(m.look_ns),
+			            m.served, m.aborts, ms(busiest));
+		}
 		std::printf(" hist=");
 		for (uint32_t b = 0; b < BucketCount; b++) {
 			std::printf("%s%" PRIu64, b ? "/" : "", m.seg_hist[b]);
@@ -690,6 +773,8 @@ void Report(double seconds) noexcept {
 		m.segments = m.items = m.front_ns = m.back_ns = m.saved_ns = m.minsum_ns = 0;
 		m.inline_items = m.fallback_items = m.queued_writers = m.queued_syncs = 0;
 		m.waits_label = m.waits_memory = 0;
+		m.look_ns = m.aborts = m.served = 0;
+		m.server_ns                    = {};
 		m.causes                       = {};
 		m.seg_hist                     = {};
 		m.back_hist                    = {};
