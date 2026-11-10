@@ -1241,7 +1241,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, !is_written); });
-	if (source && trace.slot >= 0) [[unlikely]] {
+	if (trace.slot >= 0) [[unlikely]] { // bytes=0: the tracker found the range clean, nothing re-read
 		char extra[48];
 		std::snprintf(extra, sizeof(extra), "bytes=0x%" PRIx64, total_size);
 		Common::VideoTrace::EndRead(trace, 'B', vaddr, size, extra);

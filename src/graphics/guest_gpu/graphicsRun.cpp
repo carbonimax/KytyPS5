@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/videoTrace.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/gpuCapture.h"
@@ -819,8 +820,15 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	}
 	if (!src_gds) GpuCapture::Touch(src_address_or_offset_or_immediate, num_bytes);
 	if (!dst_gds) GpuCapture::Touch(dst_address_or_offset, num_bytes, GpuCapture::Out::Dma);
+	const auto trace = src_gds ? Common::VideoTrace::Mark {}
+	                           : Common::VideoTrace::BeginRead(src_address_or_offset_or_immediate, num_bytes);
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
+	if (trace.slot >= 0) [[unlikely]] {
+		char extra[48];
+		std::snprintf(extra, sizeof(extra), "dst=0x%" PRIx64 "%s", dst_address_or_offset, dst_gds ? "(gds)" : "");
+		Common::VideoTrace::EndRead(trace, 'D', src_address_or_offset_or_immediate, num_bytes, extra);
+	}
 }
 
 void GuestGpu::Enqueue(Submission submission) {

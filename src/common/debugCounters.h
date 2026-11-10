@@ -60,6 +60,7 @@ enum class Peak { ShaderCompileNs, PipelineCreateNs, Count };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_counting {false}; // count without showing the overlay (KYTY_PACE_LOG)
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
 } // namespace Detail
@@ -72,8 +73,12 @@ inline void SetEnabled(bool enabled) noexcept {
 	Detail::g_enabled.store(enabled, std::memory_order_relaxed);
 }
 
+inline void SetCounting(bool counting) noexcept {
+	Detail::g_counting.store(counting, std::memory_order_relaxed);
+}
+
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
-	if (!Enabled()) {
+	if (!Enabled() && !Detail::g_counting.load(std::memory_order_relaxed)) {
 		return;
 	}
 	Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
