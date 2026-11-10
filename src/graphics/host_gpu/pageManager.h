@@ -26,6 +26,8 @@ public:
 	// mapping was recreated with plain guest permissions. Takes no tracker lock: the caller
 	// holds the address-space lock that concurrent watcher updates wait for before protecting.
 	void RestoreProtection(uint64_t vaddr, uint64_t size) noexcept;
+	// KYTY_FAHEAD_PROF (measurement): write + access watchers of the page, all trackers together.
+	[[nodiscard]] uint32_t Watchers(uint64_t vaddr) const noexcept;
 
 	// KYTY_PROTECT_COALESCE / KYTY_REPROTECT_BATCH (BufferCache::BeginDeferredUploads). After
 	// Begin, the protections this thread would add (read-only / no-access) inside a DeferCapture

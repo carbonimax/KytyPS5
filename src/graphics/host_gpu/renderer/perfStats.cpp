@@ -21,6 +21,10 @@ namespace Libs::Graphics::CmdRecord {
 void Report(double seconds); // cmdRecord.h (KYTY_CP_RECORD_THREAD)
 } // namespace Libs::Graphics::CmdRecord
 
+namespace Libs::Graphics::FaultAheadProf {
+void Report(double seconds); // bufferCache.cpp (KYTY_FAHEAD_PROF)
+} // namespace Libs::Graphics::FaultAheadProf
+
 namespace Libs::Graphics::EopAtGpu {
 void Report(double seconds); // graphicsRun.cpp (KYTY_EOP_AT_GPU)
 } // namespace Libs::Graphics::EopAtGpu
@@ -33,6 +37,7 @@ constexpr auto ReportInterval = std::chrono::seconds(5);
 constexpr auto CounterCount   = static_cast<size_t>(Counter::Count);
 
 std::array<std::atomic<uint64_t>, CounterCount> g_counters {};
+std::atomic<uint64_t>                           g_frame_index {0};
 thread_local bool                               g_gpu_thread = false;
 const auto                                      g_epoch      = std::chrono::steady_clock::now();
 std::atomic<int64_t>                            g_last_flip_arg {0};
@@ -84,7 +89,14 @@ bool SrtProfEnabled() noexcept {
 void Add(Counter counter, uint64_t value) noexcept {
 	if (Enabled()) {
 		g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
+		if (counter == Counter::Frames) {
+			g_frame_index.fetch_add(value, std::memory_order_relaxed);
+		}
 	}
+}
+
+uint64_t FrameIndex() noexcept {
+	return g_frame_index.load(std::memory_order_relaxed);
 }
 
 void MarkGpuThread() noexcept {
@@ -305,6 +317,7 @@ void MaybeReport() noexcept {
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
+	FaultAheadProf::Report(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));

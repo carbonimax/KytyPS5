@@ -136,6 +136,8 @@ void NoteFlipArg(int64_t arg) noexcept;
 // in microseconds (same clock and "# start" header as KYTY_FRAME_TIMES). Safe on any host thread.
 [[nodiscard]] bool     CompileLogEnabled() noexcept;
 [[nodiscard]] uint64_t SteadyUs() noexcept;
+// Guest frames counted so far (monotonic, any thread; 0 while KYTY_PERF_STATS is off).
+[[nodiscard]] uint64_t FrameIndex() noexcept;
 void                   CompileLogLine(const char* format, ...) noexcept;
 
 // Draws and dispatches recorded (GPU thread, and the KYTY_CP_PIPELINE back thread), always counted:

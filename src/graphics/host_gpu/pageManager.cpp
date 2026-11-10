@@ -417,6 +417,19 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, is_read>(vaddr, size);
 }
 
+uint32_t PageManager::Watchers(uint64_t vaddr) const noexcept {
+	if (vaddr >= ADDRESS_SIZE) {
+		return 0;
+	}
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return 0;
+	}
+	SpinGuard   lock(region->lock);
+	const auto& page = region->pages[(vaddr % REGION_SIZE) / PAGE_SIZE];
+	return static_cast<uint32_t>(page.write_watchers) + page.access_watchers;
+}
+
 void PageManager::RestoreProtection(uint64_t vaddr, uint64_t size) noexcept {
 	using Mode       = Common::VirtualMemory::Mode;
 	const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);

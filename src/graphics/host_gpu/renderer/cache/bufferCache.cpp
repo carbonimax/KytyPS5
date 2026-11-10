@@ -17,6 +17,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
@@ -25,6 +27,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -878,7 +881,328 @@ void BufferCache::ReadFaultMemory(uint64_t vaddr) {
 	PublishFaultWindow(vaddr, false);
 }
 
+// KYTY_FAHEAD_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): guest write faults by
+// class and adjacency, and a simulation of unprotecting N pages ahead of every fault (step 4.6).
+// Per guest thread and guest frame: a fault on a page predicted by an earlier fault of the same
+// thread in the same frame is a saved fault if the buffer cache is that page's only watcher; a
+// predicted page that is still CPU-clean when the frame ends was never written (over-marked).
+// Simulations: blind N = 2, 4, 8 (every fault predicts) and learned N = 2, 4, 8 (only while the
+// tracker region's windows got hits). One "PERF fahead" line every 5 s.
+namespace FaultAheadProf {
+namespace {
+
+constexpr uint32_t SIMS        = 6;
+constexpr uint32_t SIM_N[SIMS] = {2, 4, 8, 2, 4, 8};
+constexpr uint32_t BLIND8      = 2;
+constexpr uint32_t HIST        = 11;
+constexpr uint32_t CROSS_SLOTS = 1u << 16u;
+constexpr uint64_t REGIONS     = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+enum Class : uint32_t { Saveable, GpuDirty, OtherWatcher, Untracked, Deferred, ClassCount };
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAHEAD_PROF");
+		return PerfStats::Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+struct Totals {
+	std::atomic<uint64_t> cls[ClassCount] {};
+	std::atomic<uint64_t> hist[HIST] {};
+	std::atomic<uint64_t> saved[SIMS] {};
+	std::atomic<uint64_t> marked[SIMS] {};
+	std::atomic<uint64_t> over[SIMS] {};
+	std::atomic<uint64_t> offset8[8] {};
+	std::atomic<uint64_t> cross8 {};
+};
+Totals g_totals;
+
+struct RegionStat {
+	uint64_t faults   = 0;
+	uint64_t saveable = 0;
+	uint64_t adjacent = 0;
+	uint64_t saved8   = 0;
+	uint64_t over8    = 0;
+};
+std::mutex                                     g_region_mutex;
+std::unordered_map<uint64_t, RegionStat>       g_regions;
+std::atomic<uint32_t>                          g_next_tid {1};
+std::array<std::atomic<uint64_t>, CROSS_SLOTS> g_cross {};
+// Learned simulations: per tracker region, a miss score 0..3; predict while it is below 2.
+std::unique_ptr<std::atomic<uint8_t>[]> g_learn[3];
+std::once_flag                          g_learn_once;
+
+struct Window {
+	uint64_t first;
+	bool     predicted;
+	bool     hit;
+};
+struct Sim {
+	std::unordered_map<uint64_t, uint32_t> pages; // predicted or shadow page -> window
+	std::vector<Window>                    windows;
+};
+struct ThreadState {
+	uint64_t                                 frame = UINT64_MAX;
+	uint64_t                                 prev  = 0;
+	uint32_t                                 tid   = 0;
+	Sim                                      sims[SIMS];
+	uint64_t                                 cls[ClassCount] {};
+	uint64_t                                 hist[HIST] {};
+	uint64_t                                 saved[SIMS] {};
+	uint64_t                                 marked[SIMS] {};
+	uint64_t                                 offset8[8] {};
+	uint64_t                                 cross8 = 0;
+	std::unordered_map<uint64_t, RegionStat> regions;
+};
+thread_local ThreadState t_state;
+
+uint64_t CrossKey(uint64_t page, uint32_t tid, uint64_t frame) {
+	return (page << 32u) | (static_cast<uint64_t>(tid & 0xffffu) << 16u) | (frame & 0xffffu);
+}
+
+// first in frame, same page, +1, +2, +3..4, +5..8, +9..16, +17, +18..64, > +64, backwards
+uint32_t Bucket(uint64_t page, uint64_t prev) {
+	if (prev == 0) return 0;
+	if (page < prev) return 10;
+	const auto d = page - prev;
+	return d == 0 ? 1 : d == 1 ? 2 : d == 2 ? 3 : d <= 4 ? 4 : d <= 8 ? 5 : d <= 16 ? 6 : d == 17 ? 7 : d <= 64 ? 8 : 9;
+}
+
+// The thread's frame ended: predicted pages still CPU-clean were never written.
+void Expire(MemoryTracker& tracker, ThreadState& st) {
+	std::vector<uint64_t> pending;
+	for (const auto& sim: st.sims) {
+		for (const auto& [page, window]: sim.pages) {
+			if (sim.windows[window].predicted) {
+				pending.push_back(page);
+			}
+		}
+	}
+	std::sort(pending.begin(), pending.end());
+	pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
+	std::vector<uint64_t> clean;
+	for (const auto page: pending) {
+		if ((tracker.AheadCleanMask(page * TRACKER_PAGE_SIZE, 1) & 1u) != 0) {
+			clean.push_back(page);
+		}
+	}
+	for (uint32_t s = 0; s < SIMS; s++) {
+		auto&    sim  = st.sims[s];
+		uint64_t over = 0;
+		for (const auto& [page, window]: sim.pages) {
+			if (sim.windows[window].predicted && std::binary_search(clean.begin(), clean.end(), page)) {
+				over++;
+				if (s == BLIND8) {
+					st.regions[page * TRACKER_PAGE_SIZE / TRACKER_REGION_SIZE].over8++;
+				}
+			}
+		}
+		g_totals.over[s].fetch_add(over, std::memory_order_relaxed);
+		if (s >= 3) {
+			for (const auto& w: sim.windows) {
+				auto&      score = g_learn[s - 3][(w.first + 1) * TRACKER_PAGE_SIZE / TRACKER_REGION_SIZE];
+				const auto v     = score.load(std::memory_order_relaxed);
+				score.store(static_cast<uint8_t>(w.hit ? (v > 0 ? v - 1 : 0) : (v < 3 ? v + 1 : 3)),
+				            std::memory_order_relaxed);
+			}
+		}
+		sim.pages.clear();
+		sim.windows.clear();
+		g_totals.saved[s].fetch_add(std::exchange(st.saved[s], 0), std::memory_order_relaxed);
+		g_totals.marked[s].fetch_add(std::exchange(st.marked[s], 0), std::memory_order_relaxed);
+	}
+	for (uint32_t i = 0; i < ClassCount; i++) {
+		g_totals.cls[i].fetch_add(std::exchange(st.cls[i], 0), std::memory_order_relaxed);
+	}
+	for (uint32_t i = 0; i < HIST; i++) {
+		g_totals.hist[i].fetch_add(std::exchange(st.hist[i], 0), std::memory_order_relaxed);
+	}
+	for (uint32_t i = 0; i < 8; i++) {
+		g_totals.offset8[i].fetch_add(std::exchange(st.offset8[i], 0), std::memory_order_relaxed);
+	}
+	g_totals.cross8.fetch_add(std::exchange(st.cross8, 0), std::memory_order_relaxed);
+	{
+		std::lock_guard lock(g_region_mutex);
+		for (const auto& [region, stat]: st.regions) {
+			auto& total = g_regions[region];
+			total.faults += stat.faults;
+			total.saveable += stat.saveable;
+			total.adjacent += stat.adjacent;
+			total.saved8 += stat.saved8;
+			total.over8 += stat.over8;
+		}
+	}
+	st.regions.clear();
+}
+
+} // namespace
+
+struct Token {
+	uint64_t page = 0;
+	bool     saved[SIMS] {};
+};
+
+// Before the fault is resolved: classify it, histogram, simulated hits.
+Token Begin(MemoryTracker& tracker, uint64_t vaddr) {
+	Token token;
+	if (!Enabled() || GuestGpu::IsGpuThread()) {
+		return token;
+	}
+	std::call_once(g_learn_once, [] {
+		for (auto& learn: g_learn) {
+			learn = std::make_unique<std::atomic<uint8_t>[]>(REGIONS);
+		}
+	});
+	auto&      st    = t_state;
+	const auto frame = PerfStats::FrameIndex();
+	if (st.tid == 0) {
+		st.tid = g_next_tid.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (st.frame != frame) {
+		Expire(tracker, st);
+		st.frame = frame;
+		st.prev  = 0;
+	}
+	const auto page = vaddr / TRACKER_PAGE_SIZE;
+	if (CommandScheduler::InDeferredOperation()) {
+		st.cls[Deferred]++;
+		return token;
+	}
+	const auto base      = page * TRACKER_PAGE_SIZE;
+	const bool own_clean = (tracker.AheadCleanMask(base, 1) & 1u) != 0;
+	const auto watchers  = tracker.PageWatchers(base);
+	const auto cls       = tracker.IsRegionGpuModified(base, TRACKER_PAGE_SIZE) ? GpuDirty
+	                       : own_clean    ? (watchers > 1 ? OtherWatcher : Saveable)
+	                       : watchers > 0 ? OtherWatcher
+	                                      : Untracked;
+	st.cls[cls]++;
+	const auto bucket = Bucket(page, st.prev);
+	st.hist[bucket]++;
+	st.prev      = page;
+	auto& region = st.regions[base / TRACKER_REGION_SIZE];
+	region.faults++;
+	region.saveable += cls == Saveable ? 1 : 0;
+	region.adjacent += bucket == 2 ? 1 : 0;
+	if (cls == Saveable) {
+		const auto other = g_cross[page % CROSS_SLOTS].load(std::memory_order_relaxed);
+		if ((other >> 32u) == page && (other & 0xffffu) == (frame & 0xffffu) &&
+		    ((other >> 16u) & 0xffffu) != (st.tid & 0xffffu)) {
+			st.cross8++;
+		}
+	}
+	for (uint32_t s = 0; s < SIMS; s++) {
+		auto& sim = st.sims[s];
+		auto  it  = sim.pages.find(page);
+		if (it == sim.pages.end()) {
+			continue;
+		}
+		auto& window = sim.windows[it->second];
+		window.hit   = true;
+		sim.pages.erase(it);
+		if (window.predicted && cls == Saveable) {
+			token.saved[s] = true;
+			st.saved[s]++;
+			if (s == BLIND8) {
+				st.offset8[std::min<uint64_t>(page - window.first - 1, 7)]++;
+				region.saved8++;
+			}
+		}
+	}
+	token.page = page;
+	return token;
+}
+
+// After the fault (and its readahead) is resolved: the faults that still happen open windows
+// over the pages that unprotecting ahead would newly mark.
+void End(MemoryTracker& tracker, const Token& token) {
+	if (token.page == 0) {
+		return;
+	}
+	auto&      st     = t_state;
+	const auto mask   = tracker.AheadCleanMask((token.page + 1) * TRACKER_PAGE_SIZE, 8);
+	const auto region = (token.page + 1) * TRACKER_PAGE_SIZE / TRACKER_REGION_SIZE;
+	if (mask == 0) {
+		return;
+	}
+	for (uint32_t s = 0; s < SIMS; s++) {
+		if (token.saved[s]) {
+			continue;
+		}
+		auto&      sim       = st.sims[s];
+		const bool predicted = s < 3 || g_learn[s - 3][region].load(std::memory_order_relaxed) < 2;
+		const auto index     = static_cast<uint32_t>(sim.windows.size());
+		sim.windows.push_back({token.page, predicted, false});
+		for (uint32_t k = 0; k < SIM_N[s]; k++) {
+			if ((mask & (1u << k)) == 0) {
+				continue;
+			}
+			const auto page = token.page + 1 + k;
+			sim.pages[page] = index;
+			if (predicted) {
+				st.marked[s]++;
+				if (s == BLIND8) {
+					g_cross[page % CROSS_SLOTS].store(CrossKey(page, st.tid, st.frame), std::memory_order_relaxed);
+				}
+			}
+		}
+	}
+}
+
+void Report(double seconds) {
+	if (!Enabled()) {
+		return;
+	}
+	const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
+	uint64_t   cls[ClassCount];
+	uint64_t   faults = 0;
+	for (uint32_t i = 0; i < ClassCount; i++) {
+		faults += (cls[i] = take(g_totals.cls[i]));
+	}
+	std::printf("PERF fahead %.1fs: faults=%" PRIu64 " saveable=%" PRIu64 " gpu_dirty=%" PRIu64
+	            " other_watcher=%" PRIu64 " untracked=%" PRIu64 " deferred=%" PRIu64 " hist=",
+	            seconds, faults, cls[Saveable], cls[GpuDirty], cls[OtherWatcher], cls[Untracked], cls[Deferred]);
+	for (uint32_t i = 0; i < HIST; i++) {
+		std::printf("%s%" PRIu64, i == 0 ? "" : ",", take(g_totals.hist[i]));
+	}
+	static const char* names[SIMS] = {"b2", "b4", "b8", "l2", "l4", "l8"};
+	for (uint32_t s = 0; s < SIMS; s++) {
+		const auto saved  = take(g_totals.saved[s]);
+		const auto marked = take(g_totals.marked[s]);
+		const auto over   = take(g_totals.over[s]);
+		std::printf(" %s=%" PRIu64 "/%" PRIu64 "/%" PRIu64, names[s], saved, marked, over);
+	}
+	std::printf(" off8=");
+	for (uint32_t i = 0; i < 8; i++) {
+		std::printf("%s%" PRIu64, i == 0 ? "" : ",", take(g_totals.offset8[i]));
+	}
+	std::printf(" cross8=%" PRIu64 "\n", take(g_totals.cross8));
+	std::vector<std::pair<uint64_t, RegionStat>> regions;
+	{
+		std::lock_guard lock(g_region_mutex);
+		regions.assign(g_regions.begin(), g_regions.end());
+		g_regions.clear();
+	}
+	std::sort(regions.begin(), regions.end(),
+	          [](const auto& a, const auto& b) { return a.second.faults > b.second.faults; });
+	std::printf("PERF fahead_regions %.1fs: regions=%zu", seconds, regions.size());
+	for (size_t i = 0; i < std::min<size_t>(regions.size(), 8); i++) {
+		const auto& [region, r] = regions[i];
+		std::printf(" 0x%" PRIx64 "=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+		            region * TRACKER_REGION_SIZE, r.faults, r.saveable, r.adjacent, r.saved8, r.over8);
+	}
+	std::printf("\n");
+}
+
+} // namespace FaultAheadProf
+
 void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
+	// KYTY_FAHEAD_PROF: the simulated windows open once the fault and its readahead are resolved.
+	struct ProfScope {
+		MemoryTracker&        tracker;
+		FaultAheadProf::Token token;
+		~ProfScope() { FaultAheadProf::End(tracker, token); }
+	} prof {m_memory_tracker, FaultAheadProf::Begin(m_memory_tracker, vaddr)};
 	const bool gpu_thread = GuestGpu::IsGpuThread();
 	if (!gpu_thread && CommandScheduler::InDeferredOperation()) {
 		InvalidateMemory(vaddr, 1);

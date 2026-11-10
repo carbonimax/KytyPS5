@@ -87,6 +87,30 @@ uint64_t MemoryTracker::ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcep
 	return marked;
 }
 
+uint32_t MemoryTracker::AheadCleanMask(uint64_t vaddr, uint32_t pages) noexcept {
+	if (vaddr % TRACKER_PAGE_SIZE != 0 || pages == 0 || pages > 32) {
+		return 0;
+	}
+	const auto offset = vaddr % TRACKER_REGION_SIZE;
+	const auto size   = std::min<uint64_t>(pages * TRACKER_PAGE_SIZE, TRACKER_REGION_SIZE - offset);
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	auto* manager = m_regions[vaddr / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (manager == nullptr) {
+		return 0;
+	}
+	std::scoped_lock lock(manager->lock);
+	const auto       prefix = manager->UnmodifiedPrefix<DirtySource::Gpu>(offset, size) / TRACKER_PAGE_SIZE;
+	uint32_t         mask   = 0;
+	for (uint64_t k = 0; k < prefix; k++) {
+		if (!manager->IsModified<DirtySource::Cpu>(offset + k * TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE)) {
+			mask |= 1u << k;
+		}
+	}
+	return mask;
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);

@@ -36,6 +36,11 @@ public:
 	// Marks up to `size` bytes from page-aligned `vaddr` CPU-modified (unprotected), stopping at
 	// the first GPU-modified page and at the region end. Returns the bytes marked.
 	uint64_t ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcept;
+	// KYTY_FAHEAD_PROF (measurement): bit k is set when page `vaddr` + k pages (k < `pages`, clipped
+	// to the region) is one ExtendCpuModified(vaddr, ...) would newly mark (CPU-clean, before the
+	// first GPU-modified page).
+	[[nodiscard]] uint32_t AheadCleanMask(uint64_t vaddr, uint32_t pages) noexcept;
+	[[nodiscard]] uint32_t PageWatchers(uint64_t vaddr) const noexcept { return m_page_manager.Watchers(vaddr); }
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
