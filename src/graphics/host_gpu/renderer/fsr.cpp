@@ -118,8 +118,23 @@ bool Accepts(const Pssr::Request& request) {
 }
 
 bool Fits(const Dlss::Inputs& inputs) {
-	return Whole(inputs.color) && Whole(inputs.depth) && Whole(inputs.motion) &&
-	       Whole(inputs.output) && (inputs.exposure == nullptr || Whole(*inputs.exposure));
+	const bool fits = Whole(inputs.color) && Whole(inputs.depth) && Whole(inputs.motion) &&
+	                  Whole(inputs.output) &&
+	                  (inputs.exposure == nullptr || Whole(*inputs.exposure));
+	if (static bool logged = false; !fits && !logged) {
+		logged           = true;
+		const auto entry = [](const char* name, const Dlss::Resource* resource) {
+			return resource == nullptr
+			           ? fmt::format(" {}=none", name)
+			           : fmt::format(" {}=fmt{},level{},layer{}", name,
+			                         static_cast<int>(resource->format),
+			                         resource->range.baseMipLevel, resource->range.baseArrayLayer);
+		};
+		Warn("FSR can't read these inputs:" + entry("color", &inputs.color) +
+		     entry("depth", &inputs.depth) + entry("motion", &inputs.motion) +
+		     entry("exposure", inputs.exposure) + entry("output", &inputs.output));
+	}
+	return fits;
 }
 
 bool Takes(const Context* context, const Pssr::Request& request, const Dlss::Inputs& inputs) {

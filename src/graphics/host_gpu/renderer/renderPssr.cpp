@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "gpu_blit_shaders/gpu_pssr_motion_spv.h"
@@ -372,10 +373,19 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	const std::array<const uint32_t*, 3>         dlss_words {request.depth, request.motion,
 	                                                         request.exposure};
 	std::array<std::optional<TextureBinding>, 3> dlss_bindings;
-	if (((Dlss::Capabilities() != nullptr && Dlss::Accepts(request)) ||
-	     (Fsr::Enabled() && Fsr::Accepts(request))) &&
-	    parameters.output_channels[0] == 0 && parameters.output_channels[1] == 1 &&
-	    parameters.output_channels[2] == 2) {
+	const bool upscaler = (Dlss::Capabilities() != nullptr && Dlss::Accepts(request)) ||
+	                      (Fsr::Enabled() && Fsr::Accepts(request));
+	const bool unswizzled = parameters.output_channels[0] == 0 &&
+	                        parameters.output_channels[1] == 1 &&
+	                        parameters.output_channels[2] == 2;
+	if (static bool logged = false; upscaler && !unswizzled && !logged) {
+		logged = true;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "WARNING: PSSR output swizzle {},{},{} is not x,y,z; it scales linearly.\n",
+		    parameters.output_channels[0], parameters.output_channels[1],
+		    parameters.output_channels[2]));
+	}
+	if (upscaler && unswizzled) {
 		for (size_t i = 0; i < dlss_words.size(); ++i) {
 			ShaderTextureResource descriptor {};
 			std::copy_n(dlss_words[i], 8, descriptor.fields);
