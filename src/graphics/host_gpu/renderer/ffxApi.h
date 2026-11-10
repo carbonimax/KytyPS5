@@ -113,6 +113,7 @@ struct CreateBackendVkDesc {
 
 // FfxApiSurfaceFormat values.
 constexpr uint32_t SURFACE_FORMAT_UNKNOWN             = 0;
+constexpr uint32_t SURFACE_FORMAT_R32G32B32A32_FLOAT  = 3;
 constexpr uint32_t SURFACE_FORMAT_R16G16B16A16_FLOAT  = 4;
 constexpr uint32_t SURFACE_FORMAT_R11G11B10_FLOAT     = 16;
 constexpr uint32_t SURFACE_FORMAT_R16G16_FLOAT        = 18;
