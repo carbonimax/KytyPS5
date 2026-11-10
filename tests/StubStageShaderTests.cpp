@@ -106,6 +106,10 @@ int main() {
 	          vi.locations == std::map<uint32_t, uint32_t> {{0u, spv::StorageClassOutput}, {3u, spv::StorageClassOutput}},
 	      "StubStageShader.VertexForPixelWritesThePixelInputs");
 
+	const auto varying = Libs::Graphics::BuildStubVaryingVertexForPixel(pixel);
+	Check(Valid(varying) && Read(varying).locations == vi.locations && Read(varying).positions == 1,
+	      "StubStageShader.VaryingVertexForPixelIsValid");
+
 	const auto like = Libs::Graphics::BuildStubVertexLike(vs);
 	Check(Valid(like) && Read(like).locations == vi.locations, "StubStageShader.VertexLikeCopiesOutputs");
 

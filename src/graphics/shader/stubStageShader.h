@@ -13,6 +13,8 @@ namespace Libs::Graphics {
 
 // A vertex shader writing the position and every Location input of `pixel`.
 std::vector<uint32_t> BuildStubVertexForPixel(std::span<const uint32_t> pixel);
+// The same, writing the vertex index (converted) instead of zero, so no output is a constant.
+std::vector<uint32_t> BuildStubVaryingVertexForPixel(std::span<const uint32_t> pixel);
 // A vertex shader writing the position and every Location output of `vertex`.
 std::vector<uint32_t> BuildStubVertexLike(std::span<const uint32_t> vertex);
 // A pixel shader with no inputs writing every Location output of `pixel`.

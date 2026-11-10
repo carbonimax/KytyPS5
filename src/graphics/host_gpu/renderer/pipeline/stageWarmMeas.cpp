@@ -6,11 +6,12 @@
 //   a   new VS + new PS (cold)
 //   bw  stub VS (writes the PS inputs) + PS_b, then b = new VS + PS_b (same PS handle)
 //   b2w stub VS (the real VS outputs) + PS_b2, then b2 = new VS + PS_b2
+//   b3w stub VS writing the vertex index (no constant output) + PS_b3, then b3 = new VS + PS_b3
 //   cw  VS_c + stub PS, then c = VS_c + new PS (VS known, PS new: the usual game miss)
 //   ew  stub VS + PS_e, then e = VS_c + PS_e (VS known, PS warmed by a stub only)
 //   d   VS_c + PS_b (both seen with real partners, new pairing)
 //   rep VS_c + PS_c again (exact repeat)
-// a, b, b2 and c run in a rotating order. One MEASSW line per key in <dir>/meas.txt, then <dir>/done.
+// a, b, b2, b3 and c run in a rotating order. One MEASSW line per key in <dir>/meas.txt, then <dir>/done.
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -123,9 +124,11 @@ void MeasureOne(GraphicContext& graphics, MeasJob& job, uint32_t index, uint32_t
 	const auto stub_vs      = BuildStubVertexForPixel(job.pixel_spirv);
 	const auto stub_vs_like = BuildStubVertexLike(job.vertex_spirv);
 	const auto stub_ps      = BuildStubPixelLike(job.pixel_spirv);
+	const auto stub_vs_var  = BuildStubVaryingVertexForPixel(job.pixel_spirv);
 	std::string messages;
 	const char* failed = !Valid(stub_vs, messages) ? "stub_vs" : !Valid(stub_vs_like, messages) ? "stub_vs_like"
 	                                                       : !Valid(stub_ps, messages)        ? "stub_ps"
+	                                                       : !Valid(stub_vs_var, messages)    ? "stub_vs_var"
 	                                                                                         : nullptr;
 	if (failed != nullptr) {
 		std::fprintf(out, "MEASSW_SKIP i=%u vs=%016" PRIx64 " ps=%016" PRIx64 " %s: %s\n", index, job.vertex_hash,
@@ -152,10 +155,10 @@ void MeasureOne(GraphicContext& graphics, MeasJob& job, uint32_t index, uint32_t
 	const auto unique  = [&](const std::vector<uint32_t>& spirv) { return Unique(graphics, spirv); };
 	const auto destroy = [&](vk::ShaderModule module) { graphics.device.destroyShaderModule(module); };
 
-	long long        a = -1, bw = -1, b = -1, b2w = -1, b2 = -1, cw = -1, c = -1;
+	long long        a = -1, bw = -1, b = -1, b2w = -1, b2 = -1, b3w = -1, b3 = -1, cw = -1, c = -1;
 	vk::ShaderModule ps_b = nullptr, vs_c = nullptr, ps_c = nullptr;
-	for (uint32_t step = 0; step < 4; step++) {
-		switch ((index + step) % 4u) {
+	for (uint32_t step = 0; step < 5; step++) {
+		switch ((index + step) % 5u) {
 			case 0: {
 				const auto vs = unique(job.vertex_spirv), ps = unique(job.pixel_spirv);
 				a = create(vs, ps);
@@ -183,6 +186,16 @@ void MeasureOne(GraphicContext& graphics, MeasJob& job, uint32_t index, uint32_t
 				destroy(vs);
 				break;
 			}
+			case 3: {
+				const auto ps = unique(job.pixel_spirv), sv3 = unique(stub_vs_var);
+				b3w           = create(sv3, ps);
+				const auto vs = unique(job.vertex_spirv);
+				b3            = create(vs, ps);
+				destroy(ps);
+				destroy(sv3);
+				destroy(vs);
+				break;
+			}
 			default: {
 				vs_c          = unique(job.vertex_spirv);
 				const auto sp = unique(stub_ps);
@@ -204,10 +217,10 @@ void MeasureOne(GraphicContext& graphics, MeasJob& job, uint32_t index, uint32_t
 	}
 	std::fprintf(out,
 	             "MEASSW i=%u n=%u at_us=%" PRIu64 " vs=%016" PRIx64 " ps=%016" PRIx64
-	             " real=%lld a=%lld bw=%lld b=%lld b2w=%lld b2=%lld cw=%lld c=%lld ew=%lld e=%lld d=%lld rep=%lld"
+	             " real=%lld a=%lld bw=%lld b=%lld b2w=%lld b2=%lld b3w=%lld b3=%lld cw=%lld c=%lld ew=%lld e=%lld d=%lld rep=%lld"
 	             " order=%u colors=%u depth=%d samples=%u vs_words=%zu ps_words=%zu\n",
-	             index, total, job.at_us, job.vertex_hash, job.pixel_hash, job.real_us, a, bw, b, b2w, b2, cw, c, ew,
-	             e, d, rep, index % 4u, job.rendering.color_count,
+	             index, total, job.at_us, job.vertex_hash, job.pixel_hash, job.real_us, a, bw, b, b2w, b2, b3w, b3, cw, c, ew,
+	             e, d, rep, index % 5u, job.rendering.color_count,
 	             job.rendering.depth_format != vk::Format::eUndefined ? 1 : 0,
 	             static_cast<uint32_t>(job.static_params.samples), job.vertex_spirv.size(), job.pixel_spirv.size());
 	std::fflush(out);

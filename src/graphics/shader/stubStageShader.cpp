@@ -102,9 +102,40 @@ uint32_t ImportType(const SourceModule& source, Builder& builder, uint32_t id) {
 	}
 }
 
+// The source type `id` filled with `index` (a signed 32-bit value) converted to each component.
+uint32_t VaryingValue(const SourceModule& source, Builder& builder, uint32_t id, uint32_t index) {
+	const auto inst = source.definitions.at(id);
+	if ((inst[0] & spv::OpCodeMask) == spv::OpTypeInt && inst[2] == 32u && inst[3] == 1u) {
+		return index;
+	}
+	const auto type  = ImportType(source, builder, id);
+	const auto value = builder.AllocateId();
+	switch (inst[0] & spv::OpCodeMask) {
+		case spv::OpTypeFloat: builder.AddFunction(spv::OpConvertSToF, type, value, index); break;
+		case spv::OpTypeInt:
+			if (inst[2] != 32u) {
+				builder.AddFunction(spv::OpSConvert, type, value, index);
+			} else {
+				builder.AddFunction(spv::OpBitcast, type, value, index);
+			}
+			break;
+		default: { // Vector or array of a converted scalar.
+			const auto element = VaryingValue(source, builder, inst[2], index);
+			const auto count   = (inst[0] & spv::OpCodeMask) == spv::OpTypeVector
+			                         ? inst[3]
+			                         : source.definitions.at(inst[3])[3];
+			const std::vector<uint32_t> elements(count, element);
+			builder.AddFunction(spv::OpCompositeConstruct, type, value, std::span<const uint32_t>(elements));
+			break;
+		}
+	}
+	return value;
+}
+
 // A `model` stub whose outputs copy the Location variables of `storage_class` in `words`.
+// `varying`: the outputs hold the vertex index instead of zero (no constant to fold).
 std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageClass storage_class,
-                                spv::ExecutionModel model) {
+                                spv::ExecutionModel model, bool varying = false) {
 	SourceModule source;
 	if (!Parse(words, source)) {
 		return {};
@@ -122,12 +153,14 @@ std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageCla
 	const auto function_type = builder.Type(spv::OpTypeFunction, void_type);
 
 	std::vector<uint32_t>                      interfaces;
-	std::vector<std::pair<uint32_t, uint32_t>> stores; // variable, type
-	const auto output = [&](uint32_t type) {
+	std::vector<std::pair<uint32_t, uint32_t>> stores;        // variable, type
+	std::vector<uint32_t>                      source_types;  // the store's source type, 0 for the position
+	const auto output = [&](uint32_t type, uint32_t source_type) {
 		const auto variable = builder.DefineGlobalVariable(
 		    builder.Type(spv::OpTypePointer, spv::StorageClassOutput, type), spv::StorageClassOutput);
 		interfaces.push_back(variable);
 		stores.emplace_back(variable, type);
+		source_types.push_back(source_type);
 		return variable;
 	};
 	for (const auto& variable: source.variables) {
@@ -165,7 +198,7 @@ std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageCla
 		if (type == 0) {
 			return {};
 		}
-		const auto copy = output(type);
+		const auto copy = output(type, pointee);
 		for (const auto& [decoration, literal]: decorations->second) {
 			const bool keep = decoration == spv::DecorationLocation ||
 			                  decoration == spv::DecorationComponent ||
@@ -178,13 +211,22 @@ std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageCla
 	}
 	if (model == spv::ExecutionModelVertex) {
 		const auto vec4     = builder.Type(spv::OpTypeVector, builder.Type(spv::OpTypeFloat, 32u), 4u);
-		const auto position = output(vec4);
+		const auto position = output(vec4, 0);
 		builder.AddAnnotation(spv::OpDecorate, position, spv::DecorationBuiltIn, spv::BuiltInPosition);
 	}
 	std::vector<uint32_t> zeros;
 	zeros.reserve(stores.size());
 	for (const auto& store: stores) {
 		zeros.push_back(builder.Constant(spv::OpConstantNull, store.second));
+	}
+	const auto int_type     = builder.Type(spv::OpTypeInt, 32u, 1u);
+	const auto vertex_index = varying ? builder.DefineGlobalVariable(
+	                                        builder.Type(spv::OpTypePointer, spv::StorageClassInput, int_type),
+	                                        spv::StorageClassInput)
+	                                  : 0u;
+	if (varying) {
+		interfaces.push_back(vertex_index);
+		builder.AddAnnotation(spv::OpDecorate, vertex_index, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
 	}
 
 	const auto main = builder.AllocateId();
@@ -194,8 +236,24 @@ std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageCla
 	}
 	builder.AddFunction(spv::OpFunction, void_type, main, spv::FunctionControlMaskNone, function_type);
 	builder.AddFunction(spv::OpLabel, builder.AllocateId());
+	const auto index = varying ? builder.AllocateId() : 0u;
+	if (varying) {
+		builder.AddFunction(spv::OpLoad, int_type, index, vertex_index);
+	}
 	for (size_t i = 0; i < stores.size(); i++) {
-		builder.AddFunction(spv::OpStore, stores[i].first, zeros[i]);
+		auto value = zeros[i];
+		if (varying && source_types[i] != 0) {
+			value = VaryingValue(source, builder, source_types[i], index);
+		} else if (varying) { // The position.
+			const auto f32 = builder.Type(spv::OpTypeFloat, 32u);
+			const auto x   = builder.AllocateId();
+			builder.AddFunction(spv::OpConvertSToF, f32, x, index);
+			value = builder.AllocateId();
+			const std::vector<uint32_t> elements(4, x);
+			builder.AddFunction(spv::OpCompositeConstruct, stores[i].second, value,
+			                    std::span<const uint32_t>(elements));
+		}
+		builder.AddFunction(spv::OpStore, stores[i].first, value);
 	}
 	builder.AddFunction(spv::OpReturn);
 	builder.AddFunction(spv::OpFunctionEnd);
@@ -206,6 +264,10 @@ std::vector<uint32_t> BuildStub(std::span<const uint32_t> words, spv::StorageCla
 
 std::vector<uint32_t> BuildStubVertexForPixel(std::span<const uint32_t> pixel) {
 	return BuildStub(pixel, spv::StorageClassInput, spv::ExecutionModelVertex);
+}
+
+std::vector<uint32_t> BuildStubVaryingVertexForPixel(std::span<const uint32_t> pixel) {
+	return BuildStub(pixel, spv::StorageClassInput, spv::ExecutionModelVertex, true);
 }
 
 std::vector<uint32_t> BuildStubVertexLike(std::span<const uint32_t> vertex) {
