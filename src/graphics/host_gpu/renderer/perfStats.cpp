@@ -27,6 +27,10 @@ namespace Libs::Graphics::EopAtGpu {
 void Report(double seconds); // graphicsRun.cpp (KYTY_EOP_AT_GPU)
 } // namespace Libs::Graphics::EopAtGpu
 
+namespace Libs::Graphics::LateRead {
+void Report(double seconds, uint64_t frames); // bufferCache.h (KYTY_LATE_READ_PROF, KYTY_WFAULT_DELAY_US)
+} // namespace Libs::Graphics::LateRead
+
 namespace Libs::Graphics::PerfStats {
 
 namespace {
@@ -353,6 +357,7 @@ void MaybeReport() noexcept {
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
+	LateRead::Report(seconds, n(Counter::Frames));
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);

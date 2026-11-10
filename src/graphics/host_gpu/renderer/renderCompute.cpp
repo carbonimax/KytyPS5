@@ -802,8 +802,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	std::optional<BufferCache::UploadBatch> upload_batch;
 	upload_batch.emplace(m_context.GetBufferCache(), true);
+	std::optional<LateRead::Scope> late_read;
+	late_read.emplace(LateRead::Site::Indirect);
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	late_read.reset();
 	EXIT_IF((args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	upload_batch.reset();
