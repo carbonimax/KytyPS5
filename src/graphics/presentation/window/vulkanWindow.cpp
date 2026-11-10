@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/fsr.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -810,6 +811,35 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	// FSR 4's INT8 model runs on these; without the FSR DLLs the device is created as before.
+	vk::PhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix {};
+	if (Fsr::Loaded()) {
+		const bool cooperative_extension =
+		    HasExtension(device_extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+		vk::PhysicalDeviceCooperativeMatrixFeaturesKHR fsr_matrix {};
+		vk::PhysicalDeviceVulkan13Features             fsr13 {};
+		vk::PhysicalDeviceVulkan12Features             fsr12 {};
+		fsr13.pNext = cooperative_extension ? &fsr_matrix : nullptr;
+		fsr12.pNext = &fsr13;
+		vk::PhysicalDeviceFeatures2 fsr_query {};
+		fsr_query.pNext = &fsr12;
+		physical_device.getFeatures2(&fsr_query);
+		features12.shaderFloat16           = fsr12.shaderFloat16;
+		features12.shaderInt8              = fsr12.shaderInt8;
+		features13.shaderIntegerDotProduct = fsr13.shaderIntegerDotProduct;
+		features13.computeFullSubgroups    = fsr13.computeFullSubgroups;
+		device_features.shaderInt16        = fsr_query.features.shaderInt16;
+		if (cooperative_extension) {
+			cooperative_matrix.cooperativeMatrix = fsr_matrix.cooperativeMatrix;
+			cooperative_matrix.pNext             = features13.pNext;
+			features13.pNext                     = &cooperative_matrix;
+		}
+		LOGF("FSR device features: float16=%d int8=%d int16=%d dot=%d full_subgroups=%d "
+		     "cooperative_matrix=%d\n",
+		     features12.shaderFloat16, features12.shaderInt8, device_features.shaderInt16,
+		     features13.shaderIntegerDotProduct, features13.computeFullSubgroups,
+		     cooperative_matrix.cooperativeMatrix);
+	}
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -1078,6 +1108,7 @@ void WindowContext::CreateVulkan() {
 
 	Vr::OpenXrInit();
 	Dlss::Load();
+	Fsr::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -1285,6 +1316,7 @@ void WindowContext::CreateVulkan() {
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 		Dlss::AppendExtensions(device_extensions, available_extensions, true);
+		Fsr::AppendExtensions(device_extensions, available_extensions, true);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1302,6 +1334,9 @@ void WindowContext::CreateVulkan() {
 	}
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	if (Dlss::Capabilities() == nullptr) {
+		Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1344,6 +1379,7 @@ WindowContext::~WindowContext() {
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
 	Dlss::Shutdown();
+	Fsr::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");

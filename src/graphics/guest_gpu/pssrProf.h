@@ -62,8 +62,14 @@ struct ContextStats {
 	uint32_t in_w = 0, in_h = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
 };
 
+// How the host upscaled a request.
+enum class Path : uint32_t { Linear, Dlss, Fsr, Count };
+inline const char* const kPathNames[] = {"linear", "dlss", "fsr"};
+
 struct State {
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Entry::Count)> entries {};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(Path::Count)>  paths {};
+	std::atomic<uint64_t>                                                 gpu_ns {}, gpu_samples {};
 	std::atomic<uint64_t>                                                 requests {};
 	std::mutex                                                            mutex;
 	std::map<uint64_t, ContextStats>                                      contexts; // also past sizes: last one kept
@@ -95,6 +101,7 @@ inline bool Present(const uint32_t (&descriptor)[8]) {
 inline void Report() {
 	auto&    s = Get();
 	uint64_t last_entries[static_cast<size_t>(Entry::Count)] {}, last_requests = 0;
+	uint64_t last_paths[static_cast<size_t>(Path::Count)] {}, last_gpu_ns = 0, last_gpu_samples = 0;
 	std::map<uint64_t, uint64_t> last_counts;
 	for (int second = 1;; ++second) {
 		std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -119,6 +126,22 @@ inline void Report() {
 			}
 		}
 		std::printf("\n");
+		std::printf("PSSRPROF   upscale");
+		for (size_t i = 0; i < std::size(last_paths); ++i) {
+			const uint64_t path = s.paths[i].load(std::memory_order_relaxed);
+			std::printf(" %s=+%llu", kPathNames[i], static_cast<unsigned long long>(path - last_paths[i]));
+			last_paths[i] = path;
+		}
+		const uint64_t gpu_ns      = s.gpu_ns.load(std::memory_order_relaxed);
+		const uint64_t gpu_samples = s.gpu_samples.load(std::memory_order_relaxed);
+		std::printf(" gpu_ms_avg=%.4f samples=+%llu\n",
+		            gpu_samples == last_gpu_samples
+		                ? 0.0
+		                : static_cast<double>(gpu_ns - last_gpu_ns) / 1e6 /
+		                      static_cast<double>(gpu_samples - last_gpu_samples),
+		            static_cast<unsigned long long>(gpu_samples - last_gpu_samples));
+		last_gpu_ns      = gpu_ns;
+		last_gpu_samples = gpu_samples;
 		{
 			std::lock_guard lock(s.mutex);
 			for (const auto& [context, c]: s.contexts) {
@@ -152,6 +175,20 @@ inline void Call(Entry entry) {
 	}
 	Start();
 	Get().entries[static_cast<size_t>(entry)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// One upscale pass, with its GPU time when its timestamps were ready.
+inline void Upscaled(Path path, uint64_t gpu_ns, bool timed) {
+	if (!Enabled()) {
+		return;
+	}
+	Start();
+	auto& s = Get();
+	s.paths[static_cast<size_t>(path)].fetch_add(1, std::memory_order_relaxed);
+	if (timed) {
+		s.gpu_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
+		s.gpu_samples.fetch_add(1, std::memory_order_relaxed);
+	}
 }
 
 inline void Note(const Request& request) {

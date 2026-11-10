@@ -58,6 +58,8 @@ static void PrintUsage() {
 	::printf("  --dlss <folder>                      With --trinity, upscale PSSR with the DLSS\n"
 	         "                                       model in <folder> instead of linearly.\n");
 	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
+	::printf("  --fsr <folder>                       With --trinity and without DLSS, upscale PSSR\n"
+	         "                                       with the AMD FSR SDK DLLs in <folder>.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -371,6 +373,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--dlss") {
 			options.config.dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--fsr") {
+			options.config.fsr_folder = Common::PathFromUtf8(value);
 		} else if (arg == "--dlss-preset") {
 			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
 				::printf("invalid DLSS preset: %s\n", value.c_str());

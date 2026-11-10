@@ -126,6 +126,10 @@ uint32_t GetDlssPreset() {
 	return g_config->dlss_preset;
 }
 
+const std::filesystem::path& GetFsrFolder() {
+	return g_config->fsr_folder;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }

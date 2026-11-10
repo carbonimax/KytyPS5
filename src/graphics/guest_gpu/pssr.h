@@ -15,8 +15,8 @@ enum Flags : uint32_t {
 };
 
 // Zeroed depth, motion and exposure descriptors are absent inputs. Motion vectors times
-// motion_scale are render-resolution pixels to the previous frame, y down, without jitter;
-// jitter is the sample offset from the pixel center in pixels, y down.
+// motion_scale plus motion_offset are render-resolution pixels to the previous frame, y down,
+// without jitter; jitter is the sample offset from the pixel center in pixels, y down.
 struct Request {
 	uint32_t output[8];
 	uint32_t input[8];
@@ -30,12 +30,13 @@ struct Request {
 	uint32_t y;
 	float    jitter[2];
 	float    motion_scale[2];
+	float    motion_offset[2];
 	float    pre_exposure;
 	uint32_t flags;
 };
 
 constexpr uint32_t RequestDwords = sizeof(Request) / sizeof(uint32_t);
-static_assert(sizeof(Request) == 208);
+static_assert(sizeof(Request) == 216);
 
 inline bool IsColorFormat(Prospero::BufferFormat format) {
 	switch (format) {

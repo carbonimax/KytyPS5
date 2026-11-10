@@ -172,8 +172,9 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 	                       .x            = params.x,
 	                       .y            = params.y,
 	                       .jitter       = {params.jitter[0], params.jitter[1]},
-	                       .motion_scale = {params.motion_scale[0], params.motion_scale[1]},
-	                       .pre_exposure = pre_exposure};
+	                       .motion_scale  = {params.motion_scale[0], params.motion_scale[1]},
+	                       .motion_offset = {params.motion_offset[0], params.motion_offset[1]},
+	                       .pre_exposure  = pre_exposure};
 	CopyDescriptor(request.output, params.output);
 	CopyDescriptor(request.input, params.color);
 	CopyDescriptor(request.depth, params.depth);
@@ -183,8 +184,7 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 		flags |= Pssr::kReset;
 	}
 	if (params.motion_offset[0] != 0.0f || params.motion_offset[1] != 0.0f) {
-		Prof::Call(Entry::WhyMotionOffset);
-		flags |= Pssr::kSpatialOnly;
+		Prof::Call(Entry::WhyMotionOffset); // counted only: the request carries the offset
 	}
 	request.flags = flags;
 	return request;

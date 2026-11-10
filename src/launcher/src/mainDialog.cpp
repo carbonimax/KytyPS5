@@ -301,6 +301,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
 		args << "--dlss" << info.dlss_folder;
 	}
+	if (info.pro_enabled && info.pssr_upscaler == Configuration::PssrUpscaler::FSR) {
+		args << "--fsr" << info.fsr_folder;
+	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)

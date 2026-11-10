@@ -69,6 +69,8 @@ struct ConfigOptions {
 	// Folder with the user's DLSS model; DLSS upscales PSSR in Pro mode when set.
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0; // 0 is the model default
+	// Folder with the user's FSR SDK DLLs; FSR upscales PSSR in Pro mode when set and DLSS is off.
+	std::filesystem::path  fsr_folder;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -137,6 +139,7 @@ bool     VrEnabled();
 bool     Ps5ProEnabled();
 const std::filesystem::path& GetDlssFolder();
 uint32_t GetDlssPreset();
+const std::filesystem::path& GetFsrFolder();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();

@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/renderer/fsr.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -26,6 +27,7 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
+struct VulkanImage;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
@@ -343,14 +345,29 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	void                      CreatePssrPipelines();
+	// Writes the request's motion vectors with their offset applied to m_pssr_motion and points
+	// motion at it; false when the image can't be made.
+	[[nodiscard]] bool        FixMotion(vk::CommandBuffer command, const Pssr::Request& request,
+	                                    Dlss::Resource& motion);
+	// DLSS when it runs, else FSR when it runs; false scales linearly.
 	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
 	                                  Dlss::Inputs& inputs);
+	[[nodiscard]] bool        UpscaleDlss(vk::CommandBuffer command, const Pssr::Request& request,
+	                                      Dlss::Inputs& inputs);
+	[[nodiscard]] bool        UpscaleFsr(vk::CommandBuffer command, const Pssr::Request& request,
+	                                     Dlss::Inputs& inputs);
 
 	// DLSS history of a PSSR context; a null feature is one DLSS refused or failed.
 	struct DlssContext {
 		uint64_t       context;
 		Dlss::Creation creation;
 		Dlss::Feature* feature;
+	};
+	// FSR history of a PSSR context; a null one is one FSR failed to create.
+	struct FsrContext {
+		uint64_t      context;
+		Fsr::Context* fsr;
 	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
@@ -373,7 +390,13 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	vk::Pipeline                          m_pssr_motion_pipeline   = nullptr;
+	VulkanImage*                          m_pssr_motion            = nullptr; // owned
+	vk::ImageView                         m_pssr_motion_view       = nullptr;
+	vk::QueryPool                         m_pssr_queries           = nullptr; // KYTY_PSSR_PROF
+	uint32_t                              m_pssr_query             = 0;
 	std::vector<DlssContext>              m_dlss_contexts;
+	std::vector<FsrContext>               m_fsr_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
 	friend class CommandProcessor;
