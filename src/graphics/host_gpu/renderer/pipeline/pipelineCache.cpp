@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderPretranslate.h"
@@ -191,6 +192,50 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	file.Write(code.data(), code.size_bytes());
+}
+
+// KYTY_COMPILE_LOG, new guest code: L time stage hash template words ops=<opcode@word of each 32-bit
+// literal>, where the template hashes the code with its literal dwords zeroed (shaders that differ
+// only in literal constants share it). KYTY_COMPILE_LOG_CODE=<dir> also writes the code to
+// <dir>/<stage>_<hash>.bin (stage: the ShaderType number, as on M lines).
+void LogCodeTemplate(int stage, bool front, uint64_t hash, std::span<const uint32_t> code) {
+	namespace Decoder = ShaderRecompiler::Decoder;
+	std::vector<uint32_t> masked(code.begin(), code.end());
+	std::string           ops;
+	std::vector<bool>     targets(code.size() + 1);
+	// Instruction by instruction, ending as DecodeProgram (S_ENDPGM no branch jumps past) or, for a
+	// front half (`front`), DecodeFrontProgram (S_SETPC_B64); neither stops the emulator here.
+	for (uint32_t word = 0; word < code.size();) {
+		Decoder::Instruction inst;
+		Decoder::DecodeInstruction(code, word, inst);
+		if (word + inst.word_count > code.size()) break;
+		if (Decoder::IsDirectBranch(inst.opcode) && inst.branch_target / 4 < targets.size()) {
+			targets[inst.branch_target / 4] = true;
+		}
+		const auto literal = [](const Decoder::Operand& o) {
+			return o.kind == Decoder::OperandKind::LiteralConstant;
+		};
+		if (literal(inst.src0) || literal(inst.src1) || literal(inst.src2) || literal(inst.src3)) {
+			masked[word + inst.word_count - 1] = 0; // the decoder reads the literal last
+			ops += fmt::format("{}@{},", static_cast<uint32_t>(inst.opcode), word + inst.word_count - 1);
+		}
+		word += inst.word_count;
+		if ((inst.opcode == Decoder::Opcode::S_ENDPGM && !targets[word]) ||
+		    (front && inst.opcode == Decoder::Opcode::S_SETPC_B64)) {
+			break;
+		}
+	}
+	PerfStats::CompileLogLine("L %" PRIu64 " %d %016" PRIx64 " %016" PRIx64 " %zu ops=%s",
+	                          PerfStats::SteadyUs(), stage, hash,
+	                          XXH3_64bits(masked.data(), masked.size() * sizeof(uint32_t)),
+	                          code.size(), ops.c_str());
+	static const char* dir = std::getenv("KYTY_COMPILE_LOG_CODE");
+	if (dir != nullptr && dir[0] != '\0') {
+		const auto path = std::filesystem::path(dir) / fmt::format("{}_{:016x}.bin", stage, hash);
+		Common::File::CreateDirectories(path.parent_path());
+		Common::File file(path);
+		if (!file.IsInvalid()) file.Write(code.data(), code.size_bytes());
+	}
 }
 
 bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
@@ -704,7 +749,10 @@ struct PipelineCache::ProgramCache {
 			const auto code_key = params.hash ^ (static_cast<uint64_t>(options.stage) << 58u);
 			diag_class = entry != programs.end() ? (source_changed ? 'C' : 'P')
 			             : diag_codes.contains(code_key) ? 'S' : 'N';
-			diag_codes.insert(code_key);
+			if (diag_codes.insert(code_key).second) {
+				LogCodeTemplate(static_cast<int>(options.stage), options.stage == ShaderType::Local ||
+				                !params.back_code.empty(), params.hash, params.code);
+			}
 			BuildStageTranslationKey(input_info, diag_words);
 			AppendProgramTranslationKey(diag_words, options.stage, params.user_data_count,
 			                            params.code.size(), params.back_code.size(), options.wave_size,
