@@ -15643,9 +15643,21 @@ public:
     std::vector<GpuCapture::Thumb> *thumbs = nullptr; // ... and its color target thumbnails
   };
 
+  // ReplayGpuCapture result when a captured range cannot be mapped at its recorded address on this
+  // host (the replay did not run: neither a match nor a mismatch). Details in m_replay_unmappable.
+  static constexpr uint32_t kReplayUnmappable = UINT32_MAX;
+  struct ReplayUnmappable {
+    uint64_t address = 0;
+    uint64_t size = 0;
+    int allocate = 0;
+    int map = 0;
+  };
+  ReplayUnmappable m_replay_unmappable;
+
   // Replays a GPU capture without the guest CPU or HLE: maps its memory back at the same
   // addresses, registers its shaders, submits its command lists and hashes the expected ranges.
-  // Returns the number of mismatching ranges.
+  // Returns the number of mismatching ranges, or kReplayUnmappable (nothing replayed) when a range
+  // cannot be mapped at its recorded address.
   // `nondet`: Expects two replays of this capture disagreed on (address -> true when only the order
   // of their dwords differed), from <capture>.nondet.txt. Such an Expect is not counted as a
   // mismatch when it differs the same way ("order": the game's dword multiset still matches).
@@ -15691,13 +15703,28 @@ public:
     for (const auto &[begin, end] : merged) {
       int64_t offset = -1;
       void *mapped = reinterpret_cast<void *>(begin);
-      Require(name, "map memory",
-              Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
-                                                 end - begin, block, 0, &offset) == 0 &&
-                  Memory::KernelMapDirectMemory(&mapped, end - begin, 0x3, 0x10, offset,
-                                                block) == 0 &&
-                  mapped == reinterpret_cast<void *>(begin),
-              "fixed mapping of capture memory failed");
+      const int allocate = Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
+                                                              end - begin, block, 0, &offset);
+      const int map = allocate == 0 ? Memory::KernelMapDirectMemory(&mapped, end - begin, 0x3, 0x10,
+                                                                    offset, block)
+                                    : allocate;
+      if (allocate != 0 || map != 0 || mapped != reinterpret_cast<void *>(begin)) {
+        // The host does not own this address (macOS x86_64 under Rosetta reserves
+        // [0xFC0000000, 0x7000000000) for the system, which a PC capture can use): the replay cannot
+        // run here. Give back what was mapped so far and let the caller report it as inconclusive.
+        if (allocate == 0 && map != 0) {
+          Memory::KernelReleaseDirectMemory(offset, end - begin);
+        }
+        for (size_t i = 0; i < direct_offsets.size(); i++) {
+          const auto size = merged[i].second - merged[i].first;
+          Require(name, "unmap memory",
+                  Memory::KernelMunmap(merged[i].first, size) == 0 &&
+                      Memory::KernelReleaseDirectMemory(direct_offsets[i], size) == 0,
+                  "capture memory release failed");
+        }
+        m_replay_unmappable = {begin, end - begin, allocate, map};
+        return kReplayUnmappable;
+      }
       std::memset(mapped, 0, end - begin);
       direct_offsets.push_back(offset);
     }
@@ -16423,6 +16450,9 @@ public:
   // --gpu-replay-record <file> (`record`): the same, then, when it passes (or KYTY_REPLAY_RECORD_FORCE=1),
   // stores this platform's hashes in <capture>.platform.kygpucap, with the color thumbnails when the
   // sidecar has none yet and this replay matched the game's own hashes on every Expect.
+  // Exit status of ReplayGpuCaptureFile when a range cannot be mapped (nothing replayed): neither 0
+  // (all Expects match) nor 1 (they differ). A recording is never made from such a replay.
+  static constexpr int kReplayFileInconclusive = 2;
   int ReplayGpuCaptureFile(const char *path, bool record = false) {
     const auto start = std::chrono::steady_clock::now();
     const auto read_file = [](const std::string &file_path) {
@@ -16473,6 +16503,15 @@ public:
       sidecar.thumbs = &thumbs;
     }
     const auto mismatches = ReplayGpuCapture("GpuReplay", *capture, nondet, sidecar);
+    if (mismatches == kReplayUnmappable) {
+      std::printf("[gpu]     GpuReplay %s NON_CONCLUSIVE: capture memory [0x%" PRIx64 ", +0x%" PRIx64
+                  ") cannot be mapped at its recorded address on this host (allocate=0x%x map=0x%x); "
+                  "nothing was replayed\n",
+                  path, m_replay_unmappable.address, m_replay_unmappable.size,
+                  static_cast<unsigned>(m_replay_unmappable.allocate),
+                  static_cast<unsigned>(m_replay_unmappable.map));
+      return kReplayFileInconclusive;
+    }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     std::printf("[gpu]     GpuReplay %s records=%zu memory=%" PRIu64 " submits=%" PRIu64
                 " expects=%" PRIu64 " mismatches=%u ms=%.0f\n",
@@ -60492,8 +60531,21 @@ int main(int argc, char **argv) {
     std::ranges::sort(files);
     VulkanHarness vulkan;
     int failed = 0;
-    for (const auto &file : files) failed += vulkan.ReplayGpuCaptureFile(file.c_str()) != 0 ? 1 : 0;
-    std::printf("GpuReplayDir %zu captures, %d differ\n", files.size(), failed);
+    size_t inconclusive = 0;
+    for (const auto &file : files) {
+      const int status = vulkan.ReplayGpuCaptureFile(file.c_str());
+      if (status == VulkanHarness::kReplayFileInconclusive) {
+        inconclusive++;
+      } else if (status != 0) {
+        failed++;
+      }
+    }
+    // A capture that cannot be mapped here is inconclusive, not a difference; the others still count.
+    std::printf("GpuReplayDir %zu captures, %d differ, %zu inconclusive on this host\n", files.size(), failed,
+                inconclusive);
+    if (failed == 0 && inconclusive == files.size()) {
+      std::printf("GpuReplayDir skipped: no capture could be mapped on this host\n");
+    }
     return failed == 0 ? 0 : 1;
   }
   if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
