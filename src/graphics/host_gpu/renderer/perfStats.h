@@ -116,6 +116,10 @@ enum class Counter : uint32_t {
 	TgtReusableMeta,   // targets of reusable records with DCC/CMASK metadata (clear replay needed)
 	TgtUnkept,         // of exact: a previous search not keepable (insert, alias, heap wait)
 	TgtEpochMoved,     // of exact: kept, but an image was (un)registered since
+	TgtReused,         // KYTY_TARGET_REUSE=1: records that took the previous resolution
+	TgtReplayRefused,  // =1: reusable, but the replay found the epoch moved or an image gone
+	TgtVerified,       // KYTY_TARGET_REUSE=2: reusable records resolved anyway and compared
+	TgtMismatch,       // =2: of verified, resolution differs from the previous record's
 	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
 	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,
