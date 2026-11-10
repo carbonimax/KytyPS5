@@ -89,8 +89,8 @@ enum class Counter : uint32_t {
 	BindObtainNs,      // of buffers: NativeStorageBuffer (buffer cache, uploads)
 	BindUploadNs,      // of buffers: flattened SRT + shader data stream uploads
 	BindViewNs,        // of images: TextureCache::FindTexture (views)
-	// KYTY_ASYNC_PIPELINE=1: draws skipped while their pipeline is created, guest frames with a
-	// skipped draw, and the misses that waited, by why the draw could not be skipped.
+	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
+	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,
 	AsyncSkipFrames,
 	AsyncBlockWrites,    // writes buffers, images or memory by address

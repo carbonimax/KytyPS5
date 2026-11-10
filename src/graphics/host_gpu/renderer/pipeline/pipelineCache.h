@@ -210,7 +210,7 @@ public:
 	                              std::span<const RenderColorInfo> colors,
 	                              bool                             depth_feedback = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
-	// KYTY_ASYNC_PIPELINE=1 (default 0, experiment; needs the KYTY_PIPELINE_PARALLEL workers): a
+	// KYTY_ASYNC_PIPELINE (default on, =0 off; needs the KYTY_PIPELINE_PARALLEL workers): a
 	// draw whose pipeline is missing may be skipped while the workers create it (SkipMissing), for
 	// ASYNC_PIPELINE_SKIP_FRAMES guest frames at most; then it waits like any miss.
 	[[nodiscard]] bool AsyncEnabled() const { return m_async; }

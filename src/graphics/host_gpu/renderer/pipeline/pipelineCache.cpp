@@ -1077,7 +1077,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		}
 		PipelineCacheLog("Pipeline parallel: {} workers (KYTY_PIPELINE_PARALLEL)", workers);
 		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
-		m_async           = async != nullptr && async[0] == '1';
+		m_async           = async == nullptr || std::strcmp(async, "0") != 0;
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
