@@ -181,6 +181,7 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 		flags |= Pssr::kReset;
 	}
 	if (params.motion_offset[0] != 0.0f || params.motion_offset[1] != 0.0f) {
+		Prof::Call(Entry::WhyMotionOffset);
 		flags |= Pssr::kSpatialOnly;
 	}
 	request.flags = flags;
@@ -411,6 +412,18 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 	uint32_t flags = (params->flags >> 15) & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if ((params->flags & (VIEW_DEPTH | PASS_THROUGH)) != 0 || params->vr_lookup != nullptr ||
 	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
+		if ((params->flags & VIEW_DEPTH) != 0) {
+			Prof::Call(Entry::WhyViewDepth);
+		}
+		if ((params->flags & PASS_THROUGH) != 0) {
+			Prof::Call(Entry::WhyPassThrough);
+		}
+		if (params->vr_lookup != nullptr) {
+			Prof::Call(Entry::WhyVrLookup);
+		}
+		if (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f) {
+			Prof::Call(Entry::WhyMotionGamma);
+		}
 		flags |= Pssr::kSpatialOnly;
 	}
 	Prof::Call(Entry::DispatchOk);
@@ -723,6 +736,12 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	// Reverse depth and auto exposure are bits 0 and 1.
 	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
+		if (params->encoding != 0) {
+			Prof::Call(Entry::WhyMfsr2Encoding);
+		}
+		if ((params->flags & DILATED_MOTION) != 0) {
+			Prof::Call(Entry::WhyMfsr2Dilated);
+		}
 		flags |= Pssr::kSpatialOnly;
 	}
 	Prof::Call(Entry::Mfsr2DispatchOk);

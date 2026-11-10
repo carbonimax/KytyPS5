@@ -36,12 +36,22 @@ enum class Entry : uint32_t {
 	Mfsr2CreateContext,
 	Mfsr2Dispatch,
 	Mfsr2DispatchOk,
+	// why a request was marked spatial-only (one call per cause, a request may have several)
+	WhyMotionOffset,
+	WhyViewDepth,
+	WhyPassThrough,
+	WhyVrLookup,
+	WhyMotionGamma,
+	WhyMfsr2Encoding,
+	WhyMfsr2Dilated,
 	Count
 };
 
 inline const char* const kEntryNames[] = {"init",       "shared_req",  "shared_create", "ctx_req",     "ctx_create",
                                           "ctx_release", "packet_size", "dispatch",      "dispatch_ok", "mip_bias",
-                                          "mfsr2_init",  "mfsr2_ctx",   "mfsr2_disp",    "mfsr2_disp_ok"};
+                                          "mfsr2_init",  "mfsr2_ctx",   "mfsr2_disp",    "mfsr2_disp_ok",
+                                          "why_motion_offset", "why_view_depth", "why_pass_through", "why_vr_lookup",
+                                          "why_motion_gamma", "why_mfsr2_encoding", "why_mfsr2_dilated"};
 static_assert(sizeof(kEntryNames) / sizeof(kEntryNames[0]) == static_cast<size_t>(Entry::Count));
 
 struct ContextStats {
