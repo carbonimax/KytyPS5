@@ -1413,23 +1413,28 @@ struct BackShape {
 };
 } // namespace
 
-static bool SameResources(const ShaderRecompiler::IR::ResourceSnapshot& a,
-                          const ShaderRecompiler::IR::ResourceSnapshot& b) {
-	return a.buffers == b.buffers && a.images == b.images && a.samplers == b.samplers &&
-	       a.flattened_srt == b.flattened_srt && a.user_data == b.user_data && a.uniform_fill == b.uniform_fill;
-}
-
-static bool SameStage(const BackStageShape& shape, const PreparedBindings& bindings) {
-	if (bindings.runtime == nullptr || bindings.runtime->resources == nullptr ||
-	    !SameResources(shape.resources, *bindings.runtime->resources) || shape.buffers != bindings.buffers ||
-	    shape.samplers != bindings.samplers || shape.shader_data != bindings.shader_data ||
-	    shape.images.size() != bindings.images.size()) {
-		return false;
+// Bits: 1 snapshot, 2 user data, 4 buffers, 8 images, 16 samplers, 32 shader data.
+static uint32_t StageDiff(const BackStageShape& shape, const PreparedBindings& bindings) {
+	if (bindings.runtime == nullptr || bindings.runtime->resources == nullptr) {
+		return 1;
 	}
-	for (size_t i = 0; i < shape.images.size(); i++) {
-		if (shape.images[i] != std::pair {bindings.images[i].image_view, bindings.images[i].layout}) return false;
+	const auto& a    = shape.resources;
+	const auto& b    = *bindings.runtime->resources;
+	uint32_t    diff = 0;
+	if (a.buffers != b.buffers || a.images != b.images || a.samplers != b.samplers ||
+	    a.flattened_srt != b.flattened_srt || a.uniform_fill != b.uniform_fill) {
+		diff |= 1;
 	}
-	return true;
+	diff |= a.user_data != b.user_data ? 2u : 0u;
+	diff |= shape.buffers != bindings.buffers ? 4u : 0u;
+	bool images = shape.images.size() != bindings.images.size();
+	for (size_t i = 0; !images && i < shape.images.size(); i++) {
+		images = shape.images[i] != std::pair {bindings.images[i].image_view, bindings.images[i].layout};
+	}
+	diff |= images ? 8u : 0u;
+	diff |= shape.samplers != bindings.samplers ? 16u : 0u;
+	diff |= shape.shader_data != bindings.shader_data ? 32u : 0u;
+	return diff;
 }
 
 static void SaveStage(BackStageShape& shape, const PreparedBindings& bindings) {
@@ -1443,20 +1448,27 @@ static void SaveStage(BackStageShape& shape, const PreparedBindings& bindings) {
 	for (const auto& image: bindings.images) shape.images.emplace_back(image.image_view, image.layout);
 }
 
-static bool NoDynamicChange(const DynamicState& d) {
+// Dirty groups: 1 viewports/scissors, 2 depth, 4 stencil, 8 raster, 16 blend/feedback.
+static uint32_t DynamicDiff(const DynamicState& d) {
 	const auto& s = d.dirty_state;
-	return !(s.viewports || s.scissors || s.depth_test_enabled || s.depth_write_enabled || s.depth_compare_op ||
-	         s.depth_bounds_test_enabled || s.depth_bounds || s.depth_bias_enabled || s.depth_bias ||
-	         s.stencil_test_enabled || s.stencil_front_ops || s.stencil_front_reference ||
-	         s.stencil_front_write_mask || s.stencil_front_compare_mask || s.stencil_back_ops ||
-	         s.stencil_back_reference || s.stencil_back_write_mask || s.stencil_back_compare_mask || s.cull_mode ||
-	         s.front_face || s.blend_constants || s.line_width || s.feedback_loop_aspects);
+	return (s.viewports || s.scissors ? 1u : 0u) |
+	       (s.depth_test_enabled || s.depth_write_enabled || s.depth_compare_op || s.depth_bounds_test_enabled ||
+	                s.depth_bounds || s.depth_bias_enabled || s.depth_bias
+	            ? 2u
+	            : 0u) |
+	       (s.stencil_test_enabled || s.stencil_front_ops || s.stencil_front_reference || s.stencil_front_write_mask ||
+	                s.stencil_front_compare_mask || s.stencil_back_ops || s.stencil_back_reference ||
+	                s.stencil_back_write_mask || s.stencil_back_compare_mask
+	            ? 4u
+	            : 0u) |
+	       (s.cull_mode || s.front_face || s.line_width ? 8u : 0u) |
+	       (s.blend_constants || s.feedback_loop_aspects ? 16u : 0u);
 }
 
 // CP back thread, single-pass draw: compares with the previous record's draw and keeps this one.
 static void NoteBackShape(const PipelineCache::Pipeline* pipeline, const RenderState& rendering,
                           const PreparedVertexBuffers& vertex, const PreparedIndexBuffer& index,
-                          std::span<PreparedBindings* const> stages, bool dynamic_same) {
+                          std::span<PreparedBindings* const> stages, uint32_t dynamic_diff) {
 	using PerfStats::Counter;
 	static BackShape prev;
 	const auto       record   = CpPipeline::Finished();
@@ -1466,15 +1478,31 @@ static void NoteBackShape(const PipelineCache::Pipeline* pipeline, const RenderS
 	const bool       vtx      = adjacent && prev.vertex.count == vertex.count && prev.vertex.buffers == vertex.buffers &&
 	                 prev.vertex.offsets == vertex.offsets && prev.vertex.sizes == vertex.sizes &&
 	                 prev.index.buffer == index.buffer && prev.index.offset == index.offset && prev.index.type == index.type;
-	bool bind = adjacent && prev.stage_count == stages.size();
-	for (size_t i = 0; bind && i < stages.size(); i++) bind = SameStage(prev.stages[i], *stages[i]);
-	const bool dyn = adjacent && dynamic_same;
+	uint32_t bind_diff = adjacent && prev.stage_count == stages.size() ? 0u : 1u;
+	if (bind_diff == 0) {
+		for (size_t i = 0; i < stages.size(); i++) bind_diff |= StageDiff(prev.stages[i], *stages[i]);
+	}
+	const bool bind = bind_diff == 0;
+	const bool dyn  = adjacent && dynamic_diff == 0;
 	PerfStats::Add(Counter::BackShaped, 1);
 	PerfStats::Add(Counter::BackSamePipe, pipe ? 1 : 0);
 	PerfStats::Add(Counter::BackSameRt, rt ? 1 : 0);
 	PerfStats::Add(Counter::BackSameBind, bind ? 1 : 0);
 	PerfStats::Add(Counter::BackSameVtx, vtx ? 1 : 0);
 	PerfStats::Add(Counter::BackSameDyn, dyn ? 1 : 0);
+	if (adjacent) {
+		for (uint32_t i = 0; i < 5; i++) {
+			PerfStats::Add(static_cast<Counter>(static_cast<uint32_t>(Counter::BackDiffViewport) + i),
+			               (dynamic_diff >> i) & 1u);
+		}
+		if (prev.stage_count == stages.size()) {
+			for (uint32_t i = 0; i < 6; i++) {
+				PerfStats::Add(static_cast<Counter>(static_cast<uint32_t>(Counter::BackDiffSnapshot) + i),
+				               (bind_diff >> i) & 1u);
+			}
+		}
+		PerfStats::Add(Counter::BackSameNoData, pipe && rt && vtx && dyn && (bind_diff & ~34u) == 0 ? 1 : 0);
+	}
 	if (pipe && rt && bind && vtx && dyn) CpPipeline::NoteBackSame();
 	prev.record      = record;
 	prev.pipeline    = pipeline;
@@ -1741,7 +1769,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		static const bool back_same = PerfStats::BackSameEnabled();
 		if (back_same && pass_count == 1 && CpPipeline::IsBackThread()) {
 			NoteBackShape(&pipeline, renderings[pass], vertex_bindings, index_binding, stages,
-			              NoDynamicChange(dynamic_state));
+			              DynamicDiff(dynamic_state));
 		}
 		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 

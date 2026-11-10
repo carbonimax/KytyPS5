@@ -341,6 +341,13 @@ void MaybeReport() noexcept {
 		            n(Counter::BackSamePipe), n(Counter::BackSameRt), n(Counter::BackSameBind),
 		            n(Counter::BackSameVtx), n(Counter::BackSameDyn), n(Counter::BackSame), ms(Counter::BackSameNs),
 		            n(Counter::BackSameClean), ms(Counter::BackSameCleanNs));
+		std::printf("PERF backdiff %.1fs: viewport=%" PRIu64 " depth=%" PRIu64 " stencil=%" PRIu64 " raster=%" PRIu64
+		            " blend=%" PRIu64 " snapshot=%" PRIu64 " user_data=%" PRIu64 " buffers=%" PRIu64 " images=%" PRIu64
+		            " samplers=%" PRIu64 " shader_data=%" PRIu64 " same_but_data=%" PRIu64 "\n",
+		            seconds, n(Counter::BackDiffViewport), n(Counter::BackDiffDepth), n(Counter::BackDiffStencil),
+		            n(Counter::BackDiffRaster), n(Counter::BackDiffBlend), n(Counter::BackDiffSnapshot),
+		            n(Counter::BackDiffUserData), n(Counter::BackDiffBuffers), n(Counter::BackDiffImages),
+		            n(Counter::BackDiffSamplers), n(Counter::BackDiffShaderData), n(Counter::BackSameNoData));
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

@@ -118,6 +118,19 @@ enum class Counter : uint32_t {
 	BackSameNs,
 	BackSameClean, // ... with no staging copy during the record
 	BackSameCleanNs,
+	// What differs from the previous adjacent record: dynamic state groups, then binding parts.
+	BackDiffViewport,  // viewports, scissors
+	BackDiffDepth,     // depth test/write/compare/bounds/bias
+	BackDiffStencil,
+	BackDiffRaster,    // cull mode, front face, line width
+	BackDiffBlend,     // blend constants, feedback loop aspects
+	BackDiffSnapshot,  // descriptor values or flattened SRT of a stage
+	BackDiffUserData,  // user data of a stage
+	BackDiffBuffers,   // host buffers bound
+	BackDiffImages,    // image views or layouts
+	BackDiffSamplers,
+	BackDiffShaderData,
+	BackSameNoData,    // same except shader data and user data
 	Count
 };
 
