@@ -98,6 +98,24 @@ enum class Counter : uint32_t {
 	BackRecordNs,      // the per-pass recording loop, whole (commit, dynamic state, barriers, emission)
 	BackFlushNs,       // CommandScheduler::Flush: submission + next command buffer
 	BackFlushCount,
+	// KYTY_BIND_PROF (1 or 2), CP back thread: target resolution split and repeats ("PERF tgtback" line).
+	TgtRecords,        // records that resolved their targets on the back
+	TgtFindNs,         // TextureCache::FindImage of the targets (search + access tick + metadata clear)
+	TgtFindCount,
+	TgtFindKept,       // searches FindImageMemo may keep (same result while the image epoch holds)
+	TgtRememberNs,     // RememberTarget (KYTY_PIPELINE_PARALLEL prediction): key hash + map write
+	TgtMergeNs,        // MergeAliasedColorTargets + per-target pass slots
+	TgtKeyNs,          // exact target inputs: compare with the previous record + capture
+	TgtHashNs,         // the prediction keys (ColorTargetKey/DepthTargetKey) of every record (profiling only)
+	TgtSameHash,       // records with mrt_mask and prediction keys equal to the previous record's
+	TgtSameHashNs,     // their resolution time (whole block)
+	TgtSameExact,      // records with exact target inputs equal to the previous record's
+	TgtSameExactNs,
+	TgtReusable,       // of exact: previous searches kept and the image epoch unchanged
+	TgtReusableNs,
+	TgtReusableMeta,   // targets of reusable records with DCC/CMASK metadata (clear replay needed)
+	TgtUnkept,         // of exact: a previous search not keepable (insert, alias, heap wait)
+	TgtEpochMoved,     // of exact: kept, but an image was (un)registered since
 	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
 	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,
@@ -156,6 +174,9 @@ inline std::atomic<uint64_t> t_work_recorded {0};
 inline void                  NoteWork() noexcept {
     t_work_recorded.fetch_add(1, std::memory_order_relaxed);
 }
+
+// KYTY_BIND_PROF: set on the CP back thread while PrepareDrawRenderState resolves its targets.
+inline thread_local bool t_target_prof = false;
 
 class ScopedTimer {
 public:

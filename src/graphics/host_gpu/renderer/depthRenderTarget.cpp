@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -251,7 +252,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r,
+                                              TextureCache::FindImageMemo* memo) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw          = buffer.GetRegisters();
 	const auto& z           = hw.GetDepthRenderTarget();
@@ -347,7 +349,10 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 	}
 	auto& cache = m_context.GetTextureCache();
-	r.image_id = cache.FindImage(r.desc);
+	{
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::TgtFindNs, PerfStats::t_target_prof);
+		r.image_id = cache.FindImage(r.desc, false, memo);
+	}
 	BindRenderTarget(r.image_id);
 }
 
