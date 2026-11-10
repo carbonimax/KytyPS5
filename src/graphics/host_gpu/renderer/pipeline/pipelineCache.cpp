@@ -55,6 +55,9 @@
 
 namespace Libs::Graphics {
 
+// Local measurement (stageWarmMeas.cpp).
+void MeasNoteSpirv(vk::ShaderModule module, uint64_t hash, const std::vector<uint32_t>& spirv);
+
 namespace {
 
 // GPU capture: the guest bytes the SRT walk loads, walked again while recording (the walk itself
@@ -507,6 +510,7 @@ struct PipelineCache::ProgramCache {
 		const auto module_begin = diag_log ? PerfStats::SteadyUs() : 0;
 		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
+		MeasNoteSpirv(module, options.shader_hash, result.spirv);
 		if (diag_log) diag_module_us = PerfStats::SteadyUs() - module_begin;
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,

@@ -541,6 +541,14 @@ add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(async_pipeline_policy_tests PRIVATE ${inc_headers})
 
+add_executable(stub_stage_shader_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StubStageShaderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/stubStageShader.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp"
+)
+target_link_libraries(stub_stage_shader_tests common spirv-tools)
+target_include_directories(stub_stage_shader_tests PRIVATE ${inc_headers})
+
 add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StagingMemoryPolicyTests.cpp"
 )
@@ -834,6 +842,7 @@ if(BUILD_TESTING)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
+	add_test(NAME stub_stage_shader COMMAND $<TARGET_FILE:stub_stage_shader_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
@@ -991,6 +1000,7 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
+		stub_stage_shader_tests
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests

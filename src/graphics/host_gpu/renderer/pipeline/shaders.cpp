@@ -50,6 +50,13 @@ void NoteCreationFeedback(vk::Result result, const vk::PipelineCreationFeedback&
 
 } // namespace
 
+// Local measurement (stageWarmMeas.cpp).
+bool MeasStageWarmOn();
+void MeasStageWarmEnqueue(GraphicContext& graphics, const PipelineRenderingState& rendering,
+                          const PipelineVertexInputState& vertex_input,
+                          const PipelineStaticParameters& static_params, const ShaderModule& vertex,
+                          const ShaderModule& pixel, long long real_us, uint64_t at_us);
+
 PipelineCacheFeedback LastPipelineCacheFeedback() noexcept {
 	return t_last_feedback;
 }
@@ -558,12 +565,20 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
 	}
 
+	const bool meas_warm  = MeasStageWarmOn();
+	const auto meas_begin = meas_warm ? PerfStats::SteadyUs() : 0;
 	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline.pipeline);
 	NoteCreationFeedback(result, creation_feedback, true);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (meas_warm && t_last_feedback.valid && !t_last_feedback.hit && vertex_stages.size() == 1 && ps_active &&
+	    !rect_list && !mesh && !task_module) {
+		const auto end = PerfStats::SteadyUs();
+		MeasStageWarmEnqueue(graphics, rendering, vertex_input, static_params, vertex, *pixel,
+		                     static_cast<long long>(end - meas_begin), end);
+	}
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
