@@ -812,6 +812,7 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	const PageManager::NoObsTag tag(PageManager::NoObsSource::BufInvalidate);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
@@ -1045,8 +1046,25 @@ struct Token {
 
 // Before the fault is resolved: classify it, histogram, simulated hits.
 Token Begin(MemoryTracker& tracker, uint64_t vaddr) {
-	Token token;
-	if (!Enabled() || GuestGpu::IsGpuThread()) {
+	Token      token;
+	const bool noobs = PageManager::NoObsEnabled();
+	if ((!Enabled() && !noobs) || GuestGpu::IsGpuThread()) {
+		return token;
+	}
+	const auto classify = [&tracker](uint64_t base) {
+		const bool own_clean = (tracker.AheadCleanMask(base, 1) & 1u) != 0;
+		const auto watchers  = tracker.PageWatchers(base);
+		return tracker.IsRegionGpuModified(base, TRACKER_PAGE_SIZE) ? GpuDirty
+		       : own_clean    ? (watchers > 1 ? OtherWatcher : Saveable)
+		       : watchers > 0 ? OtherWatcher
+		                      : Untracked;
+	};
+	if (!Enabled()) {
+		// KYTY_NOOBS_PROF alone: the class only, none of the simulation's cost.
+		if (!CommandScheduler::InDeferredOperation()) {
+			const auto base = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+			tracker.NoObsFault(base, classify(base) == Untracked);
+		}
 		return token;
 	}
 	std::call_once(g_learn_once, [] {
@@ -1069,13 +1087,11 @@ Token Begin(MemoryTracker& tracker, uint64_t vaddr) {
 		st.cls[Deferred]++;
 		return token;
 	}
-	const auto base      = page * TRACKER_PAGE_SIZE;
-	const bool own_clean = (tracker.AheadCleanMask(base, 1) & 1u) != 0;
-	const auto watchers  = tracker.PageWatchers(base);
-	const auto cls       = tracker.IsRegionGpuModified(base, TRACKER_PAGE_SIZE) ? GpuDirty
-	                       : own_clean    ? (watchers > 1 ? OtherWatcher : Saveable)
-	                       : watchers > 0 ? OtherWatcher
-	                                      : Untracked;
+	const auto base = page * TRACKER_PAGE_SIZE;
+	const auto cls  = classify(base);
+	if (noobs) {
+		tracker.NoObsFault(base, cls == Untracked);
+	}
 	st.cls[cls]++;
 	const auto bucket = Bucket(page, st.prev);
 	st.hist[bucket]++;
@@ -1212,10 +1228,13 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
 	bool flushed = false;
-	m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr, &flushed] {
-		flushed = true;
-		PublishFaultWindow(vaddr, true);
-	});
+	{
+		const PageManager::NoObsTag tag(PageManager::NoObsSource::BufFault);
+		m_memory_tracker.InvalidateRegion(vaddr, 1, [this, vaddr, &flushed] {
+			flushed = true;
+			PublishFaultWindow(vaddr, true);
+		});
+	}
 	QueueBdaSync(vaddr, 1);
 	// KYTY_WRITE_FAULT_READAHEAD=N (pages, default 15; 0 disables): a guest thread that write-
 	// faults on the page after its previous write fault (a sequential writer, e.g. a constant
@@ -1237,6 +1256,7 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	if (!sequential) {
 		return;
 	}
+	const PageManager::NoObsTag tag(PageManager::NoObsSource::BufReadahead);
 	const auto marked = m_memory_tracker.ExtendCpuModified((page + 1) * TRACKER_PAGE_SIZE,
 	                                                       readahead * TRACKER_PAGE_SIZE);
 	if (marked != 0) {
@@ -1369,7 +1389,8 @@ bool BufferCache::InvalidateCompletedWrite(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
-	bool gpu_owned = false;
+	bool                        gpu_owned = false;
+	const PageManager::NoObsTag tag(PageManager::NoObsSource::BufInvalidate);
 	m_memory_tracker.InvalidateRegion(vaddr, size, [&gpu_owned] { gpu_owned = true; });
 	if (gpu_owned) {
 		return false;

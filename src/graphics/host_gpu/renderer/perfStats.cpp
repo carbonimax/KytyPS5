@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
+#include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -318,6 +319,7 @@ void MaybeReport() noexcept {
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);
 	FaultAheadProf::Report(seconds);
+	PageManager::NoObsReport(seconds);
 	CpSplitProf::Report(seconds);
 	CpPipeline::Report(seconds);
 	DispatchChain::Report(seconds, n(Counter::Frames));

@@ -68,6 +68,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// Only reads and writes are tracking faults: an execute or unknown access is not resolved here
 	// (it would otherwise publish GPU bytes as a read and report the fault handled).
 	constexpr uint64_t fault_size = 1;
+	// KYTY_NOOBS_PROF: the page's watchers before anything below can change them.
+	if (access == PageFaultAccess::Write && PageManager::NoObsEnabled() && !GuestGpu::IsGpuThread()) {
+		m_page_manager.NoObsEntry(fault_vaddr);
+	}
 	// KYTY_CP_PIPELINE: a GPU-thread fault resolves through the caches the back thread uses.
 	CpPipeline::Drain();
 	if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) || !IsMapped(fault_vaddr, fault_size)) {

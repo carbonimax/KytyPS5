@@ -41,6 +41,8 @@ public:
 	// first GPU-modified page).
 	[[nodiscard]] uint32_t AheadCleanMask(uint64_t vaddr, uint32_t pages) noexcept;
 	[[nodiscard]] uint32_t PageWatchers(uint64_t vaddr) const noexcept { return m_page_manager.Watchers(vaddr); }
+	// KYTY_NOOBS_PROF (measurement): PageManager::NoObsFault.
+	void NoObsFault(uint64_t vaddr, bool untracked) const noexcept { m_page_manager.NoObsFault(vaddr, untracked); }
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

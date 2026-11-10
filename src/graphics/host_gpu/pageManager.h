@@ -29,6 +29,27 @@ public:
 	// KYTY_FAHEAD_PROF (measurement): write + access watchers of the page, all trackers together.
 	[[nodiscard]] uint32_t Watchers(uint64_t vaddr) const noexcept;
 
+	// KYTY_NOOBS_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1, step 4.7): why a guest
+	// write fault finds no watcher on its page. NoObsEntry (RenderContext::HandleFault entry, guest
+	// write, not the GPU thread) snapshots the page's watchers and, when it has none, its host
+	// protection, under the region lock. NoObsFault (BufferCache fault path) classifies the fault
+	// against that snapshot; the page records who changed its protection last. "PERF noobs" lines.
+	enum class NoObsSource : uint8_t { BufOther, BufFault, BufReadahead, BufInvalidate, Texture, Heap, Count };
+	class NoObsTag final {
+	public:
+		explicit NoObsTag(NoObsSource source) noexcept;
+		~NoObsTag();
+		NoObsTag(const NoObsTag&)            = delete;
+		NoObsTag& operator=(const NoObsTag&) = delete;
+
+	private:
+		uint8_t m_previous;
+	};
+	[[nodiscard]] static bool NoObsEnabled() noexcept;
+	void                      NoObsEntry(uint64_t vaddr) const noexcept;
+	void                      NoObsFault(uint64_t vaddr, bool untracked) const noexcept;
+	static void               NoObsReport(double seconds) noexcept;
+
 	// KYTY_PROTECT_COALESCE / KYTY_REPROTECT_BATCH (BufferCache::BeginDeferredUploads). After
 	// Begin, the protections this thread would add (read-only / no-access) inside a DeferCapture
 	// scope are recorded instead of applied; the watcher counts change at once. The recorded

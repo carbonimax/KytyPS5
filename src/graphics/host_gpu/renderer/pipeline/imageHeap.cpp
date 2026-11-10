@@ -265,6 +265,7 @@ void ImageHeap::MarkDirty(Memory& memory, size_t begin, size_t end) {
 template <bool track>
 void ImageHeap::Watch(const Memory& memory, size_t begin, size_t end) {
 	const auto [address, limit] = PageRange(memory.base, memory.size, begin, end);
+	const PageManager::NoObsTag tag(PageManager::NoObsSource::Heap);
 	m_page_manager.UpdatePageWatchers<track>(address, limit - address);
 }
 
