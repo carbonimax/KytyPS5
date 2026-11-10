@@ -125,6 +125,7 @@ private:
 		Format      format      = Format::Unknown;
 		OutputClock clock;
 		bool        queue_primed = false;
+		bool        fed          = false; // a block was queued since open (KYTY_PACE_LOG drain count)
 		int         channels_num = 0;
 		int         volume[12]   = {};
 
@@ -383,6 +384,17 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
+
+	if (Common::DebugCounters::Counting()) [[unlikely]] {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioPuts);
+		if (blocking) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioPutsBlocking);
+		}
+		if (port->fed && SDL_GetAudioStreamQueued(port->stream) == 0) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioDrained);
+		}
+		port->fed = true;
+	}
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
