@@ -30,6 +30,8 @@ int main() {
 	Check(!AsyncPipelineMaySkip(first, 100 + 10 * ASYNC_PIPELINE_SKIP_FRAMES),
 	      "a draw long after the cap was skipped");
 	Check(first == 100, "a later skip moved the cap start");
+	Check(AsyncPipelineMaySkip(first, 100 + 299, 300) && !AsyncPipelineMaySkip(first, 100 + 300, 300),
+	      "a longer cap was not applied from the same start");
 
 	uint64_t from_zero = ASYNC_PIPELINE_NOT_SKIPPED;
 	Check(AsyncPipelineMaySkip(from_zero, 0) && from_zero == 0, "frame 0 was not a valid start");

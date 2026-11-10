@@ -541,6 +541,14 @@ add_executable(async_pipeline_policy_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(async_pipeline_policy_tests PRIVATE ${inc_headers})
 
+add_executable(async_stub_policy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AsyncStubPolicyTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/asyncStubShader.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/backend/spirv/SpirvBuilder.cpp"
+)
+target_link_libraries(async_stub_policy_tests common Vulkan::Headers spirv-tools)
+target_include_directories(async_stub_policy_tests PRIVATE ${inc_headers})
+
 add_executable(staging_memory_policy_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/StagingMemoryPolicyTests.cpp"
 )
@@ -840,6 +848,7 @@ if(BUILD_TESTING)
 	add_test(NAME aliased_color_pass_policy COMMAND $<TARGET_FILE:aliased_color_pass_policy_tests>)
 	add_test(NAME dispatch_chain_policy COMMAND $<TARGET_FILE:dispatch_chain_policy_tests>)
 	add_test(NAME async_pipeline_policy COMMAND $<TARGET_FILE:async_pipeline_policy_tests>)
+	add_test(NAME async_stub_policy COMMAND $<TARGET_FILE:async_stub_policy_tests>)
 	add_test(NAME staging_memory_policy COMMAND $<TARGET_FILE:staging_memory_policy_tests>)
 	add_test(NAME aliased_mrt COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-only)
 	add_test(NAME aliased_mrt_passes COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --aliased-mrt-passes-only)
@@ -1021,6 +1030,7 @@ if(BUILD_TESTING)
 		aliased_color_pass_policy_tests
 		dispatch_chain_policy_tests
 		async_pipeline_policy_tests
+		async_stub_policy_tests
 		staging_memory_policy_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

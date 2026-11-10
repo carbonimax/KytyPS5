@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -220,9 +221,12 @@ public:
 	// A missing pipeline: hands it to the workers (ahead of the predicted ones, in first-skip order;
 	// a predicted key moves there at its first skip) and returns true while the draw
 	// may still be skipped; false once it is created, or once its skip cap is reached while it is
-	// still queued (the draw waits and creates it).
+	// still queued (the draw waits and creates it). KYTY_ASYNC_STUB_PS=1 (asyncStubPolicy.h): a true
+	// return may set `stub`, a pipeline with the real vertex stage and a stub pixel stage, which the
+	// draw binds instead of being skipped.
 	[[nodiscard]] bool SkipMissing(const CommandBuffer& command, const DrawRenderState& state,
-	                               std::span<const RenderColorInfo> colors, bool depth_feedback);
+	                               std::span<const RenderColorInfo> colors, bool depth_feedback,
+	                               Pipeline** stub = nullptr);
 	// Guest frames so far (the skip cap's clock).
 	void NextFrame() { m_frame.fetch_add(1, std::memory_order_relaxed); }
 	[[nodiscard]] uint64_t Frame() const { return m_frame.load(std::memory_order_relaxed); }
@@ -308,6 +312,11 @@ private:
 	                              m_pending;
 	std::unique_ptr<ParallelPool> m_pool;
 	bool                          m_async = false;
+	// KYTY_ASYNC_STUB_PS: every stub job (kept until shutdown: in-flight draws may use the pipeline),
+	// and the stub pixel module of each target format set.
+	bool                                              m_stub_ps = false;
+	std::vector<std::shared_ptr<PendingPipeline>>     m_stubs;
+	std::map<std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX>, vk::ShaderModule> m_stub_modules;
 	std::atomic<uint64_t>         m_frame {0};
 	PrefetchHook                  m_prefetch_hook    = nullptr;
 	void*                         m_prefetch_context = nullptr;
@@ -324,6 +333,8 @@ private:
 	// Hands a missing key to the workers (`first`: a skip miss, AsyncPipelinePop); nullptr if a stage
 	// has no module.
 	PendingPipeline* StartPending(const GraphicsPipelineKey& key, const DrawRenderState& state, bool first);
+	// KYTY_ASYNC_STUB_PS: hands an eligible skipped key's stub pipeline to the workers, first.
+	void StartStub(PendingPipeline& job, const DrawRenderState& state);
 	// KYTY_COMPILE_LOG: a skipped key's age and queue position (A/Q/X lines).
 	void LogSkip(PendingPipeline& job, bool may_skip);
 	// The pipeline of a pending key: created inline if no worker took it yet, else waited for.

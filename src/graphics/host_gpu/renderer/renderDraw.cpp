@@ -1535,16 +1535,21 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			                   : state.color_count == 0                     ? Counter::AsyncBlockDepthOnly
 			                   : m_context.GetOcclusionQueries().Counting() ? Counter::AsyncBlockQuery
 			                                                                : Counter::Count;
+			PipelineCache::Pipeline* stub = nullptr;
 			if (block != Counter::Count) {
 				PerfStats::Add(block, 1);
-			} else if (pipeline_cache.SkipMissing(buffer, state, colors, depth_feedback)) {
-				PerfStats::Add(Counter::AsyncSkipped, 1);
-				static uint64_t last_frame = UINT64_MAX;
-				if (const auto frame = pipeline_cache.Frame(); frame != last_frame) {
-					last_frame = frame;
-					PerfStats::Add(Counter::AsyncSkipFrames, 1);
+			} else if (pipeline_cache.SkipMissing(buffer, state, colors, depth_feedback, &stub)) {
+				if (stub != nullptr) {
+					pipelines[0] = stub; // KYTY_ASYNC_STUB_PS: drawn with the stub pixel stage
+				} else {
+					PerfStats::Add(Counter::AsyncSkipped, 1);
+					static uint64_t last_frame = UINT64_MAX;
+					if (const auto frame = pipeline_cache.Frame(); frame != last_frame) {
+						last_frame = frame;
+						PerfStats::Add(Counter::AsyncSkipFrames, 1);
+					}
+					return;
 				}
-				return;
 			}
 		}
 	}

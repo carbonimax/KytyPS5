@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/asyncStubPolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 
@@ -1007,6 +1008,16 @@ struct PipelineCache::PendingPipeline {
 	// KYTY_COMPILE_LOG: handed out by a skip miss (set before it is queued), last skip log frame (CP).
 	bool                               skip_miss = false;
 	uint64_t                           log_frame = ASYNC_PIPELINE_NOT_SKIPPED;
+	// KYTY_ASYNC_STUB_PS: a real key's stub job, decided at its first skip (the thread that owns
+	// m_pending). A stub job: its pixel module, the real key's hash, its creation time (worker, read
+	// once created) and the guest frames drawn with it. State 3: cancelled while queued.
+	std::shared_ptr<PendingPipeline>   stub;
+	bool                               stub_checked = false;
+	std::unique_ptr<ShaderModule>      stub_pixel;
+	size_t                             stub_for        = 0;
+	uint64_t                           stub_us         = 0;
+	uint64_t                           stub_frames     = 0;
+	uint64_t                           stub_last_frame = ASYNC_PIPELINE_NOT_SKIPPED;
 };
 
 struct PipelineCache::ParallelPool {
@@ -1079,6 +1090,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		const char* async = std::getenv("KYTY_ASYNC_PIPELINE");
 		m_async           = async != nullptr && async[0] == '1';
 		if (m_async) PipelineCacheLog("Pipeline async: draws skipped while their pipeline is created (KYTY_ASYNC_PIPELINE)");
+		const char* stub = std::getenv("KYTY_ASYNC_STUB_PS");
+		m_stub_ps        = m_async && stub != nullptr && stub[0] == '1';
+		if (m_stub_ps) PipelineCacheLog("Pipeline async: eligible skipped draws drawn with a stub pixel stage (KYTY_ASYNC_STUB_PS)");
 	}
 	if (graphics.storage_bounds_verify && GetShaderStoreMode() != ShaderStoreMode::Off) {
 		// The verify shaders embed this launch's counter address.
@@ -1113,6 +1127,18 @@ PipelineCache::~PipelineCache() {
 			}
 		}
 		m_pending.clear();
+		for (const auto& job: m_stubs) {
+			if (job->state.load(std::memory_order_acquire) == 2) {
+				m_graphics.device.destroyPipeline(job->pipeline.pipeline, nullptr);
+				m_graphics.device.destroyPipelineLayout(job->pipeline.pipeline_layout, nullptr);
+				m_graphics.device.destroyDescriptorSetLayout(job->pipeline.descriptor_set_layout, nullptr);
+			}
+		}
+		m_stubs.clear();
+		for (const auto& [formats, module]: m_stub_modules) {
+			(void)formats;
+			m_graphics.device.destroyShaderModule(module, nullptr);
+		}
 		m_pool.reset();
 	}
 	auto destroy = [this](const auto& pipelines) {
@@ -2190,6 +2216,18 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	if (const auto found = m_pending.find(key); found != m_pending.end()) {
 		pending = std::move(found->second);
 		m_pending.erase(found);
+		if (const auto& stub = pending->stub; stub != nullptr) {
+			// The stub pipeline stays alive (in-flight draws); a queued one is no longer needed.
+			uint32_t   queued  = 0;
+			const bool created = !stub->state.compare_exchange_strong(queued, 3) &&
+			                     stub->state.load(std::memory_order_acquire) == 2;
+			if (PerfStats::CompileLogEnabled()) {
+				// F time key_hash stub_us(-1: not created) frames_drawn: the real key replaced its stub.
+				PerfStats::CompileLogLine("F %" PRIu64 " %zx %" PRId64 " %" PRIu64, PerfStats::SteadyUs(),
+				                          stub->stub_for, created ? static_cast<int64_t>(stub->stub_us) : -1,
+				                          stub->stub_frames);
+			}
+		}
 	}
 	if (m_pool != nullptr && m_prefetch_hook != nullptr && CpPipeline::IsBackThread()) {
 		m_prefetch_hook(m_prefetch_context);
@@ -2306,7 +2344,8 @@ PipelineCache::Pipeline* PipelineCache::FindGraphicsPipeline(const CommandBuffer
 }
 
 bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderState& state,
-                                std::span<const RenderColorInfo> colors, bool depth_feedback) {
+                                std::span<const RenderColorInfo> colors, bool depth_feedback,
+                                Pipeline** stub) {
 	GraphicsPipelineKey key;
 	(void)MakeGraphicsKey(command.GetRegisters(), command.GetUserConfig(), state, colors,
 	                      depth_feedback, false, key);
@@ -2333,10 +2372,18 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 			m_prefetch_hook(m_prefetch_context);
 		}
 	}
+	if (m_stub_ps && !job->stub_checked) {
+		job->stub_checked = true;
+		StartStub(*job, state);
+	}
+	// A created stub stands in for the draw for a longer cap.
+	auto* const stub_job   = job->stub.get();
+	const bool  stub_ready = stub_job != nullptr && stub_job->state.load(std::memory_order_acquire) == 2;
 	// Past the cap the draw waits; a job still queued is then created inline (TakePending). One a
 	// worker is creating stays skipped: waiting would block the CP for the rest of its creation,
 	// and the hole lasts at most one creation longer.
-	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame());
+	const bool may_skip = AsyncPipelineMaySkip(job->first_skip, Frame(),
+	                                           stub_ready ? ASYNC_STUB_SKIP_FRAMES : ASYNC_PIPELINE_SKIP_FRAMES);
 	if (PerfStats::CompileLogEnabled()) [[unlikely]] {
 		LogSkip(*job, may_skip);
 	}
@@ -2344,7 +2391,61 @@ bool PipelineCache::SkipMissing(const CommandBuffer& command, const DrawRenderSt
 		PerfStats::Add(PerfStats::Counter::AsyncBlockCap, 1);
 		return false;
 	}
+	if (stub_ready && stub != nullptr) {
+		*stub = &stub_job->pipeline;
+		if (const auto frame = Frame(); frame != stub_job->stub_last_frame) {
+			stub_job->stub_last_frame = frame;
+			stub_job->stub_frames++;
+		}
+	}
 	return true;
+}
+
+void PipelineCache::StartStub(PendingPipeline& job, const DrawRenderState& state) {
+	if (job.pixel == nullptr) return;
+	const auto& ps        = state.ps_input_info;
+	const auto& rendering = job.key.rendering;
+	const auto& params    = job.key.static_params;
+	const auto  count     = rendering.color_count;
+	bool        merged    = false;
+	for (const auto mask: ps.target_merge_mask) merged |= mask != 0;
+	const auto formats = std::span(rendering.color_formats).first(count);
+	if (!AsyncStubEligible({.pixel_kill        = ps.ps_pixel_kill_enable,
+	                        .depth_export      = ps.ps_depth_export_enable,
+	                        .sample_mask       = ps.ps_sample_mask_export_enable,
+	                        .alpha_to_coverage = params.alpha_to_coverage_enable,
+	                        .merged_targets    = merged,
+	                        .formats           = formats,
+	                        .color_mask        = std::span(params.color_mask).first(count),
+	                        .blend             = std::span(params.blend_enable).first(count)})) {
+		return;
+	}
+	auto [module, inserted] = m_stub_modules.try_emplace(rendering.color_formats);
+	if (inserted) {
+		module->second = CompileSPV(BuildAsyncStubPixel(formats), m_graphics.device);
+	}
+	EXIT_IF(module->second == nullptr);
+	auto stub         = std::make_shared<PendingPipeline>();
+	stub->key         = job.key;
+	stub->stages      = job.stages;
+	stub->stage_count = job.stage_count;
+	{
+		// LoadStoredModule may set the real module's handle on a worker meanwhile.
+		std::scoped_lock lock(m_module_mutex);
+		stub->stub_pixel = std::make_unique<ShaderModule>(*job.pixel);
+	}
+	// The real program's resources keep the pipeline layout, so the draw binds it unchanged.
+	stub->stub_pixel->handle.module = module->second;
+	stub->stub_pixel->store_spirv   = 0;
+	stub->pixel                     = stub->stub_pixel.get();
+	stub->stub_for                  = GraphicsPipelineKeyHash {}(job.key);
+	job.stub                        = stub;
+	m_stubs.push_back(stub);
+	{
+		std::scoped_lock lock(m_pool->mutex);
+		m_pool->skipped.push_front(std::move(stub));
+	}
+	m_pool->work.notify_one();
 }
 
 PipelineCache::PendingPipeline* PipelineCache::StartPending(const GraphicsPipelineKey& key,
@@ -2415,6 +2516,14 @@ void PipelineCache::CreatePending(PendingPipeline& job, bool worker) {
 	                       job.pixel, m_driver_cache);
 	job.feedback = LastPipelineCacheFeedback();
 	EXIT_NOT_IMPLEMENTED(job.pipeline.pipeline == nullptr || job.pipeline.pipeline_layout == nullptr);
+	if (job.stub_for != 0) {
+		job.stub_us = PerfStats::SteadyUs() - begin;
+		if (PerfStats::CompileLogEnabled()) {
+			// F time key_hash stub_us -1: a stub pipeline created (no J line: the key is the real one's).
+			PerfStats::CompileLogLine("F %" PRIu64 " %zx %" PRIu64 " -1", begin, job.stub_for, job.stub_us);
+		}
+		return;
+	}
 	if (PerfStats::CompileLogEnabled()) {
 		// J time driver_hit us vs_id ps_id worker(1/0) skip_miss(1/0) key_hash: a pipeline handed out
 		// ahead of its draw.
