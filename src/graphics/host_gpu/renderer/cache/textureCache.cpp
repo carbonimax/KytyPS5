@@ -1500,6 +1500,30 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 	return result;
 }
 
+bool TextureCache::ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch) {
+	{
+		std::scoped_lock lock {m_lock};
+		if (epoch != m_image_index_epoch) {
+			return false;
+		}
+		for (const auto& find: finds) {
+			const auto* image = m_slot_images.try_get(find.id);
+			if (image == nullptr || !image->registered) {
+				return false;
+			}
+		}
+		for (const auto& find: finds) {
+			auto& image              = m_slot_images[find.id];
+			image.tick_accessed_last = m_gc_tick;
+			TouchImage(image);
+		}
+	}
+	for (const auto& find: finds) {
+		MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
+	}
+	return true;
+}
+
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for
 // another extent. memo (if any) is filled when the result may be kept, cleared otherwise.
 ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, bool exact_format,

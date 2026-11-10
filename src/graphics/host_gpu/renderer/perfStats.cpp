@@ -271,13 +271,16 @@ void MaybeReport() noexcept {
 		std::printf("PERF tgtback %.1fs: records=%" PRIu64 " find=%.0fms(%" PRIu64 ",kept=%" PRIu64
 		            ") remember=%.0fms merge=%.0fms key=%.0fms hash=%.0fms same_hash=%" PRIu64
 		            "(%.0fms) same=%" PRIu64 "(%.0fms) reusable=%" PRIu64 "(%.0fms,meta=%" PRIu64 ") unkept=%" PRIu64
-		            " epoch_moved=%" PRIu64 "\n",
+		            " epoch_moved=%" PRIu64 " reused=%" PRIu64 " refused=%" PRIu64 " verified=%" PRIu64
+		            " mismatch=%" PRIu64 "\n",
 		            seconds, n(Counter::TgtRecords), ms(Counter::TgtFindNs), n(Counter::TgtFindCount),
 		            n(Counter::TgtFindKept),
 		            ms(Counter::TgtRememberNs), ms(Counter::TgtMergeNs), ms(Counter::TgtKeyNs), ms(Counter::TgtHashNs),
 		            n(Counter::TgtSameHash), ms(Counter::TgtSameHashNs), n(Counter::TgtSameExact),
 		            ms(Counter::TgtSameExactNs), n(Counter::TgtReusable), ms(Counter::TgtReusableNs),
-		            n(Counter::TgtReusableMeta), n(Counter::TgtUnkept), n(Counter::TgtEpochMoved));
+		            n(Counter::TgtReusableMeta), n(Counter::TgtUnkept), n(Counter::TgtEpochMoved),
+		            n(Counter::TgtReused), n(Counter::TgtReplayRefused), n(Counter::TgtVerified),
+		            n(Counter::TgtMismatch));
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
 		            " descriptors=%" PRIu64 "\n",

@@ -67,6 +67,16 @@ public:
 		std::scoped_lock lock {m_lock};
 		return m_image_index_epoch;
 	}
+	// KYTY_TARGET_REUSE: an image a kept search gave, its description as FindImage left it and the
+	// view base layer before FindImage offset it.
+	struct KeptFind {
+		ImageId          id;
+		const ImageDesc* desc                = nullptr;
+		uint32_t         metadata_base_layer = 0;
+	};
+	// What FindImage does besides its search (access tick, LRU touch, color metadata clear), for
+	// searches kept at `epoch`. False, with nothing done, when the epoch moved or an image is gone.
+	[[nodiscard]] bool ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch);
 
 	// memo: kept for a description identical to desc (or empty); FindImage fills it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
