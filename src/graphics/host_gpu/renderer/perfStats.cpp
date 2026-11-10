@@ -327,10 +327,13 @@ void MaybeReport() noexcept {
 		for (size_t c = 0; c < 2; c++) {
 			const auto* b = &v[static_cast<size_t>(Counter::SyncCmpBase) + c * 8];
 			std::printf("PERF synccmp %s %.1fs: unchanged=%" PRIu64 "(%.1fms,%.1fMB,page_same=%" PRIu64
-			            ") changed=%" PRIu64 "(%.1fms,%.1fMB,page_same=%" PRIu64 ")\n",
+			            ") changed=%" PRIu64 "(%.1fms,%.1fMB,page_same=%" PRIu64 ") no_download=%" PRIu64
+			            " still_dirty=%" PRIu64 "\n",
 			            c == 0 ? "walk" : "other", seconds, b[0], static_cast<double>(b[1]) / 1e6,
 			            static_cast<double>(b[2]) / 1048576.0, b[3], b[4], static_cast<double>(b[5]) / 1e6,
-			            static_cast<double>(b[6]) / 1048576.0, b[7]);
+			            static_cast<double>(b[6]) / 1048576.0, b[7],
+			            n(c == 0 ? Counter::SyncNoDownloadWalk : Counter::SyncNoDownloadOther),
+			            n(c == 0 ? Counter::SyncStillDirtyWalk : Counter::SyncStillDirtyOther));
 		}
 	}
 	if (BackSameEnabled()) {
@@ -343,11 +346,13 @@ void MaybeReport() noexcept {
 		            n(Counter::BackSameClean), ms(Counter::BackSameCleanNs));
 		std::printf("PERF backdiff %.1fs: viewport=%" PRIu64 " depth=%" PRIu64 " stencil=%" PRIu64 " raster=%" PRIu64
 		            " blend=%" PRIu64 " snapshot=%" PRIu64 " user_data=%" PRIu64 " buffers=%" PRIu64 " images=%" PRIu64
-		            " samplers=%" PRIu64 " shader_data=%" PRIu64 " same_but_data=%" PRIu64 "\n",
+		            " samplers=%" PRIu64 " shader_data=%" PRIu64 " flat=%" PRIu64 " same_but_data=%" PRIu64
+		            " compare=%.1fms\n",
 		            seconds, n(Counter::BackDiffViewport), n(Counter::BackDiffDepth), n(Counter::BackDiffStencil),
 		            n(Counter::BackDiffRaster), n(Counter::BackDiffBlend), n(Counter::BackDiffSnapshot),
 		            n(Counter::BackDiffUserData), n(Counter::BackDiffBuffers), n(Counter::BackDiffImages),
-		            n(Counter::BackDiffSamplers), n(Counter::BackDiffShaderData), n(Counter::BackSameNoData));
+		            n(Counter::BackDiffSamplers), n(Counter::BackDiffShaderData), n(Counter::BackDiffFlat),
+		            n(Counter::BackSameNoData), ms(Counter::BackCompareNs));
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

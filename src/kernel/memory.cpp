@@ -899,7 +899,7 @@ bool MaybeGpuModifiedPage(uint64_t vaddr) {
 }
 
 // KYTY_SYNC_CMP: the backing bytes of a synchronized read (and of its 4 KiB page) before and after
-// the synchronization, with the time and window bytes it cost.
+// the synchronization, with the time and the GPU-written bytes it downloaded.
 static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::BufferCache& buffers) {
 	using Graphics::PerfStats::Counter;
 	constexpr uint64_t Page = 4096;
@@ -915,6 +915,9 @@ static void SyncCompared(uint64_t vaddr, uint64_t size, bool walker, Graphics::B
 	Graphics::CpPipeline::Drain();
 	const auto window = buffers.ReadMemoryWindow(vaddr, size);
 	const auto ns     = static_cast<uint64_t>(std::chrono::nanoseconds(std::chrono::steady_clock::now() - start).count());
+	Graphics::PerfStats::Add(walker ? Counter::SyncNoDownloadWalk : Counter::SyncNoDownloadOther, window == 0 ? 1 : 0);
+	Graphics::PerfStats::Add(walker ? Counter::SyncStillDirtyWalk : Counter::SyncStillDirtyOther,
+	                         buffers.HasGpuDirtyBytes(vaddr, size) ? 1 : 0);
 	if (!have || !TryReadBacking(vaddr, after.data(), size)) {
 		return;
 	}

@@ -102,9 +102,13 @@ enum class Counter : uint32_t {
 	StagingWriteBytes,
 	StagingWriteCount,
 	// KYTY_SYNC_CMP: synchronized buffer-backing reads, [caller walk/other][bytes unchanged/changed] x
-	// {reads, sync ns, window bytes downloaded, reads whose 4 KiB page is unchanged too}.
+	// {reads, sync ns, GPU-written bytes downloaded, reads whose 4 KiB page is unchanged too}.
 	SyncCmpBase,
 	SyncCmpEnd = SyncCmpBase + 16,
+	SyncNoDownloadWalk, // synchronized reads that downloaded no byte (walk / other)
+	SyncNoDownloadOther,
+	SyncStillDirtyWalk, // ... after which the read range was still GPU-dirty
+	SyncStillDirtyOther,
 	// KYTY_BACK_SAME: CP back records, and those whose resolved draw state equals the previous one.
 	BackRecords,
 	BackRecordNs,
@@ -124,13 +128,15 @@ enum class Counter : uint32_t {
 	BackDiffStencil,
 	BackDiffRaster,    // cull mode, front face, line width
 	BackDiffBlend,     // blend constants, feedback loop aspects
-	BackDiffSnapshot,  // descriptor values or flattened SRT of a stage
+	BackDiffSnapshot,  // descriptor values of a stage
 	BackDiffUserData,  // user data of a stage
 	BackDiffBuffers,   // host buffers bound
 	BackDiffImages,    // image views or layouts
 	BackDiffSamplers,
 	BackDiffShaderData,
-	BackSameNoData,    // same except shader data and user data
+	BackDiffFlat,      // flattened SRT of a stage
+	BackSameNoData,    // same except shader data, user data and flattened SRT
+	BackCompareNs,     // time of the comparison itself (inside the record time)
 	Count
 };
 

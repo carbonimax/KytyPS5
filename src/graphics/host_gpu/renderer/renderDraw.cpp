@@ -1413,7 +1413,7 @@ struct BackShape {
 };
 } // namespace
 
-// Bits: 1 snapshot, 2 user data, 4 buffers, 8 images, 16 samplers, 32 shader data.
+// Bits: 1 descriptor values, 2 user data, 4 buffers, 8 images, 16 samplers, 32 shader data, 64 flattened SRT.
 static uint32_t StageDiff(const BackStageShape& shape, const PreparedBindings& bindings) {
 	if (bindings.runtime == nullptr || bindings.runtime->resources == nullptr) {
 		return 1;
@@ -1421,10 +1421,10 @@ static uint32_t StageDiff(const BackStageShape& shape, const PreparedBindings& b
 	const auto& a    = shape.resources;
 	const auto& b    = *bindings.runtime->resources;
 	uint32_t    diff = 0;
-	if (a.buffers != b.buffers || a.images != b.images || a.samplers != b.samplers ||
-	    a.flattened_srt != b.flattened_srt || a.uniform_fill != b.uniform_fill) {
+	if (a.buffers != b.buffers || a.images != b.images || a.samplers != b.samplers || a.uniform_fill != b.uniform_fill) {
 		diff |= 1;
 	}
+	diff |= a.flattened_srt != b.flattened_srt ? 64u : 0u;
 	diff |= a.user_data != b.user_data ? 2u : 0u;
 	diff |= shape.buffers != bindings.buffers ? 4u : 0u;
 	bool images = shape.images.size() != bindings.images.size();
@@ -1470,6 +1470,7 @@ static void NoteBackShape(const PipelineCache::Pipeline* pipeline, const RenderS
                           const PreparedVertexBuffers& vertex, const PreparedIndexBuffer& index,
                           std::span<PreparedBindings* const> stages, uint32_t dynamic_diff) {
 	using PerfStats::Counter;
+	const PerfStats::ScopedTimer timer(Counter::BackCompareNs);
 	static BackShape prev;
 	const auto       record   = CpPipeline::Finished();
 	const bool       adjacent = prev.record + 1 == record;
@@ -1496,12 +1497,12 @@ static void NoteBackShape(const PipelineCache::Pipeline* pipeline, const RenderS
 			               (dynamic_diff >> i) & 1u);
 		}
 		if (prev.stage_count == stages.size()) {
-			for (uint32_t i = 0; i < 6; i++) {
+			for (uint32_t i = 0; i < 7; i++) {
 				PerfStats::Add(static_cast<Counter>(static_cast<uint32_t>(Counter::BackDiffSnapshot) + i),
 				               (bind_diff >> i) & 1u);
 			}
 		}
-		PerfStats::Add(Counter::BackSameNoData, pipe && rt && vtx && dyn && (bind_diff & ~34u) == 0 ? 1 : 0);
+		PerfStats::Add(Counter::BackSameNoData, pipe && rt && vtx && dyn && (bind_diff & ~98u) == 0 ? 1 : 0);
 	}
 	if (pipe && rt && bind && vtx && dyn) CpPipeline::NoteBackSame();
 	prev.record      = record;

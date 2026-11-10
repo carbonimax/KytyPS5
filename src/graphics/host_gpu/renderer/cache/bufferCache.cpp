@@ -463,6 +463,9 @@ uint64_t BufferCache::LatestWriteTick(uint64_t vaddr, uint64_t size) {
 // submitted but still running (waits for the latest writer's tick first). The copied bytes, their
 // publication and the memory-tracker state are the same; later main-queue writes to them wait for
 // the copy (NoteBufferWrite). Interrupts, labels and command order are untouched.
+// Bytes CollectDownload packed on this thread (ReadMemoryWindow returns its share).
+static thread_local uint64_t t_collected_bytes = 0;
+
 static uint32_t SyncSideReads() {
 	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_SYNC_SIDE_READS");
@@ -675,6 +678,7 @@ void BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	    });
 	if (!copies.empty()) {
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+		t_collected_bytes += total_size;
 	}
 }
 
@@ -1059,9 +1063,10 @@ uint64_t BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 		const char* value = std::getenv("KYTY_BACKING_READ_WINDOW");
 		return value == nullptr || std::strtol(value, nullptr, 10) != 0;
 	}();
+	const auto collected = t_collected_bytes;
 	if (!enabled || !GuestGpu::IsGpuThread()) {
 		ReadMemory(vaddr, size);
-		return size;
+		return t_collected_bytes - collected;
 	}
 	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	const auto base   = buffer.CpuAddress();
@@ -1069,12 +1074,12 @@ uint64_t BufferCache::ReadMemoryWindow(uint64_t vaddr, uint64_t size) {
 	const auto begin  = std::max(base, Common::AlignDown(vaddr, window));
 	const auto last   = std::min(base + buffer.Size(), Common::AlignUp(vaddr + size, window));
 	if (begin < last && ReadWindowOnSideQueue(buffer, begin, last - begin)) {
-		return last - begin;
+		return t_collected_bytes - collected;
 	}
 	if (begin < last && DownloadBufferMemory<false>(buffer, begin, last - begin)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(begin, last - begin);
 	}
-	return begin < last ? last - begin : 0;
+	return t_collected_bytes - collected;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
