@@ -1605,19 +1605,21 @@ bool TextureCache::KeptClearHolds(const ColorClearResult& kept) {
 	return true;
 }
 
-TextureCache::ColorClearResult TextureCache::ReplayColorClear(const KeptFind& find, bool keep) {
+void TextureCache::ReplayColorClear(const KeptFind& find, bool keep, ColorClearResult& result) {
 	if (keep && KeptClearHolds(*find.clear)) {
-		ColorClearResult result = *find.clear;
-		result.meta_changed     = false;
-		result.erased           = false;
-		result.cleared          = false;
-		result.kept             = true;
+		if (&result != find.clear) {
+			result = *find.clear;
+		}
+		result.meta_changed = false;
+		result.erased       = false;
+		result.cleared      = false;
+		result.kept         = true;
 		if (result.path == ColorClearResult::Checked) {
 			result.path = ColorClearResult::SameCheck; // the check is stored now
 		}
-		return result;
+		return;
 	}
-	return MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
+	result = MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
 }
 
 uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {

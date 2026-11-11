@@ -96,8 +96,9 @@ public:
 	// touch here, then ReplayColorClear per find. False, with nothing done, when the epoch moved or
 	// an image is gone. `keep` (bit per find): the clear would do nothing again (KeepColorClear).
 	[[nodiscard]] bool ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch, uint32_t& keep);
-	// MaterializeColorClear for a kept find, unless `keep` and its kept check still holds.
-	ColorClearResult ReplayColorClear(const KeptFind& find, bool keep);
+	// MaterializeColorClear for a kept find into `result`, unless `keep` and its kept check still
+	// holds; `result` may be *find.clear (updated in place).
+	void ReplayColorClear(const KeptFind& find, bool keep, ColorClearResult& result);
 	// KYTY_TARGET_REUSE=2: the finds whose clear ReplayColorClear would keep (nothing done).
 	[[nodiscard]] uint32_t KeptColorClears(std::span<const KeptFind> finds);
 
