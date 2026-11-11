@@ -100,6 +100,10 @@ void PublishStaged(uint64_t route) noexcept;
 [[nodiscard]] bool OffFrontLookup() noexcept;
 void               AbortLookup() noexcept;
 [[nodiscard]] bool LookupWasAborted() noexcept;
+// Lookup server thread: a guest memory fault there is resolved by the front (GPU thread), which serves
+// it while it waits; a back parked on a staged lookup counts as idle meanwhile. Returns fn(arg).
+[[nodiscard]] bool IsLookupServer() noexcept;
+bool               ResolveOnFront(bool (*fn)(void*), void* arg) noexcept;
 
 [[nodiscard]] bool IsBackThread() noexcept;
 // GPU thread with the pipeline on (records may be queued).

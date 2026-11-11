@@ -738,8 +738,18 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				}
 			}
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr,
-		                                            info->exception_address)) {
+		// KYTY_CP_LOOKUP_STAGE: resolving it here could wait for the GPU thread, which may wait for the
+		// back, which waits for this lookup: the front resolves it instead.
+		struct GpuFault {
+			Libs::Graphics::PageFaultAccess access;
+			uint64_t                        vaddr, pc;
+		} fault {access, info->access_violation_vaddr, info->exception_address};
+		const auto resolve = [](void* arg) {
+			const auto& f = *static_cast<const GpuFault*>(arg);
+			return Libs::LibKernel::Memory::HandleGpuFault(f.access, f.vaddr, f.pc);
+		};
+		if (Libs::Graphics::CpPipeline::IsLookupServer() ? Libs::Graphics::CpPipeline::ResolveOnFront(resolve, &fault)
+		                                                 : resolve(&fault)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			if (Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address) != 0) {
 				Libs::Graphics::ShaderRecompiler::IR::NoteWalkerFaultRead(false);

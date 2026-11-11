@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -68,6 +69,15 @@ struct State {
 	uint64_t                                        relook_until = 0;
 	std::atomic<uint64_t>                           lookup_wait_ns {0};
 	std::atomic<uint64_t>                           server_busy_ns {0};
+	// A server's guest memory fault, resolved by the front (one at a time).
+	struct FaultRequest {
+		bool (*fn)(void*) = nullptr;
+		void* arg         = nullptr;
+		bool  result      = false;
+	};
+	std::mutex                  fault_mutex;
+	std::atomic<FaultRequest*>  fault_request {nullptr};
+	std::atomic<uint64_t>       server_faults {0};
 };
 
 uint64_t NowNs() noexcept {
@@ -86,6 +96,9 @@ thread_local bool t_in_lookup   = false;
 thread_local bool t_heap_inline = false;
 thread_local bool t_off_front   = false;
 thread_local bool t_aborted     = false;
+thread_local bool t_server      = false;
+// Front: inside ServeFault (a back parked on a staged lookup then counts as idle).
+thread_local bool t_serving_fault = false;
 HeapFn            g_heap_hook   = nullptr;
 
 DrawRecord& Slot(uint64_t index) noexcept {
@@ -118,12 +131,28 @@ void NotifyFront() noexcept {
 	}
 }
 
-// Front: wait until `done()` holds, serving re-lookup requests unless inside a lookup.
+// Front: resolves a lookup server's guest memory fault on the GPU thread (KYTY_CP_LOOKUP_STAGE).
+void ServeFault() noexcept {
+	auto& s   = S();
+	auto* req = s.fault_request.load(std::memory_order_acquire);
+	if (req == nullptr) return;
+	t_serving_fault = true;
+	req->result     = req->fn(req->arg);
+	t_serving_fault = false;
+	s.fault_request.store(nullptr, std::memory_order_seq_cst);
+	s.fault_request.notify_all();
+}
+
+// Front: wait until `done()` holds, serving re-lookup requests unless inside a lookup, and server faults.
 template <typename Done>
 void FrontWait(Done&& done) noexcept {
 	auto&      s     = S();
 	const auto start = std::chrono::steady_clock::now();
 	for (;;) {
+		if (!t_serving_fault && s.fault_request.load(std::memory_order_acquire) != nullptr) {
+			ServeFault();
+			continue;
+		}
 		if (!t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr) {
 			Serve();
 			continue;
@@ -135,16 +164,23 @@ void FrontWait(Done&& done) noexcept {
 			continue;
 		}
 		s.front_sleeping.store(true, std::memory_order_seq_cst);
-		if (!done() && (t_in_lookup || s.request.load(std::memory_order_seq_cst) == nullptr)) {
+		if (!done() && (t_in_lookup || s.request.load(std::memory_order_seq_cst) == nullptr) &&
+		    (t_serving_fault || s.fault_request.load(std::memory_order_seq_cst) == nullptr)) {
 			s.back_event.wait(event, std::memory_order_seq_cst);
 		}
 		s.front_sleeping.store(false, std::memory_order_seq_cst);
 	}
 }
 
+// Front serving a server fault: a back parked on a staged lookup touches nothing until it is done.
+bool ParkedForFault() noexcept {
+	return t_serving_fault && S().back_waits_lookup.load(std::memory_order_acquire);
+}
+
 void ServerThread(State::Server& server) {
 	KYTY_PROFILER_THREAD("Thread_GpuLookup");
 	t_off_front = true;
+	t_server    = true;
 	auto& s     = S();
 	for (;;) {
 		const auto tail = server.tail.load(std::memory_order_relaxed);
@@ -339,6 +375,23 @@ void AbortLookup() noexcept {
 	t_aborted = true;
 }
 
+bool ResolveOnFront(bool (*fn)(void*), void* arg) noexcept {
+	auto& s = S();
+	s.server_faults.fetch_add(1, std::memory_order_relaxed);
+	std::scoped_lock    lock(s.fault_mutex);
+	State::FaultRequest req {.fn = fn, .arg = arg};
+	s.fault_request.store(&req, std::memory_order_seq_cst);
+	NotifyFront();
+	while (s.fault_request.load(std::memory_order_acquire) != nullptr) {
+		s.fault_request.wait(&req, std::memory_order_acquire);
+	}
+	return req.result;
+}
+
+bool IsLookupServer() noexcept {
+	return t_server;
+}
+
 bool LookupWasAborted() noexcept {
 	return t_aborted;
 }
@@ -377,7 +430,7 @@ void Drain() noexcept {
 			if (s.tail.load(std::memory_order_acquire) == s.head.load(std::memory_order_relaxed)) {
 				return true;
 			}
-			return t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr;
+			return (t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr) || ParkedForFault();
 		});
 		s.drains_waited.fetch_add(1, std::memory_order_relaxed);
 		s.drain_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
@@ -387,13 +440,14 @@ void Drain() noexcept {
 			return true;
 		}
 		// Parked on a request this lookup cannot serve: it touches nothing until served.
-		return t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr;
+		return (t_in_lookup && s.request.load(std::memory_order_acquire) != nullptr) || ParkedForFault();
 	});
 	if (!t_in_lookup) ApplyFeedback();
 }
 
 void Poll() noexcept {
 	if (S().slots == nullptr || t_in_lookup || !FrontActive()) return;
+	if (S().fault_request.load(std::memory_order_acquire) != nullptr) ServeFault();
 	if (S().request.load(std::memory_order_acquire) != nullptr) Serve();
 }
 
@@ -490,9 +544,9 @@ void Report(double seconds) noexcept {
 	if (LookupServers() != 0) {
 		std::printf(" servers=%u lookup_wait=%.0fms server_busy=%.0fms staged_aborts=%" PRIu64
 		            " staged_stale=%" PRIu64 " staged_writes=%" PRIu64 " lookup_verified=%" PRIu64
-		            " lookup_mismatch=%" PRIu64,
+		            " lookup_mismatch=%" PRIu64 " server_faults=%" PRIu64,
 		            LookupServers(), ms(take(s.lookup_wait_ns)), ms(take(s.server_busy_ns)), st[7], st[8],
-		            st[9], st[11], st[10]);
+		            st[9], st[11], st[10], take(s.server_faults));
 	}
 	std::printf("\n");
 }
