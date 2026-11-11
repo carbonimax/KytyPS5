@@ -437,6 +437,29 @@ void CommandBuffer::FlushDispatchChain() const {
 	}
 }
 
+// KYTY_GPU_MARKERS: what the shader does (marker flags), and its buffer resources once per shader.
+static uint32_t MarkerFlags(uint64_t cs_address, const ShaderComputeInputInfo& input, bool writes) {
+	const auto& info  = input.stage.program->info;
+	const bool  atomic = std::any_of(info.buffers.begin(), info.buffers.end(), [](const auto& b) { return b.atomic; });
+	const uint32_t flags = (info.uses_dma ? 1u : 0u) | (info.uses_gds ? 2u : 0u) | (writes ? 4u : 0u) |
+	                       (atomic ? 8u : 0u) | (info.coherent_buffers ? 16u : 0u) | (info.uses_lds ? 32u : 0u) |
+	                       (info.buffer_int64_atomics ? 64u : 0u);
+	static std::unordered_map<uint64_t, uint32_t> seen; // GPU thread only
+	if (GpuMarkers::Active() && seen.emplace(cs_address, flags).second) {
+		std::string text;
+		for (const auto& b: info.buffers) {
+			char item[64];
+			std::snprintf(item, sizeof(item), " [%s%s%s%s%s extent=0x%x]", b.read ? "r" : "", b.written ? "w" : "",
+			              b.atomic ? "a" : "", b.scalar ? "s" : "", b.formatted ? "f" : "", b.max_byte_extent);
+			text += item;
+		}
+		LOGF("GpuMarkers: CS 0x%016" PRIx64 " hash=0x%016" PRIx64 " flags=0x%x threads %ux%ux%u buffers=%zu:%s\n",
+		     cs_address, input.stage.program->shader_hash, flags, input.threads_num[0], input.threads_num[1],
+		     input.threads_num[2], info.buffers.size(), text.c_str());
+	}
+	return flags;
+}
+
 // Records the barrier a direct dispatch of a chain needs before it and updates the chain.
 // KYTY_MEM_IMPORT_SHADERS: the listed compute shader's bindings leave imported memory.
 struct ImportShaderScope {
@@ -744,7 +767,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	const uint32_t marker = GpuMarkers::Begin(
 	    vk_buffer, 'C', sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash, thread_group_x, thread_group_y,
 	    thread_group_z, m_context.GetCommandScheduler().CurrentTick(),
-	    (program.info.uses_dma ? 1u : 0u) | (program.info.uses_gds ? 2u : 0u) | (has_storage_writes ? 4u : 0u));
+	    GpuMarkers::Active() ? MarkerFlags(sh_ctx.GetCs().cs_regs.data_addr, input_info, has_storage_writes) : 0u);
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -874,7 +897,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	const uint32_t marker = GpuMarkers::Begin(
 	    vk_buffer, 'I', cs_regs.cs_regs.data_addr, program.shader_hash, guest_args.x, guest_args.y, guest_args.z,
 	    m_context.GetCommandScheduler().CurrentTick(),
-	    (program.info.uses_dma ? 1u : 0u) | (program.info.uses_gds ? 2u : 0u) | (has_storage_writes ? 4u : 0u));
+	    GpuMarkers::Active() ? MarkerFlags(cs_regs.cs_regs.data_addr, input_info, has_storage_writes) : 0u);
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 	GpuMarkers::End(vk_buffer, marker);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

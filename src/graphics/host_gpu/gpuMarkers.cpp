@@ -18,8 +18,8 @@ namespace Libs::Graphics::GpuMarkers {
 
 namespace {
 
-constexpr uint32_t TableSize   = 1u << 14u; // commands kept (power of two)
-constexpr uint32_t MaxBindings = 24;
+constexpr uint32_t TableSize   = 1u << 16u; // commands kept (power of two): the front runs far ahead
+constexpr uint32_t MaxBindings = 16;
 constexpr uint32_t HeadBytes   = 32; // first bytes of each imported read, at bind time
 
 struct Binding {
