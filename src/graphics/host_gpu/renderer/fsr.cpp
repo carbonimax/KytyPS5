@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 
@@ -21,6 +22,7 @@ struct Context {
 	Ffx::Context                          handle = nullptr;
 	Ffx::CreateBackendVkDesc              backend {};
 	Ffx::CreateContextDescUpscaleVersion  version {};
+	Ffx::OverrideVersion                  override_version {};
 	Ffx::CreateContextDescUpscale         create {};
 	uint32_t                              flags = 0; // Pssr::Flags fixed at creation
 	std::chrono::steady_clock::time_point last;
@@ -43,6 +45,7 @@ SDL_SharedObject*  g_module = nullptr;
 Api                g_api {};
 Ffx::DeviceContext g_device {};
 bool               g_enabled = false;
+uint64_t           g_version_id = 0; // KYTY_PSSR_FSR_VERSION: the loader's id to force, 0 = default
 
 void Warn(std::string_view text) {
 	Log::WriteToConsoleAndLog(fmt::format("WARNING: FSR: {}; PSSR scales linearly.\n", text));
@@ -216,14 +219,28 @@ void Init(const GraphicContext& graphics, PFN_vkGetDeviceProcAddr get_device_pro
 	for (uint64_t i = 0; i < count; ++i) {
 		list += fmt::format("{}{}", i == 0 ? "" : ", ", names[i] != nullptr ? names[i] : "?");
 	}
+	// Test switch: KYTY_PSSR_FSR_VERSION=3.1 forces the first offered version starting with "3.1".
+	if (const char* wanted = std::getenv("KYTY_PSSR_FSR_VERSION"); wanted != nullptr) {
+		for (uint64_t i = 0; i < count; ++i) {
+			if (names[i] != nullptr && std::string_view(names[i]).starts_with(wanted)) {
+				g_version_id = ids[i];
+				list += fmt::format("; forcing {}", names[i]);
+				break;
+			}
+		}
+		if (g_version_id == 0) {
+			list += fmt::format("; no version starts with {}", wanted);
+		}
+	}
 	g_enabled = true;
 	Log::WriteToConsoleAndLog(fmt::format("FSR: upscaling PSSR with the DLLs in {}; versions: {}\n",
 	                                      Common::PathToString(Config::GetFsrFolder()), list));
 }
 
 void Shutdown() {
-	g_enabled = false;
-	g_device  = {};
+	g_enabled    = false;
+	g_version_id = 0;
+	g_device     = {};
 	if (g_module != nullptr) {
 		Close();
 	}
@@ -239,6 +256,10 @@ Context* CreateContext(const Pssr::Request& request, const Dlss::Inputs& inputs)
 	// One context takes every render size up to the output's, so dynamic resolution keeps its
 	// history.
 	context->backend = {{Ffx::CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, nullptr}, g_device};
+	if (g_version_id != 0) {
+		context->override_version    = {{Ffx::DESC_TYPE_OVERRIDE_VERSION, nullptr}, g_version_id};
+		context->backend.header.next = &context->override_version.header;
+	}
 	context->version = {{Ffx::CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, &context->backend.header},
 	                    Ffx::UPSCALER_VERSION};
 	uint32_t flags = Ffx::UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | Ffx::UPSCALE_ENABLE_DYNAMIC_RESOLUTION;
