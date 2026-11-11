@@ -193,7 +193,8 @@ private:
 	// its tick in `wait_tick` (submitted) and returns false.
 	[[nodiscard]] bool PublishImported(uint64_t vaddr, uint64_t size, bool may_wait,
 	                                   uint64_t* wait_tick);
-	[[nodiscard]] bool IsImportedRange(uint64_t vaddr, uint64_t size);
+	// ring: set to whether the imported buffer holding the range is a CPU-written ring (leaped).
+	[[nodiscard]] bool IsImportedRange(uint64_t vaddr, uint64_t size, bool* ring = nullptr);
 
 	void PublishFaultWindow(uint64_t vaddr, bool is_write);
 
