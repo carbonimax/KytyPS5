@@ -169,6 +169,8 @@ public:
 	void               DropImported(uint64_t vaddr, uint64_t size);
 	// KYTY_MEM_IMPORT: KYTY_MEM_IMPORT_EXCLUDE ranges and buffers the safety net sent back to copies.
 	[[nodiscard]] bool ImportExcludedRange(uint64_t vaddr, uint64_t size) const;
+	// KYTY_MEM_IMPORT: drops the imported buffers of the range for good; it uploads to device memory.
+	void               DemoteImported(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool ImportActive() const noexcept { return m_import != nullptr; }
 	// KYTY_MEM_IMPORT (GPU thread): the command processor is about to write [vaddr, vaddr + size)
 	// with the CPU (WRITE_DATA, DMA fill/copy), ahead of the GPU work recorded before it. On imported
