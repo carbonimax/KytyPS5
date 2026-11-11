@@ -42,6 +42,9 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Tags the BDA page-table entries of pages a DMA shader accessed; an access to another page
+	// records a fault.
+	static constexpr vk::DeviceAddress BDA_ACCESSED = 1;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -148,12 +151,15 @@ public:
 		return m_color_metadata_epoch.load(std::memory_order_relaxed);
 	}
 	void               ProcessFaultBuffer();
+	// Tags fault-scan pages as DMA-accessed and queues them; creates buffers for unbacked ones.
+	void               MarkDmaAccess(const RangeSet& pages);
 	// Synchronizes the queued BDA ranges that are mapped, with deferred uploads (see
 	// BeginDeferredUploads).
 	void               SynchronizeBda(const RangeSet& mapped);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
-	void                   QueueBdaSync(uint64_t vaddr, uint64_t size);
+	// A write queues only the pages a DMA shader accessed.
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] RangeSet TakeBdaSync();
 	// KYTY_REPROTECT_BATCH (see BeginDeferredUploads): GPU thread, at a guest sync point (after
 	// the command-processor back thread drained). Applies the batched re-protections, then copies
@@ -309,6 +315,8 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	// Pages DMA shaders accessed, guarded by m_bda_sync_mutex.
+	RangeSet                                          m_dma_accessed;
 	StreamBuffer                                      m_staging_buffer;
 	struct BatchRange {
 		vk::Buffer buffer;
