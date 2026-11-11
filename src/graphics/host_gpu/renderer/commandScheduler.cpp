@@ -212,6 +212,8 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackFlushNs, PerfStats::BackProfEnabled());
+	if (PerfStats::BackProfEnabled()) PerfStats::Add(PerfStats::Counter::BackFlushCount, 1);
 	CpPipeline::Drain();
 	Submit(submit);
 	BeginNext();

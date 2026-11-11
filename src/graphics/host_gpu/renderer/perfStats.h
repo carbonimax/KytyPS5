@@ -89,6 +89,15 @@ enum class Counter : uint32_t {
 	BindObtainNs,      // of buffers: NativeStorageBuffer (buffer cache, uploads)
 	BindUploadNs,      // of buffers: flattened SRT + shader data stream uploads
 	BindViewNs,        // of images: TextureCache::FindTexture (views)
+	// KYTY_BIND_PROF (1 or 2): CP back thread only (records of KYTY_CP_PIPELINE), "PERF bindback" line.
+	BackResolveNs,     // PrepareDrawRenderState after the lookup: color/depth target resolution
+	BackTargetsNs,     // AcquireRenderTargets
+	BackPipelineNs,    // FindGraphicsPipeline / GetGraphicsPipeline (key + lookup)
+	BackVertexNs,      // vertex/index/indirect-args buffers (AcquireVertexBuffers, PrepareIndexBuffer)
+	BackDynamicNs,     // dynamic state update + commit
+	BackRecordNs,      // the per-pass recording loop, whole (commit, dynamic state, barriers, emission)
+	BackFlushNs,       // CommandScheduler::Flush: submission + next command buffer
+	BackFlushCount,
 	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
 	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,
@@ -105,8 +114,11 @@ enum class Counter : uint32_t {
 };
 
 [[nodiscard]] bool Enabled() noexcept;
-// KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases.
+// KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases;
+// =2: only on the CP back thread (KYTY_CP_PIPELINE), so they add up against its back_busy.
 [[nodiscard]] bool BindProfEnabled() noexcept;
+// KYTY_BIND_PROF=1 or 2, on the CP back thread: the back-only phases (Back* counters).
+[[nodiscard]] bool BackProfEnabled() noexcept;
 // KYTY_SRT_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): splits program lookups (walk,
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
