@@ -2086,6 +2086,28 @@ static bool ImportGpuWrites() {
 	return keep;
 }
 
+// KYTY_MEM_IMPORT_SHADERS=addr[,addr...] (hex guest shader addresses, local configuration): the
+// buffers these compute shaders bind, read or written, leave imported memory for good.
+void BufferCache::BeginImportShader(uint64_t cs_address) {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> out;
+		const char*           value = std::getenv("KYTY_MEM_IMPORT_SHADERS");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next    = nullptr;
+			const auto address = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.push_back(address);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
+	}();
+	m_import_shader = m_import && std::find(shaders.begin(), shaders.end(), cs_address) != shaders.end()
+	                      ? cs_address
+	                      : 0;
+}
+
 bool BufferCache::ImportExcludedRange(uint64_t vaddr, uint64_t size) const {
 	return ImportExcluded(vaddr, size) ||
 	       std::any_of(m_import_demoted.begin(), m_import_demoted.end(),
@@ -2490,13 +2512,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
-	if (is_written && m_slot_buffers[id].IsImported() && !ImportGpuWrites()) {
+	static uint32_t shader_logs = 0;
+	if (m_import_shader != 0 && ImportLogEnabled() && (m_slot_buffers[id].IsImported() || shader_logs++ < 64)) {
+		LOGF("BufferCache: KYTY_MEM_IMPORT shader 0x%016" PRIx64 " binds 0x%016" PRIx64 "+0x%" PRIx64
+		     " written=%d imported=%d\n",
+		     m_import_shader, vaddr, size, is_written ? 1 : 0, m_slot_buffers[id].IsImported() ? 1 : 0);
+	}
+	if (m_slot_buffers[id].IsImported() && (m_import_shader != 0 || (is_written && !ImportGpuWrites()))) {
 		const auto& imported = m_slot_buffers[id];
 		g_import_stats.write_demotes.fetch_add(1, std::memory_order_relaxed);
 		if (ImportLogEnabled()) {
-			LOGF("BufferCache: KYTY_MEM_IMPORT gpu write 0x%016" PRIx64 "+0x%" PRIx64
+			LOGF("BufferCache: KYTY_MEM_IMPORT gpu %s 0x%016" PRIx64 "+0x%" PRIx64
 			     ": buffer 0x%016" PRIx64 "+0x%" PRIx64 " back to device memory\n",
-			     vaddr, size, imported.CpuAddress(), imported.Size());
+			     is_written ? "write" : "read", vaddr, size, imported.CpuAddress(), imported.Size());
 		}
 		DemoteImported(imported.CpuAddress(), imported.Size());
 		id = FindBuffer(vaddr, size);

@@ -437,6 +437,15 @@ void CommandBuffer::FlushDispatchChain() const {
 }
 
 // Records the barrier a direct dispatch of a chain needs before it and updates the chain.
+// KYTY_MEM_IMPORT_SHADERS: the listed compute shader's bindings leave imported memory.
+struct ImportShaderScope {
+	ImportShaderScope(BufferCache& c, uint64_t cs_address): cache(c) { cache.BeginImportShader(cs_address); }
+	~ImportShaderScope() { cache.EndImportShader(); }
+	ImportShaderScope(const ImportShaderScope&)            = delete;
+	ImportShaderScope& operator=(const ImportShaderScope&) = delete;
+	BufferCache&       cache;
+};
+
 static void ChainDispatchBarrier(RenderContext& context, const CommandBuffer& buffer,
                                  vk::CommandBuffer vk_buffer, const ShaderComputeInputInfo& input,
                                  const PreparedBindings& bindings, bool writes,
@@ -539,6 +548,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 		     thread_group_x, thread_group_y, thread_group_z, mode);
 		return;
 	}
+	const ImportShaderScope import_scope(m_context.GetBufferCache(), sh_ctx.GetCs().cs_regs.data_addr);
 
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS     = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS = 0xa038u;
@@ -617,6 +627,11 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	BackAddressBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	if (program.info.uses_dma) {
+		static std::atomic<uint32_t> bda_logs {0};
+		if (m_context.GetBufferCache().ImportShader() != 0 && bda_logs.fetch_add(1) < 16) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT shader 0x%016" PRIx64 " also reads by device address\n",
+			     m_context.GetBufferCache().ImportShader());
+		}
 		m_context.PrepareBda();
 	}
 	if (program.info.uses_image_heap) {
@@ -772,6 +787,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	const ImportShaderScope import_scope(m_context.GetBufferCache(), cs_regs.cs_regs.data_addr);
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
@@ -791,6 +807,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
+		static std::atomic<uint32_t> bda_logs {0};
+		if (m_context.GetBufferCache().ImportShader() != 0 && bda_logs.fetch_add(1) < 16) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT shader 0x%016" PRIx64 " also reads by device address\n",
+			     m_context.GetBufferCache().ImportShader());
+		}
 		m_context.PrepareBda();
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);

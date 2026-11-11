@@ -171,6 +171,10 @@ public:
 	[[nodiscard]] bool ImportExcludedRange(uint64_t vaddr, uint64_t size) const;
 	// KYTY_MEM_IMPORT: drops the imported buffers of the range for good; it uploads to device memory.
 	void               DemoteImported(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT_SHADERS: set around a compute dispatch's bindings (0 ends the scope).
+	void               BeginImportShader(uint64_t cs_address);
+	void               EndImportShader() noexcept { m_import_shader = 0; }
+	[[nodiscard]] uint64_t ImportShader() const noexcept { return m_import_shader; }
 	[[nodiscard]] bool ImportActive() const noexcept { return m_import != nullptr; }
 	// KYTY_MEM_IMPORT (GPU thread): the command processor is about to write [vaddr, vaddr + size)
 	// with the CPU (WRITE_DATA, DMA fill/copy), ahead of the GPU work recorded before it. On imported
@@ -330,6 +334,7 @@ private:
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_write_ticks;
 	std::vector<std::pair<uint64_t, uint64_t>> m_import_demoted; // GPU thread (SealLateReads)
+	uint64_t m_import_shader = 0; // listed compute shader binding now (KYTY_MEM_IMPORT_SHADERS)
 	// KYTY_MEM_IMPORT: latest tick that may read each 64 KiB of imported memory (BeforeCpuWrite).
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_read_ticks;
 	struct SideCopy {
