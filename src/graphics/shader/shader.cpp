@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -413,12 +414,21 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			GpuCapture::Touch(reinterpret_cast<uint64_t>(attrib), uint64_t {attrib_count} * sizeof(uint32_t));
 			GpuCapture::Touch(reinterpret_cast<uint64_t>(buffer), sizeof(buffer_copy));
 		}
-		if (backing_reads && GuestGpu::IsGpuThread() && attrib_count <= attrib_copy.size()) {
-			const auto read_table = [](const uint32_t* table, uint32_t* out, uint32_t dwords) {
+		// KYTY_CP_LOOKUP_STAGE: a lookup off the front must not fault on GPU-written pages either.
+		const bool off_front = CpPipeline::OffFrontLookup();
+		if ((backing_reads || off_front) && (GuestGpu::IsGpuThread() || off_front) &&
+		    attrib_count <= attrib_copy.size()) {
+			const auto read_table = [off_front](const uint32_t* table, uint32_t* out, uint32_t dwords) {
 				const auto address = reinterpret_cast<uint64_t>(table);
 				if (dwords != 0 && !Libs::LibKernel::Memory::TryReadBufferBacking(
 				                       address, out, dwords * sizeof(uint32_t))) {
-					std::memcpy(out, table, dwords * sizeof(uint32_t));
+					if (off_front) {
+						// The front redoes the lookup.
+						std::memset(out, 0, dwords * sizeof(uint32_t));
+						CpPipeline::AbortLookup();
+					} else {
+						std::memcpy(out, table, dwords * sizeof(uint32_t));
+					}
 				}
 			};
 			read_table(attrib, attrib_copy.data(), attrib_count);

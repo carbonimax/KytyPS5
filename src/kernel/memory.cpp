@@ -891,13 +891,23 @@ bool IsGpuDirtyBufferRange(uint64_t vaddr, uint64_t size) {
 }
 
 bool MaybeGpuModifiedPage(uint64_t vaddr) {
-	return g_gpu_resources != nullptr && Graphics::GuestGpu::IsGpuThread() &&
+	// A lookup server reads the page bits as a hint only: TryReadBufferBacking tests the bytes.
+	return g_gpu_resources != nullptr &&
+	       (Graphics::GuestGpu::IsGpuThread() || Graphics::CpPipeline::OffFrontLookup()) &&
 	       IsGpuAddressRange(vaddr, sizeof(uint32_t)) &&
 	       GetGpuResources().GetBufferCache().MaybeGpuModifiedPage(vaddr);
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		// KYTY_CP_LOOKUP_STAGE: a lookup off the front never waits for GPU-written bytes; it aborts.
+		if (Graphics::CpPipeline::OffFrontLookup()) {
+			if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+				Graphics::CpPipeline::AbortLookup();
+				return false;
+			}
+			return TryReadBacking(vaddr, data, size);
+		}
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}

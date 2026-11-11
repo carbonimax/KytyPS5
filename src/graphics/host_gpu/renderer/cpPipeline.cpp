@@ -5,11 +5,13 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -18,7 +20,8 @@ namespace Libs::Graphics::CpPipeline {
 
 namespace {
 
-constexpr uint64_t Slots = 32;
+constexpr uint64_t Slots      = 32;
+constexpr uint32_t MaxServers = 8;
 // Spin this long before sleeping on the other side (a draw's back part takes a few microseconds).
 constexpr auto SpinTime = std::chrono::microseconds(50);
 
@@ -48,6 +51,23 @@ struct State {
 	std::atomic<uint64_t> full_wait_ns {0};
 	std::atomic<uint64_t> relookups {0};
 	std::atomic<uint64_t> back_busy_ns {0};
+
+	// KYTY_CP_LOOKUP_STAGE: each server's queue of record indices (a record in flight is in at most
+	// one, so Slots entries are enough).
+	struct Server {
+		std::array<uint64_t, Slots> items {};
+		std::atomic<uint64_t>       head {0};
+		std::atomic<uint64_t>       tail {0};
+		std::atomic<bool>           sleeping {false};
+	};
+	std::unique_ptr<std::array<Server, MaxServers>> servers;
+	LookupFn                                        lookup = nullptr;
+	VerifyFn                                        verify = nullptr;
+	std::atomic<bool>                               back_waits_lookup {false};
+	// Back only: records below this index are looked up again (a staged draw wrote memory).
+	uint64_t                                        relook_until = 0;
+	std::atomic<uint64_t>                           lookup_wait_ns {0};
+	std::atomic<uint64_t>                           server_busy_ns {0};
 };
 
 uint64_t NowNs() noexcept {
@@ -64,6 +84,8 @@ State& S() noexcept {
 thread_local bool t_back        = false;
 thread_local bool t_in_lookup   = false;
 thread_local bool t_heap_inline = false;
+thread_local bool t_off_front   = false;
+thread_local bool t_aborted     = false;
 HeapFn            g_heap_hook   = nullptr;
 
 DrawRecord& Slot(uint64_t index) noexcept {
@@ -120,6 +142,77 @@ void FrontWait(Done&& done) noexcept {
 	}
 }
 
+void ServerThread(State::Server& server) {
+	KYTY_PROFILER_THREAD("Thread_GpuLookup");
+	t_off_front = true;
+	auto& s     = S();
+	for (;;) {
+		const auto tail = server.tail.load(std::memory_order_relaxed);
+		if (server.head.load(std::memory_order_acquire) == tail) {
+			const auto start = std::chrono::steady_clock::now();
+			while (server.head.load(std::memory_order_acquire) == tail &&
+			       std::chrono::steady_clock::now() - start < SpinTime) {
+				std::this_thread::yield();
+			}
+			while (server.head.load(std::memory_order_seq_cst) == tail) {
+				server.sleeping.store(true, std::memory_order_seq_cst);
+				if (server.head.load(std::memory_order_seq_cst) == tail) {
+					server.head.wait(tail, std::memory_order_seq_cst);
+				}
+				server.sleeping.store(false, std::memory_order_seq_cst);
+			}
+		}
+		auto&      rec   = Slot(server.items[tail % Slots]);
+		const auto start = NowNs();
+		s.lookup(s.context, rec);
+		const bool aborted = std::exchange(t_aborted, false);
+		s.server_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		server.tail.store(tail + 1, std::memory_order_relaxed);
+		rec.lookup.store(aborted ? LookupAborted : LookupDone, std::memory_order_seq_cst);
+		if (s.back_waits_lookup.load(std::memory_order_seq_cst)) {
+			rec.lookup.notify_all();
+		}
+	}
+}
+
+// Back: waits for the staged record's lookup, then has the front redo it if it cannot be used.
+void FinishStaged(DrawRecord& rec, uint64_t index) noexcept {
+	auto& s = S();
+	if (rec.lookup.load(std::memory_order_acquire) == LookupPending) {
+		const auto start = NowNs();
+		const auto spin  = std::chrono::steady_clock::now();
+		while (rec.lookup.load(std::memory_order_acquire) == LookupPending &&
+		       std::chrono::steady_clock::now() - spin < SpinTime) {
+			std::this_thread::yield();
+		}
+		s.back_waits_lookup.store(true, std::memory_order_seq_cst);
+		while (rec.lookup.load(std::memory_order_seq_cst) == LookupPending) {
+			rec.lookup.wait(LookupPending, std::memory_order_seq_cst);
+		}
+		s.back_waits_lookup.store(false, std::memory_order_seq_cst);
+		s.lookup_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+	}
+	const bool aborted = rec.lookup.load(std::memory_order_acquire) == LookupAborted;
+	if (aborted || index < s.relook_until) {
+		Note(aborted ? Stat::StagedAborts : Stat::StagedStale);
+		// The draw starts before the front's lookup acquires image heap views; the back runs it.
+		g_heap_hook(s.context);
+		rec.heap_begun             = true;
+		rec.relookup_single_sample = rec.guessed_single_sample;
+		RequestRelookup(rec);
+		s.relookups.fetch_sub(1, std::memory_order_relaxed);
+	}
+	if (s.verify != nullptr && LookupVerify()) {
+		t_off_front   = true;
+		const bool eq = s.verify(s.context, rec);
+		t_off_front   = false;
+		if (!std::exchange(t_aborted, false)) {
+			Note(Stat::LookupVerified);
+			if (!eq) Note(Stat::LookupMismatch);
+		}
+	}
+}
+
 void BackThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuBack");
 	t_back = true;
@@ -143,9 +236,16 @@ void BackThread() {
 				s.back_sleeping.store(false, std::memory_order_seq_cst);
 			}
 		}
+		auto& rec = Slot(tail);
+		if (rec.staged) FinishStaged(rec, tail);
 		const auto start = NowNs();
-		s.execute(s.context, Slot(tail));
+		s.execute(s.context, rec);
 		s.back_busy_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+		if (rec.staged && rec.writes) {
+			// Records published so far may have read what it writes before it ran.
+			Note(Stat::StagedWrites);
+			s.relook_until = s.head.load(std::memory_order_acquire);
+		}
 		s.tail.store(tail + 1, std::memory_order_seq_cst);
 		NotifyFront();
 	}
@@ -182,6 +282,65 @@ void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feed
 		// Detached: it only ever waits for work or runs a record, and dies with the process.
 		std::thread(BackThread).detach();
 	}
+}
+
+uint32_t LookupServers() noexcept {
+	static const uint32_t servers = [] {
+		const char* value = std::getenv("KYTY_CP_LOOKUP_STAGE");
+		const int   k     = value != nullptr ? std::atoi(value) : 0;
+		return Mode() == 1 ? static_cast<uint32_t>(std::clamp(k, 0, static_cast<int>(MaxServers))) : 0u;
+	}();
+	return servers;
+}
+
+bool LookupVerify() noexcept {
+	static const bool verify = [] {
+		const char* value = std::getenv("KYTY_CP_LOOKUP_STAGE_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return verify;
+}
+
+void SetLookupHooks(LookupFn lookup, VerifyFn verify) noexcept {
+	auto& s = S();
+	if (s.servers != nullptr || LookupServers() == 0 || s.slots == nullptr) return;
+	s.lookup  = lookup;
+	s.verify  = verify;
+	s.servers = std::make_unique<std::array<State::Server, MaxServers>>();
+	for (uint32_t i = 0; i < LookupServers(); i++) {
+		// Detached like the back thread.
+		std::thread(ServerThread, std::ref((*s.servers)[i])).detach();
+	}
+}
+
+void PublishStaged(uint64_t route) noexcept {
+	auto&      s      = S();
+	const auto head   = s.head.load(std::memory_order_relaxed);
+	auto&      rec    = Slot(head);
+	auto&      server = (*s.servers)[route % LookupServers()];
+	rec.staged        = true;
+	rec.writes        = false;
+	rec.heap_begun    = false;
+	rec.lookup.store(LookupPending, std::memory_order_relaxed);
+	const auto at            = server.head.load(std::memory_order_relaxed);
+	server.items[at % Slots] = head;
+	server.head.store(at + 1, std::memory_order_seq_cst);
+	if (server.sleeping.load(std::memory_order_seq_cst)) {
+		server.head.notify_one();
+	}
+	Publish();
+}
+
+bool OffFrontLookup() noexcept {
+	return t_off_front;
+}
+
+void AbortLookup() noexcept {
+	t_aborted = true;
+}
+
+bool LookupWasAborted() noexcept {
+	return t_aborted;
 }
 
 bool IsBackThread() noexcept {
@@ -258,6 +417,7 @@ DrawRecord& Acquire() noexcept {
 	ApplyFeedback();
 	auto& rec          = Slot(head);
 	rec.feedback_valid = false;
+	rec.staged         = false;
 	return rec;
 }
 
@@ -324,9 +484,17 @@ void Report(double seconds) noexcept {
 	std::printf("PERF cppipe %.1fs: queued=%" PRIu64 " inline_heap=%" PRIu64 " inline_writes=%" PRIu64
 	            " fallback_args=%" PRIu64 " fallback_targets=%" PRIu64 " fallback_shaders=%" PRIu64 " fallback_fast=%" PRIu64
 	            " drain_waits=%" PRIu64 "(%.0fms) full_waits=%" PRIu64 "(%.0fms) relookups=%" PRIu64
-	            " back_busy=%.0fms\n",
+	            " back_busy=%.0fms",
 	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], drains, ms(drain), fulls, ms(full),
 	            take(s.relookups), ms(take(s.back_busy_ns)));
+	if (LookupServers() != 0) {
+		std::printf(" servers=%u lookup_wait=%.0fms server_busy=%.0fms staged_aborts=%" PRIu64
+		            " staged_stale=%" PRIu64 " staged_writes=%" PRIu64 " lookup_verified=%" PRIu64
+		            " lookup_mismatch=%" PRIu64,
+		            LookupServers(), ms(take(s.lookup_wait_ns)), ms(take(s.server_busy_ns)), st[7], st[8],
+		            st[9], st[11], st[10]);
+	}
+	std::printf("\n");
 }
 
 } // namespace Libs::Graphics::CpPipeline

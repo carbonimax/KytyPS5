@@ -32,6 +32,15 @@
 // Modes: 0 = off (every draw runs on the GPU thread); 1 = back thread (default when the variable is
 // unset); 2 = records executed inline on the GPU thread (checks that a record holds everything its
 // draw reads, no concurrency). Any other value is off.
+// KYTY_CP_LOOKUP_STAGE=K (default 0 = off; 1-8, mode 1 only): K lookup servers take the program
+// lookups of the draws mode 1 queues off the front. The front publishes the record before any lookup
+// and routes it by its ES/GS/PS addresses, so a server always sees the same programs; each server
+// has a program cache of its own (no store, cold at start). The back waits for a record's lookup,
+// then runs it as before. A server lookup that would need the GPU thread (GPU-written memory, the
+// image heap) aborts: the back asks the front to look the record up again, in order. A draw whose
+// shaders write memory runs on the back, then every record published before it finished is looked
+// up again by the front. KYTY_CP_LOOKUP_STAGE_VERIFY=1: the back also looks each staged record up
+// with its own cache and counts the differences ("PERF cppipe" lookup_mismatch).
 namespace Libs::Graphics::CpPipeline {
 
 struct DrawRecord {
@@ -51,11 +60,24 @@ struct DrawRecord {
 	bool     feedback_single_sample = true;
 	// Back -> front: program lookup again with this single-sample value.
 	bool relookup_single_sample = true;
+	// KYTY_CP_LOOKUP_STAGE: looked up by a server; `lookup` is LookupPending until it is done.
+	bool                  staged = false;
+	std::atomic<uint32_t> lookup {0};
+	// The shaders write memory (set with the lookup) / the back began the draw's image heap draw.
+	bool writes     = false;
+	bool heap_begun = false;
 };
+
+constexpr uint32_t LookupPending = 1;
+constexpr uint32_t LookupDone    = 2;
+constexpr uint32_t LookupAborted = 3;
 
 using ExecuteFn  = void (*)(void* context, DrawRecord& record);
 using RelookupFn = void (*)(void* context, DrawRecord& record);
 using FeedbackFn = void (*)(void* context, const DrawRecord& record);
+// KYTY_CP_LOOKUP_STAGE: a server's lookup; verify (back thread) returns false on a difference.
+using LookupFn = void (*)(void* context, DrawRecord& record);
+using VerifyFn = bool (*)(void* context, DrawRecord& record);
 
 [[nodiscard]] int Mode() noexcept;
 // KYTY_CP_PIPELINE_MIN_FRAME_MS=M (default 25, 0 = always): mode 1 queues draws only while presented
@@ -64,6 +86,19 @@ using FeedbackFn = void (*)(void* context, const DrawRecord& record);
 [[nodiscard]] bool Engaged() noexcept;
 // Registered once by the renderer before the first record.
 void Init(void* context, ExecuteFn execute, RelookupFn relookup, FeedbackFn feedback);
+
+// KYTY_CP_LOOKUP_STAGE: the server count (0 = off) and KYTY_CP_LOOKUP_STAGE_VERIFY.
+[[nodiscard]] uint32_t LookupServers() noexcept;
+[[nodiscard]] bool     LookupVerify() noexcept;
+// Registered with Init, before the first staged record.
+void SetLookupHooks(LookupFn lookup, VerifyFn verify) noexcept;
+// Front: publishes the acquired record for a server lookup; `route` picks the server.
+void PublishStaged(uint64_t route) noexcept;
+// A program lookup off the front (server, or back verify): it must not wait for the GPU thread.
+// AbortLookup marks the lookup unusable (the result is thrown away and redone by the front).
+[[nodiscard]] bool OffFrontLookup() noexcept;
+void               AbortLookup() noexcept;
+[[nodiscard]] bool LookupWasAborted() noexcept;
 
 [[nodiscard]] bool IsBackThread() noexcept;
 // GPU thread with the pipeline on (records may be queued).
@@ -110,6 +145,11 @@ enum class Stat : uint32_t {
 	FallbackTargets,  // metadata color operation, resolve or depth copy
 	FallbackShaders,  // no valid vertex shader or topology
 	FallbackFast,     // frames faster than KYTY_CP_PIPELINE_MIN_FRAME_MS
+	StagedAborts,     // KYTY_CP_LOOKUP_STAGE: server lookups redone by the front (GPU memory, heap)
+	StagedStale,      // records looked up again after a staged draw that writes memory
+	StagedWrites,     // staged draws that write memory
+	LookupMismatch,   // KYTY_CP_LOOKUP_STAGE_VERIFY: differences
+	LookupVerified,
 	Count
 };
 void Note(Stat stat) noexcept;

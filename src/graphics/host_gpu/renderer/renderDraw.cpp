@@ -2002,9 +2002,34 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		m_context.GetPipelineCache().SetPrefetchHook(PipelinePrefetch, this);
 		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
 		CpPipeline::SetHeapHook(PipelineHeap);
+		CpPipeline::SetLookupHooks(PipelineLookup, PipelineVerify);
 		return true;
 	}();
 	(void)initialized;
+
+	if (CpPipeline::LookupServers() != 0) {
+		// KYTY_CP_LOOKUP_STAGE: a server looks the programs up; it classifies the draw (heap,
+		// shader writes) itself, the back then handles it.
+		auto& record                 = CpPipeline::Acquire();
+		record.state                 = {};
+		record.state.topology        = topology;
+		record.indexed               = indexed;
+		if (indexed) {
+			record.index_args = *index_args;
+		} else {
+			record.auto_args = *auto_args;
+		}
+		record.registers             = buffer.GetRegisters();
+		record.user_config           = buffer.GetUserConfig();
+		record.shaders               = buffer.GetShaders();
+		record.guessed_single_sample = GuessSingleSample(record.shaders.GetPs().ps_regs.data_addr);
+		const uint64_t programs[3]   = {record.shaders.GetVs().es_regs.data_addr,
+		                                record.shaders.GetVs().gs_regs.data_addr,
+		                                record.shaders.GetPs().ps_regs.data_addr};
+		CpPipeline::Note(CpPipeline::Stat::Queued);
+		CpPipeline::PublishStaged(XXH3_64bits(programs, sizeof(programs)));
+		return true;
+	}
 
 	auto& record          = CpPipeline::Acquire();
 	record.state          = {};
@@ -2051,12 +2076,11 @@ void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& reco
 	auto&                  scheduler = self->m_context.GetCommandScheduler();
 	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
 	auto&                  buffer = scheduler.Current();
+	const auto stage = record.staged && record.heap_begun ? DrawPrepared::LookedUpHeapBegun : DrawPrepared::LookedUp;
 	if (record.indexed) {
-		self->DrawIndexBody(buffer, record.index_args, &record.state, &record,
-		                    DrawPrepared::LookedUp);
+		self->DrawIndexBody(buffer, record.index_args, &record.state, &record, stage);
 	} else {
-		self->DrawAutoBody(buffer, record.auto_args, &record.state, &record,
-		                   DrawPrepared::LookedUp);
+		self->DrawAutoBody(buffer, record.auto_args, &record.state, &record, stage);
 	}
 	// KYTY_IDLE_SUBMIT: the GPU thread only checks it between packets with an idle back thread.
 	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
@@ -2081,7 +2105,53 @@ void RenderExecutor::PipelineRelookup(void* context, CpPipeline::DrawRecord& rec
 	CpPipeline::SetInLookup(false);
 	(void)CpPipeline::TakeHeapInline();
 	g_pipeline_relookup = false;
+	record.writes       = record.state.vertex_info[0].stage && DrawWritesMemory(record.state);
 	CopySnapshots(record);
+}
+
+void RenderExecutor::PipelineLookup(void* context, CpPipeline::DrawRecord& record) {
+	auto* self = static_cast<RenderExecutor*>(context);
+	static thread_local const bool bound = (self->m_context.GetPipelineCache().UseThreadProgramCache(), true);
+	(void)bound;
+	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
+	auto&                  buffer = self->m_context.GetCommandScheduler().CurrentUnchecked();
+	RefreshShaders(buffer, record.state, record.guessed_single_sample);
+	record.writes = record.state.vertex_info[0].stage && DrawWritesMemory(record.state);
+	CopySnapshots(record);
+}
+
+static bool SameStage(const ShaderStageRuntime& a, const ShaderStageRuntime& b) {
+	if (!a || !b) return !a && !b;
+	const auto& x = *a.resources;
+	const auto& y = *b.resources;
+	return a.handle->id == b.handle->id && x.buffers == y.buffers && x.images == y.images &&
+	       x.samplers == y.samplers && x.flattened_srt == y.flattened_srt && x.user_data == y.user_data;
+}
+
+bool RenderExecutor::PipelineVerify(void* context, CpPipeline::DrawRecord& record) {
+	auto* self = static_cast<RenderExecutor*>(context);
+	static thread_local const bool bound = (self->m_context.GetPipelineCache().UseThreadProgramCache(), true);
+	(void)bound;
+	ScopedRegisterOverride        registers(record.registers, record.user_config, record.shaders);
+	auto&                         buffer = self->m_context.GetCommandScheduler().CurrentUnchecked();
+	static thread_local DrawRenderState state;
+	state          = {};
+	state.topology = record.state.topology;
+	RefreshShaders(buffer, state, record.guessed_single_sample);
+	const auto& got  = record.state;
+	bool        same = state.ps_active == got.ps_active && state.mrt_mask == got.mrt_mask &&
+	            state.aliased_passes == got.aliased_passes &&
+	            SameStage(state.ps_input_info.stage, got.ps_input_info.stage);
+	for (size_t i = 0; i < state.vertex_info.size(); i++) {
+		same = same && SameStage(state.vertex_info[i].stage, got.vertex_info[i].stage);
+	}
+	static std::atomic_uint logged = 0;
+	if (!same && !CpPipeline::LookupWasAborted() && logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::printf("lookup stage mismatch: ps=0x%016" PRIx64 " es=0x%016" PRIx64 " ps_active=%d/%d mrt=0x%x/0x%x\n",
+		            record.shaders.GetPs().ps_regs.data_addr, record.shaders.GetVs().es_regs.data_addr,
+		            state.ps_active ? 1 : 0, got.ps_active ? 1 : 0, state.mrt_mask, got.mrt_mask);
+	}
+	return same;
 }
 
 void RenderExecutor::PipelineFeedback(void* /*context*/, const CpPipeline::DrawRecord& record) {
@@ -2098,16 +2168,22 @@ void RenderExecutor::PipelinePrefetch(void* context) {
 	// Back thread only: each queued record is looked at once.
 	static uint64_t        scanned = 0;
 	static DrawRenderState state;
-	const auto             end = CpPipeline::Published();
+	const auto             end  = CpPipeline::Published();
+	auto                   stop = end;
 	for (auto index = std::max(scanned, CpPipeline::Finished() + 1); index < end; index++) {
 		const auto& record = CpPipeline::Queued(index);
-		state              = record.state;
+		// KYTY_CP_LOOKUP_STAGE: a record whose lookup is not done is scanned next time.
+		if (record.staged && record.lookup.load(std::memory_order_acquire) != CpPipeline::LookupDone) {
+			stop = index;
+			break;
+		}
+		state = record.state;
 		if (state.vertex_info[0].stage && PredictTargets(record, state)) {
 			cache.Prefetch(record.registers, record.user_config, state,
 			               {state.color_info, state.color_count});
 		}
 	}
-	scanned = std::max(scanned, end);
+	scanned = std::max(scanned, stop);
 }
 
 void RenderExecutor::PipelineHeap(void* context) {

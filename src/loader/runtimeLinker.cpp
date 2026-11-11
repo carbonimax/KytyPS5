@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -726,6 +727,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 					Libs::Graphics::ShaderRecompiler::IR::SetProtectedLoadReader(&ReadWalkerBacking);
 					Libs::Graphics::ShaderRecompiler::IR::NoteProtectedLoad(
 					    Loader::X64InstructionEmulator::LoadBaseR10(info->native_context));
+					return true;
+				}
+				// KYTY_CP_LOOKUP_STAGE: a lookup off the front never publishes the page (that waits for
+				// the GPU thread): the load reads 0 and the front redoes the lookup.
+				if (Libs::Graphics::CpPipeline::OffFrontLookup()) {
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, 0);
+					Libs::Graphics::CpPipeline::AbortLookup();
 					return true;
 				}
 			}

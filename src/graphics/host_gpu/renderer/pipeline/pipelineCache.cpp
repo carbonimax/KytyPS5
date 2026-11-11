@@ -609,7 +609,8 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
-		PerfStats::ScopedTimer program_timer(PerfStats::Counter::ProgramNs, PerfStats::Counter::ProgramCount);
+		std::optional<PerfStats::ScopedTimer> program_timer;
+		if (count_programs) program_timer.emplace(PerfStats::Counter::ProgramNs, PerfStats::Counter::ProgramCount);
 		auto entry = programs.find(lookup_key);
 		const auto bind = [&](const Permutation& permutation) {
 			input_info.stage = {.program   = &permutation.program,
@@ -981,6 +982,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t                     diag_module_us = 0;
 	// The shader store, when open (GPU thread).
 	ShaderStore*          store = nullptr;
+	// False for the caches of KYTY_CP_LOOKUP_STAGE threads: PERF programs stays the GPU thread's.
+	bool                  count_programs = true;
 	ShaderStoreModule     store_record;
 	std::vector<uint32_t> store_spirv;
 	std::vector<uint32_t> store_words;
@@ -1037,6 +1040,7 @@ static uint32_t ParallelWorkers() {
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)),
+      m_image_heap(image_heap),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
@@ -1898,7 +1902,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	uint32_t push_data_cursor = ShaderRecompiler::IR::PushData::GraphicsDrawDwords(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	if (pixel_active) {
-		m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		Programs().Get(pixel_params, pixel_info, push_data_cursor);
 		for (const auto& output: pixel_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
 			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
@@ -1915,8 +1919,19 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		Programs().Get(vertex_params[i], vertex_info[i], push_data_cursor);
 	}
+}
+
+thread_local PipelineCache::ProgramCache* PipelineCache::t_programs = nullptr;
+
+void PipelineCache::UseThreadProgramCache() {
+	if (t_programs != nullptr) return;
+	auto cache            = std::make_unique<ProgramCache>(m_graphics, m_image_heap);
+	cache->count_programs = false;
+	t_programs            = cache.get();
+	std::scoped_lock lock(m_thread_caches_mutex);
+	m_thread_caches.push_back(std::move(cache));
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

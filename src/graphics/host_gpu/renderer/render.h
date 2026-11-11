@@ -302,6 +302,9 @@ private:
 	                  const DrawAutoArgs* auto_args);
 	static void PipelineExecute(void* context, CpPipeline::DrawRecord& record);
 	static void PipelineRelookup(void* context, CpPipeline::DrawRecord& record);
+	// KYTY_CP_LOOKUP_STAGE: a lookup server's lookup; the back's check of it (false: different).
+	static void PipelineLookup(void* context, CpPipeline::DrawRecord& record);
+	static bool PipelineVerify(void* context, CpPipeline::DrawRecord& record);
 	static void PipelineFeedback(void* context, const CpPipeline::DrawRecord& record);
 	static void PipelineHeap(void* context);
 	// KYTY_PIPELINE_PARALLEL (pipelineCache.h): predicts the pipelines of the queued draws.

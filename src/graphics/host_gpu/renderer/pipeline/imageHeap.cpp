@@ -136,6 +136,11 @@ ImageHeap::~ImageHeap() {
 
 bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
+	// KYTY_CP_LOOKUP_STAGE: the heap is per draw and the front's; a lookup off the front aborts.
+	if (CpPipeline::OffFrontLookup()) {
+		CpPipeline::AbortLookup();
+		return false;
+	}
 	// KYTY_CP_PIPELINE: a pipelined lookup that needs the heap runs its draw on the GPU thread.
 	CpPipeline::NoteHeapAcquire();
 	if (!m_context.GetGraphics().null_descriptor_enabled) return false;

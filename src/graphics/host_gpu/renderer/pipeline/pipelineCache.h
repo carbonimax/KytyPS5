@@ -201,6 +201,10 @@ public:
 	// An empty program skips the dispatch.
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                ShaderComputeInputInfo&      input_info);
+	// KYTY_CP_LOOKUP_STAGE (cpPipeline.h): gives the calling thread a program cache of its own, which
+	// GetGraphicsPrograms then uses (lookup servers, the back thread in verify mode). No shader store
+	// behind it, and its lookups stay out of the PERF programs counter.
+	void UseThreadProgramCache();
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state) {
 		return GetGraphicsPipeline(command, state, {state.color_info, state.color_count});
@@ -282,6 +286,11 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	ShaderRecompiler::IR::ImageHeapSource*     m_image_heap;
+	std::mutex                                 m_thread_caches_mutex;
+	std::vector<std::unique_ptr<ProgramCache>> m_thread_caches;
+	static thread_local ProgramCache*          t_programs;
+	[[nodiscard]] ProgramCache& Programs() noexcept { return t_programs != nullptr ? *t_programs : *m_program_cache; }
 	// The shader store (KYTY_SHADER_STORE, --shader-cache), loaded by m_warm_up. Every other member
 	// function waits for the warm-up first.
 	std::unique_ptr<ShaderStore>  m_store;
