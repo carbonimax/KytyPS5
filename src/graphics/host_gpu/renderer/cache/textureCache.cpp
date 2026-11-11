@@ -1239,7 +1239,8 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 		{
 			std::scoped_lock lock {m_lock};
 			if (m_slot_images[id].color_clear_check == check) {
-				result.path = ColorClearResult::SameCheck;
+				result.path  = ColorClearResult::SameCheck;
+				result.check = check;
 				return result;
 			}
 		}
@@ -1250,7 +1251,8 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 		if (checked) {
 			std::scoped_lock lock {m_lock};
 			m_slot_images[id].color_clear_check = check;
-			result.path = ColorClearResult::Checked;
+			result.path  = ColorClearResult::Checked;
+			result.check = check;
 			return result;
 		}
 		{
@@ -1502,7 +1504,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
 	}
-	MaterializeColorClear(result, desc, metadata_base_layer);
+	const auto clear = MaterializeColorClear(result, desc, metadata_base_layer);
+	if (memo != nullptr) {
+		memo->clear = clear;
+	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
@@ -1518,8 +1523,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 	return result;
 }
 
-bool TextureCache::ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch) {
+bool TextureCache::ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch, uint32_t& keep) {
 	std::scoped_lock lock {m_lock};
+	keep = 0;
 	if (epoch != m_image_index_epoch) {
 		return false;
 	}
@@ -1529,12 +1535,80 @@ bool TextureCache::ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epo
 			return false;
 		}
 	}
-	for (const auto& find: finds) {
-		auto& image              = m_slot_images[find.id];
+	for (uint32_t i = 0; i < finds.size(); i++) {
+		auto& image              = m_slot_images[finds[i].id];
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
+		if (KeepColorClear(finds[i])) {
+			keep |= 1u << i;
+		}
 	}
 	return true;
+}
+
+bool TextureCache::KeepColorClear(const KeptFind& find) {
+	if (find.clear == nullptr) {
+		return false;
+	}
+	const auto& kept = *find.clear;
+	switch (kept.path) {
+		case ColorClearResult::NoMeta: return true; // the description has no color metadata
+		case ColorClearResult::NoRange:
+		case ColorClearResult::NoMip:
+		case ColorClearResult::SameCheck:
+		case ColorClearResult::Checked: break;
+		default: return false; // a clear, or CPU-read metadata: run again
+	}
+	// The same description sets the same metadata, and no surface metadata entry came back.
+	const auto& metadata = find.desc->info.metadata;
+	const auto& image    = m_slot_images[find.id];
+	if (!SameMetadata(image.info.metadata, metadata) || m_surface_metas.contains(metadata.range.address)) {
+		return false;
+	}
+	if (kept.path == ColorClearResult::NoRange || kept.path == ColorClearResult::NoMip) {
+		return true; // decided by the description alone
+	}
+	// The check this description computes is the kept one while the epoch holds; it must still be
+	// the stored one (another view of the image may have replaced it).
+	return kept.check.epoch == m_buffer_cache.ColorMetadataEpoch() && image.color_clear_check == kept.check;
+}
+
+bool TextureCache::KeptCheckGpuModified(const ColorClearResult& kept) {
+	if (kept.path != ColorClearResult::SameCheck && kept.path != ColorClearResult::Checked) {
+		return true;
+	}
+	const auto& check = kept.check;
+	return m_buffer_cache.IsRegionGpuModified(check.address, check.stride * (check.count - 1) + check.size);
+}
+
+TextureCache::ColorClearResult TextureCache::ReplayColorClear(const KeptFind& find, bool keep) {
+	if (keep && KeptCheckGpuModified(*find.clear)) {
+		ColorClearResult result {.path = find.clear->path, .kept = true, .check = find.clear->check};
+		if (result.path == ColorClearResult::Checked) {
+			result.path = ColorClearResult::SameCheck; // the check is stored now
+		}
+		return result;
+	}
+	return MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
+}
+
+uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {
+	uint32_t keep = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		for (uint32_t i = 0; i < finds.size(); i++) {
+			const auto* image = m_slot_images.try_get(finds[i].id);
+			if (image != nullptr && KeepColorClear(finds[i])) {
+				keep |= 1u << i;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < finds.size(); i++) {
+		if ((keep & (1u << i)) != 0 && !KeptCheckGpuModified(*finds[i].clear)) {
+			keep &= ~(1u << i);
+		}
+	}
+	return keep;
 }
 
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for

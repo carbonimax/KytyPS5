@@ -144,6 +144,8 @@ enum class Counter : uint32_t {
 	TgtClearErased,      // a surface metadata entry was removed
 	TgtClearCleared,     // a slice cleared from CPU-read metadata
 	TgtClearActed,       // any effect (the above, a check stored, a GPU clear)
+	TgtClearKept,        // not run again: it would do nothing (KYTY_TARGET_REUSE=1)
+	TgtVerifiedKeeps,    // =2: kept clears checked against the resolution
 	// KYTY_ASYNC_PIPELINE=1: draws skipped while their pipeline is created, guest frames with a
 	// skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,

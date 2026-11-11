@@ -284,7 +284,8 @@ void MaybeReport() noexcept {
 		std::printf("PERF tgtreuse %.1fs: reused=%" PRIu64 " targets=%" PRIu64 " cmp=%.1fms epoch=%.1fms lock=%.1fms"
 		            " clear=%.1fms bind=%.1fms copy=%.1fms empty=%.1fms merge=%.1fms paths=%" PRIu64 "/%" PRIu64
 		            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " meta_changed=%" PRIu64
-		            " erased=%" PRIu64 " cleared=%" PRIu64 " acted=%" PRIu64 "\n",
+		            " erased=%" PRIu64 " cleared=%" PRIu64 " acted=%" PRIu64 " kept=%" PRIu64
+		            " verified_keeps=%" PRIu64 "\n",
 		            seconds, n(Counter::TgtReused), n(Counter::TgtReuseTargets), ms(Counter::TgtReuseCmpNs),
 		            ms(Counter::TgtReuseEpochNs), ms(Counter::TgtReuseLockNs), ms(Counter::TgtReuseClearNs),
 		            ms(Counter::TgtReuseBindNs), ms(Counter::TgtReuseCopyNs), ms(Counter::TgtReuseEmptyNs),
@@ -292,7 +293,7 @@ void MaybeReport() noexcept {
 		            n(Counter::TgtClearNoMip), n(Counter::TgtClearSameCheck), n(Counter::TgtClearChecked),
 		            n(Counter::TgtClearGpu), n(Counter::TgtClearReadMemory), n(Counter::TgtClearPlain),
 		            n(Counter::TgtClearMetaChanged), n(Counter::TgtClearErased), n(Counter::TgtClearCleared),
-		            n(Counter::TgtClearActed));
+		            n(Counter::TgtClearActed), n(Counter::TgtClearKept), n(Counter::TgtVerifiedKeeps));
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
 		            " descriptors=%" PRIu64 "\n",
