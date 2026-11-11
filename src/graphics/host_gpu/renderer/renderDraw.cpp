@@ -1133,7 +1133,7 @@ static void CaptureTargetInputs(TargetInputs& in, const HW::Context& hw, uint32_
 	in.stencil_clear = hw.GetStencilClearValue();
 }
 
-// KYTY_TARGET_REUSE (default 0): on the CP back thread, a record whose target registers equal the
+// KYTY_TARGET_REUSE (default 1; 0 turns it off): on the CP back thread, a record whose target registers equal the
 // previous record's takes that record's resolution while its searches stay valid (FindImageMemo:
 // kept, image epoch unchanged); FindImage's other effects and BindRenderTarget are replayed, except
 // a color metadata clear that would do nothing again (TextureCache::KeepColorClear).
@@ -1142,7 +1142,7 @@ static void CaptureTargetInputs(TargetInputs& in, const HW::Context& hw, uint32_
 static int TargetReuseMode() noexcept {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_TARGET_REUSE");
-		return value != nullptr ? std::atoi(value) : 0;
+		return value != nullptr ? std::atoi(value) : 1;
 	}();
 	return mode;
 }
