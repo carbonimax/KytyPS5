@@ -145,9 +145,9 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	}
 	// Let the producer refill, then model the game's immediate late-frame retries.
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
-	for (unsigned i = 0; i < 5; ++i) {
+	for (unsigned i = 0; i < 3; ++i) {
 		const auto previous = info.time_stamp;
-		Check(source.Video(&info), "six output buffers keep five video frames ready");
+		Check(source.Video(&info), "six output buffers keep three video frames ready beside two held ones");
 		Check(info.time_stamp > previous, "video retries return successive frames");
 	}
 	Check(source.Pause() == 0, "pause video");
@@ -160,8 +160,81 @@ void CheckVideoReadAhead(const std::filesystem::path& root) {
 	Check(!memory.released_protected &&
 	          std::memcmp(current.data(), memory.protected_buffer, current.size()) == 0,
 	      "restart preserves output until the next successful video get");
+	Check(memory.allocations - memory.deallocations == 6, "restart keeps held buffers without allocating more");
 	Check(source.Stop() == 0 && memory.allocations == memory.deallocations,
 	      "stop releases all video buffers");
+}
+
+void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+	_putenv_s(name, value);
+#else
+	setenv(name, value, 1);
+#endif
+}
+
+// Marks a delivered frame the way a game's late copy would see it, then counts the Video() calls after which the
+// decoder (blocked on a free buffer, given 50 ms each time) has not rewritten it yet.
+unsigned DeliveriesBeforeRewrite(const char* hold, int buffers) {
+	SetEnv("KYTY_AVPLAYER_HOLD", hold);
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, buffers, false, 0);
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "open held-buffer fixture");
+	source.SetSync(1);
+	Check(source.Start() == 0, "start held-buffer fixture");
+	AvPlayerFrameInfoEx info {};
+	auto next = [&] {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		while (!source.Video(&info)) {
+			Check(std::chrono::steady_clock::now() < deadline, "decode held-buffer fixture");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	};
+	next();
+	auto* marked = static_cast<uint8_t*>(info.data);
+	std::memset(marked, 0xa5, 256);
+	unsigned survived = 0;
+	for (; survived < 4; ++survived) {
+		next();
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		if (std::any_of(marked, marked + 256, [](uint8_t b) { return b != 0xa5; })) {
+			break;
+		}
+	}
+	Check(memory.allocations == static_cast<unsigned>(buffers), "holding buffers allocates nothing more");
+	Check(source.Stop() == 0 && memory.allocations == memory.deallocations, "stop releases held buffers");
+	SetEnv("KYTY_AVPLAYER_HOLD", "");
+	return survived;
+}
+
+void CheckHeldBuffers() {
+	Check(DeliveriesBeforeRewrite("0", 6) == 0, "hold 0 gives a replaced buffer straight back to the decoder");
+	Check(DeliveriesBeforeRewrite("1", 6) == 1, "hold 1 keeps a buffer through one more delivery");
+	Check(DeliveriesBeforeRewrite("", 6) == 2, "the default keeps a buffer through two more deliveries");
+	Check(DeliveriesBeforeRewrite("", 3) == 1, "three buffers shrink the hold to one");
+	Check(DeliveriesBeforeRewrite("", 2) == 0, "two buffers leave nothing to hold");
+}
+
+// Polls a clock-synced source 300 ms after its start, with six frames of the 30 Hz fixture ready and all due.
+uint64_t FirstFrameAfterLatePoll(const char* skip) {
+	SetEnv("KYTY_AVPLAYER_SKIP_LATE", skip);
+	VideoMemory memory;
+	const AvPlayerMemAllocator allocator {&memory, Allocate, Deallocate, Allocate, Deallocate};
+	Source source(allocator, {}, {}, 6, false, 0);
+	Check(source.Init("/app0/movie.m4v", AvPlayerSourceFileMp4) == 0, "open late-poll fixture");
+	Check(source.Start() == 0, "start late-poll fixture");
+	std::this_thread::sleep_for(std::chrono::milliseconds(300));
+	AvPlayerFrameInfoEx info {};
+	Check(source.Video(&info), "a late poll gets a frame");
+	Check(source.Stop() == 0 && memory.allocations == memory.deallocations, "stop releases skipped buffers");
+	SetEnv("KYTY_AVPLAYER_SKIP_LATE", "");
+	return info.time_stamp;
+}
+
+void CheckSkipLateVideo() {
+	Check(FirstFrameAfterLatePoll("") == 0, "by default a late poll gets the oldest ready frame");
+	Check(FirstFrameAfterLatePoll("1") >= 100, "KYTY_AVPLAYER_SKIP_LATE=1 gets the newest due frame");
 }
 
 void CheckFileUriSource() {
@@ -285,6 +358,8 @@ int main() {
 	}
 	content_root = root;
 	CheckVideoReadAhead(root);
+	CheckHeldBuffers();
+	CheckSkipLateVideo();
 	CheckFileUriSource();
 	CheckStopAtEndOfStream();
 	std::error_code error;
