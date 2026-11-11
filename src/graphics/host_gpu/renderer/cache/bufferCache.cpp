@@ -275,6 +275,7 @@ struct ImportStats {
 	std::atomic<uint64_t> cp_writes {0};    // command-processor CPU writes into imported memory
 	std::atomic<uint64_t> cp_waits {0};     // ... that waited for earlier GPU work
 	std::atomic<uint64_t> cp_wait_ns {0};
+	std::atomic<uint64_t> write_demotes {0}; // imported buffers sent back to device memory by a GPU write
 };
 
 ImportStats g_import_stats;
@@ -454,6 +455,7 @@ void BufferCache::ReportImport(double seconds) {
 	const auto cp_writes    = take(st.cp_writes);
 	const auto cp_waits     = take(st.cp_waits);
 	const auto cp_wait_ns   = take(st.cp_wait_ns);
+	const auto demotes      = take(st.write_demotes);
 	if (imported + device + failed + read_syncs + write_syncs + published + waited == 0) {
 		return;
 	}
@@ -461,7 +463,7 @@ void BufferCache::ReportImport(double seconds) {
 	            " chunks=%" PRIu64 " own=%" PRIu64 " import=%.1fms | syncs read=%.0f/s write=%.0f/s"
 	            " stream_skips=%.0f/s | publish now=%.0f/s waited=%.0f/s(%.2fms/s) replayed=%.0f/s"
 	            " | join_copies=%" PRIu64 " dropped=%" PRIu64 " image_syncs=%.0f/s owned_labels=%.0f/s"
-	            " | cp_writes=%.0f/s cp_waits=%.0f/s(%.2fms/s)\n",
+	            " | cp_writes=%.0f/s cp_waits=%.0f/s(%.2fms/s) write_demotes=%" PRIu64 "\n",
 	            seconds, imported, device, failed, chunks, own, static_cast<double>(import_ns) / 1e6,
 	            static_cast<double>(read_syncs) / seconds, static_cast<double>(write_syncs) / seconds,
 	            static_cast<double>(stream_skips) / seconds, static_cast<double>(published) / seconds,
@@ -469,7 +471,7 @@ void BufferCache::ReportImport(double seconds) {
 	            static_cast<double>(replayed) / seconds, join_copies, dropped,
 	            static_cast<double>(image_syncs) / seconds, static_cast<double>(owned_labels) / seconds,
 	            static_cast<double>(cp_writes) / seconds, static_cast<double>(cp_waits) / seconds,
-	            static_cast<double>(cp_wait_ns) / 1e6 / seconds);
+	            static_cast<double>(cp_wait_ns) / 1e6 / seconds, demotes);
 }
 
 void BufferCache::BeforeCpuWrite(uint64_t vaddr, uint64_t size) {
@@ -1638,9 +1640,7 @@ void BufferCache::SealLateReads() {
 			LOGF("BufferCache: KYTY_MEM_IMPORT guest rewrote 0x%016" PRIx64 "+0x%" PRIx64
 			     " under the GPU: back to device memory\n",
 			     key.vaddr, key.size);
-			m_import_demoted.emplace_back(key.vaddr, key.vaddr + key.size);
-			DropImported(key.vaddr, key.size);
-			m_memory_tracker.MarkRegionAsCpuModified(key.vaddr, key.size);
+			DemoteImported(key.vaddr, key.size);
 			std::lock_guard lock(st.mutex);
 			st.demoted++;
 		}
@@ -2069,6 +2069,23 @@ static bool ImportExcluded(uint64_t vaddr, uint64_t size) {
 	                   [&](const auto& r) { return vaddr < r.second && r.first < vaddr + size; });
 }
 
+void BufferCache::DemoteImported(uint64_t vaddr, uint64_t size) {
+	m_import_demoted.emplace_back(vaddr, vaddr + size);
+	DropImported(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+}
+
+// KYTY_MEM_IMPORT_GPU_WRITES=1 keeps GPU-written buffers on imported memory (device lost in game A:
+// a compute shader then never completes); by default they go back to device memory at their first
+// write binding, and only buffers the GPU reads use guest memory.
+static bool ImportGpuWrites() {
+	static const bool keep = [] {
+		const char* value = std::getenv("KYTY_MEM_IMPORT_GPU_WRITES");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return keep;
+}
+
 bool BufferCache::ImportExcludedRange(uint64_t vaddr, uint64_t size) const {
 	return ImportExcluded(vaddr, size) ||
 	       std::any_of(m_import_demoted.begin(), m_import_demoted.end(),
@@ -2471,6 +2488,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	if (is_written && m_slot_buffers[id].IsImported() && !ImportGpuWrites()) {
+		const auto& imported = m_slot_buffers[id];
+		g_import_stats.write_demotes.fetch_add(1, std::memory_order_relaxed);
+		if (ImportLogEnabled()) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT gpu write 0x%016" PRIx64 "+0x%" PRIx64
+			     ": buffer 0x%016" PRIx64 "+0x%" PRIx64 " back to device memory\n",
+			     vaddr, size, imported.CpuAddress(), imported.Size());
+		}
+		DemoteImported(imported.CpuAddress(), imported.Size());
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
