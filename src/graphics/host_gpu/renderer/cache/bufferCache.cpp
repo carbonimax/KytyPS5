@@ -1248,6 +1248,12 @@ int SamplePeriod() {
 	return period;
 }
 
+// The detector runs only as the import safety net (KYTY_LATE_READ_PROF unset).
+bool NetOnly() {
+	static const bool net = std::getenv("KYTY_LATE_READ_PROF") == nullptr;
+	return net;
+}
+
 uint64_t WfaultDelayNs() {
 	static const uint64_t ns = [] {
 		const char* value = std::getenv("KYTY_WFAULT_DELAY_US");
@@ -1608,7 +1614,7 @@ void Report(double seconds, uint64_t frames) {
 } // namespace LateRead
 
 void BufferCache::SealLateReads() {
-	if (!LateRead::Enabled()) {
+	if (!LateRead::Enabled() || (LateRead::NetOnly() && !m_import)) {
 		return;
 	}
 	auto&                        st = LateRead::S();
@@ -2457,7 +2463,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
 			m_stream_buffer.Commit();
-			if (LateRead::Enabled() && !m_import) [[unlikely]] {
+			if (LateRead::Enabled() && !m_import && !LateRead::NetOnly()) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}
 			return {&m_stream_buffer, offset};
@@ -2471,7 +2477,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	// Imported GPU-written bytes change under the GPU by design: not checked.
 	if (!is_written && LateRead::Enabled() &&
-	    (!m_import || (buffer.IsImported() && !m_memory_tracker.IsRegionGpuModified(vaddr, size)))) [[unlikely]] {
+	    (m_import ? buffer.IsImported() && !m_memory_tracker.IsRegionGpuModified(vaddr, size)
+	              : !LateRead::NetOnly())) [[unlikely]] {
 		// With KYTY_MEM_IMPORT only imported ranges are checked (copies are snapshots).
 		LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed,
 		               buffer.IsImported() ? buffer.CpuAddress() : 0, buffer.IsImported() ? buffer.Size() : 0);
