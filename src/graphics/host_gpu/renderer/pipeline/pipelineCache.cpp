@@ -156,6 +156,26 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// KYTY_SHADER_DUMP_HASH=hash[,hash...] (hex, diagnostic): these programs log their decoded RDNA2 code
+// and IR as if the shader log were on.
+bool ShaderDumpRequested(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> out;
+		const char*           value = std::getenv("KYTY_SHADER_DUMP_HASH");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next = nullptr;
+			const auto h    = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.push_back(h);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
+	}();
+	return !hashes.empty() && std::find(hashes.begin(), hashes.end(), hash) != hashes.end();
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -637,7 +657,8 @@ struct PipelineCache::ProgramCache {
 			options.shader_hash = params.hash;
 			options.user_data   = user_data;
 			options.back_code      = params.back_code;
-			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+			                      ShaderDumpRequested(params.hash);
 			options.early_dump  = options.dump_ir;
 			options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 			options.dump_label  = label;

@@ -212,6 +212,25 @@ void Dump(const char* site) noexcept {
 		}
 		const char* tag = seq <= finished ? "done " : seq == finished + 1 ? "HUNG " : seq <= begun ? "begun" : "queued";
 		Print(f, e, tag);
+		if (seq != finished + 1) {
+			continue;
+		}
+		// The hung command's guest bytes now (first 1 KiB of each binding).
+		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
+			const auto&                bind = e.bindings[i];
+			std::array<uint8_t, 1024> bytes {};
+			const auto                size = std::min<uint64_t>(bind.size, bytes.size());
+			if (!LibKernel::Memory::TryReadBacking(bind.vaddr, bytes.data(), size)) {
+				continue;
+			}
+			std::fprintf(f, "  raw 0x%016" PRIx64 " (%" PRIu64 " of 0x%" PRIx64 " bytes):", bind.vaddr, size, bind.size);
+			for (uint64_t k = 0; k < size; k += 4) {
+				uint32_t word = 0;
+				std::memcpy(&word, bytes.data() + k, std::min<uint64_t>(4, size - k));
+				std::fprintf(f, "%s%08x", k % 64 == 0 ? "\n    " : " ", word);
+			}
+			std::fprintf(f, "\n");
+		}
 	}
 	std::fflush(f);
 	std::fclose(f);
