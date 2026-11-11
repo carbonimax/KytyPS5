@@ -975,17 +975,22 @@ static void MergeAliasedColorTargets(DrawRenderState& state) {
 	std::array<uint32_t, 8> slots {};
 	for (uint32_t index = 0; index < 8u; index++) slots[index] = ShaderPixelExportTarget(pixel.target_shader_mask, index);
 	uint32_t kept = 0;
+	// Kept colors move down to `kept` (< i once one merged): color_info[i] is read before it moves.
+	const auto keep = [&](uint32_t i) {
+		if (kept != i) state.color_info[kept] = state.color_info[i];
+		kept++;
+	};
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		const auto color       = state.color_info[i];
-		const auto slot        = color.target_slot;
+		const auto& color = state.color_info[i];
+		const auto  slot  = color.target_slot;
 		const auto index = static_cast<uint32_t>(std::find(slots.begin(), slots.end(), slot) - slots.begin());
 		if (index >= 8u || pixel.target_merge_mask[index] == 0) {
-			state.color_info[kept++] = color;
+			keep(i);
 			continue;
 		}
 		const auto destination = slots[pixel.target_merge_slot[index]];
 		if (destination == slot) {
-			state.color_info[kept++] = color;
+			keep(i);
 			continue;
 		}
 		RenderColorInfo* primary = nullptr;
@@ -1157,6 +1162,8 @@ struct PreviousTargets {
 	std::array<uint64_t, RENDER_COLOR_ATTACHMENTS_MAX + 1> hash {}; // prediction keys, depth last
 	// The last color metadata clear result of each color, depth last (KYTY_TARGET_REUSE keeps it).
 	std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1> clears {};
+	// The slot loop wrote colors[color_count] (a slot without image); otherwise it is as constructed.
+	bool tail = false;
 };
 
 // Two buffers, swapped when a record resolves: the kept targets are not copied per record.
@@ -1201,7 +1208,13 @@ static bool SameDepth(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 	       a.stencil_back == b.stencil_back;
 }
 
-using KeptFinds = std::array<TextureCache::KeptFind, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+using KeptFinds  = std::array<TextureCache::KeptFind, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+using KeptClears = std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+using FindMemos  = std::array<TextureCache::FindImageMemo, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+// Scratch of the back's target resolution, written before read (no per-record construction).
+static thread_local KeptFinds  t_kept_finds;
+static thread_local KeptClears t_kept_clears;
+static thread_local FindMemos  t_find_memos;
 
 // The searches of a kept resolution, colors then depth (the order the slot loop binds them).
 static uint32_t GetKeptFinds(const PreviousTargets& kept, KeptFinds& finds) {
@@ -1317,6 +1330,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			next.epoch = 0;
 			next.meta  = 0;
 			next.hash  = {};
+			next.tail  = false;
 		}
 		if (track && prof) { // the prediction keys (registers hashed), outside the resolve bucket
 			PerfStats::ScopedTimer hash_timer(PerfStats::Counter::TgtHashNs, true);
@@ -1342,14 +1356,14 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 		bool reused = false;
 		if (reusable && reuse_mode == 1) {
-			KeptFinds      finds {};
+			auto&          finds = t_kept_finds;
 			const uint32_t count = GetKeptFinds(previous, finds);
 			uint32_t       keep  = 0;
 			reused = cache.ReplayKeptFinds(std::span {finds.data(), count}, previous.epoch, keep);
 			if (split) mark[3] = Clock::now();
 			if (reused) {
 				// A clear that would do nothing again (same metadata, check still stored and valid) is kept.
-				std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1> clears {};
+				auto& clears = t_kept_clears;
 				for (uint32_t i = 0; i < count; i++) {
 					clears[i] = cache.ReplayColorClear(finds[i], (keep >> i & 1u) != 0);
 				}
@@ -1361,7 +1375,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				// an inline draw cleared the map meanwhile (one misprediction). Upgrade if mispredictions rise.
 				for (uint32_t i = 0; i < count; i++) BindRenderTarget(finds[i].id);
 				if (split) mark[5] = Clock::now();
-				std::copy_n(previous.colors.begin(), KeptColorEntries(previous.color_count), state.color_info);
+				// The draw state starts as constructed (DrawRecord reset): only written entries are copied.
+				std::copy_n(previous.colors.begin(),
+				            previous.tail ? KeptColorEntries(previous.color_count) : previous.color_count,
+				            state.color_info);
 				state.color_count = previous.color_count;
 				state.depth_info  = previous.depth;
 				if (split) {
@@ -1395,7 +1412,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			if (prof) PerfStats::Add(reused ? PerfStats::Counter::TgtReused : PerfStats::Counter::TgtReplayRefused, 1);
 		}
 		// =2: what the replay would keep and bind, checked against the resolution below.
-		KeptFinds  verify_finds {};
+		auto&      verify_finds = t_kept_finds;
 		uint32_t   verify_count = 0;
 		uint32_t   verify_keep  = 0;
 		const auto bound_before = m_bound_images.size();
@@ -1403,13 +1420,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			verify_count = GetKeptFinds(previous, verify_finds);
 			verify_keep  = cache.KeptColorClears(std::span {verify_finds.data(), verify_count});
 		}
-		std::array<TextureCache::FindImageMemo, RENDER_COLOR_ATTACHMENTS_MAX + 1> memos {};
+		auto& memos = t_find_memos;
+		if (track && !reused) memos.fill({});
 		PerfStats::t_target_prof = prof;
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && !reused; slot++) {
 			if ((state.mrt_mask & (1u << slot)) != 0) {
 				auto& color = state.color_info[state.color_count];
 				ResolveRenderColorTarget(buffer, color, slot, false, false, track ? &memos[slot] : nullptr);
 				if (track) NoteTargetFind(next, color.desc, color.image_id, memos[slot], prof);
+				if (track && !color.image_id) next.tail = true;
 				if (remember) {
 					PerfStats::ScopedTimer remember_timer(PerfStats::Counter::TgtRememberNs, prof);
 					RememberTarget(g_color_targets, ColorTargetKey(hw, slot), color);

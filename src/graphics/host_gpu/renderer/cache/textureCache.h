@@ -54,7 +54,7 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	// What MaterializeColorClear did: the return it took, its effects and (SameCheck, Checked) the
-	// check it found stored.
+	// check it found stored or (Plain) the runs it read, with `codes` (slices 0-3) when `quiet`.
 	struct ColorClearResult {
 		enum Path : uint8_t { NoMeta, NoRange, NoMip, SameCheck, Checked, GpuClear, ReadMemory, Plain };
 		Path                   path         = NoMeta;
@@ -62,6 +62,8 @@ public:
 		bool                   erased       = false; // a surface metadata entry was removed
 		bool                   cleared      = false; // a slice cleared from CPU-read metadata
 		bool                   kept         = false; // ReplayColorClear: not run again (nothing to do)
+		bool                   quiet        = false; // Plain: at most 4 slices, none read a clear code
+		uint32_t               codes        = 0;     // Plain: the code byte read per slice
 		Image::ColorClearCheck check;
 		[[nodiscard]] bool     Acted() const {
 			return meta_changed || erased || cleared || path == Checked || path == GpuClear;
@@ -226,9 +228,10 @@ private:
 	ColorClearResult            MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	// KYTY_TARGET_REUSE: MaterializeColorClear would do nothing again for `find` (caller holds m_lock;
-	// a kept check also needs its runs still GPU-modified, KeptCheckGpuModified, without m_lock).
+	// then KeptClearHolds, without m_lock: a kept check needs its runs still GPU-modified, a quiet
+	// Plain read its runs not GPU-modified and the same code bytes, touched as the read would).
 	[[nodiscard]] bool          KeepColorClear(const KeptFind& find);
-	[[nodiscard]] bool          KeptCheckGpuModified(const ColorClearResult& kept);
+	[[nodiscard]] bool          KeptClearHolds(const ColorClearResult& kept);
 	void                        InitializeImage(ImageId id);
 	// `dcc_as_plain` (GPU capture): a compressed video-out image is written as if every DCC block
 	// were uncompressed, the layout the cache itself uploads for DCC targets.
