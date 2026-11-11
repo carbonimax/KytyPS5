@@ -279,6 +279,18 @@ struct ImportStats {
 
 ImportStats g_import_stats;
 
+// KYTY_MEM_IMPORT_LOG=1 (diagnostic): log every imported buffer and the GPU-written ranges of each.
+static bool ImportLogEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MEM_IMPORT_LOG");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// First GPU write of each 16 KiB page of imported memory (KYTY_MEM_IMPORT_LOG, GPU thread).
+std::unordered_set<uint64_t> g_import_logged_writes;
+
 uint64_t ImportNowNs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -2085,6 +2097,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 			     static_cast<int>(LibKernel::Memory::BackingHostAddress(vaddr, size) != 0),
 			     static_cast<int>(overlap.has_stream_leap), static_cast<int>(overlap.first != overlap.last));
 		}
+		if (imported && ImportLogEnabled()) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT imported guest=0x%016" PRIx64 " size=0x%" PRIx64 " leap=%d\n",
+			     overlap.begin, bytes, static_cast<int>(overlap.has_stream_leap));
+		}
 	}
 	const auto id =
 	    imported ? m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin, flags, bytes, *imported)
@@ -2160,6 +2176,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			}
 		}
 		if (is_written) {
+			if (ImportLogEnabled() && g_import_logged_writes.insert(vaddr >> 14u).second) {
+				LOGF("BufferCache: KYTY_MEM_IMPORT gpu write guest=0x%016" PRIx64 "+0x%" PRIx64
+				     " buffer=0x%016" PRIx64 "+0x%" PRIx64 " texel=%d\n",
+				     vaddr, size, buffer.CpuAddress(), buffer.Size(), static_cast<int>(is_texel_buffer));
+			}
 			m_memory_tracker.ForEachUploadRange(
 			    vaddr, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
 			g_import_stats.write_syncs.fetch_add(1, std::memory_order_relaxed);
