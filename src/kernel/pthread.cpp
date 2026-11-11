@@ -203,8 +203,10 @@ static uint64_t KernelGetElapsedTsc() {
 }
 
 static uint64_t KernelGetProcessTimeUsNative() {
-	return static_cast<uint64_t>((static_cast<long double>(KernelGetElapsedTsc()) * 1000000.0L) /
-	                             static_cast<long double>(KernelGetTscFrequencyNative()));
+	// Exact integer split, no long double: x87 math is slow under Rosetta.
+	const uint64_t elapsed   = KernelGetElapsedTsc();
+	const uint64_t frequency = KernelGetTscFrequencyNative();
+	return elapsed / frequency * 1000000 + elapsed % frequency * 1000000 / frequency;
 }
 
 static void KernelUsToTimespec(uint64_t us, KernelTimespec* tp) {
