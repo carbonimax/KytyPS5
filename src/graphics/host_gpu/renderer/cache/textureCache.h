@@ -53,11 +53,26 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
+	// What MaterializeColorClear did: the return it took, its effects and (SameCheck, Checked) the
+	// check it found stored.
+	struct ColorClearResult {
+		enum Path : uint8_t { NoMeta, NoRange, NoMip, SameCheck, Checked, GpuClear, ReadMemory, Plain };
+		Path                   path         = NoMeta;
+		bool                   meta_changed = false; // image.info.metadata differed from the description's
+		bool                   erased       = false; // a surface metadata entry was removed
+		bool                   cleared      = false; // a slice cleared from CPU-read metadata
+		bool                   kept         = false; // ReplayColorClear: not run again (nothing to do)
+		Image::ColorClearCheck check;
+		[[nodiscard]] bool     Acted() const {
+			return meta_changed || erased || cleared || path == Checked || path == GpuClear;
+		}
+	};
 	// What FindImage resolved a description to, kept by the caller next to a description it
-	// reuses as is (KYTY_FIND_IMAGE_MEMO).
+	// reuses as is (KYTY_FIND_IMAGE_MEMO). FindImage also leaves its color metadata clear result.
 	struct FindImageMemo {
-		ImageId  id {};
-		uint64_t epoch = 0;
+		ImageId          id {};
+		uint64_t         epoch = 0;
+		ColorClearResult clear;
 	};
 	// KYTY_FIND_IMAGE_MEMO: 1 (default) reuse a FindImageMemo, 0 off, 2 search anyway and exit if
 	// the search does not give the kept image.
@@ -67,31 +82,22 @@ public:
 		std::scoped_lock lock {m_lock};
 		return m_image_index_epoch;
 	}
-	// KYTY_TARGET_REUSE: an image a kept search gave, its description as FindImage left it and the
-	// view base layer before FindImage offset it.
+	// KYTY_TARGET_REUSE: an image a kept search gave, its description as FindImage left it, the
+	// view base layer before FindImage offset it and the last color metadata clear result for them.
 	struct KeptFind {
-		ImageId          id;
-		const ImageDesc* desc                = nullptr;
-		uint32_t         metadata_base_layer = 0;
-	};
-	// What MaterializeColorClear did: the return it took and its effects.
-	struct ColorClearResult {
-		enum Path : uint8_t { NoMeta, NoRange, NoMip, SameCheck, Checked, GpuClear, ReadMemory, Plain };
-		Path path         = NoMeta;
-		bool meta_changed = false; // image.info.metadata differed from the description's
-		bool erased       = false; // a surface metadata entry was removed
-		bool cleared      = false; // a slice cleared from CPU-read metadata
-		[[nodiscard]] bool Acted() const {
-			return meta_changed || erased || cleared || path == Checked || path == GpuClear;
-		}
+		ImageId                 id;
+		const ImageDesc*        desc                = nullptr;
+		uint32_t                metadata_base_layer = 0;
+		const ColorClearResult* clear               = nullptr;
 	};
 	// What FindImage does besides its search, for searches kept at `epoch`: access tick and LRU
-	// touch here; then ReplayColorClear per find. False, with nothing done, when the epoch moved or
-	// an image is gone.
-	[[nodiscard]] bool ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch);
-	ColorClearResult   ReplayColorClear(const KeptFind& find) {
-		return MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
-	}
+	// touch here, then ReplayColorClear per find. False, with nothing done, when the epoch moved or
+	// an image is gone. `keep` (bit per find): the clear would do nothing again (KeepColorClear).
+	[[nodiscard]] bool ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch, uint32_t& keep);
+	// MaterializeColorClear for a kept find, unless `keep` and its kept check still holds.
+	ColorClearResult ReplayColorClear(const KeptFind& find, bool keep);
+	// KYTY_TARGET_REUSE=2: the finds whose clear ReplayColorClear would keep (nothing done).
+	[[nodiscard]] uint32_t KeptColorClears(std::span<const KeptFind> finds);
 
 	// memo: kept for a description identical to desc (or empty); FindImage fills it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
@@ -219,6 +225,10 @@ private:
 	[[nodiscard]] bool          DeferRefresh(Image& image, const ImageViewInfo& view);
 	ColorClearResult            MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// KYTY_TARGET_REUSE: MaterializeColorClear would do nothing again for `find` (caller holds m_lock;
+	// a kept check also needs its runs still GPU-modified, KeptCheckGpuModified, without m_lock).
+	[[nodiscard]] bool          KeepColorClear(const KeptFind& find);
+	[[nodiscard]] bool          KeptCheckGpuModified(const ColorClearResult& kept);
 	void                        InitializeImage(ImageId id);
 	// `dcc_as_plain` (GPU capture): a compressed video-out image is written as if every DCC block
 	// were uncompressed, the layout the cache itself uploads for DCC targets.
