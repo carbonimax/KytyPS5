@@ -222,6 +222,8 @@ void FinishStaged(DrawRecord& rec, uint64_t index) noexcept {
 			std::this_thread::yield();
 		}
 		s.back_waits_lookup.store(true, std::memory_order_seq_cst);
+		// A front draining inside a server fault it serves waits for this (ParkedForFault).
+		NotifyFront();
 		while (rec.lookup.load(std::memory_order_seq_cst) == LookupPending) {
 			rec.lookup.wait(LookupPending, std::memory_order_seq_cst);
 		}
