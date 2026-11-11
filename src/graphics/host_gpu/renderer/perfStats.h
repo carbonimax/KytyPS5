@@ -120,6 +120,30 @@ enum class Counter : uint32_t {
 	TgtReplayRefused,  // =1: reusable, but the replay found the epoch moved or an image gone
 	TgtVerified,       // KYTY_TARGET_REUSE=2: reusable records resolved anyway and compared
 	TgtMismatch,       // =2: of verified, resolution differs from the previous record's
+	// KYTY_BIND_PROF + KYTY_TARGET_REUSE=1, reused records ("PERF tgtreuse"): chained timestamps; the
+	// last bucket is empty (the clock's own cost, to subtract once per bucket when reading them).
+	TgtReuseCmpNs,     // SameTargetInputs
+	TgtReuseEpochNs,   // the image epoch read before the replay (m_lock)
+	TgtReuseLockNs,    // the kept finds + ReplayKeptFinds (one locked section)
+	TgtReuseClearNs,   // color metadata clear replay (MaterializeColorClear per target)
+	TgtReuseBindNs,    // BindRenderTarget per target
+	TgtReuseCopyNs,    // infos into the draw state
+	TgtReuseEmptyNs,   // nothing: the clock
+	TgtReuseMergeNs,   // MergeAliasedColorTargets + pass slots
+	TgtReuseTargets,   // replayed targets
+	// Replayed MaterializeColorClear: return taken (TextureCache::ColorClearResult::Path order), effects.
+	TgtClearNoMeta,
+	TgtClearNoRange,
+	TgtClearNoMip,
+	TgtClearSameCheck,
+	TgtClearChecked,
+	TgtClearGpu,
+	TgtClearReadMemory,
+	TgtClearPlain,
+	TgtClearMetaChanged, // image.info.metadata differed from the description's
+	TgtClearErased,      // a surface metadata entry was removed
+	TgtClearCleared,     // a slice cleared from CPU-read metadata
+	TgtClearActed,       // any effect (the above, a check stored, a GPU clear)
 	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
 	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,

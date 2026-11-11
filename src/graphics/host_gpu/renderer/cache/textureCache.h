@@ -74,9 +74,24 @@ public:
 		const ImageDesc* desc                = nullptr;
 		uint32_t         metadata_base_layer = 0;
 	};
-	// What FindImage does besides its search (access tick, LRU touch, color metadata clear), for
-	// searches kept at `epoch`. False, with nothing done, when the epoch moved or an image is gone.
+	// What MaterializeColorClear did: the return it took and its effects.
+	struct ColorClearResult {
+		enum Path : uint8_t { NoMeta, NoRange, NoMip, SameCheck, Checked, GpuClear, ReadMemory, Plain };
+		Path path         = NoMeta;
+		bool meta_changed = false; // image.info.metadata differed from the description's
+		bool erased       = false; // a surface metadata entry was removed
+		bool cleared      = false; // a slice cleared from CPU-read metadata
+		[[nodiscard]] bool Acted() const {
+			return meta_changed || erased || cleared || path == Checked || path == GpuClear;
+		}
+	};
+	// What FindImage does besides its search, for searches kept at `epoch`: access tick and LRU
+	// touch here; then ReplayColorClear per find. False, with nothing done, when the epoch moved or
+	// an image is gone.
 	[[nodiscard]] bool ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch);
+	ColorClearResult   ReplayColorClear(const KeptFind& find) {
+		return MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
+	}
 
 	// memo: kept for a description identical to desc (or empty); FindImage fills it.
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false,
@@ -202,7 +217,7 @@ private:
 	// `view` (texture lookups): KYTY_REFRESH_SKIP_SAME may keep the native image (DeferRefresh).
 	void                        RefreshImage(ImageId id, const ImageViewInfo* view = nullptr);
 	[[nodiscard]] bool          DeferRefresh(Image& image, const ImageViewInfo& view);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
+	ColorClearResult            MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	// `dcc_as_plain` (GPU capture): a compressed video-out image is written as if every DCC block
