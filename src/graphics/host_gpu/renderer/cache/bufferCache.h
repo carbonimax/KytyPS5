@@ -167,6 +167,8 @@ public:
 	// KYTY_MEM_IMPORT (GPU thread, RenderContext::UnmapMemory after the range was published): the
 	// imported buffers touching the range are deleted, their physical pages may be mapped elsewhere.
 	void               DropImported(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT: KYTY_MEM_IMPORT_EXCLUDE ranges and buffers the safety net sent back to copies.
+	[[nodiscard]] bool ImportExcludedRange(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool ImportActive() const noexcept { return m_import != nullptr; }
 	// KYTY_MEM_IMPORT (GPU thread): the command processor is about to write [vaddr, vaddr + size)
 	// with the CPU (WRITE_DATA, DMA fill/copy), ahead of the GPU work recorded before it. On imported
@@ -325,6 +327,7 @@ private:
 	std::vector<PendingPublish>                       m_pending_publishes;
 	std::unique_ptr<ReadbackQueue>                    m_readback_queue;
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_write_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>> m_import_demoted; // GPU thread (SealLateReads)
 	// KYTY_MEM_IMPORT: latest tick that may read each 64 KiB of imported memory (BeforeCpuWrite).
 	MultiLevelPageTable<uint64_t, 16, 44, 16>         m_read_ticks;
 	struct SideCopy {

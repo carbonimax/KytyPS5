@@ -1215,10 +1215,23 @@ uint64_t ReadbackWindowBytes() {
 namespace LateRead {
 namespace {
 
+// KYTY_LATE_READ_PROF=N checks one batch in N. Unset with KYTY_MEM_IMPORT on, the safety net of the
+// imported buffers samples one batch in KYTY_MEM_IMPORT_NET (default 16, 0 = off).
 int SamplePeriod() {
 	static const int period = [] {
+		const auto number = [](const char* value) {
+			return std::max(0, static_cast<int>(std::strtol(value, nullptr, 10)));
+		};
 		const char* value = std::getenv("KYTY_LATE_READ_PROF");
-		return value != nullptr ? std::max(0, static_cast<int>(std::strtol(value, nullptr, 10))) : 0;
+		if (value != nullptr) {
+			return number(value);
+		}
+		const char* import = std::getenv("KYTY_MEM_IMPORT");
+		if (import == nullptr || number(import) == 0) {
+			return 0;
+		}
+		const char* net = std::getenv("KYTY_MEM_IMPORT_NET");
+		return net != nullptr ? number(net) : 16;
 	}();
 	return period;
 }
@@ -1252,7 +1265,8 @@ struct Entry {
 	uint64_t             vaddr = 0, size = 0, hash = 0, seq = 0; // hash 0: unreadable
 	Path                 path = PathFixed;
 	Site                 site = Site::None;
-	std::vector<uint8_t> bytes; // size <= MaxCopy
+	std::vector<uint8_t> bytes;                            // size <= MaxCopy
+	uint64_t             buffer_vaddr = 0, buffer_size = 0; // imported buffer holding it, else 0
 };
 
 struct Key {
@@ -1293,6 +1307,8 @@ struct State {
 	std::array<std::array<Cell, static_cast<size_t>(Site::Count)>, PathCount> cells {};
 	std::unordered_map<Key, Changed, KeyHash> changed;
 	uint64_t batches = 0, checked = 0, bind_ns = 0, check_ns = 0, lost = 0, latency_ns = 0;
+	std::vector<Key> demote; // imported buffers the guest rewrote under the GPU (back to copies)
+	uint64_t         demoted = 0;
 
 	std::mutex            log_mutex;
 	std::deque<Write>     log;
@@ -1329,7 +1345,7 @@ uint64_t Hash(uint64_t vaddr, uint64_t size, bool overlay) {
 }
 
 // GPU thread or CP back thread, inside ObtainBuffer of a read.
-void Bind(uint64_t vaddr, uint64_t size, Path path) {
+void Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
 	if (t_site == Site::None) {
 		return;
 	}
@@ -1341,7 +1357,8 @@ void Bind(uint64_t vaddr, uint64_t size, Path path) {
 		}
 	}
 	// Taken before reading: a logged write racing with the read is attributed to its writer.
-	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}};
+	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}, buffer_vaddr,
+	             buffer_size};
 	const auto start = NowNs();
 	if (size <= MaxCopy) {
 		entry.bytes.resize(size);
@@ -1468,6 +1485,9 @@ void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
 			case Unreadable: cell.unread++; break;
 			default: break;
 		}
+		if (kinds[i] == Guest && entry.buffer_size != 0) {
+			st.demote.push_back({entry.buffer_vaddr, entry.buffer_size});
+		}
 		if (kinds[i] == Guest || kinds[i] == Cp) {
 			auto& changed = st.changed[{entry.vaddr, entry.size}];
 			(kinds[i] == Guest ? changed.guest : changed.cp)++;
@@ -1536,12 +1556,12 @@ void Report(double seconds, uint64_t frames) {
 	std::lock_guard lock(st.mutex);
 	const char*     eop = std::getenv("KYTY_EOP_AT_GPU");
 	std::printf("PERF lateread %.1fs period=%d eop=%s: frames=%" PRIu64 " batches=%" PRIu64 " checked=%" PRIu64
-	            " bind=%.2fms/frame check=%.2fms/frame latency=%.2fms lost=%" PRIu64 "\n",
+	            " bind=%.2fms/frame check=%.2fms/frame latency=%.2fms lost=%" PRIu64 " demoted=%" PRIu64 "\n",
 	            seconds, SamplePeriod(), eop != nullptr ? eop : "0", frames, st.batches, st.checked,
 	            static_cast<double>(st.bind_ns) / 1e6 / f, static_cast<double>(st.check_ns) / 1e6 / f,
 	            st.checked != 0 ? static_cast<double>(st.latency_ns) / 1e6 / static_cast<double>(st.checked)
 	                            : 0.0,
-	            st.lost);
+	            st.lost, st.demoted);
 	for (size_t p = 0; p < PathCount; p++) {
 		for (size_t s = 0; s < SiteNames.size(); s++) {
 			const auto& c = st.cells[p][s];
@@ -1570,7 +1590,7 @@ void Report(double seconds, uint64_t frames) {
 	std::fflush(stdout);
 	st.cells = {};
 	st.changed.clear();
-	st.batches = st.checked = st.bind_ns = st.check_ns = st.lost = st.latency_ns = 0;
+	st.batches = st.checked = st.bind_ns = st.check_ns = st.lost = st.latency_ns = st.demoted = 0;
 }
 
 } // namespace LateRead
@@ -1579,10 +1599,34 @@ void BufferCache::SealLateReads() {
 	if (!LateRead::Enabled()) {
 		return;
 	}
-	// Draws queued on the CP back before this point bind their ranges first (measurement only).
-	CpPipeline::Drain();
 	auto&                        st = LateRead::S();
 	std::vector<LateRead::Entry> batch;
+	std::vector<LateRead::Key>   demote;
+	bool                         sampled = false;
+	{
+		std::lock_guard lock(st.mutex);
+		sampled = st.sampled;
+		demote.swap(st.demote);
+	}
+	// Draws queued on the CP back before this point bind their ranges first; the back is idle for
+	// the demotions too.
+	if (sampled || !demote.empty()) {
+		CpPipeline::Drain();
+	}
+	for (const auto& key: demote) {
+		// Safety net (KYTY_MEM_IMPORT): the guest rewrote bytes of this imported buffer while the
+		// GPU could still read them. Its range goes back to device memory and uploads.
+		if (m_import && !ImportExcludedRange(key.vaddr, key.size)) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT guest rewrote 0x%016" PRIx64 "+0x%" PRIx64
+			     " under the GPU: back to device memory\n",
+			     key.vaddr, key.size);
+			m_import_demoted.emplace_back(key.vaddr, key.vaddr + key.size);
+			DropImported(key.vaddr, key.size);
+			m_memory_tracker.MarkRegionAsCpuModified(key.vaddr, key.size);
+			std::lock_guard lock(st.mutex);
+			st.demoted++;
+		}
+	}
 	{
 		std::lock_guard lock(st.mutex);
 		batch.swap(st.pending);
@@ -2007,6 +2051,12 @@ static bool ImportExcluded(uint64_t vaddr, uint64_t size) {
 	                   [&](const auto& r) { return vaddr < r.second && r.first < vaddr + size; });
 }
 
+bool BufferCache::ImportExcludedRange(uint64_t vaddr, uint64_t size) const {
+	return ImportExcluded(vaddr, size) ||
+	       std::any_of(m_import_demoted.begin(), m_import_demoted.end(),
+	                   [&](const auto& r) { return vaddr < r.second && r.first < vaddr + size; });
+}
+
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
@@ -2019,7 +2069,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	// KYTY_MEM_IMPORT: a range mapped from one run of direct memory gets the guest's own bytes.
 	std::optional<ImportedMemory> imported;
 	if (m_import) {
-		const auto host = ImportExcluded(overlap.begin, bytes)
+		const auto host = ImportExcludedRange(overlap.begin, bytes)
 		                      ? 0
 		                      : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
 		if (host != 0) {
@@ -2386,7 +2436,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 			(void)EopAtGpu::OverlayPending(vaddr, mapped, size);
 			m_stream_buffer.Commit();
-			if (LateRead::Enabled()) [[unlikely]] {
+			if (LateRead::Enabled() && !m_import) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}
 			return {&m_stream_buffer, offset};
@@ -2398,14 +2448,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	if (!is_written && LateRead::Enabled()) [[unlikely]] {
-		LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed);
+	// Imported GPU-written bytes change under the GPU by design: not checked.
+	if (!is_written && LateRead::Enabled() &&
+	    (!m_import || (buffer.IsImported() && !m_memory_tracker.IsRegionGpuModified(vaddr, size)))) [[unlikely]] {
+		// With KYTY_MEM_IMPORT only imported ranges are checked (copies are snapshots).
+		LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed,
+		               buffer.IsImported() ? buffer.CpuAddress() : 0, buffer.IsImported() ? buffer.Size() : 0);
 	}
 	if (is_written) {
 		WaitPendingPublishes(vaddr, size);
 	}
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		if (buffer.IsImported()) {
+			LateRead::NoteBackingWrite(vaddr, size, true); // the GPU writes guest memory itself
+		}
 		{
 			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
@@ -2456,9 +2513,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	(void)m_texture_cache.ClearMeta(vaddr);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		BeforeCpuWrite(vaddr, size);
+		LateRead::NoteBackingWrite(vaddr, size, true);
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
+		LateRead::NoteBackingWrite(vaddr, size, true);
 		return;
 	}
 
@@ -2489,8 +2548,10 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
 		BeforeCpuWrite(dst_vaddr, size);
+		LateRead::NoteBackingWrite(dst_vaddr, size, true);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
 		            size);
+		LateRead::NoteBackingWrite(dst_vaddr, size, true);
 		return;
 	}
 
