@@ -1585,6 +1585,32 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
+// KYTY_MEM_IMPORT_EXCLUDE=begin-end[,begin-end...] (hex guest addresses, diagnostic): buffers
+// touching these ranges stay in device memory.
+static bool ImportExcluded(uint64_t vaddr, uint64_t size) {
+	static const std::vector<std::pair<uint64_t, uint64_t>> ranges = [] {
+		std::vector<std::pair<uint64_t, uint64_t>> out;
+		const char* value = std::getenv("KYTY_MEM_IMPORT_EXCLUDE");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next  = nullptr;
+			const auto begin = std::strtoull(at, &next, 16);
+			if (next == at || *next != '-') {
+				break;
+			}
+			at             = next + 1;
+			const auto end = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.emplace_back(begin, end);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
+	}();
+	return std::any_of(ranges.begin(), ranges.end(),
+	                   [&](const auto& r) { return vaddr < r.second && r.first < vaddr + size; });
+}
+
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
@@ -1597,7 +1623,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	// KYTY_MEM_IMPORT: a range mapped from one run of direct memory gets the guest's own bytes.
 	std::optional<ImportedMemory> imported;
 	if (m_import) {
-		const auto host = LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
+		const auto host = ImportExcluded(overlap.begin, bytes)
+		                      ? 0
+		                      : LibKernel::Memory::BackingHostAddress(overlap.begin, bytes);
 		if (host != 0) {
 			imported = m_import->Acquire(host, bytes, flags);
 		}
@@ -1673,10 +1701,7 @@ void BufferCache::EndUploadBatch() {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	if (m_reprotect_batch && !is_written) {
-		EnsureReprotectBatch();
-	}
-	MemTrackProf::Timer         prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
+	MemTrackProf::Timer prof_timer(MemTrackProf::Counter::SyncNs, MemTrackProf::Counter::SyncCount);
 	if (buffer.IsImported()) {
 		// The GPU reads the guest's bytes at execution: nothing to upload, no re-protection. A
 		// write only takes GPU ownership (CPU readers wait for the writer, see PublishImported).
@@ -1702,6 +1727,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			return filled;
 		}
 		return false;
+	}
+	if (m_reprotect_batch && !is_written) {
+		EnsureReprotectBatch();
 	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
@@ -1860,7 +1888,7 @@ void BufferCache::FlushDeferredUploads() {
 	// One flush at a time: the protections of everything recorded so far, then all their copies.
 	std::lock_guard lock(m_deferred_mutex);
 	PageManager::FlushDeferredProtect();
-	MemTrackProf::Timer timer(MemTrackProf::Counter::UploadCopyNs);
+	MemTrackProf::Timer prof_timer(MemTrackProf::Counter::UploadCopyNs);
 	PerfStats::ScopedTimer timer(PerfStats::Counter::StagingWriteNs);
 	for (const auto& copy: m_deferred_copies) {
 		PerfStats::Add(PerfStats::Counter::StagingWriteBytes, copy.size);

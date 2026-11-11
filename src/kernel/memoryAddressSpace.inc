@@ -243,7 +243,7 @@ public:
 	// KYTY_MEM_IMPORT: backing offset of [vaddr, vaddr + size) when the whole range is mapped from one
 	// contiguous run of the backing (one view, or adjacent views of adjacent backing ranges).
 	bool ContiguousOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
-		if (!IsAvailable() || offset == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
+		if (m_backing_base == nullptr || offset == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 		std::shared_lock lock(m_mutex);
@@ -272,7 +272,7 @@ public:
 				return false;
 			}
 		}
-		if (!RangeOk(base, size)) {
+		if (base >= m_size || size > m_size - base) {
 			return false;
 		}
 		*offset = base;
