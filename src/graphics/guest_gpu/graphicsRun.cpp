@@ -905,6 +905,7 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 	PerfStats::MarkGpuThread();
+	Common::Thread::SetHostQos(Common::Thread::HostQos::UserInteractive);
 
 	for (;;) {
 		Submission                   submission;

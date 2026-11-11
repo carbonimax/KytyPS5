@@ -299,6 +299,15 @@ TEST(Thread, SleepsAtLeastTheRequestedTimeAndIdsAreUniquePerThread) {
 	EXPECT_FALSE(other_main);
 }
 
+TEST(Threads, HostQosIsEnabledOnlyByOne) {
+	EXPECT_TRUE(Common::Thread::HostQosEnabled("1"));
+	EXPECT_FALSE(Common::Thread::HostQosEnabled(nullptr));
+	EXPECT_FALSE(Common::Thread::HostQosEnabled(""));
+	EXPECT_FALSE(Common::Thread::HostQosEnabled("0"));
+	EXPECT_FALSE(Common::Thread::HostQosEnabled("11"));
+	EXPECT_FALSE(Common::Thread::HostQosEnabled("true"));
+}
+
 } // namespace
 
 int main(int argc, char** argv) {

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 
 #include "common/assert.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <algorithm>
@@ -177,6 +178,7 @@ uint64_t Replay(uint64_t from, uint64_t to) {
 }
 
 void RecorderThread() {
+	Common::Thread::SetHostQos(Common::Thread::HostQos::UserInteractive);
 	uint64_t read = 0;
 	for (;;) {
 		uint64_t write = g_write.load(std::memory_order_acquire);

@@ -1054,6 +1054,7 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 		m_pool = std::make_unique<ParallelPool>();
 		for (uint32_t i = 0; i < workers; i++) {
 			m_pool->threads.emplace_back([this] {
+				Common::Thread::SetHostQos(Common::Thread::HostQos::Utility);
 				SetPipelineCreationQuiet(true);
 				auto&             pool = *m_pool;
 				std::unique_lock lock(pool.mutex);

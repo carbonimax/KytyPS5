@@ -786,6 +786,7 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	Common::Thread::SetHostQos(Common::Thread::HostQos::UserInteractive);
 	using Clock = std::chrono::steady_clock;
 
 	std::chrono::nanoseconds total_wait {};

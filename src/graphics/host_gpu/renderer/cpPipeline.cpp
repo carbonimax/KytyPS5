@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
@@ -126,6 +127,7 @@ void BackThread() {
 	// The back part runs GPU-thread code paths (caches, recording, inline fault resolution).
 	GuestGpu::MarkHostGpuThread();
 	PerfStats::MarkGpuThread();
+	Common::Thread::SetHostQos(Common::Thread::HostQos::UserInteractive);
 	auto& s = S();
 	for (;;) {
 		const auto tail = s.tail.load(std::memory_order_relaxed);

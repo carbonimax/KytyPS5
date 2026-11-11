@@ -1,8 +1,12 @@
 #include "common/threads.h"
 
+#include "common/logging/log.h"
+
 #include <atomic>
 #include <cerrno>
 #include <chrono> // IWYU pragma: keep
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <memory>
 #include <thread>
@@ -49,6 +53,10 @@ static CONDITION_VARIABLE* ToCv(void** storage) {
 
 #endif
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 namespace Common {
 
 static wait_poll_func_t g_cond_wait_poll_callback = nullptr;
@@ -81,6 +89,33 @@ void Thread::SleepNano(uint64_t nanos) {
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
 	}
+#endif
+}
+
+bool Thread::HostQosEnabled(const char* value) {
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void Thread::SetHostQos(HostQos qos) {
+#ifdef __APPLE__
+	static const bool enabled = [] {
+		const bool on = HostQosEnabled(std::getenv("KYTY_HOST_QOS"));
+		if (on) {
+			LOGF("Host thread QoS: on (GPU/CP, CP back, recorder, present: user-interactive; "
+			     "pipeline workers: utility)\n");
+		}
+		return on;
+	}();
+	if (!enabled) {
+		return;
+	}
+	const int result = pthread_set_qos_class_self_np(
+	    qos == HostQos::UserInteractive ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_UTILITY, 0);
+	if (result != 0) {
+		LOGF("Host thread QoS: warning: pthread_set_qos_class_self_np failed (%d)\n", result);
+	}
+#else
+	(void)qos;
 #endif
 }
 

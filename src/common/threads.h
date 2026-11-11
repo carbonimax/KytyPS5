@@ -22,6 +22,12 @@ bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
 
+enum class HostQos { UserInteractive, Utility };
+// KYTY_HOST_QOS=1 (macOS): gives the calling thread this QoS class. Off by default: no call.
+void SetHostQos(HostQos qos);
+// The KYTY_HOST_QOS value: "1" enables, anything else (or unset) disables.
+bool HostQosEnabled(const char* value);
+
 } // namespace Thread
 
 // Recursive.
