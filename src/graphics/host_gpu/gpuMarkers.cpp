@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 namespace Libs::Graphics::GpuMarkers {
 
@@ -47,6 +48,36 @@ std::atomic<uint32_t>   g_seq {0};
 Entry*                  g_table = nullptr;
 thread_local uint64_t   t_shader = 0;
 thread_local Pending    t_pending;
+
+// KYTY_GPU_MARKERS_SNAP=address (hex, one compute shader): full copies of its imported reads at bind
+// time, kept for its last SnapSlots commands and printed next to the bytes at the loss.
+constexpr uint64_t SnapMax   = 16384;
+constexpr uint32_t SnapSlots = 256;
+struct Snap {
+	uint32_t                            seq = 0, count = 0;
+	std::array<uint64_t, 4>             vaddr {};
+	std::array<std::vector<uint8_t>, 4> bytes {};
+};
+Snap*             g_snaps = nullptr;
+thread_local Snap t_snap;
+
+uint64_t SnapShader() {
+	static const uint64_t address = [] {
+		const char* value = std::getenv("KYTY_GPU_MARKERS_SNAP");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	return address;
+}
+
+void Words(std::FILE* f, const char* tag, uint64_t vaddr, const uint8_t* bytes, uint64_t size) {
+	std::fprintf(f, "  %s 0x%016" PRIx64 " (%" PRIu64 " bytes):", tag, vaddr, size);
+	for (uint64_t k = 0; k < size; k += 4) {
+		uint32_t word = 0;
+		std::memcpy(&word, bytes + k, std::min<uint64_t>(4, size - k));
+		std::fprintf(f, "%s%08x", k % 64 == 0 ? "\n    " : " ", word);
+	}
+	std::fprintf(f, "\n");
+}
 
 void Print(std::FILE* f, const Entry& e, const char* tag) {
 	std::fprintf(f, "%s seq=%u type=%c shader=0x%016" PRIx64 " shader2=0x%016" PRIx64
@@ -111,6 +142,7 @@ void Init(GraphicContext& graphics) {
 	}
 	std::memset(allocation_info.pMappedData, 0, 256);
 	g_table  = new Entry[TableSize];
+	g_snaps  = SnapShader() != 0 ? new Snap[SnapSlots] : nullptr;
 	g_mapped = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
 	LOGF("GpuMarkers: on (VK_AMD_buffer_marker, %u commands kept)\n", TableSize);
 }
@@ -122,6 +154,7 @@ bool Active() noexcept {
 void SetShader(uint64_t address) noexcept {
 	t_shader        = address;
 	t_pending.count = 0; // bindings of a command that wrote no marker (copies, clears)
+	t_snap.count    = 0;
 }
 
 uint64_t Shader() noexcept {
@@ -145,6 +178,14 @@ void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind) noexcept
 		                : 0;
 	}
 	p.count++;
+	if (g_snaps != nullptr && kind == 1 && !written && size <= SnapMax && t_shader == SnapShader() &&
+	    t_snap.count < t_snap.vaddr.size()) {
+		auto& bytes = t_snap.bytes[t_snap.count];
+		bytes.resize(size);
+		if (LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size)) {
+			t_snap.vaddr[t_snap.count++] = vaddr;
+		}
+	}
 }
 
 uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shader2, uint32_t x, uint32_t y,
@@ -167,6 +208,12 @@ uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shade
 	e.count            = t_pending.count;
 	std::copy_n(t_pending.bindings.begin(), std::min(t_pending.count, MaxBindings), e.bindings.begin());
 	t_pending.count = 0;
+	if (t_snap.count != 0) {
+		auto& slot = g_snaps[seq % SnapSlots];
+		std::swap(slot, t_snap);
+		slot.seq     = seq;
+		t_snap.count = 0;
+	}
 	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, vk::Buffer(g_buffer), 0, seq);
 	return seq;
 }
@@ -215,21 +262,18 @@ void Dump(const char* site) noexcept {
 		if (seq != finished + 1) {
 			continue;
 		}
-		// The hung command's guest bytes now (first 1 KiB of each binding).
+		// The hung command's guest bytes now (up to 16 KiB of each binding), and at bind time (SNAP).
+		std::vector<uint8_t> now(SnapMax);
 		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
-			const auto&                bind = e.bindings[i];
-			std::array<uint8_t, 1024> bytes {};
-			const auto                size = std::min<uint64_t>(bind.size, bytes.size());
-			if (!LibKernel::Memory::TryReadBacking(bind.vaddr, bytes.data(), size)) {
-				continue;
+			const auto& bind = e.bindings[i];
+			const auto  size = std::min<uint64_t>(bind.size, SnapMax);
+			if (LibKernel::Memory::TryReadBacking(bind.vaddr, now.data(), size)) {
+				Words(f, "now", bind.vaddr, now.data(), size);
 			}
-			std::fprintf(f, "  raw 0x%016" PRIx64 " (%" PRIu64 " of 0x%" PRIx64 " bytes):", bind.vaddr, size, bind.size);
-			for (uint64_t k = 0; k < size; k += 4) {
-				uint32_t word = 0;
-				std::memcpy(&word, bytes.data() + k, std::min<uint64_t>(4, size - k));
-				std::fprintf(f, "%s%08x", k % 64 == 0 ? "\n    " : " ", word);
-			}
-			std::fprintf(f, "\n");
+		}
+		const auto* snap = g_snaps != nullptr ? &g_snaps[seq % SnapSlots] : nullptr;
+		for (uint32_t i = 0; snap != nullptr && snap->seq == seq && i < snap->count; i++) {
+			Words(f, "bind", snap->vaddr[i], snap->bytes[i].data(), snap->bytes[i].size());
 		}
 	}
 	std::fflush(f);
