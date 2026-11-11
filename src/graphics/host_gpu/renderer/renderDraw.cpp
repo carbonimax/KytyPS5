@@ -52,6 +52,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1968,6 +1969,17 @@ static bool DrawWritesMemory(const DrawRenderState& state) {
 // GPU thread: a re-lookup serves a draw that already began its image heap draw.
 static bool g_pipeline_relookup = false;
 
+// KYTY_CP_LOOKUP_STAGE (GPU thread): the server of a draw, from its ES/GS/PS addresses, and the draws
+// whose shaders were found writing memory (each staged one makes the front redo the later lookups).
+// shortcut: the set only grows (one entry per writing program combination); clear it if that ever matters.
+static std::unordered_set<uint64_t> g_staged_writers;
+
+static uint64_t StagedRoute(const HW::Shader& shaders) {
+	const uint64_t programs[3] = {shaders.GetVs().es_regs.data_addr, shaders.GetVs().gs_regs.data_addr,
+	                              shaders.GetPs().ps_regs.data_addr};
+	return XXH3_64bits(programs, sizeof(programs));
+}
+
 bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
                                   const DrawIndexArgs* index_args, const DrawAutoArgs* auto_args) {
 	const bool indexed  = index_args != nullptr;
@@ -2007,9 +2019,10 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 	}();
 	(void)initialized;
 
-	if (CpPipeline::LookupServers() != 0) {
+	const auto route = StagedRoute(buffer.GetShaders());
+	if (CpPipeline::LookupServers() != 0 && !g_staged_writers.contains(route)) {
 		// KYTY_CP_LOOKUP_STAGE: a server looks the programs up; it classifies the draw (heap,
-		// shader writes) itself, the back then handles it.
+		// shader writes) itself, the back then handles it. Programs seen writing memory stay here.
 		auto& record                 = CpPipeline::Acquire();
 		record.state                 = {};
 		record.state.topology        = topology;
@@ -2023,11 +2036,8 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		record.user_config           = buffer.GetUserConfig();
 		record.shaders               = buffer.GetShaders();
 		record.guessed_single_sample = GuessSingleSample(record.shaders.GetPs().ps_regs.data_addr);
-		const uint64_t programs[3]   = {record.shaders.GetVs().es_regs.data_addr,
-		                                record.shaders.GetVs().gs_regs.data_addr,
-		                                record.shaders.GetPs().ps_regs.data_addr};
 		CpPipeline::Note(CpPipeline::Stat::Queued);
-		CpPipeline::PublishStaged(XXH3_64bits(programs, sizeof(programs)));
+		CpPipeline::PublishStaged(route);
 		return true;
 	}
 
@@ -2155,6 +2165,9 @@ bool RenderExecutor::PipelineVerify(void* context, CpPipeline::DrawRecord& recor
 }
 
 void RenderExecutor::PipelineFeedback(void* /*context*/, const CpPipeline::DrawRecord& record) {
+	if (record.staged && record.writes) {
+		g_staged_writers.insert(StagedRoute(record.shaders));
+	}
 	if (!record.feedback_valid) {
 		return;
 	}

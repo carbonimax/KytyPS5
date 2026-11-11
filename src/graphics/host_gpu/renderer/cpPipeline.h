@@ -39,7 +39,8 @@
 // then runs it as before. A server lookup that would need the GPU thread (GPU-written memory, the
 // image heap) aborts: the back asks the front to look the record up again, in order. A draw whose
 // shaders write memory runs on the back, then every record published before it finished is looked
-// up again by the front. KYTY_CP_LOOKUP_STAGE_VERIFY=1: the back also looks each staged record up
+// up again by the front, which then keeps that program combination on the mode 1 path (lookup on
+// the front, inline when it writes). KYTY_CP_LOOKUP_STAGE_VERIFY=1: the back also looks each staged record up
 // with its own cache and counts the differences ("PERF cppipe" lookup_mismatch).
 namespace Libs::Graphics::CpPipeline {
 
