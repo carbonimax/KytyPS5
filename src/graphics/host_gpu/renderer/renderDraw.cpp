@@ -1209,11 +1209,9 @@ static bool SameDepth(const RenderDepthInfo& a, const RenderDepthInfo& b) {
 }
 
 using KeptFinds  = std::array<TextureCache::KeptFind, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
-using KeptClears = std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
 using FindMemos  = std::array<TextureCache::FindImageMemo, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
 // Scratch of the back's target resolution, written before read (no per-record construction).
 static thread_local KeptFinds  t_kept_finds;
-static thread_local KeptClears t_kept_clears;
 static thread_local FindMemos  t_find_memos;
 
 // The searches of a kept resolution, colors then depth (the order the slot loop binds them).
@@ -1361,7 +1359,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			reusable = same && previous.kept && (reuse_mode == 1 || previous.epoch == cache.ImageIndexEpoch());
 			if (split) mark[2] = Clock::now();
 		}
-		bool reused = false;
+		bool     reused       = false;
+		uint32_t reused_finds = 0; // KYTY_BIND_PROF: the reused record's counts are added after its timed span
 		if (reusable && reuse_mode == 1) {
 			auto&          finds = t_kept_finds;
 			const uint32_t count = GetKeptFinds(previous, finds);
@@ -1370,12 +1369,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			if (split) mark[3] = Clock::now();
 			if (reused) {
 				// A clear that would do nothing again (same metadata, check still stored and valid) is kept.
-				auto& clears = t_kept_clears;
+				// The result is updated in place: finds[i].clear points to it.
 				for (uint32_t i = 0; i < count; i++) {
-					clears[i] = cache.ReplayColorClear(finds[i], (keep >> i & 1u) != 0);
-				}
-				for (uint32_t i = 0; i < count; i++) {
-					previous.clears[i < previous.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX] = clears[i];
+					cache.ReplayColorClear(finds[i], (keep >> i & 1u) != 0,
+					                       previous.clears[i < previous.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX]);
 				}
 				if (split) mark[4] = Clock::now();
 				// shortcut: RememberTarget is skipped; equal registers already map to these targets unless
@@ -1391,32 +1388,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				if (split) {
 					mark[6] = Clock::now();
 					mark[7] = Clock::now();
-					using C = PerfStats::Counter;
-					constexpr std::array<C, 7> buckets {C::TgtReuseCmpNs,  C::TgtReuseEpochNs, C::TgtReuseLockNs,
-					                                    C::TgtReuseClearNs, C::TgtReuseBindNs, C::TgtReuseCopyNs,
-					                                    C::TgtReuseEmptyNs};
-					for (uint32_t i = 0; i < buckets.size(); i++) {
-						PerfStats::Add(buckets[i], static_cast<uint64_t>(
-						                               std::chrono::duration_cast<std::chrono::nanoseconds>(
-						                                   mark[i + 1] - mark[i])
-						                                   .count()));
-					}
 				}
-				if (prof) {
-					using C = PerfStats::Counter;
-					PerfStats::Add(C::TgtReuseTargets, count);
-					for (uint32_t i = 0; i < count; i++) {
-						const auto& r = clears[i];
-						PerfStats::Add(static_cast<C>(static_cast<uint32_t>(C::TgtClearNoMeta) + r.path), 1);
-						if (r.meta_changed) PerfStats::Add(C::TgtClearMetaChanged, 1);
-						if (r.erased) PerfStats::Add(C::TgtClearErased, 1);
-						if (r.cleared) PerfStats::Add(C::TgtClearCleared, 1);
-						if (r.Acted()) PerfStats::Add(C::TgtClearActed, 1);
-						if (r.kept) PerfStats::Add(C::TgtClearKept, 1);
-					}
-				}
+				reused_finds = count;
 			}
-			if (prof) PerfStats::Add(reused ? PerfStats::Counter::TgtReused : PerfStats::Counter::TgtReplayRefused, 1);
+			if (prof && !reused) PerfStats::Add(PerfStats::Counter::TgtReplayRefused, 1);
 		}
 		// =2: what the replay would keep and bind, checked against the resolution below.
 		auto&      verify_finds = t_kept_finds;
@@ -1463,11 +1438,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				     resolved, state.aliased_passes);
 			}
 		}
+		uint64_t merge_ns = 0;
 		if (prof) {
-			const auto merge_ns = static_cast<uint64_t>(
+			merge_ns = static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - merge_start).count());
-			PerfStats::Add(PerfStats::Counter::TgtMergeNs, merge_ns);
-			if (reused) PerfStats::Add(PerfStats::Counter::TgtReuseMergeNs, merge_ns);
+			if (!reused) PerfStats::Add(PerfStats::Counter::TgtMergeNs, merge_ns);
 		}
 		if (!reused) {
 			ResolveRenderDepthTarget(buffer, state.depth_info,
@@ -1524,6 +1499,33 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
 			PerfStats::Add(PerfStats::Counter::BackResolveNs, ns);
 			PerfStats::Add(PerfStats::Counter::TgtRecords, 1);
+			if (reused) { // outside the span: only clock reads stay inside it (and the key timer's add)
+				using C = PerfStats::Counter;
+				PerfStats::Add(C::TgtMergeNs, merge_ns);
+				PerfStats::Add(C::TgtReuseMergeNs, merge_ns);
+				if (split) {
+					constexpr std::array<C, 7> buckets {C::TgtReuseCmpNs,  C::TgtReuseEpochNs, C::TgtReuseLockNs,
+					                                    C::TgtReuseClearNs, C::TgtReuseBindNs, C::TgtReuseCopyNs,
+					                                    C::TgtReuseEmptyNs};
+					for (uint32_t i = 0; i < buckets.size(); i++) {
+						PerfStats::Add(buckets[i], static_cast<uint64_t>(
+						                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+						                                   mark[i + 1] - mark[i])
+						                                   .count()));
+					}
+				}
+				PerfStats::Add(C::TgtReused, 1);
+				PerfStats::Add(C::TgtReuseTargets, reused_finds);
+				for (uint32_t i = 0; i < reused_finds; i++) {
+					const auto& r = previous.clears[i < previous.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX];
+					PerfStats::Add(static_cast<C>(static_cast<uint32_t>(C::TgtClearNoMeta) + r.path), 1);
+					if (r.meta_changed) PerfStats::Add(C::TgtClearMetaChanged, 1);
+					if (r.erased) PerfStats::Add(C::TgtClearErased, 1);
+					if (r.cleared) PerfStats::Add(C::TgtClearCleared, 1);
+					if (r.Acted()) PerfStats::Add(C::TgtClearActed, 1);
+					if (r.kept) PerfStats::Add(C::TgtClearKept, 1);
+				}
+			}
 			if (track && previous.valid && previous.inputs.mrt_mask == state.mrt_mask && previous.hash == next.hash) {
 				PerfStats::Add(PerfStats::Counter::TgtSameHash, 1);
 				PerfStats::Add(PerfStats::Counter::TgtSameHashNs, ns);
