@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -1287,6 +1288,7 @@ struct Entry {
 	Site                 site = Site::None;
 	std::vector<uint8_t> bytes;                            // size <= MaxCopy
 	uint64_t             buffer_vaddr = 0, buffer_size = 0; // imported buffer holding it, else 0
+	uint64_t             shader = 0;                        // binding shader (GpuMarkers::Shader)
 };
 
 struct Key {
@@ -1378,7 +1380,7 @@ void Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, u
 	}
 	// Taken before reading: a logged write racing with the read is attributed to its writer.
 	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}, buffer_vaddr,
-	             buffer_size};
+	             buffer_size, GpuMarkers::Shader()};
 	const auto start = NowNs();
 	if (size <= MaxCopy) {
 		entry.bytes.resize(size);
@@ -1507,6 +1509,10 @@ void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
 		}
 		if (kinds[i] == Guest && entry.buffer_size != 0) {
 			st.demote.push_back({entry.buffer_vaddr, entry.buffer_size});
+			LOGF("BufferCache: KYTY_MEM_IMPORT net: bound 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s shader=0x%016" PRIx64
+			     " changed=%" PRIu64 " bytes, seal->check %.2f ms\n",
+			     entry.vaddr, entry.size, PathNames[entry.path], SiteNames[static_cast<size_t>(entry.site)],
+			     entry.shader, diffs[i], static_cast<double>(start - sealed_ns) / 1e6);
 		}
 		if (kinds[i] == Guest || kinds[i] == Cp) {
 			auto& changed = st.changed[{entry.vaddr, entry.size}];
@@ -2086,6 +2092,16 @@ static bool ImportGpuWrites() {
 	return keep;
 }
 
+// KYTY_MEM_IMPORT_SHADERS_ACCESS=r|w (diagnostic): only the listed shaders' reads (r) or writes (w)
+// leave imported memory; unset, both do.
+static bool ImportShaderAccess(bool is_written) {
+	static const int only = [] {
+		const char* value = std::getenv("KYTY_MEM_IMPORT_SHADERS_ACCESS");
+		return value == nullptr ? 0 : value[0] == 'r' ? 1 : value[0] == 'w' ? 2 : 0;
+	}();
+	return only == 0 || (only == 1) != is_written;
+}
+
 // KYTY_MEM_IMPORT_SHADERS=addr[,addr...] (hex guest shader addresses, local configuration): the
 // buffers these compute shaders bind, read or written, leave imported memory for good.
 void BufferCache::BeginImportShader(uint64_t cs_address) {
@@ -2505,6 +2521,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			if (LateRead::Enabled() && !m_import && !LateRead::NetOnly()) [[unlikely]] {
 				LateRead::Bind(vaddr, size, LateRead::PathStream);
 			}
+			GpuMarkers::NoteBinding(vaddr, size, false, 2);
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -2518,7 +2535,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		     " written=%d imported=%d\n",
 		     m_import_shader, vaddr, size, is_written ? 1 : 0, m_slot_buffers[id].IsImported() ? 1 : 0);
 	}
-	if (m_slot_buffers[id].IsImported() && (m_import_shader != 0 || (is_written && !ImportGpuWrites()))) {
+	if (m_slot_buffers[id].IsImported() &&
+	    ((m_import_shader != 0 && ImportShaderAccess(is_written)) || (is_written && !ImportGpuWrites()))) {
 		const auto& imported = m_slot_buffers[id];
 		g_import_stats.write_demotes.fetch_add(1, std::memory_order_relaxed);
 		if (ImportLogEnabled()) {
@@ -2554,6 +2572,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
 	}
+	GpuMarkers::NoteBinding(vaddr, size, is_written, buffer.IsImported() ? 1 : 0);
 	return {&buffer, buffer.Offset(vaddr)};
 }
 

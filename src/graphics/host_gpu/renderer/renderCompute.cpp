@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
@@ -439,7 +440,10 @@ void CommandBuffer::FlushDispatchChain() const {
 // Records the barrier a direct dispatch of a chain needs before it and updates the chain.
 // KYTY_MEM_IMPORT_SHADERS: the listed compute shader's bindings leave imported memory.
 struct ImportShaderScope {
-	ImportShaderScope(BufferCache& c, uint64_t cs_address): cache(c) { cache.BeginImportShader(cs_address); }
+	ImportShaderScope(BufferCache& c, uint64_t cs_address): cache(c) {
+		GpuMarkers::SetShader(cs_address);
+		cache.BeginImportShader(cs_address);
+	}
 	~ImportShaderScope() { cache.EndImportShader(); }
 	ImportShaderScope(const ImportShaderScope&)            = delete;
 	ImportShaderScope& operator=(const ImportShaderScope&) = delete;
@@ -737,6 +741,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const uint32_t marker = GpuMarkers::Begin(
+	    vk_buffer, 'C', sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash, thread_group_x, thread_group_y,
+	    thread_group_z, m_context.GetCommandScheduler().CurrentTick(),
+	    (program.info.uses_dma ? 1u : 0u) | (program.info.uses_gds ? 2u : 0u) | (has_storage_writes ? 4u : 0u));
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
@@ -758,6 +766,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}
+	GpuMarkers::End(vk_buffer, marker);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
 	// The removed host fence also ordered read-only dispatches before later writers. A chain
@@ -858,7 +867,16 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	vk::DispatchIndirectCommand guest_args {};
+	if (GpuMarkers::Active()) {
+		(void)LibKernel::Memory::TryReadBacking(args_addr, &guest_args, sizeof(guest_args));
+	}
+	const uint32_t marker = GpuMarkers::Begin(
+	    vk_buffer, 'I', cs_regs.cs_regs.data_addr, program.shader_hash, guest_args.x, guest_args.y, guest_args.z,
+	    m_context.GetCommandScheduler().CurrentTick(),
+	    (program.info.uses_dma ? 1u : 0u) | (program.info.uses_gds ? 2u : 0u) | (has_storage_writes ? 4u : 0u));
 	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	GpuMarkers::End(vk_buffer, marker);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

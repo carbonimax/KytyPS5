@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
 #include "graphics/host_gpu/memTrackProf.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <array>
@@ -318,6 +319,7 @@ void MaybeReport() noexcept {
 	DispatchChain::Report(seconds, n(Counter::Frames));
 	MemTrackProf::Report(seconds, n(Counter::Frames));
 	LateRead::Report(seconds, n(Counter::Frames));
+	GpuMarkers::Report(seconds);
 	GuestStacks::Report();
 	ShaderPretranslate::Report();
 	std::fflush(stdout);

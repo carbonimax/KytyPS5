@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/deviceFault.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -1254,6 +1255,11 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
+		if (GpuMarkers::Requested() &&
+		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+			graphic_ctx.buffer_marker_enabled = true;
+		}
 		if (!HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
@@ -1325,6 +1331,7 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create the KYTY_BOUNDS_MODE=2 counters");
 	}
 	PerfStats::SetStorageBoundsCounters(graphic_ctx.storage_bounds_verify_counters);
+	GpuMarkers::Init(graphic_ctx);
 	graphic_ctx.stencil_copy_via_buffer = ResolveStencilCopyViaBuffer(graphic_ctx);
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);

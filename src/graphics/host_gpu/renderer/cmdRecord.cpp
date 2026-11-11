@@ -1181,6 +1181,7 @@ void InstallCaptures(D& d) {
 	KYTY_BYVAL(vkCmdEndRendering)
 	KYTY_BYVAL(vkCmdEndRenderingKHR)
 	KYTY_BYVAL(vkCmdFillBuffer)
+	KYTY_BYVAL(vkCmdWriteBufferMarkerAMD)
 	KYTY_BYVAL(vkCmdResetQueryPool)
 	KYTY_BYVAL(vkCmdBeginQuery)
 	KYTY_BYVAL(vkCmdEndQuery)

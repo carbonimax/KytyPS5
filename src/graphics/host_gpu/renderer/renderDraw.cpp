@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -1109,6 +1110,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		m_context.GetImageHeap().BeginDraw();
 	}
 	const auto ps_address = buffer.GetShaders().GetPs().ps_regs.data_addr;
+	GpuMarkers::SetShader(ps_address);
 	if (prepared == DrawPrepared::No) {
 		CpSplitProf::LookupScope lookup;
 		RefreshShaders(buffer, state, GuessSingleSample(ps_address));
@@ -1669,6 +1671,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		// Every aliased-target pass rasterizes the same samples: only the first one counts them.
 		auto&         occlusion_queries = m_context.GetOcclusionQueries();
 		const int32_t occlusion_query   = pass == 0 ? occlusion_queries.Begin(vk_buffer) : -1;
+		const uint32_t marker = GpuMarkers::Begin(
+		    vk_buffer, args_buffer.first != nullptr ? 'X' : 'D', GpuMarkers::Shader(),
+		    state.vertex_info[0].stage.program->shader_hash, draw.index_count, draw.instance_count, pass,
+		    m_context.GetCommandScheduler().CurrentTick(), mesh_active ? 1u : 0u);
 		if (mesh_task) {
 			vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 		} else if (mesh_active) {
@@ -1682,6 +1688,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 			                       emit.indirect.count, emit.indirect.stride);
 		}
+		GpuMarkers::End(vk_buffer, marker);
 		occlusion_queries.End(vk_buffer, occlusion_query);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);

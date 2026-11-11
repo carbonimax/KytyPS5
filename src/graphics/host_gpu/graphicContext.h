@@ -30,6 +30,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_device_fault deviceFault (KYTY_DEVICE_FAULT, default on when offered).
 	bool                               device_fault_enabled                  = false;
+	// VK_AMD_buffer_marker, enabled only with KYTY_GPU_MARKERS (diagnostic).
+	bool                               buffer_marker_enabled                 = false;
 	bool                               null_descriptor_enabled               = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;

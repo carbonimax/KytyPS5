@@ -19,6 +19,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/deviceFault.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 
 #include <algorithm>
 #include <atomic>
@@ -219,6 +220,7 @@ void GraphicContext::ReportDeviceLost(vk::Result result, const char* site) const
 	if (result != vk::Result::eErrorDeviceLost || reported.test_and_set()) {
 		return;
 	}
+	GpuMarkers::Dump(site);
 	if (!device_fault_enabled) {
 		LOGF("Device lost at %s: no fault record (VK_EXT_device_fault off or not offered)\n", site);
 		return;
