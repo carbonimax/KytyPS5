@@ -1312,7 +1312,9 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	} else {
-		result.path = ColorClearResult::Plain;
+		result.path  = ColorClearResult::Plain;
+		result.quiet = count <= 4;
+		result.check = {.address = viewed.address, .stride = slice_size, .size = mip.size, .count = count};
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
@@ -1321,10 +1323,14 @@ TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, c
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
+		if (slice < 4) {
+			result.codes |= uint32_t {code} << (8u * slice);
+		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
+		result.quiet = false;
 		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
@@ -1557,7 +1563,10 @@ bool TextureCache::KeepColorClear(const KeptFind& find) {
 		case ColorClearResult::NoMip:
 		case ColorClearResult::SameCheck:
 		case ColorClearResult::Checked: break;
-		default: return false; // a clear, or CPU-read metadata: run again
+		case ColorClearResult::Plain:
+			if (!kept.quiet) return false;
+			break;
+		default: return false; // a clear, or metadata read after a GPU write: run again
 	}
 	// The same description sets the same metadata, and no surface metadata entry came back.
 	const auto& metadata = find.desc->info.metadata;
@@ -1565,25 +1574,44 @@ bool TextureCache::KeepColorClear(const KeptFind& find) {
 	if (!SameMetadata(image.info.metadata, metadata) || m_surface_metas.contains(metadata.range.address)) {
 		return false;
 	}
-	if (kept.path == ColorClearResult::NoRange || kept.path == ColorClearResult::NoMip) {
-		return true; // decided by the description alone
+	if (kept.path == ColorClearResult::NoRange || kept.path == ColorClearResult::NoMip ||
+	    kept.path == ColorClearResult::Plain) {
+		return true; // decided by the description alone; Plain by the bytes (KeptClearHolds)
 	}
 	// The check this description computes is the kept one while the epoch holds; it must still be
 	// the stored one (another view of the image may have replaced it).
 	return kept.check.epoch == m_buffer_cache.ColorMetadataEpoch() && image.color_clear_check == kept.check;
 }
 
-bool TextureCache::KeptCheckGpuModified(const ColorClearResult& kept) {
-	if (kept.path != ColorClearResult::SameCheck && kept.path != ColorClearResult::Checked) {
+bool TextureCache::KeptClearHolds(const ColorClearResult& kept) {
+	const bool plain = kept.path == ColorClearResult::Plain;
+	if (!plain && kept.path != ColorClearResult::SameCheck && kept.path != ColorClearResult::Checked) {
 		return true;
 	}
 	const auto& check = kept.check;
-	return m_buffer_cache.IsRegionGpuModified(check.address, check.stride * (check.count - 1) + check.size);
+	if (m_buffer_cache.IsRegionGpuModified(check.address, check.stride * (check.count - 1) + check.size) == plain) {
+		return false;
+	}
+	// The read finds the same code bytes, which decoded to no clear for this description.
+	for (uint32_t slice = 0; plain && slice < check.count; slice++) {
+		const auto address = check.address + check.stride * slice;
+		uint8_t    code    = 0;
+		GpuCapture::Touch(address, sizeof(code));
+		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code)) ||
+		    code != static_cast<uint8_t>(kept.codes >> (8u * slice))) {
+			return false;
+		}
+	}
+	return true;
 }
 
 TextureCache::ColorClearResult TextureCache::ReplayColorClear(const KeptFind& find, bool keep) {
-	if (keep && KeptCheckGpuModified(*find.clear)) {
-		ColorClearResult result {.path = find.clear->path, .kept = true, .check = find.clear->check};
+	if (keep && KeptClearHolds(*find.clear)) {
+		ColorClearResult result = *find.clear;
+		result.meta_changed     = false;
+		result.erased           = false;
+		result.cleared          = false;
+		result.kept             = true;
 		if (result.path == ColorClearResult::Checked) {
 			result.path = ColorClearResult::SameCheck; // the check is stored now
 		}
@@ -1604,7 +1632,7 @@ uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {
 		}
 	}
 	for (uint32_t i = 0; i < finds.size(); i++) {
-		if ((keep & (1u << i)) != 0 && !KeptCheckGpuModified(*finds[i].clear)) {
+		if ((keep & (1u << i)) != 0 && !KeptClearHolds(*finds[i].clear)) {
 			keep &= ~(1u << i);
 		}
 	}
