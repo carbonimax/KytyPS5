@@ -1316,10 +1316,16 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		const auto start    = prof ? Clock::now() : Clock::time_point {};
 		bool       same     = false;
 		bool       reusable = false;
+		// KYTY_BIND_PROF with KYTY_TARGET_REUSE=1: the reuse path in chained timestamps (PERF tgtreuse).
+		const bool                       split = prof && reuse_mode == 1;
+		std::array<Clock::time_point, 8> mark {};
 		if (track) {
 			PerfStats::ScopedTimer key_timer(PerfStats::Counter::TgtKeyNs, prof);
-			same     = previous.valid && SameTargetInputs(previous.inputs, hw, state.mrt_mask);
+			if (split) mark[0] = Clock::now();
+			same = previous.valid && SameTargetInputs(previous.inputs, hw, state.mrt_mask);
+			if (split) mark[1] = Clock::now();
 			reusable = same && previous.kept && previous.epoch == cache.ImageIndexEpoch();
+			if (split) mark[2] = Clock::now();
 		}
 		bool reused = false;
 		if (reusable && reuse_mode == 1) {
@@ -1334,13 +1340,44 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 				finds[count++] = {previous.depth.image_id, &previous.depth.desc, 0};
 			}
 			reused = cache.ReplayKeptFinds(std::span {finds.data(), count}, previous.epoch);
+			if (split) mark[3] = Clock::now();
 			if (reused) {
+				std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1> clears {};
+				for (uint32_t i = 0; i < count; i++) clears[i] = cache.ReplayColorClear(finds[i]);
+				if (split) mark[4] = Clock::now();
 				// shortcut: RememberTarget is skipped; equal registers already map to these targets unless
 				// an inline draw cleared the map meanwhile (one misprediction). Upgrade if mispredictions rise.
 				for (uint32_t i = 0; i < count; i++) BindRenderTarget(finds[i].id);
+				if (split) mark[5] = Clock::now();
 				std::copy_n(previous.colors.begin(), KeptColorEntries(previous.color_count), state.color_info);
 				state.color_count = previous.color_count;
 				state.depth_info  = previous.depth;
+				if (split) {
+					mark[6] = Clock::now();
+					mark[7] = Clock::now();
+					using C = PerfStats::Counter;
+					constexpr std::array<C, 7> buckets {C::TgtReuseCmpNs,  C::TgtReuseEpochNs, C::TgtReuseLockNs,
+					                                    C::TgtReuseClearNs, C::TgtReuseBindNs, C::TgtReuseCopyNs,
+					                                    C::TgtReuseEmptyNs};
+					for (uint32_t i = 0; i < buckets.size(); i++) {
+						PerfStats::Add(buckets[i], static_cast<uint64_t>(
+						                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+						                                   mark[i + 1] - mark[i])
+						                                   .count()));
+					}
+				}
+				if (prof) {
+					using C = PerfStats::Counter;
+					PerfStats::Add(C::TgtReuseTargets, count);
+					for (uint32_t i = 0; i < count; i++) {
+						const auto& r = clears[i];
+						PerfStats::Add(static_cast<C>(static_cast<uint32_t>(C::TgtClearNoMeta) + r.path), 1);
+						if (r.meta_changed) PerfStats::Add(C::TgtClearMetaChanged, 1);
+						if (r.erased) PerfStats::Add(C::TgtClearErased, 1);
+						if (r.cleared) PerfStats::Add(C::TgtClearCleared, 1);
+						if (r.Acted()) PerfStats::Add(C::TgtClearActed, 1);
+					}
+				}
 			}
 			if (prof) PerfStats::Add(reused ? PerfStats::Counter::TgtReused : PerfStats::Counter::TgtReplayRefused, 1);
 		}
@@ -1378,10 +1415,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			}
 		}
 		if (prof) {
-			PerfStats::Add(PerfStats::Counter::TgtMergeNs,
-			               static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                         Clock::now() - merge_start)
-			                                         .count()));
+			const auto merge_ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - merge_start).count());
+			PerfStats::Add(PerfStats::Counter::TgtMergeNs, merge_ns);
+			if (reused) PerfStats::Add(PerfStats::Counter::TgtReuseMergeNs, merge_ns);
 		}
 		if (!reused) {
 			ResolveRenderDepthTarget(buffer, state.depth_info,
