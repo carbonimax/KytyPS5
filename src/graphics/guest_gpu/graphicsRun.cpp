@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -724,6 +725,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	    write_one_address ? uint64_t {sizeof(uint32_t)} : uint64_t {dw_num} * sizeof(uint32_t);
 	// KYTY_LATE_READ_PROF: a command-processor write, not a guest one (logged before and after).
 	LateRead::NoteBackingWrite(address, bytes, true);
+	Libs::Graphics::GpuMarkers::NoteCpWrite(address, bytes, 'W');
 	// Destinations whose bytes the GPU owns: write through the command stream.
 	GpuCapture::Touch(address, bytes);
 	if (m_renderer.GetBufferCache().WriteGpuOwned(address, write_one_address ? &src[dw_num - 1] : src,

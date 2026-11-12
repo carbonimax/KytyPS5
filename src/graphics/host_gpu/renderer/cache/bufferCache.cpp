@@ -2641,6 +2641,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+	GpuMarkers::NoteCpWrite(vaddr, size, IsRegionGpuModified(vaddr, size) ? 'f' : 'F');
 	if (!IsRegionGpuModified(vaddr, size)) {
 		BeforeCpuWrite(vaddr, size);
 		LateRead::NoteBackingWrite(vaddr, size, true);
@@ -2677,6 +2678,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	}
 	if (src_memory && dst_memory && !IsRegionGpuModified(dst_vaddr, size) &&
 	    !IsRegionGpuModified(src_vaddr, size) && !m_texture_cache.FindImageFromRange(src_vaddr, size)) {
+		GpuMarkers::NoteCpWrite(dst_vaddr, size, 'C');
 		BeforeCpuWrite(dst_vaddr, size);
 		LateRead::NoteBackingWrite(dst_vaddr, size, true);
 		std::memcpy(reinterpret_cast<void*>(dst_vaddr), reinterpret_cast<const void*>(src_vaddr),
@@ -2687,6 +2689,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
+		GpuMarkers::NoteCpWrite(dst_vaddr, size, 'c');
 		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size, RefreshProf::GpuCopy);
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};

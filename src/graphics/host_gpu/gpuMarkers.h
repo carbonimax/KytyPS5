@@ -29,6 +29,10 @@ void               SetShader(uint64_t address) noexcept;
 void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer = 0,
                  uint64_t buffer_size = 0) noexcept;
 
+// A command-processor write of guest memory (DMA fill/copy, WRITE_DATA): kind 'F'/'C'/'W' on the CPU
+// at record time, 'f'/'c' through the command stream. Kept in a ring, printed against the hung reads.
+void NoteCpWrite(uint64_t vaddr, uint64_t size, char kind) noexcept;
+
 // type: 'C' dispatch, 'I' indirect dispatch, 'D' draw, 'X' indirect draw. Returns 0 when inactive.
 uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shader2, uint32_t x,
                uint32_t y, uint32_t z, uint64_t tick, uint32_t flags = 0) noexcept;

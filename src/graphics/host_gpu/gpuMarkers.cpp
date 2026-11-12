@@ -61,13 +61,37 @@ struct Snap {
 Snap*             g_snaps = nullptr;
 thread_local Snap t_snap;
 
-uint64_t SnapShader() {
-	static const uint64_t address = [] {
-		const char* value = std::getenv("KYTY_GPU_MARKERS_SNAP");
-		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+// KYTY_GPU_MARKERS_SNAP=addr[,addr...]: the shaders whose imported reads are copied at bind.
+const std::vector<uint64_t>& SnapShaders() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> out;
+		const char*           value = std::getenv("KYTY_GPU_MARKERS_SNAP");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next    = nullptr;
+			const auto address = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.push_back(address);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
 	}();
-	return address;
+	return list;
 }
+bool IsSnapShader(uint64_t address) {
+	const auto& list = SnapShaders();
+	return address != 0 && std::find(list.begin(), list.end(), address) != list.end();
+}
+
+struct CpWrite {
+	uint32_t seq = 0; // last command recorded before the write
+	char     kind = 0;
+	uint64_t vaddr = 0, size = 0;
+};
+constexpr uint32_t CpWrites = 1u << 14u;
+CpWrite*              g_cp_writes = nullptr;
+std::atomic<uint32_t> g_cp_count {0};
 
 void Words(std::FILE* f, const char* tag, uint64_t vaddr, const uint8_t* bytes, uint64_t size) {
 	std::fprintf(f, "  %s 0x%016" PRIx64 " (%" PRIu64 " bytes):", tag, vaddr, size);
@@ -77,6 +101,30 @@ void Words(std::FILE* f, const char* tag, uint64_t vaddr, const uint8_t* bytes, 
 		std::fprintf(f, "%s%08x", k % 64 == 0 ? "\n    " : " ", word);
 	}
 	std::fprintf(f, "\n");
+}
+
+// Bind-time copies of a command's reads (SNAP) against the bytes now: changed word count and first index.
+void SnapDiff(std::FILE* f, uint32_t seq) {
+	const auto* snap = g_snaps != nullptr ? &g_snaps[seq % SnapSlots] : nullptr;
+	if (snap == nullptr || snap->seq != seq) {
+		return;
+	}
+	std::vector<uint8_t> now(SnapMax);
+	for (uint32_t i = 0; i < snap->count; i++) {
+		const auto& bytes = snap->bytes[i];
+		if (!LibKernel::Memory::TryReadBacking(snap->vaddr[i], now.data(), bytes.size())) {
+			continue;
+		}
+		uint32_t changed = 0, first = UINT32_MAX;
+		for (uint64_t k = 0; k + 4 <= bytes.size(); k += 4) {
+			if (std::memcmp(bytes.data() + k, now.data() + k, 4) != 0) {
+				changed++;
+				first = std::min<uint32_t>(first, static_cast<uint32_t>(k / 4));
+			}
+		}
+		std::fprintf(f, "      snap 0x%016" PRIx64 " (%zu bytes): %u words changed bind->now, first %d\n",
+		             snap->vaddr[i], bytes.size(), changed, first == UINT32_MAX ? -1 : static_cast<int>(first));
+	}
 }
 
 void Print(std::FILE* f, const Entry& e, const char* tag) {
@@ -143,7 +191,8 @@ void Init(GraphicContext& graphics) {
 	}
 	std::memset(allocation_info.pMappedData, 0, 256);
 	g_table  = new Entry[TableSize];
-	g_snaps  = SnapShader() != 0 ? new Snap[SnapSlots] : nullptr;
+	g_snaps  = !SnapShaders().empty() ? new Snap[SnapSlots] : nullptr;
+	g_cp_writes = new CpWrite[CpWrites];
 	g_mapped = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
 	LOGF("GpuMarkers: on (VK_AMD_buffer_marker, %u commands kept)\n", TableSize);
 }
@@ -182,7 +231,7 @@ void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t
 		                : 0;
 	}
 	p.count++;
-	if (g_snaps != nullptr && kind == 1 && !written && size <= SnapMax && t_shader == SnapShader() &&
+	if (g_snaps != nullptr && kind == 1 && !written && size <= SnapMax && IsSnapShader(t_shader) &&
 	    t_snap.count < t_snap.vaddr.size()) {
 		auto& bytes = t_snap.bytes[t_snap.count];
 		bytes.resize(size);
@@ -190,6 +239,18 @@ void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t
 			t_snap.vaddr[t_snap.count++] = vaddr;
 		}
 	}
+}
+
+void NoteCpWrite(uint64_t vaddr, uint64_t size, char kind) noexcept {
+	if (!Active() || g_cp_writes == nullptr) {
+		return;
+	}
+	const uint32_t n = g_cp_count.fetch_add(1, std::memory_order_relaxed);
+	auto&          w = g_cp_writes[n & (CpWrites - 1)];
+	w.seq            = g_seq.load(std::memory_order_relaxed);
+	w.kind           = kind;
+	w.vaddr          = vaddr;
+	w.size           = size;
 }
 
 uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shader2, uint32_t x, uint32_t y,
@@ -286,7 +347,7 @@ void Dump(const char* site) noexcept {
 				continue;
 			}
 			std::fprintf(f, "  users of 0x%016" PRIx64 "+0x%" PRIx64 ":\n", r.vaddr, r.size);
-			uint32_t shown = 0;
+			uint32_t shown = 0, writers_shown = 0;
 			for (uint32_t back = 1; back < TableSize && shown < 24; back++) {
 				const auto& o = g_table[(seq - back) & (TableSize - 1)];
 				if (o.seq != seq - back) {
@@ -300,7 +361,24 @@ void Dump(const char* site) noexcept {
 						             o.seq, back, o.type, o.shader, w.vaddr, w.size, w.written != 0 ? "w" : "r", w.kind,
 						             w.buffer, w.buffer_size);
 						shown++;
+						if (w.written != 0 && writers_shown < 4) {
+							// The writer itself: its reads at bind and now, and its SNAP copies.
+							writers_shown++;
+							Print(f, o, "    writer");
+							SnapDiff(f, o.seq);
+						}
 					}
+				}
+			}
+			// Command-processor writes over the read, latest first (the ring keeps the last CpWrites).
+			const uint32_t total = g_cp_count.load(std::memory_order_relaxed);
+			uint32_t       cp_shown = 0;
+			for (uint32_t back = 1; g_cp_writes != nullptr && back <= std::min(total, CpWrites) && cp_shown < 16; back++) {
+				const auto& w = g_cp_writes[(total - back) & (CpWrites - 1)];
+				if (w.vaddr < r.vaddr + r.size && r.vaddr < w.vaddr + w.size) {
+					std::fprintf(f, "    cp %c 0x%016" PRIx64 "+0x%" PRIx64 " after seq=%u (%d)\n", w.kind, w.vaddr,
+					             w.size, w.seq, static_cast<int>(w.seq) - static_cast<int>(seq));
+					cp_shown++;
 				}
 			}
 		}
