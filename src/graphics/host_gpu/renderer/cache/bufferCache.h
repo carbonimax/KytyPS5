@@ -337,7 +337,10 @@ private:
 		uint64_t             vaddr = 0, tick = 0;
 		std::vector<uint8_t> bytes;
 	};
-	std::vector<OwnedWrite> m_owned_writes; // OverlayOwnedWrites, oldest first (GPU thread)
+	// OverlayOwnedWrites, oldest first: the CP pipeline's front and back threads both read backings.
+	std::vector<OwnedWrite> m_owned_writes;
+	std::mutex              m_owned_mutex;
+	std::atomic<size_t>     m_owned_count {0};
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};
