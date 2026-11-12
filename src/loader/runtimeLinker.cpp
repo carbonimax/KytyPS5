@@ -744,84 +744,88 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	ReportUnhandledHostException(exception_info);
+}
+
+[[noreturn]] void
+ReportUnhandledHostException(const Common::HostException::ExceptionInfo& exception_info) {
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
-	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
-				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
-			}
+	const auto* info = &exception_info;
+	char thread_name[64] = "(host thread)";
+	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s, pc 0x%016" PRIx64 ", access %u at 0x%016" PRIx64 "\n", thread_name,
-		            info->exception_address, static_cast<unsigned>(info->access_violation_type),
-		            info->access_violation_vaddr);
-		std::fflush(stdout);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
-			}
-			std::printf("\n");
-		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
-			}
-			std::printf("\n");
-		}
-		Libs::Graphics::GuestStacks::Describe(info->rsp);
-		Libs::Graphics::CmdRecord::Describe();
-		std::fflush(stdout);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		// Host call stack from the faulting context (unwind data only, no symbols): identifies
-		// the emulator code that called into a driver or system DLL that faulted.
-		if (info->native_context != nullptr) {
-			CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
-			std::printf("host backtrace:\n");
-			for (int frame = 0; frame < 48 && context.Rip != 0; frame++) {
-				HMODULE module = nullptr;
-				char    path[MAX_PATH] = "?";
-				if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-				                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-				                       reinterpret_cast<LPCSTR>(context.Rip), &module) &&
-				    GetModuleFileNameA(module, path, MAX_PATH) != 0) {
-					const char* name = std::strrchr(path, '\\');
-					std::printf("  #%02d %s+0x%" PRIx64 "\n", frame, name != nullptr ? name + 1 : path,
-					            static_cast<uint64_t>(context.Rip - reinterpret_cast<uint64_t>(module)));
-				} else {
-					std::printf("  #%02d 0x%016" PRIx64 "\n", frame, static_cast<uint64_t>(context.Rip));
-				}
-				DWORD64 image_base = 0;
-				auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
-				if (entry == nullptr) {
-					// Leaf function: the return address is on top of the stack.
-					if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) break;
-					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
-					context.Rsp += sizeof(uint64_t);
-					continue;
-				}
-				void*   handler_data = nullptr;
-				DWORD64 frame_base   = 0;
-				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
-				                 &handler_data, &frame_base, nullptr);
-			}
-		}
-#endif
-		std::fflush(stdout);
-		WriteFaultMinidump(info);
 	}
+	std::printf("--- Guest fault context ---\n");
+	std::printf("thread: %s, pc 0x%016" PRIx64 ", access %u at 0x%016" PRIx64 "\n", thread_name,
+	            info->exception_address, static_cast<unsigned>(info->access_violation_type),
+	            info->access_violation_vaddr);
+	std::fflush(stdout);
+	std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
+	            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
+	            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
+	            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
+	            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+	            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+	            info->r14, info->r15);
+	if (IsReadableRange(info->exception_address - 48, 96)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
+		std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+		for (int i = 0; i < 96; i++) {
+			std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+		}
+		std::printf("\n");
+	}
+	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+		std::printf("stack:");
+		for (int i = 0; i < 32; i++) {
+			std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+		}
+		std::printf("\n");
+	}
+	Libs::Graphics::GuestStacks::Describe(info->rsp);
+	Libs::Graphics::CmdRecord::Describe();
+	std::fflush(stdout);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Host call stack from the faulting context (unwind data only, no symbols): identifies
+	// the emulator code that called into a driver or system DLL that faulted.
+	if (info->native_context != nullptr) {
+		CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
+		std::printf("host backtrace:\n");
+		for (int frame = 0; frame < 48 && context.Rip != 0; frame++) {
+			HMODULE module = nullptr;
+			char    path[MAX_PATH] = "?";
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(context.Rip), &module) &&
+			    GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+				const char* name = std::strrchr(path, '\\');
+				std::printf("  #%02d %s+0x%" PRIx64 "\n", frame, name != nullptr ? name + 1 : path,
+				            static_cast<uint64_t>(context.Rip - reinterpret_cast<uint64_t>(module)));
+			} else {
+				std::printf("  #%02d 0x%016" PRIx64 "\n", frame, static_cast<uint64_t>(context.Rip));
+			}
+			DWORD64 image_base = 0;
+			auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+			if (entry == nullptr) {
+				// Leaf function: the return address is on top of the stack.
+				if (!IsReadableRange(context.Rsp, sizeof(uint64_t))) break;
+				context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+				context.Rsp += sizeof(uint64_t);
+				continue;
+			}
+			void*   handler_data = nullptr;
+			DWORD64 frame_base   = 0;
+			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
+			                 &handler_data, &frame_base, nullptr);
+		}
+	}
+#endif
+	std::fflush(stdout);
+	WriteFaultMinidump(info);
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
