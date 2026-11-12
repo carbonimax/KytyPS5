@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 
 namespace {
 void Check(bool condition, const char* message) {
@@ -17,6 +19,17 @@ std::array<int, 2>    guest_stick {128, 128};
 uint32_t              guest_buttons = 0;
 bool                  guest_touch   = false;
 float                 guest_click_x = 0.0f;
+Uint64                now           = 1000;
+Sint32                wait_timeout  = 0;
+
+struct Touch {
+	bool  down;
+	float x;
+	float y;
+	bool  click;
+};
+// Finger 1 of the host input controller.
+std::vector<Touch> host_touches;
 } // namespace
 
 namespace Fake {
@@ -28,7 +41,11 @@ Sint16 GetGamepadAxis(SDL_Gamepad*, SDL_GamepadAxis axis) {
 	return physical_stick[axis == SDL_GAMEPAD_AXIS_LEFTY ? 1 : 0];
 }
 Uint64 GetTicks() {
-	return 1000;
+	return now;
+}
+bool WaitEventTimeout(SDL_Event*, Sint32 timeout) {
+	wait_timeout = timeout;
+	return false;
 }
 bool HideCursor() {
 	return true;
@@ -45,6 +62,7 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #define SDL_GetGamepadFromID Fake::GetGamepadFromID
 #define SDL_GetGamepadAxis   Fake::GetGamepadAxis
 #define SDL_GetTicks         Fake::GetTicks
+#define SDL_WaitEventTimeout Fake::WaitEventTimeout
 #define SDL_HideCursor       Fake::HideCursor
 #define SDL_ShowCursor       Fake::ShowCursor
 #define SDL_GetMouseState    Fake::GetMouseState
@@ -52,6 +70,7 @@ SDL_MouseButtonFlags GetMouseState(float* x, float* y) {
 #undef SDL_GetGamepadFromID
 #undef SDL_GetGamepadAxis
 #undef SDL_GetTicks
+#undef SDL_WaitEventTimeout
 #undef SDL_HideCursor
 #undef SDL_ShowCursor
 #undef SDL_GetMouseState
@@ -68,12 +87,15 @@ void SetAxis(int id, Axis axis, int value) {
 		guest_stick[axis == Axis::LeftY ? 1 : 0] = value;
 	}
 }
-void SetTouchPad(int id, int finger, bool down, float x, float) {
+void SetTouchPad(int id, int finger, bool down, float x, float y, bool click) {
 	if (id == 1 && finger == 1) {
 		guest_touch = down;
 	}
 	if (id == 1 && finger == 0) {
 		guest_click_x = down ? x : 0.0f;
+	}
+	if (id == HOST_INPUT_CONTROLLER_ID && finger == 1) {
+		host_touches.push_back({down, x, y, click});
 	}
 }
 void SetRightStick(int, int, int) {}
@@ -212,6 +234,49 @@ void TestPadTouchPadClick() {
 	      "the mapped touchpad click was not released");
 }
 
+// Runs one window loop iteration at time_ms and returns its event wait.
+Sint32 WaitAt(Uint64 time_ms) {
+	now = time_ms;
+	SDL_Event event {};
+	(void)HostInputWaitEvent(&event, 1000);
+	return wait_timeout;
+}
+
+bool Near(float a, float b) {
+	return std::abs(a - b) < 0.001f;
+}
+
+void TestTouchPadSwipes() {
+	Inputs               inputs;
+	constexpr std::array keys = {SDLK_U, SDLK_N, SDLK_B, SDLK_M};
+	constexpr std::array dx   = {0.0f, 0.0f, -0.3f, 0.3f};
+	constexpr std::array dy   = {-0.3f, 0.3f, 0.0f, 0.0f};
+	for (std::size_t i = 0; i < keys.size(); i++) {
+		host_touches.clear();
+		now = 1000;
+		HostInputKey(keys[i], true);
+		HostInputKey(keys[i], false);
+		Check(WaitAt(1000) == 8 && WaitAt(1200) == 8 && WaitAt(1201) == 1000,
+		      "a swipe did not poll every 8 ms for 200 ms");
+		const auto& t = host_touches;
+		Check(t.size() == 3 && t[0].down && t[1].down && !t[2].down && !t[0].click && !t[1].click &&
+		          !t[2].click,
+		      "a swipe clicked or did not lift its finger after 200 ms");
+		Check(Near(t[0].x, 0.5f - dx[i]) && Near(t[0].y, 0.5f - dy[i]) &&
+		          Near(t[1].x, 0.5f + dx[i]) && Near(t[1].y, 0.5f + dy[i]),
+		      "a swipe moved the wrong way");
+	}
+	host_touches.clear();
+	now = 1000;
+	HostInputKey(SDLK_U, true);
+	WaitAt(1100);
+	HostInputKey(SDLK_M, true);
+	WaitAt(1100);
+	Check(host_touches.size() == 3 && !host_touches[1].down && !host_touches[1].click &&
+	          host_touches[2].down && Near(host_touches[2].x, 0.2f),
+	      "a new swipe did not lift the unfinished one first");
+}
+
 void TestDisabledMappingTabs() {
 	Config::ConfigOptions options;
 	const auto south = InputMap::SourceFromButton(SDL_GAMEPAD_BUTTON_SOUTH);
@@ -246,9 +311,19 @@ void TestDisabledMappingTabs() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
 	Config::Initialize();
 	Config::ConfigOptions options;
+	// The input map is built once per process, and keyboard entries replace the default keys the
+	// tests below check, so the swipe keys run in their own process.
+	if (argc == 2 && std::strcmp(argv[1], "--touch-pad-swipes") == 0) {
+		options.keymap = {"TouchPadSwipeUp=U", "TouchPadSwipeDown=N", "TouchPadSwipeLeft=B",
+		                  "TouchPadSwipeRight=M"};
+		Config::Load(options);
+		TestTouchPadSwipes();
+		Config::Shutdown();
+		return 0;
+	}
 	options.keymap = {"Pad:Cross=LeftTrigger", "Pad:Circle=RightTrigger",
 	                  "Pad:TouchPadRight=South"};
 	Config::Load(options);
