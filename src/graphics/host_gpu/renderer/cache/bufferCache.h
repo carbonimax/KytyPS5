@@ -137,6 +137,9 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_MEM_IMPORT: copies over a CPU read of the backing the WRITE_DATA bytes that WriteGpuOwned put
+	// in the command stream of imported memory and whose command buffer has not completed (GPU thread).
+	void OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size);
 	// GPU thread: the tracker page of vaddr may hold GPU-written bytes (page bits only).
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));
@@ -330,6 +333,11 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	// KYTY_CP_PIPELINE: the GPU thread's program lookups test the ranges while the back thread runs.
 	std::mutex                                        m_gpu_ranges_mutex;
+	struct OwnedWrite {
+		uint64_t             vaddr = 0, tick = 0;
+		std::vector<uint8_t> bytes;
+	};
+	std::vector<OwnedWrite> m_owned_writes; // OverlayOwnedWrites, oldest first (GPU thread)
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	std::atomic<uint64_t>                             m_color_metadata_epoch {0};

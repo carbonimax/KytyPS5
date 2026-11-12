@@ -35,6 +35,10 @@ void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t
 // host ring, with its first 16 user SGPRs. Written to <markers file>.cap at the loss, and every
 // KYTY_GPU_MARKERS_CAP_PERIOD seconds (default 0: never) to <markers file>.cap<n> (at most 6).
 void SetUserData(const uint32_t* sgprs) noexcept;
+// KYTY_GPU_MARKERS_CAP: one SRT walker load (guest address, value, state bits: 1 GPU-dirty bytes, 2 GPU-dirty
+// tracker page) of the next dispatch of a listed shader, attached to its capture.
+bool CapListed(uint64_t shader) noexcept;
+void NoteSrtRead(uint64_t shader, uint64_t vaddr, uint32_t value, uint32_t state) noexcept;
 
 // A command-processor write of guest memory (DMA fill/copy, WRITE_DATA): kind 'F'/'C'/'W' on the CPU
 // at record time, 'f'/'c' through the command stream. Kept in a ring, printed against the hung reads.

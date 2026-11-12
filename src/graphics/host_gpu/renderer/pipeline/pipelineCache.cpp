@@ -24,6 +24,7 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderPretranslate.h"
+#include "graphics/host_gpu/gpuMarkers.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
@@ -61,6 +62,19 @@ namespace {
 // keeps only the reads a specialization needs).
 void CaptureSrtReads(const ShaderRecompiler::IR::ResourcePlan& plan,
                      const ShaderRecompiler::IR::SrtRuntime& runtime, const auto& snapshot) {
+	if (GpuMarkers::CapListed(runtime.shader_base)) [[unlikely]] {
+		// KYTY_GPU_MARKERS_CAP: the walk's loads, as read now, for this dispatch's capture.
+		std::vector<uint32_t>                      flat;
+		std::vector<std::pair<uint64_t, uint64_t>> reads;
+		(void)ShaderRecompiler::IR::WalkSrt(plan, runtime, flat, &reads);
+		for (const auto& [address, size]: reads) {
+			uint32_t value = 0;
+			(void)Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+			const uint32_t state = (Libs::LibKernel::Memory::IsGpuDirtyBufferRange(address, 4) ? 1u : 0u) |
+			                       (Libs::LibKernel::Memory::MaybeGpuModifiedPage(address) ? 2u : 0u);
+			GpuMarkers::NoteSrtRead(runtime.shader_base, address, value, state);
+		}
+	}
 	if (!GpuCapture::Recording()) return;
 	std::vector<uint32_t>                      flat;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;

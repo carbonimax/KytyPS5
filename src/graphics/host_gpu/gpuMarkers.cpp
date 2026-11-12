@@ -104,11 +104,22 @@ constexpr uint64_t CapRing       = 128ull << 20u;
 constexpr uint64_t CapBindingMax = 128ull << 10u;
 constexpr uint32_t CapMetas      = 4096;
 constexpr uint32_t CapUser       = 16;
+constexpr uint32_t CapSrt        = 64;
+struct SrtRead {
+	uint64_t vaddr = 0;
+	uint32_t value = 0, state = 0;
+};
+struct SrtReads {
+	uint64_t                         shader = 0;
+	uint32_t                         count  = 0;
+	std::array<SrtRead, CapSrt>      reads {};
+};
 struct CapMeta {
 	std::atomic<uint32_t> seq {0}; // 0 while being filled
 	uint32_t              x = 0, y = 0, z = 0, count = 0;
 	uint64_t              shader = 0, start = 0, bytes = 0; // ring cursor of the pre copies, total bytes
 	std::array<uint32_t, CapUser>    user {};
+	SrtReads                         srt {};
 	std::array<Binding, MaxBindings> bindings {};
 	std::array<uint32_t, MaxBindings> copied {}, pre {}, post {}; // bytes copied, ring offsets
 };
@@ -121,6 +132,7 @@ uint64_t          g_cap_cursor = 0; // bytes ever allocated in the ring (g_cap_m
 uint32_t          g_cap_count  = 0; // captures ever started (g_cap_mutex)
 thread_local std::array<uint32_t, CapUser> t_user {};
 thread_local CapMeta* t_cap = nullptr; // capture whose after-copies End records
+thread_local SrtReads t_srt;           // walker loads noted since the last dispatch
 
 const std::vector<uint64_t>& CapShaders() {
 	static const std::vector<uint64_t> list = [] {
@@ -177,6 +189,7 @@ void CapCopies(vk::CommandBuffer cmd, const CapMeta& m, bool post) {
 // Before the dispatch `e` (its bindings are final): reserves ring space and records the before-copies.
 void CapBegin(vk::CommandBuffer cmd, const Entry& e) {
 	t_cap = nullptr;
+	const uint32_t srt_count = std::exchange(t_srt.count, 0u);
 	if (g_caps == nullptr || (e.type != 'C' && e.type != 'I')) {
 		return;
 	}
@@ -207,6 +220,8 @@ void CapBegin(vk::CommandBuffer cmd, const Entry& e) {
 	m->z      = e.z;
 	m->count  = std::min(e.count, MaxBindings);
 	m->user   = t_user;
+	m->srt    = t_srt;
+	m->srt.count = srt_count;
 	uint64_t at = m->start % CapRing;
 	for (uint32_t i = 0; i < m->count; i++) {
 		m->bindings[i] = e.bindings[i];
@@ -237,7 +252,34 @@ void WriteCaps(const char* path, uint32_t finished, bool done_only, uint32_t new
 		total  = g_cap_count;
 	}
 	const uint32_t recorded = g_seq.load(std::memory_order_relaxed);
-	std::fwrite("KCAP1\0\0\0", 1, 8, f);
+	// The newest GPU write binding and CP write over `vaddr` recorded before command `from` (0: none kept).
+	const auto last_writers = [](uint32_t from, uint64_t vaddr, uint32_t& gpu_seq, uint64_t& gpu_shader, uint32_t& cp_seq) {
+		gpu_seq = cp_seq = 0;
+		gpu_shader       = 0;
+		for (uint32_t back = 1; back < TableSize && gpu_seq == 0; back++) {
+			const auto& o = g_table[(from - back) & (TableSize - 1)];
+			if (o.seq != from - back) {
+				break;
+			}
+			for (uint32_t k = 0; k < std::min(o.count, MaxBindings); k++) {
+				const auto& w = o.bindings[k];
+				if (w.written != 0 && w.vaddr <= vaddr && vaddr < w.vaddr + w.size) {
+					gpu_seq    = o.seq;
+					gpu_shader = o.shader;
+					break;
+				}
+			}
+		}
+		const uint32_t total = g_cp_count.load(std::memory_order_relaxed);
+		for (uint32_t back = 1; g_cp_writes != nullptr && back <= std::min(total, CpWrites); back++) {
+			const auto& w = g_cp_writes[(total - back) & (CpWrites - 1)];
+			if (static_cast<int32_t>(w.seq - from) < 0 && w.vaddr <= vaddr && vaddr < w.vaddr + w.size) {
+				cp_seq = w.seq;
+				break;
+			}
+		}
+	};
+	std::fwrite("KCAP2\0\0\0", 1, 8, f);
 	std::fwrite(&recorded, 4, 1, f);
 	std::fwrite(&finished, 4, 1, f);
 	std::vector<uint8_t> data;
@@ -260,6 +302,28 @@ void WriteCaps(const char* path, uint32_t finished, bool done_only, uint32_t new
 		std::fwrite(&m.y, 4, 1, f);
 		std::fwrite(&m.z, 4, 1, f);
 		std::fwrite(m.user.data(), 4, CapUser, f);
+		// KCAP2: the walker loads noted for this dispatch, the value now, and (when it changed) the last writers.
+		const uint32_t srt_count = std::min(m.srt.count, CapSrt);
+		std::fwrite(&m.srt.shader, 8, 1, f);
+		std::fwrite(&srt_count, 4, 1, f);
+		for (uint32_t i = 0; i < srt_count; i++) {
+			const auto& r   = m.srt.reads[i];
+			uint32_t    now = 0, gpu_seq = 0, cp_seq = 0;
+			uint64_t    gpu_shader = 0;
+			const uint32_t now_ok = LibKernel::Memory::TryReadBacking(r.vaddr, &now, 4) ? 1u : 0u;
+			if (now != r.value || now_ok == 0) {
+				last_writers(seq, r.vaddr, gpu_seq, gpu_shader, cp_seq);
+			}
+			const uint32_t state = r.state | (now_ok << 8u);
+			std::fwrite(&r.vaddr, 8, 1, f);
+			std::fwrite(&r.value, 4, 1, f);
+			std::fwrite(&now, 4, 1, f);
+			std::fwrite(&state, 4, 1, f);
+			std::fwrite(&gpu_seq, 4, 1, f);
+			std::fwrite(&gpu_shader, 8, 1, f);
+			std::fwrite(&cp_seq, 4, 1, f);
+			std::fwrite(&cp_seq, 4, 1, f); // pad to 40 bytes
+		}
 		std::fwrite(&m.count, 4, 1, f);
 		for (uint32_t i = 0; i < m.count; i++) {
 			const auto& b = m.bindings[i];
@@ -475,6 +539,25 @@ void SetUserData(const uint32_t* sgprs) noexcept {
 	if (g_caps != nullptr) {
 		std::copy_n(sgprs, CapUser, t_user.begin());
 	}
+}
+
+bool CapListed(uint64_t shader) noexcept {
+	if (g_caps == nullptr) {
+		return false;
+	}
+	const auto& list = CapShaders();
+	return std::find(list.begin(), list.end(), shader) != list.end();
+}
+
+void NoteSrtRead(uint64_t shader, uint64_t vaddr, uint32_t value, uint32_t state) noexcept {
+	if (t_srt.shader != shader) {
+		t_srt.shader = shader;
+		t_srt.count  = 0;
+	}
+	if (t_srt.count < CapSrt) {
+		t_srt.reads[t_srt.count] = {vaddr, value, state};
+	}
+	t_srt.count++;
 }
 
 void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer,
