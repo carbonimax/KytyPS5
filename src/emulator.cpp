@@ -55,6 +55,47 @@ static void PrintSystemInfo() {
 	     std::thread::hardware_concurrency());
 }
 
+// ID[=MODE][,ID[=MODE]...]: the mode listed for title_id ("1" when none is given), or nullptr.
+static const char* ModeForTitle(const char* list, const std::string& title_id) {
+	static thread_local std::string mode;
+	if (list == nullptr || title_id.empty()) {
+		return nullptr;
+	}
+	const std::string_view all(list);
+	for (size_t at = 0; at <= all.size();) {
+		auto end         = all.find(',', at);
+		end              = end == std::string_view::npos ? all.size() : end;
+		const auto item  = all.substr(at, end - at);
+		const auto equal = item.find('=');
+		if (item.substr(0, equal) == title_id) {
+			mode = equal == std::string_view::npos ? "1" : std::string(item.substr(equal + 1));
+			return mode.c_str();
+		}
+		at = end + 1;
+	}
+	return nullptr;
+}
+
+// KYTY_SPARSE_COPY_CACHE_TITLES=ID[=MODE][,...] (local configuration, default empty) sets
+// KYTY_SPARSE_COPY_CACHE for the running title before any guest memory is copied; an explicit
+// KYTY_SPARSE_COPY_CACHE keeps precedence.
+static void ApplyPerTitleSparseCopy(const std::string& title_id) {
+	EXIT_IF(ModeForTitle("A1,B2=2", "B2") == nullptr || std::string(ModeForTitle("A1,B2=2", "B2")) != "2" ||
+	        std::string(ModeForTitle("A1,B2=2", "A1")) != "1" || ModeForTitle("A1", "A") != nullptr ||
+	        ModeForTitle("", "A1") != nullptr);
+	const char* mode = ModeForTitle(std::getenv("KYTY_SPARSE_COPY_CACHE_TITLES"), title_id);
+	if (mode == nullptr || std::getenv("KYTY_SPARSE_COPY_CACHE") != nullptr) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	_putenv_s("KYTY_SPARSE_COPY_CACHE", mode);
+#else
+	setenv("KYTY_SPARSE_COPY_CACHE", mode, 0);
+#endif
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Title {}: KYTY_SPARSE_COPY_CACHE={} from KYTY_SPARSE_COPY_CACHE_TITLES\n", title_id, mode));
+}
+
 static void KytyClose() {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -165,6 +206,7 @@ void Run(const RunOptions& options) {
 	if (!title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
+	ApplyPerTitleSparseCopy(title_id);
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
