@@ -277,6 +277,7 @@ struct ImportStats {
 	std::atomic<uint64_t> dropped {0};      // imported buffers deleted at unmap
 	std::atomic<uint64_t> image_syncs {0};  // texel buffers filled from an image (guest memory written)
 	std::atomic<uint64_t> owned_labels {0}; // GPU-owned labels written in the stream only
+	std::atomic<uint64_t> stream_labels {0}; // KYTY_MEM_IMPORT_LABELS: labels on imported pages
 	std::atomic<uint64_t> cp_writes {0};    // command-processor CPU writes into imported memory
 	std::atomic<uint64_t> cp_waits {0};     // ... that waited for earlier GPU work
 	std::atomic<uint64_t> cp_wait_ns {0};
@@ -470,6 +471,7 @@ void BufferCache::ReportImport(double seconds) {
 	const auto dropped      = take(st.dropped);
 	const auto image_syncs  = take(st.image_syncs);
 	const auto owned_labels = take(st.owned_labels);
+	const auto stream_labels = take(st.stream_labels);
 	const auto cp_writes    = take(st.cp_writes);
 	const auto cp_waits     = take(st.cp_waits);
 	const auto cp_wait_ns   = take(st.cp_wait_ns);
@@ -480,7 +482,7 @@ void BufferCache::ReportImport(double seconds) {
 	std::printf("PERF import %.1fs: buffers imported=%" PRIu64 " device=%" PRIu64 " failed=%" PRIu64
 	            " chunks=%" PRIu64 " own=%" PRIu64 " import=%.1fms | syncs read=%.0f/s write=%.0f/s"
 	            " stream_skips=%.0f/s snaps=%.0f/s(%.2fMiB/s) shader_snaps=%.0f/s skipped_gpu=%.0f/s | publish now=%.0f/s waited=%.0f/s(%.2fms/s) replayed=%.0f/s"
-	            " | join_copies=%" PRIu64 " dropped=%" PRIu64 " image_syncs=%.0f/s owned_labels=%.0f/s"
+	            " | join_copies=%" PRIu64 " dropped=%" PRIu64 " image_syncs=%.0f/s owned_labels=%.0f/s stream_labels=%.0f/s"
 	            " | cp_writes=%.0f/s cp_waits=%.0f/s(%.2fms/s) write_demotes=%" PRIu64 "\n",
 	            seconds, imported, device, failed, chunks, own, static_cast<double>(import_ns) / 1e6,
 	            static_cast<double>(read_syncs) / seconds, static_cast<double>(write_syncs) / seconds,
@@ -490,6 +492,7 @@ void BufferCache::ReportImport(double seconds) {
 	            static_cast<double>(waited) / seconds, static_cast<double>(wait_ns) / 1e6 / seconds,
 	            static_cast<double>(replayed) / seconds, join_copies, dropped,
 	            static_cast<double>(image_syncs) / seconds, static_cast<double>(owned_labels) / seconds,
+	            static_cast<double>(stream_labels) / seconds,
 	            static_cast<double>(cp_writes) / seconds, static_cast<double>(cp_waits) / seconds,
 	            static_cast<double>(cp_wait_ns) / 1e6 / seconds, demotes);
 }
@@ -1908,6 +1911,31 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 	// these bytes in command-stream order with the GPU writes around them.
 	WriteDataBuffer(buffer, vaddr, data, size);
 	NoteBufferWrite(vaddr, size);
+	return true;
+}
+
+// Copy mode overlays a pending RELEASE_MEM label on the uploads of later GPU work; imported memory has
+// no upload, so without this the GPU reads the old bytes until the label lands at completion.
+bool BufferCache::WriteImportedLabel(uint64_t vaddr, const void* data, uint64_t size) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MEM_IMPORT_LABELS");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	if (!enabled || !m_import || size == 0 || !GuestGpu::IsGpuThread() || !GuestRange {vaddr, size}.Valid() ||
+	    m_scheduler.Current().IsInvalid()) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return false;
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (!buffer.IsImported() || !buffer.IsInBounds(vaddr, size)) {
+		return false;
+	}
+	LateRead::NoteBackingWrite(vaddr, size, true);
+	WriteDataBuffer(buffer, vaddr, data, size); // lands in guest memory when the GPU gets there
+	g_import_stats.stream_labels.fetch_add(1, std::memory_order_relaxed);
 	return true;
 }
 

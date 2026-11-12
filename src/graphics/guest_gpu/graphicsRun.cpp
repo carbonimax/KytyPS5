@@ -1797,6 +1797,12 @@ void CommandProcessor::ReleaseMemAtGpu(uint32_t data_sel, bool interrupt, void* 
 			m_renderer.GetTextureCache().InvalidateMemory(address_value, label_size, RefreshProf::Label);
 			seq = g_pending_labels.Add(address_value, label_size, value, false);
 			st.gpu_owned.fetch_add(1, std::memory_order_relaxed);
+		} else if (!g_pending_labels.HasPending(address_value, label_size) &&
+		           m_renderer.GetBufferCache().WriteImportedLabel(address_value, &value, label_size)) {
+			// Imported guest memory: the stream write is the release (KYTY_MEM_IMPORT_LABELS).
+			m_renderer.GetTextureCache().InvalidateMemory(address_value, label_size, RefreshProf::Label);
+			seq = g_pending_labels.Add(address_value, label_size, value, false);
+			st.gpu_owned.fetch_add(1, std::memory_order_relaxed);
 		} else {
 			seq      = g_pending_labels.Add(address_value, label_size, value, true);
 			deferred = true;

@@ -81,6 +81,9 @@ public:
 	// at this point of the command stream. Returns false when the regular CPU write must be used
 	// (KYTY_GPU_OWNED_WRITE_DATA=0 always does).
 	[[nodiscard]] bool     WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size);
+	// KYTY_MEM_IMPORT_LABELS=1: a RELEASE_MEM label over imported guest memory, written through the
+	// command stream (later GPU work reads it in stream order). False when not applicable.
+	[[nodiscard]] bool     WriteImportedLabel(uint64_t vaddr, const void* data, uint64_t size);
 	// Any thread (KYTY_EOP_AT_GPU label delivery): the bytes were just written through the backing.
 	// Marks them CPU-modified, as a guest write fault would, and returns true; returns false and
 	// changes nothing when a byte is GPU-modified (a readback would overwrite them).
