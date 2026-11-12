@@ -355,6 +355,42 @@ void Dump(const char* site) noexcept {
 							writers_shown++;
 							Print(f, o, "    writer");
 							SnapDiff(f, o.seq);
+							// What wrote the writer's reads after it was recorded: GPU writes landing in
+							// stream order, or command-processor writes. Neither: the guest CPU.
+							for (uint32_t j = 0; j < std::min(o.count, MaxBindings); j++) {
+								const auto& in = o.bindings[j];
+								if (in.written != 0) {
+									continue;
+								}
+								uint32_t later = 0;
+								for (uint32_t s2 = o.seq + 1; s2 != seq + 1 && later < 8; s2++) {
+									const auto& l = g_table[s2 & (TableSize - 1)];
+									for (uint32_t m = 0; l.seq == s2 && m < std::min(l.count, MaxBindings); m++) {
+										const auto& lw = l.bindings[m];
+										if (lw.written != 0 && lw.vaddr < in.vaddr + in.size && in.vaddr < lw.vaddr + lw.size) {
+											std::fprintf(f, "      later GPU write of 0x%016" PRIx64 ": seq=%u (+%u) shader=0x%016" PRIx64
+											                " 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+											             in.vaddr, l.seq, l.seq - o.seq, l.shader, lw.vaddr, lw.size);
+											later++;
+										}
+									}
+								}
+								const uint32_t total = g_cp_count.load(std::memory_order_relaxed);
+								for (uint32_t back = 1; g_cp_writes != nullptr && back <= std::min(total, CpWrites); back++) {
+									const auto& w2 = g_cp_writes[(total - back) & (CpWrites - 1)];
+									if (static_cast<int32_t>(w2.seq - o.seq) < 0) {
+										break; // ring is in record order
+									}
+									if (w2.vaddr < in.vaddr + in.size && in.vaddr < w2.vaddr + w2.size) {
+										std::fprintf(f, "      later cp %c over 0x%016" PRIx64 ": 0x%016" PRIx64 "+0x%" PRIx64
+										                " after seq=%u (+%d)\n",
+										             w2.kind, in.vaddr, w2.vaddr, w2.size, w2.seq,
+										             static_cast<int>(w2.seq) - static_cast<int>(o.seq));
+									}
+								}
+								std::fprintf(f, "      read 0x%016" PRIx64 "+0x%" PRIx64 ": %u later GPU writes shown\n", in.vaddr,
+								             in.size, later);
+							}
 						}
 					}
 				}

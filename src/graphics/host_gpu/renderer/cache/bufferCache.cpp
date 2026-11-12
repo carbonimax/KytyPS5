@@ -271,6 +271,8 @@ struct ImportStats {
 	std::atomic<uint64_t> stream_skips {0}; // small reads bound directly instead of stream copies
 	std::atomic<uint64_t> snaps {0};        // small imported reads copied at bind (KYTY_MEM_IMPORT_SNAP)
 	std::atomic<uint64_t> snap_bytes {0};
+	std::atomic<uint64_t> shader_snaps {0}; // KYTY_MEM_IMPORT_SNAP_SHADERS reads copied at bind
+	std::atomic<uint64_t> shader_skips {0}; // ... left imported: GPU-modified bytes in the range
 	std::atomic<uint64_t> join_copies {0};  // GPU-written ranges copied into a new imported buffer
 	std::atomic<uint64_t> dropped {0};      // imported buffers deleted at unmap
 	std::atomic<uint64_t> image_syncs {0};  // texel buffers filled from an image (guest memory written)
@@ -453,6 +455,8 @@ void BufferCache::ReportImport(double seconds) {
 	const auto stream_skips = take(st.stream_skips);
 	const auto snaps        = take(st.snaps);
 	const auto snap_bytes   = take(st.snap_bytes);
+	const auto shader_snaps = take(st.shader_snaps);
+	const auto shader_skips = take(st.shader_skips);
 	const auto join_copies  = take(st.join_copies);
 	const auto dropped      = take(st.dropped);
 	const auto image_syncs  = take(st.image_syncs);
@@ -466,13 +470,14 @@ void BufferCache::ReportImport(double seconds) {
 	}
 	std::printf("PERF import %.1fs: buffers imported=%" PRIu64 " device=%" PRIu64 " failed=%" PRIu64
 	            " chunks=%" PRIu64 " own=%" PRIu64 " import=%.1fms | syncs read=%.0f/s write=%.0f/s"
-	            " stream_skips=%.0f/s snaps=%.0f/s(%.2fMiB/s) | publish now=%.0f/s waited=%.0f/s(%.2fms/s) replayed=%.0f/s"
+	            " stream_skips=%.0f/s snaps=%.0f/s(%.2fMiB/s) shader_snaps=%.0f/s skipped_gpu=%.0f/s | publish now=%.0f/s waited=%.0f/s(%.2fms/s) replayed=%.0f/s"
 	            " | join_copies=%" PRIu64 " dropped=%" PRIu64 " image_syncs=%.0f/s owned_labels=%.0f/s"
 	            " | cp_writes=%.0f/s cp_waits=%.0f/s(%.2fms/s) write_demotes=%" PRIu64 "\n",
 	            seconds, imported, device, failed, chunks, own, static_cast<double>(import_ns) / 1e6,
 	            static_cast<double>(read_syncs) / seconds, static_cast<double>(write_syncs) / seconds,
 	            static_cast<double>(stream_skips) / seconds, static_cast<double>(snaps) / seconds,
-	            static_cast<double>(snap_bytes) / 1048576.0 / seconds, static_cast<double>(published) / seconds,
+	            static_cast<double>(snap_bytes) / 1048576.0 / seconds, static_cast<double>(shader_snaps) / seconds,
+	            static_cast<double>(shader_skips) / seconds, static_cast<double>(published) / seconds,
 	            static_cast<double>(waited) / seconds, static_cast<double>(wait_ns) / 1e6 / seconds,
 	            static_cast<double>(replayed) / seconds, join_copies, dropped,
 	            static_cast<double>(image_syncs) / seconds, static_cast<double>(owned_labels) / seconds,
@@ -2109,6 +2114,26 @@ static int ImportSnap() {
 	return mode;
 }
 
+// KYTY_MEM_IMPORT_SNAP_SHADERS=addr[,addr...] (hex compute shader addresses): their small imported
+// reads are copied at bind like KYTY_MEM_IMPORT_SNAP=2 does for every shader.
+static bool SnapShaderListed(uint64_t address) {
+	static const std::vector<uint64_t> shaders = [] {
+		std::vector<uint64_t> out;
+		const char*           value = std::getenv("KYTY_MEM_IMPORT_SNAP_SHADERS");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next = nullptr;
+			const auto item = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.push_back(item);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
+	}();
+	return address != 0 && std::find(shaders.begin(), shaders.end(), address) != shaders.end();
+}
+
 // KYTY_MEM_IMPORT_SHADERS_ACCESS=r|w (diagnostic): only the listed shaders' reads (r) or writes (w)
 // leave imported memory; unset, both do.
 static bool ImportShaderAccess(bool is_written) {
@@ -2523,8 +2548,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	                            IsImportedRange(vaddr, size, &ring);
 	// KYTY_MEM_IMPORT_SNAP: a small read of an imported ring (2: of any imported buffer) is copied now,
 	// as copy mode does, instead of read by the GPU later from guest memory the guest may rewrite first.
-	const bool snapshot = imported_range && (ImportSnap() == 2 || (ImportSnap() == 1 && ring)) &&
+	const bool listed   = imported_range && SnapShaderListed(GpuMarkers::Shader());
+	const bool snapshot = imported_range && (ImportSnap() == 2 || (ImportSnap() == 1 && ring) || listed) &&
 	                      !m_memory_tracker.IsRegionGpuModified(vaddr, size);
+	if (listed) {
+		(snapshot ? g_import_stats.shader_snaps : g_import_stats.shader_skips).fetch_add(1, std::memory_order_relaxed);
+		static std::atomic<uint32_t> skip_logs {0};
+		if (!snapshot && ImportLogEnabled() && skip_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
+			LOGF("BufferCache: KYTY_MEM_IMPORT_SNAP_SHADERS 0x%016" PRIx64 " read 0x%016" PRIx64 "+0x%" PRIx64
+			     " left imported (GPU-modified)\n",
+			     GpuMarkers::Shader(), vaddr, size);
+		}
+	}
 	if (imported_range && !snapshot) {
 		g_import_stats.stream_skips.fetch_add(1, std::memory_order_relaxed);
 	}
