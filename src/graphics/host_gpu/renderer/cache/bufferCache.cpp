@@ -1346,15 +1346,24 @@ struct Entry {
 	uint64_t             buffer_vaddr = 0, buffer_size = 0; // imported buffer holding it, else 0
 	uint64_t             shader = 0;                        // binding shader (GpuMarkers::Shader)
 	// KYTY_MEM_IMPORT_WATCH: the bytes just before the guest's first write to one of its pages.
-	bool                 watched = false, snapped = false;
+	bool                 snapped   = false;
 	uint64_t             snap_hash = 0; // like hash
 	std::vector<uint8_t> snap;
 };
 
-// The ranges bound since a seal; watched entries are indexed by 64 KiB chunk for the write hook.
+// KYTY_MEM_IMPORT_WATCH: a watched range (no bytes), from its first binding to the check of the last
+// batch that bound it before the guest wrote one of its pages (it stays write-protected until then, so
+// its bytes are those of the first binding: a new binding only extends it).
+struct Live {
+	Entry    entry;
+	uint64_t last_batch = 0;
+};
+
+// The ranges bound since a seal: copied at bind (period net, reference) or watched.
 struct Batch {
-	std::deque<Entry>                                   entries;
-	std::unordered_map<uint64_t, std::vector<uint32_t>> chunks;
+	uint64_t                           index = 0;
+	std::deque<Entry>                  entries;
+	std::vector<std::shared_ptr<Live>> touched;
 };
 
 struct Key {
@@ -1389,17 +1398,19 @@ struct Write {
 struct State {
 	std::mutex                          mutex; // everything but the write log
 	std::shared_ptr<Batch>              open = std::make_shared<Batch>();
-	std::vector<std::shared_ptr<Batch>> inflight; // sealed, not checked yet (watched by the hook)
-	std::unordered_set<Key, KeyHash>    seen;     // ranges of the open batch
+	std::unordered_set<Key, KeyHash>    seen; // copied ranges of the open batch
+	std::unordered_map<Key, std::shared_ptr<Live>, KeyHash> live;   // watched ranges by range
+	std::unordered_map<uint64_t, std::vector<Live*>>        chunks; // ... by 64 KiB chunk (write hook)
 	uint64_t                            batch_index = 0;
 	bool                                sampled     = true;
 	std::array<std::array<Cell, static_cast<size_t>(Site::Count)>, PathCount> cells {};
 	std::unordered_map<Key, Changed, KeyHash> changed;
 	uint64_t batches = 0, checked = 0, bind_ns = 0, check_ns = 0, lost = 0, latency_ns = 0;
 	// KYTY_MEM_IMPORT_WATCH: bind-time protection, write hooks (guest threads), entries copied by them;
-	// with the copy at bind too, guest verdicts of the copy only (miss) and of the watch only (extra).
-	uint64_t protect_ns = 0, hooks = 0, hook_ns = 0, snaps = 0, ref_guest = 0, watch_guest = 0, miss = 0,
-	         extra = 0;
+	// guest verdicts of the copy at bind (with KYTY_LATE_READ_PROF) and of the watch; watched ranges new,
+	// extended (bound again before any write) and checked.
+	uint64_t protect_ns = 0, hooks = 0, hook_ns = 0, snaps = 0, ref_guest = 0, watch_guest = 0, fresh = 0,
+	         extended = 0, judged = 0;
 	std::atomic<uint64_t> backing_ns {0}; // NoteBackingWrite
 	std::vector<Key> demote; // imported buffers the guest rewrote under the GPU (back to copies)
 	uint64_t         demoted = 0;
@@ -1453,37 +1464,59 @@ void Copy(uint64_t vaddr, uint64_t size, std::vector<uint8_t>& bytes, uint64_t& 
 	}
 }
 
-// GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new entry of the open batch.
+// KYTY_MEM_IMPORT_WATCH, st.mutex held: the range is watched from now (a new one) or further (same bytes).
+// True for a new one: the caller write-protects its pages.
+bool Track(State& st, const Entry& entry) {
+	auto& slot = st.live[{entry.vaddr, entry.size}];
+	if (slot != nullptr && !slot->entry.snapped) {
+		if (slot->last_batch != st.open->index) {
+			slot->last_batch = st.open->index;
+			st.open->touched.push_back(slot);
+			st.extended++;
+		}
+		return false;
+	}
+	// A snapped one keeps its pending check; the range is watched again from this binding.
+	slot             = std::make_shared<Live>(Live {entry, st.open->index});
+	slot->entry.seq  = st.seq.load(std::memory_order_acquire);
+	for (auto chunk = entry.vaddr >> 16u; chunk <= (entry.vaddr + entry.size - 1) >> 16u; chunk++) {
+		st.chunks[chunk].push_back(slot.get());
+	}
+	st.open->touched.push_back(slot);
+	st.fresh++;
+	return true;
+}
+
+// GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new watched range (protect it).
 bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
 	if (t_site == Site::None) {
 		return false;
 	}
 	auto&      st    = S();
 	const auto start = NowNs();
+	Entry      entry {vaddr, size, 0, 0, path, t_site, {}, buffer_vaddr, buffer_size, GpuMarkers::Shader()};
+	bool       fresh = false;
+	if (Watch() != 0 && buffer_size != 0) {
+		std::lock_guard lock(st.mutex);
+		fresh = Track(st, entry);
+		if (NetOnly()) {
+			st.bind_ns += NowNs() - start;
+			return fresh;
+		}
+	}
 	{
 		std::lock_guard lock(st.mutex);
 		if (!st.sampled || !st.seen.insert({vaddr, size}).second) {
-			return false;
+			return fresh;
 		}
 	}
 	// Taken before reading: a logged write racing with the read is attributed to its writer.
-	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}, buffer_vaddr,
-	             buffer_size, GpuMarkers::Shader()};
-	entry.watched = Watch() != 0 && buffer_size != 0;
-	if (!entry.watched || !NetOnly()) {
-		Copy(vaddr, size, entry.bytes, entry.hash);
-	}
+	entry.seq = st.seq.load(std::memory_order_acquire);
+	Copy(vaddr, size, entry.bytes, entry.hash);
 	std::lock_guard lock(st.mutex);
-	auto&           batch = *st.open;
-	if (entry.watched) {
-		const auto index = static_cast<uint32_t>(batch.entries.size());
-		for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
-			batch.chunks[chunk].push_back(index);
-		}
-	}
-	batch.entries.push_back(std::move(entry));
+	st.open->entries.push_back(std::move(entry));
 	st.bind_ns += NowNs() - start;
-	return true;
+	return fresh;
 }
 
 // The logged writes overlapping the entry since its bind read started; false when the log lost some.
@@ -1568,69 +1601,71 @@ Kind Judge(const Entry& entry, const std::vector<uint8_t>& before, uint64_t befo
 // Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
 void Check(const std::shared_ptr<Batch>& shared, uint64_t sealed_ns) {
 	auto& st = S();
+	// Watched ranges last bound in this batch, detached first: the write hook no longer touches them.
+	std::vector<std::shared_ptr<Live>> due;
 	{
-		// From here the write hook no longer touches the batch.
 		std::lock_guard lock(st.mutex);
-		std::erase(st.inflight, shared);
+		for (const auto& live: shared->touched) {
+			if (live->last_batch != shared->index) {
+				continue; // bound again by a later batch, which checks it
+			}
+			due.push_back(live);
+			const auto& e = live->entry;
+			if (const auto it = st.live.find({e.vaddr, e.size}); it != st.live.end() && it->second == live) {
+				st.live.erase(it);
+			}
+			for (auto chunk = e.vaddr >> 16u; chunk <= (e.vaddr + e.size - 1) >> 16u; chunk++) {
+				if (const auto it = st.chunks.find(chunk); it != st.chunks.end()) {
+					std::erase(it->second, live.get());
+					if (it->second.empty()) {
+						st.chunks.erase(it);
+					}
+				}
+			}
+		}
 	}
-	const auto&           batch = shared->entries;
-	const auto            start = NowNs();
-	std::vector<Kind>     kinds(batch.size());
-	std::vector<uint64_t> diffs(batch.size());
-	uint64_t              lost_count = 0, ref_guest = 0, watch_guest = 0, miss = 0, extra = 0;
-	for (size_t i = 0; i < batch.size(); i++) {
-		const auto& entry = batch[i];
-		bool        lost  = false;
-		// The copy at bind is the reference when it ran; a watched entry never copied by the hook
-		// was not written by the guest (its pages stayed write-protected).
-		const bool ref_on = !entry.watched || !NetOnly();
-		Kind       ref = Same, watch = Same;
-		uint64_t   ref_diff = 0, watch_diff = 0;
-		if (ref_on) {
-			ref = Judge(entry, entry.bytes, entry.hash, ref_diff, lost);
-		}
-		if (entry.watched && entry.snapped) {
-			bool watch_lost = false;
-			watch           = Judge(entry, entry.snap, entry.snap_hash, watch_diff, watch_lost);
-			lost |= watch_lost;
-		}
-		kinds[i] = ref_on ? ref : watch;
-		diffs[i] = std::max(ref_diff, watch_diff);
-		if (entry.watched && ref_on) {
-			ref_guest += ref == Guest ? 1 : 0;
-			watch_guest += watch == Guest ? 1 : 0;
-			if ((ref == Guest) != (watch == Guest)) {
-				(ref == Guest ? miss : extra)++;
-				LOGF("BufferCache: KYTY_MEM_IMPORT_WATCH %s 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s shader=0x%016" PRIx64
-				     " snapped=%d bind_changed=%" PRIu64 " watch_changed=%" PRIu64 "\n",
-				     ref == Guest ? "miss" : "extra", entry.vaddr, entry.size, PathNames[entry.path],
-				     SiteNames[static_cast<size_t>(entry.site)], entry.shader, entry.snapped ? 1 : 0, ref_diff,
-				     watch_diff);
-			}
-			if (watch == Guest) {
-				kinds[i] = Guest; // demoted on either verdict
-			}
+	struct Result {
+		const Entry* entry = nullptr;
+		Kind         kind  = Same;
+		uint64_t     diff  = 0;
+		bool         watch = false;
+	};
+	const auto          start = NowNs();
+	std::vector<Result> results;
+	results.reserve(shared->entries.size() + due.size());
+	uint64_t lost_count = 0;
+	for (const auto& entry: shared->entries) {
+		Result r {&entry};
+		bool   lost = false;
+		r.kind      = Judge(entry, entry.bytes, entry.hash, r.diff, lost);
+		lost_count += lost ? 1 : 0;
+		results.push_back(r);
+	}
+	for (const auto& live: due) {
+		// Never copied by the hook: its pages stayed write-protected, the guest did not write it.
+		Result r {&live->entry, Same, 0, true};
+		bool   lost = false;
+		if (live->entry.snapped) {
+			r.kind = Judge(live->entry, live->entry.snap, live->entry.snap_hash, r.diff, lost);
 		}
 		lost_count += lost ? 1 : 0;
+		results.push_back(r);
 	}
 	std::lock_guard lock(st.mutex);
 	st.checked++;
 	st.lost += lost_count;
 	st.latency_ns += start - sealed_ns;
-	st.ref_guest += ref_guest;
-	st.watch_guest += watch_guest;
-	st.miss += miss;
-	st.extra += extra;
-	for (size_t i = 0; i < batch.size(); i++) {
-		const auto& entry = batch[i];
+	st.judged += due.size();
+	for (const auto& r: results) {
+		const auto& entry = *r.entry;
 		auto&       cell  = st.cells[entry.path][static_cast<size_t>(entry.site)];
 		cell.n++;
 		cell.bytes += entry.size;
-		switch (kinds[i]) {
+		switch (r.kind) {
 			case Guest:
 				cell.guest++;
 				cell.guest_bytes += entry.size;
-				cell.guest_diff += diffs[i];
+				cell.guest_diff += r.diff;
 				break;
 			case Cp:
 				cell.cp++;
@@ -1641,16 +1676,21 @@ void Check(const std::shared_ptr<Batch>& shared, uint64_t sealed_ns) {
 			case Unreadable: cell.unread++; break;
 			default: break;
 		}
-		if (kinds[i] == Guest && entry.buffer_size != 0) {
-			st.demote.push_back({entry.buffer_vaddr, entry.buffer_size});
-			LOGF("BufferCache: KYTY_MEM_IMPORT net: bound 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s shader=0x%016" PRIx64
-			     " changed=%" PRIu64 " bytes, seal->check %.2f ms\n",
-			     entry.vaddr, entry.size, PathNames[entry.path], SiteNames[static_cast<size_t>(entry.site)],
-			     entry.shader, diffs[i], static_cast<double>(start - sealed_ns) / 1e6);
+		if (r.kind == Guest && Watch() != 0) {
+			(r.watch ? st.watch_guest : st.ref_guest)++;
 		}
-		if (kinds[i] == Guest || kinds[i] == Cp) {
+		if (r.kind == Guest && entry.buffer_size != 0) {
+			st.demote.push_back({entry.buffer_vaddr, entry.buffer_size});
+			// With both nets (KYTY_MEM_IMPORT_WATCH + KYTY_LATE_READ_PROF) the copy at bind logs "net(ref)".
+			LOGF("BufferCache: KYTY_MEM_IMPORT %s: bound 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s shader=0x%016" PRIx64
+			     " changed=%" PRIu64 " bytes, seal->check %.2f ms\n",
+			     r.watch || Watch() == 0 ? "net" : "net(ref)", entry.vaddr, entry.size, PathNames[entry.path],
+			     SiteNames[static_cast<size_t>(entry.site)], entry.shader, r.diff,
+			     static_cast<double>(start - sealed_ns) / 1e6);
+		}
+		if (r.kind == Guest || r.kind == Cp) {
 			auto& changed = st.changed[{entry.vaddr, entry.size}];
-			(kinds[i] == Guest ? changed.guest : changed.cp)++;
+			(r.kind == Guest ? changed.guest : changed.cp)++;
 			changed.path = entry.path;
 			changed.site = entry.site;
 		}
@@ -1682,25 +1722,19 @@ void BeforeCpuDirty(uint64_t vaddr, uint64_t size) {
 	auto&           st    = S();
 	const auto      start = NowNs();
 	std::lock_guard lock(st.mutex);
-	const auto      copy_overlapping = [&](Batch& batch) {
-        for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
-            const auto it = batch.chunks.find(chunk);
-            if (it == batch.chunks.end()) {
-                continue;
-            }
-            for (const auto index: it->second) {
-                auto& entry = batch.entries[index];
-                if (!entry.snapped && entry.vaddr < vaddr + size && vaddr < entry.vaddr + entry.size) {
-                    entry.snapped = true;
-                    Copy(entry.vaddr, entry.size, entry.snap, entry.snap_hash);
-                    st.snaps++;
-                }
-            }
-        }
-	};
-	copy_overlapping(*st.open);
-	for (const auto& batch: st.inflight) {
-		copy_overlapping(*batch);
+	for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
+		const auto it = st.chunks.find(chunk);
+		if (it == st.chunks.end()) {
+			continue;
+		}
+		for (auto* live: it->second) {
+			auto& e = live->entry;
+			if (!e.snapped && e.vaddr < vaddr + size && vaddr < e.vaddr + e.size) {
+				e.snapped = true;
+				Copy(e.vaddr, e.size, e.snap, e.snap_hash);
+				st.snaps++;
+			}
+		}
 	}
 	st.hooks++;
 	st.hook_ns += NowNs() - start;
@@ -1762,12 +1796,14 @@ void Report(double seconds, uint64_t frames) {
 	if (Watch() != 0) {
 		std::printf("PERF lateread_watch %.1fs mode=%d: protect=%.2fms/frame log=%.2fms/frame hooks=%.0f/frame"
 		            " hook=%.2fms/frame snaps=%.0f/frame ref_guest=%" PRIu64 " watch_guest=%" PRIu64
-		            " miss=%" PRIu64 " extra=%" PRIu64 "\n",
+		            " fresh=%.0f/frame extended=%.0f/frame judged=%.0f/frame live=%zu\n",
 		            seconds, Watch(), static_cast<double>(st.protect_ns) / 1e6 / f,
 		            static_cast<double>(backing_ns) / 1e6 / f, static_cast<double>(st.hooks) / f,
 		            static_cast<double>(st.hook_ns) / 1e6 / f, static_cast<double>(st.snaps) / f, st.ref_guest,
-		            st.watch_guest, st.miss, st.extra);
-		st.protect_ns = st.hooks = st.hook_ns = st.snaps = st.ref_guest = st.watch_guest = st.miss = st.extra = 0;
+		            st.watch_guest, static_cast<double>(st.fresh) / f, static_cast<double>(st.extended) / f,
+		            static_cast<double>(st.judged) / f, st.live.size());
+		st.protect_ns = st.hooks = st.hook_ns = st.snaps = st.ref_guest = st.watch_guest = 0;
+		st.fresh = st.extended = st.judged = 0;
 	}
 	for (size_t p = 0; p < PathCount; p++) {
 		for (size_t s = 0; s < SiteNames.size(); s++) {
@@ -1837,12 +1873,10 @@ void BufferCache::SealLateReads() {
 		batch = std::exchange(st.open, std::make_shared<LateRead::Batch>());
 		st.seen.clear();
 		st.batches++;
-		st.sampled = ++st.batch_index % static_cast<uint64_t>(LateRead::SamplePeriod()) == 0;
-		if (!batch->entries.empty() && !batch->chunks.empty()) {
-			st.inflight.push_back(batch);
-		}
+		st.sampled     = ++st.batch_index % static_cast<uint64_t>(LateRead::SamplePeriod()) == 0;
+		st.open->index = st.batch_index;
 	}
-	if (batch->entries.empty()) {
+	if (batch->entries.empty() && batch->touched.empty()) {
 		return;
 	}
 	m_scheduler.DeferPriorityOperation(
