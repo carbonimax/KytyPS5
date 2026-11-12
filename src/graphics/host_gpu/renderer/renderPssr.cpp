@@ -4,6 +4,7 @@
 #include "gpu_blit_shaders/gpu_pssr_motion_spv.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -230,6 +231,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 			                                     {request.context, {}, nullptr});
 		}
 		context->creation = *creation;
+		CmdRecord::Drain(); // NGX records with the driver's entry points, not the recorder's
 		context->feature  = Upscaler::Create(command, *creation);
 		reset             = true;
 	}
@@ -237,6 +239,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 		return false;
 	}
 	MemoryBarrier(command);
+	CmdRecord::Drain(); // DLSS and FSR record with the driver's entry points, not the recorder's
 	if (!context->feature->Evaluate(command, request, inputs, reset)) {
 		release(context->feature);
 		return false;
