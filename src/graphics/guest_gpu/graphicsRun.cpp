@@ -1412,6 +1412,8 @@ void CommandProcessor::CountDraw() {
 		return;
 	}
 	if (m_draws == m_flush_draws) {
+		// The CP back thread may still be recording queued draws into the buffer being submitted.
+		CpPipeline::Drain();
 		GetScheduler().Flush();
 		m_draws = 0;
 	}
