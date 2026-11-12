@@ -23,11 +23,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -217,10 +219,19 @@ void GraphicContext::DestroyAllocator() {
 
 void GraphicContext::ReportDeviceLost(vk::Result result, const char* site) const {
 	static std::atomic_flag reported = ATOMIC_FLAG_INIT;
-	if (result != vk::Result::eErrorDeviceLost || reported.test_and_set()) {
+	static std::atomic<bool> dumped {false};
+	if (result != vk::Result::eErrorDeviceLost) {
+		return;
+	}
+	if (reported.test_and_set()) {
+		// Another thread reports this loss: let its marker dump finish before this one exits.
+		for (int i = 0; i < 300 && GpuMarkers::Active() && !dumped.load(); i++) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
 		return;
 	}
 	GpuMarkers::Dump(site);
+	dumped.store(true);
 	if (!device_fault_enabled) {
 		LOGF("Device lost at %s: no fault record (VK_EXT_device_fault off or not offered)\n", site);
 		return;

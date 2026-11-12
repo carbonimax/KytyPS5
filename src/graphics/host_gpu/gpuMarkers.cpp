@@ -324,22 +324,11 @@ void Dump(const char* site) noexcept {
 		}
 		const char* tag = seq <= finished ? "done " : seq == finished + 1 ? "HUNG " : seq <= begun ? "begun" : "queued";
 		Print(f, e, tag);
+		std::fflush(f); // keep what is written if the process ends during the dump
 		if (seq != finished + 1) {
 			continue;
 		}
-		// The hung command's guest bytes now (up to 16 KiB of each binding), and at bind time (SNAP).
-		std::vector<uint8_t> now(SnapMax);
-		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
-			const auto& bind = e.bindings[i];
-			const auto  size = std::min<uint64_t>(bind.size, SnapMax);
-			if (LibKernel::Memory::TryReadBacking(bind.vaddr, now.data(), size)) {
-				Words(f, "now", bind.vaddr, now.data(), size);
-			}
-		}
-		const auto* snap = g_snaps != nullptr ? &g_snaps[seq % SnapSlots] : nullptr;
-		for (uint32_t i = 0; snap != nullptr && snap->seq == seq && i < snap->count; i++) {
-			Words(f, "bind", snap->vaddr[i], snap->bytes[i].data(), snap->bytes[i].size());
-		}
+		SnapDiff(f, seq);
 		// Every kept command that bound bytes of the hung command's reads (latest first, 24 per read).
 		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
 			const auto& r = e.bindings[i];
@@ -381,6 +370,20 @@ void Dump(const char* site) noexcept {
 					cp_shown++;
 				}
 			}
+			std::fflush(f);
+		}
+		// The hung command's guest bytes now (up to 16 KiB of each binding), and at bind time (SNAP).
+		std::vector<uint8_t> now(SnapMax);
+		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
+			const auto& bind = e.bindings[i];
+			const auto  size = std::min<uint64_t>(bind.size, SnapMax);
+			if (LibKernel::Memory::TryReadBacking(bind.vaddr, now.data(), size)) {
+				Words(f, "now", bind.vaddr, now.data(), size);
+			}
+		}
+		const auto* snap = g_snaps != nullptr ? &g_snaps[seq % SnapSlots] : nullptr;
+		for (uint32_t i = 0; snap != nullptr && snap->seq == seq && i < snap->count; i++) {
+			Words(f, "bind", snap->vaddr[i], snap->bytes[i].data(), snap->bytes[i].size());
 		}
 	}
 	std::fflush(f);
