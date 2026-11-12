@@ -937,6 +937,11 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			Graphics::CpPipeline::Drain();
 			buffers.ReadMemoryWindow(vaddr, size);
 		}
+		if (!TryReadBacking(vaddr, data, size)) {
+			return false;
+		}
+		buffers.OverlayOwnedWrites(vaddr, data, size);
+		return true;
 	}
 	return TryReadBacking(vaddr, data, size);
 }
