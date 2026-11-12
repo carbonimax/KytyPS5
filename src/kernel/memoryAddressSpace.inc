@@ -298,7 +298,8 @@ public:
 			const char* value = std::getenv("KYTY_SPARSE_COPY_CACHE");
 			const int   m     = value == nullptr ? 0 : static_cast<int>(std::strtol(value, nullptr, 10));
 			if (m != 0) {
-				LOGF("KYTY_SPARSE_COPY_CACHE=%d: lock-free sparse guest copies\n", m);
+				std::printf("KYTY_SPARSE_COPY_CACHE=%d: lock-free sparse guest copies\n", m);
+				std::fflush(stdout);
 			}
 			return m;
 		}();
@@ -781,8 +782,18 @@ public:
 					const auto check = m_backing->CheckCopyTranslation(vaddr, size, generation,
 					                                                   backing_offset);
 					EXIT_IF(check == 0 || (check == 1 && OverlapsPrivateUnlocked(vaddr, size)));
+					const auto n = m_sparse_checked.fetch_add(1, std::memory_order_relaxed) + 1;
+					if ((n & 0xfffff) == 0) {
+						std::printf("KYTY_SPARSE_COPY_CACHE=2: %" PRIu64 " lock-free copies checked, %" PRIu64
+						     " locked\n",
+						     n, m_sparse_locked.load(std::memory_order_relaxed));
+						std::fflush(stdout);
+					}
 				}
 				return true;
+			}
+			if (GuestBackingStore::SparseCopyCacheMode() == 2) {
+				m_sparse_locked.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
 		if (data == nullptr || !Owns(vaddr, size)) {
@@ -1372,4 +1383,6 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
+	std::atomic<uint64_t>                      m_sparse_checked {0}; // KYTY_SPARSE_COPY_CACHE=2 only
+	std::atomic<uint64_t>                      m_sparse_locked {0};
 };

@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
