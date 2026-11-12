@@ -294,6 +294,20 @@
                 <property name="clearButtonEnabled"><bool>true</bool></property>
                </widget>
               </item>
+              <item row="3" column="0">
+               <widget class="QLabel" name="label_fsr_version">
+                <property name="text"><string>FSR version:</string></property>
+               </widget>
+              </item>
+              <item row="3" column="1">
+               <widget class="QComboBox" name="comboBox_fsr_version">
+                <property name="toolTip"><string>Auto: 4.x on GPUs with FP8 (RDNA 4), else 3.1 (FSR 4 costs about 8 times more on RDNA 2). Linear: no FSR for this game</string></property>
+                <item><property name="text"><string>Auto</string></property></item>
+                <item><property name="text"><string>4.x</string></property></item>
+                <item><property name="text"><string>3.1</string></property></item>
+                <item><property name="text"><string>Linear</string></property></item>
+               </widget>
+              </item>
              </layout>
             </item>
             <item>

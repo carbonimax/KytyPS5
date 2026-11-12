@@ -134,6 +134,10 @@ const std::filesystem::path& GetFsrFolder() {
 	return g_config->fsr_folder;
 }
 
+const std::string& GetFsrVersion() {
+	return g_config->fsr_version;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }

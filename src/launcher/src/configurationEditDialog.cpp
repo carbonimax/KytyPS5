@@ -179,6 +179,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		m_ui->pssrLayout->setRowVisible(0, pro);
 		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
 		m_ui->pssrLayout->setRowVisible(2, pro && upscaler == Configuration::PssrUpscaler::FSR);
+		m_ui->pssrLayout->setRowVisible(3, pro && upscaler == Configuration::PssrUpscaler::FSR);
 	};
 	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
 	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
@@ -341,6 +342,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_pssr_upscaler, info.pssr_upscaler);
 	m_ui->lineEdit_dlss_folder->setText(info.dlss_folder);
 	m_ui->lineEdit_fsr_folder->setText(info.fsr_folder);
+	m_ui->comboBox_fsr_version->setCurrentIndex(
+	    qMax(0, m_ui->comboBox_fsr_version->findText(info.fsr_version)));
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
 	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
 #if !defined(_WIN32)
@@ -590,6 +593,9 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::PssrUpscaler>(ui.comboBox_pssr_upscaler->currentText());
 	info.dlss_folder               = ui.lineEdit_dlss_folder->text();
 	info.fsr_folder                = ui.lineEdit_fsr_folder->text();
+	// Auto is saved empty, so a configuration without the field picks per GPU.
+	info.fsr_version =
+	    ui.comboBox_fsr_version->currentIndex() == 0 ? QString() : ui.comboBox_fsr_version->currentText();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
 	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)

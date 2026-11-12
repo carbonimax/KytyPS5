@@ -151,6 +151,7 @@ public:
 	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
 	QString                dlss_folder;
 	QString                fsr_folder;
+	QString                fsr_version; // Auto (empty), 4.x, 3.1 or Linear
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 #if defined(_WIN32)
@@ -213,6 +214,7 @@ public:
 		pssr_upscaler               = other.pssr_upscaler;
 		dlss_folder                 = other.dlss_folder;
 		fsr_folder                  = other.fsr_folder;
+		fsr_version                 = other.fsr_version;
 		amd_cpu_enabled             = other.amd_cpu_enabled;
 		guest_tsc_enabled           = other.guest_tsc_enabled;
 #if defined(_WIN32)

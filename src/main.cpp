@@ -8,6 +8,7 @@
 #include "kytyGitVersion.h"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstdio>
 #include <filesystem>
@@ -60,6 +61,8 @@ static void PrintUsage() {
 	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
 	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --fsr-folder <folder>                FidelityFX DLL folder (Windows).\n");
+	::printf("  --fsr-version <value>                Auto, 4.x, 3.1, or Linear. Default: Auto\n"
+	         "                                       (4.x with FP8, else 3.1).\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --guest-tsc                          Run the guest TSC at the PS5's 1.6 GHz.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
@@ -386,6 +389,20 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--fsr-folder") {
 			options.config.fsr_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--fsr-version") {
+			std::string version = value;
+			std::ranges::transform(version, version.begin(), [](unsigned char c) {
+				return static_cast<char>(std::tolower(c));
+			});
+			if (version.ends_with(".x")) {
+				version.resize(version.size() - 2);
+			}
+			if (version.empty() || (version != "auto" && version != "linear" &&
+			                        std::isdigit(static_cast<unsigned char>(version[0])) == 0)) {
+				::printf("invalid FSR version: %s\n", value.c_str());
+				return false;
+			}
+			options.config.fsr_version = version == "auto" ? std::string {} : version;
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());
