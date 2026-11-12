@@ -2598,7 +2598,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
 	}
-	GpuMarkers::NoteBinding(vaddr, size, is_written, buffer.IsImported() ? 1 : 0);
+	GpuMarkers::NoteBinding(vaddr, size, is_written, buffer.IsImported() ? 1 : 0, buffer.CpuAddress(),
+	                        buffer.Size());
 	return {&buffer, buffer.Offset(vaddr)};
 }
 

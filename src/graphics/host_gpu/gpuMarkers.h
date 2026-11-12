@@ -25,7 +25,9 @@ void Init(GraphicContext& graphics);
 void               SetShader(uint64_t address) noexcept;
 [[nodiscard]] uint64_t Shader() noexcept;
 // kind: 0 device memory, 1 imported guest memory, 2 stream copy.
-void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind) noexcept;
+// buffer/buffer_size: the cache buffer bound (its guest base), 0 for a stream copy.
+void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer = 0,
+                 uint64_t buffer_size = 0) noexcept;
 
 // type: 'C' dispatch, 'I' indirect dispatch, 'D' draw, 'X' indirect draw. Returns 0 when inactive.
 uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shader2, uint32_t x,

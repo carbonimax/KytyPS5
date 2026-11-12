@@ -24,7 +24,7 @@ constexpr uint32_t MaxBindings = 16;
 constexpr uint32_t HeadBytes   = 32; // first bytes of each imported read, at bind time
 
 struct Binding {
-	uint64_t vaddr = 0, size = 0;
+	uint64_t vaddr = 0, size = 0, buffer = 0, buffer_size = 0;
 	uint8_t  written = 0, kind = 0, head_ok = 0;
 	std::array<uint8_t, HeadBytes> head {};
 };
@@ -87,8 +87,9 @@ void Print(std::FILE* f, const Entry& e, const char* tag) {
 	for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
 		const auto& b = e.bindings[i];
 		static constexpr std::array<const char*, 3> kinds {"vram", "imported", "stream"};
-		std::fprintf(f, "  bind 0x%016" PRIx64 "+0x%" PRIx64 " %s %s", b.vaddr, b.size, b.written != 0 ? "w" : "r",
-		             kinds[std::min<uint32_t>(b.kind, 2)]);
+		std::fprintf(f, "  bind 0x%016" PRIx64 "+0x%" PRIx64 " %s %s buffer=0x%" PRIx64 "+0x%" PRIx64, b.vaddr,
+		             b.size, b.written != 0 ? "w" : "r", kinds[std::min<uint32_t>(b.kind, 2)], b.buffer,
+		             b.buffer_size);
 		if (b.head_ok != 0) {
 			std::array<uint8_t, HeadBytes> now {};
 			const bool now_ok = LibKernel::Memory::TryReadBacking(b.vaddr, now.data(), HeadBytes);
@@ -161,15 +162,18 @@ uint64_t Shader() noexcept {
 	return t_shader;
 }
 
-void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind) noexcept {
+void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer,
+                 uint64_t buffer_size) noexcept {
 	if (!Active()) {
 		return;
 	}
 	auto& p = t_pending;
 	if (p.count < MaxBindings) {
 		auto& b   = p.bindings[p.count];
-		b.vaddr   = vaddr;
-		b.size    = size;
+		b.vaddr       = vaddr;
+		b.size        = size;
+		b.buffer      = buffer;
+		b.buffer_size = buffer_size;
 		b.written = written ? 1 : 0;
 		b.kind    = static_cast<uint8_t>(kind);
 		b.head_ok = kind == 1 && !written && size >= HeadBytes &&
@@ -274,6 +278,31 @@ void Dump(const char* site) noexcept {
 		const auto* snap = g_snaps != nullptr ? &g_snaps[seq % SnapSlots] : nullptr;
 		for (uint32_t i = 0; snap != nullptr && snap->seq == seq && i < snap->count; i++) {
 			Words(f, "bind", snap->vaddr[i], snap->bytes[i].data(), snap->bytes[i].size());
+		}
+		// Every kept command that bound bytes of the hung command's reads (latest first, 24 per read).
+		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
+			const auto& r = e.bindings[i];
+			if (r.written != 0) {
+				continue;
+			}
+			std::fprintf(f, "  users of 0x%016" PRIx64 "+0x%" PRIx64 ":\n", r.vaddr, r.size);
+			uint32_t shown = 0;
+			for (uint32_t back = 1; back < TableSize && shown < 24; back++) {
+				const auto& o = g_table[(seq - back) & (TableSize - 1)];
+				if (o.seq != seq - back) {
+					break;
+				}
+				for (uint32_t k = 0; k < std::min(o.count, MaxBindings); k++) {
+					const auto& w = o.bindings[k];
+					if (w.vaddr < r.vaddr + r.size && r.vaddr < w.vaddr + w.size) {
+						std::fprintf(f, "    seq=%u (-%u) %c shader=0x%016" PRIx64 " 0x%016" PRIx64 "+0x%" PRIx64
+						                " %s kind=%u buffer=0x%" PRIx64 "+0x%" PRIx64 "\n",
+						             o.seq, back, o.type, o.shader, w.vaddr, w.size, w.written != 0 ? "w" : "r", w.kind,
+						             w.buffer, w.buffer_size);
+						shown++;
+					}
+				}
+			}
 		}
 	}
 	std::fflush(f);
