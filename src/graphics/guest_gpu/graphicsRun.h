@@ -12,6 +12,8 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <utility>
+#include <vector>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -132,6 +134,8 @@ namespace EopAtGpu {
 // GPU work recorded now; overlays the pending label bytes (as if written at release). Returns true
 // when it changed something.
 bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept;
+// The pending labels overlapping [address, address + size) as (start, size); mode 1 only.
+void PendingRanges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) noexcept;
 // Command-processor reads of a value that may be a pending label.
 [[nodiscard]] uint32_t ReadFront32(const volatile uint32_t* address) noexcept;
 [[nodiscard]] uint64_t ReadFront64(const volatile uint64_t* address) noexcept;
