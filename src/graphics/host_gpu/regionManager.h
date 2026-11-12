@@ -75,6 +75,10 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+// KYTY_MEM_IMPORT_WATCH (BufferCache LateRead): called under the region lock with each run of pages
+// about to become CPU-modified, before their write protection is lifted.
+inline void (*g_cpu_dirty_hook)(uint64_t vaddr, uint64_t size) = nullptr;
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -108,6 +112,13 @@ public:
 		}
 		auto&      bits = GetBits<source>();
 		RegionBits changed(enable ? ~bits : bits, start, end);
+		if constexpr (source == DirtySource::Cpu && enable) {
+			if (g_cpu_dirty_hook != nullptr && !changed.None()) [[unlikely]] {
+				for (const auto [first, last]: changed) {
+					g_cpu_dirty_hook(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+				}
+			}
+		}
 		if constexpr (enable) {
 			bits.SetRange(start, end);
 		} else {

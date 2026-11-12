@@ -41,6 +41,9 @@
 
 namespace Libs::Graphics {
 
+static std::atomic<BufferCache*> g_import_cache {nullptr};
+
+
 // Second queue (KYTY_READBACK_QUEUE) for guest-fault readbacks of GPU writes that already
 // completed: the copy does not wait behind the work queued on the main queue. GPU thread:
 // Allocate, Begin, Submit. Faulting threads: Wait, Release.
@@ -1162,6 +1165,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 			m_import.reset();
 		}
 	}
+	if (m_import && LateRead::WatchMode() != 0) {
+		g_cpu_dirty_hook = LateRead::BeforeCpuDirty;
+	}
+	if (m_import) {
+		g_import_cache.store(this, std::memory_order_release);
+	}
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -1177,6 +1186,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	g_cpu_dirty_hook = nullptr;
+	BufferCache* self = this;
+	(void)g_import_cache.compare_exchange_strong(self, nullptr);
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -1257,8 +1269,22 @@ uint64_t ReadbackWindowBytes() {
 namespace LateRead {
 namespace {
 
+int Watch() {
+	static const int mode = [] {
+		const char* import = std::getenv("KYTY_MEM_IMPORT");
+		const char* value  = std::getenv("KYTY_MEM_IMPORT_WATCH");
+		if (import == nullptr || std::strtol(import, nullptr, 10) == 0 || value == nullptr) {
+			return 0;
+		}
+		const auto m = static_cast<int>(std::strtol(value, nullptr, 10));
+		return m == 1 || m == 2 ? m : 0;
+	}();
+	return mode;
+}
+
 // KYTY_LATE_READ_PROF=N checks one batch in N. Unset with KYTY_MEM_IMPORT on, the safety net of the
-// imported buffers samples one batch in KYTY_MEM_IMPORT_NET (default 16, 0 = off).
+// imported buffers samples one batch in KYTY_MEM_IMPORT_NET (default 16, 0 = off), or every batch with
+// KYTY_MEM_IMPORT_WATCH.
 int SamplePeriod() {
 	static const int period = [] {
 		const auto number = [](const char* value) {
@@ -1271,6 +1297,9 @@ int SamplePeriod() {
 		const char* import = std::getenv("KYTY_MEM_IMPORT");
 		if (import == nullptr || number(import) == 0) {
 			return 0;
+		}
+		if (Watch() != 0) {
+			return 1;
 		}
 		const char* net = std::getenv("KYTY_MEM_IMPORT_NET");
 		return net != nullptr ? number(net) : 16;
@@ -1316,6 +1345,16 @@ struct Entry {
 	std::vector<uint8_t> bytes;                            // size <= MaxCopy
 	uint64_t             buffer_vaddr = 0, buffer_size = 0; // imported buffer holding it, else 0
 	uint64_t             shader = 0;                        // binding shader (GpuMarkers::Shader)
+	// KYTY_MEM_IMPORT_WATCH: the bytes just before the guest's first write to one of its pages.
+	bool                 watched = false, snapped = false;
+	uint64_t             snap_hash = 0; // like hash
+	std::vector<uint8_t> snap;
+};
+
+// The ranges bound since a seal; watched entries are indexed by 64 KiB chunk for the write hook.
+struct Batch {
+	std::deque<Entry>                                   entries;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> chunks;
 };
 
 struct Key {
@@ -1348,14 +1387,20 @@ struct Write {
 };
 
 struct State {
-	std::mutex                       mutex; // everything but the write log
-	std::vector<Entry>               pending;
-	std::unordered_set<Key, KeyHash> seen; // ranges of the open batch
-	uint64_t                         batch_index = 0;
-	bool                             sampled     = true;
+	std::mutex                          mutex; // everything but the write log
+	std::shared_ptr<Batch>              open = std::make_shared<Batch>();
+	std::vector<std::shared_ptr<Batch>> inflight; // sealed, not checked yet (watched by the hook)
+	std::unordered_set<Key, KeyHash>    seen;     // ranges of the open batch
+	uint64_t                            batch_index = 0;
+	bool                                sampled     = true;
 	std::array<std::array<Cell, static_cast<size_t>(Site::Count)>, PathCount> cells {};
 	std::unordered_map<Key, Changed, KeyHash> changed;
 	uint64_t batches = 0, checked = 0, bind_ns = 0, check_ns = 0, lost = 0, latency_ns = 0;
+	// KYTY_MEM_IMPORT_WATCH: bind-time protection, write hooks (guest threads), entries copied by them;
+	// with the copy at bind too, guest verdicts of the copy only (miss) and of the watch only (extra).
+	uint64_t protect_ns = 0, hooks = 0, hook_ns = 0, snaps = 0, ref_guest = 0, watch_guest = 0, miss = 0,
+	         extra = 0;
+	std::atomic<uint64_t> backing_ns {0}; // NoteBackingWrite
 	std::vector<Key> demote; // imported buffers the guest rewrote under the GPU (back to copies)
 	uint64_t         demoted = 0;
 
@@ -1393,36 +1438,52 @@ uint64_t Hash(uint64_t vaddr, uint64_t size, bool overlay) {
 	return XXH3_64bits_digest(state) | 1u;
 }
 
-// GPU thread or CP back thread, inside ObtainBuffer of a read.
-void Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
-	if (t_site == Site::None) {
-		return;
+// Guest bytes now, with the pending labels as an upload recorded now sees them; hash 0: unreadable.
+void Copy(uint64_t vaddr, uint64_t size, std::vector<uint8_t>& bytes, uint64_t& hash) {
+	if (size <= MaxCopy) {
+		bytes.resize(size);
+		if (LibKernel::Memory::TryReadBacking(vaddr, bytes.data(), size)) {
+			if (EopAtGpu::Enabled()) {
+				(void)EopAtGpu::OverlayPending(vaddr, bytes.data(), size);
+			}
+			hash = 1;
+		}
+	} else {
+		hash = Hash(vaddr, size, EopAtGpu::Enabled());
 	}
-	auto& st = S();
+}
+
+// GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new entry of the open batch.
+bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
+	if (t_site == Site::None) {
+		return false;
+	}
+	auto&      st    = S();
+	const auto start = NowNs();
 	{
 		std::lock_guard lock(st.mutex);
 		if (!st.sampled || !st.seen.insert({vaddr, size}).second) {
-			return;
+			return false;
 		}
 	}
 	// Taken before reading: a logged write racing with the read is attributed to its writer.
 	Entry entry {vaddr, size, 0, st.seq.load(std::memory_order_acquire), path, t_site, {}, buffer_vaddr,
 	             buffer_size, GpuMarkers::Shader()};
-	const auto start = NowNs();
-	if (size <= MaxCopy) {
-		entry.bytes.resize(size);
-		if (LibKernel::Memory::TryReadBacking(vaddr, entry.bytes.data(), size)) {
-			if (EopAtGpu::Enabled()) {
-				(void)EopAtGpu::OverlayPending(vaddr, entry.bytes.data(), size);
-			}
-			entry.hash = 1;
-		}
-	} else {
-		entry.hash = Hash(vaddr, size, EopAtGpu::Enabled());
+	entry.watched = Watch() != 0 && buffer_size != 0;
+	if (!entry.watched || !NetOnly()) {
+		Copy(vaddr, size, entry.bytes, entry.hash);
 	}
 	std::lock_guard lock(st.mutex);
+	auto&           batch = *st.open;
+	if (entry.watched) {
+		const auto index = static_cast<uint32_t>(batch.entries.size());
+		for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
+			batch.chunks[chunk].push_back(index);
+		}
+	}
+	batch.entries.push_back(std::move(entry));
 	st.bind_ns += NowNs() - start;
-	st.pending.push_back(std::move(entry));
+	return true;
 }
 
 // The logged writes overlapping the entry since its bind read started; false when the log lost some.
@@ -1442,19 +1503,19 @@ enum Kind : uint8_t { Same, Guest, Cp, Backing, Big, Unreadable };
 
 // A copied entry whose bytes changed: runs of differing bytes (closer than 16 bytes are merged) not
 // covered by a logged write are guest writes.
-Kind Attribute(const Entry& entry, const uint8_t* now, uint64_t& guest_diff, bool& lost) {
+Kind Attribute(const Entry& entry, const uint8_t* before, const uint8_t* now, uint64_t& guest_diff, bool& lost) {
 	thread_local std::vector<Write> writes;
 	lost       = !WritesSince(entry, writes);
 	bool cp    = false;
 	guest_diff = 0;
 	for (uint64_t i = 0; i < entry.size;) {
-		if (now[i] == entry.bytes[i]) {
+		if (now[i] == before[i]) {
 			i++;
 			continue;
 		}
 		auto end = i + 1;
 		for (auto gap = end; gap < entry.size && gap < end + 16; gap++) {
-			if (now[gap] != entry.bytes[gap]) {
+			if (now[gap] != before[gap]) {
 				end = gap + 1;
 			}
 		}
@@ -1473,47 +1534,93 @@ Kind Attribute(const Entry& entry, const uint8_t* now, uint64_t& guest_diff, boo
 	return guest_diff != 0 || lost ? Guest : cp ? Cp : Backing;
 }
 
-// Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
-void Check(const std::vector<Entry>& batch, uint64_t sealed_ns) {
+// `before` (hash 0: unreadable; no bytes: hashed only) against the guest bytes now.
+Kind Judge(const Entry& entry, const std::vector<uint8_t>& before, uint64_t before_hash, uint64_t& diff,
+           bool& lost) {
 	thread_local std::vector<uint8_t> now;
 	thread_local std::vector<Write>   writes;
-	const auto                        start = NowNs();
-	std::vector<Kind>                 kinds(batch.size());
-	std::vector<uint64_t>             diffs(batch.size());
-	uint64_t                          lost_count = 0;
+	if (before_hash == 0) {
+		return Unreadable;
+	}
+	if (before.empty()) {
+		const auto hash = Hash(entry.vaddr, entry.size, false);
+		if (hash == 0) {
+			return Unreadable;
+		}
+		if (hash == before_hash) {
+			return Same;
+		}
+		lost            = !WritesSince(entry, writes);
+		const auto kind = !lost && !writes.empty() ? Big : Guest;
+		diff            = kind == Guest ? entry.size : 0;
+		return kind;
+	}
+	now.resize(entry.size);
+	if (!LibKernel::Memory::TryReadBacking(entry.vaddr, now.data(), entry.size)) {
+		return Unreadable;
+	}
+	if (std::memcmp(now.data(), before.data(), entry.size) == 0) {
+		return Same;
+	}
+	return Attribute(entry, before.data(), now.data(), diff, lost);
+}
+
+// Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
+void Check(const std::shared_ptr<Batch>& shared, uint64_t sealed_ns) {
+	auto& st = S();
+	{
+		// From here the write hook no longer touches the batch.
+		std::lock_guard lock(st.mutex);
+		std::erase(st.inflight, shared);
+	}
+	const auto&           batch = shared->entries;
+	const auto            start = NowNs();
+	std::vector<Kind>     kinds(batch.size());
+	std::vector<uint64_t> diffs(batch.size());
+	uint64_t              lost_count = 0, ref_guest = 0, watch_guest = 0, miss = 0, extra = 0;
 	for (size_t i = 0; i < batch.size(); i++) {
 		const auto& entry = batch[i];
 		bool        lost  = false;
-		if (entry.hash == 0) {
-			kinds[i] = Unreadable;
-		} else if (entry.bytes.empty()) {
-			const auto hash = Hash(entry.vaddr, entry.size, false);
-			if (hash == 0) {
-				kinds[i] = Unreadable;
-			} else if (hash == entry.hash) {
-				kinds[i] = Same;
-			} else {
-				lost     = !WritesSince(entry, writes);
-				kinds[i] = !lost && !writes.empty() ? Big : Guest;
-				diffs[i] = kinds[i] == Guest ? entry.size : 0;
+		// The copy at bind is the reference when it ran; a watched entry never copied by the hook
+		// was not written by the guest (its pages stayed write-protected).
+		const bool ref_on = !entry.watched || !NetOnly();
+		Kind       ref = Same, watch = Same;
+		uint64_t   ref_diff = 0, watch_diff = 0;
+		if (ref_on) {
+			ref = Judge(entry, entry.bytes, entry.hash, ref_diff, lost);
+		}
+		if (entry.watched && entry.snapped) {
+			bool watch_lost = false;
+			watch           = Judge(entry, entry.snap, entry.snap_hash, watch_diff, watch_lost);
+			lost |= watch_lost;
+		}
+		kinds[i] = ref_on ? ref : watch;
+		diffs[i] = std::max(ref_diff, watch_diff);
+		if (entry.watched && ref_on) {
+			ref_guest += ref == Guest ? 1 : 0;
+			watch_guest += watch == Guest ? 1 : 0;
+			if ((ref == Guest) != (watch == Guest)) {
+				(ref == Guest ? miss : extra)++;
+				LOGF("BufferCache: KYTY_MEM_IMPORT_WATCH %s 0x%016" PRIx64 "+0x%" PRIx64 " %s/%s shader=0x%016" PRIx64
+				     " snapped=%d bind_changed=%" PRIu64 " watch_changed=%" PRIu64 "\n",
+				     ref == Guest ? "miss" : "extra", entry.vaddr, entry.size, PathNames[entry.path],
+				     SiteNames[static_cast<size_t>(entry.site)], entry.shader, entry.snapped ? 1 : 0, ref_diff,
+				     watch_diff);
 			}
-		} else {
-			now.resize(entry.size);
-			if (!LibKernel::Memory::TryReadBacking(entry.vaddr, now.data(), entry.size)) {
-				kinds[i] = Unreadable;
-			} else if (std::memcmp(now.data(), entry.bytes.data(), entry.size) == 0) {
-				kinds[i] = Same;
-			} else {
-				kinds[i] = Attribute(entry, now.data(), diffs[i], lost);
+			if (watch == Guest) {
+				kinds[i] = Guest; // demoted on either verdict
 			}
 		}
 		lost_count += lost ? 1 : 0;
 	}
-	auto&           st = S();
 	std::lock_guard lock(st.mutex);
 	st.checked++;
 	st.lost += lost_count;
 	st.latency_ns += start - sealed_ns;
+	st.ref_guest += ref_guest;
+	st.watch_guest += watch_guest;
+	st.miss += miss;
+	st.extra += extra;
 	for (size_t i = 0; i < batch.size(); i++) {
 		const auto& entry = batch[i];
 		auto&       cell  = st.cells[entry.path][static_cast<size_t>(entry.site)];
@@ -1567,6 +1674,38 @@ bool Enabled() noexcept {
 	return SamplePeriod() != 0;
 }
 
+int WatchMode() noexcept {
+	return Watch();
+}
+
+void BeforeCpuDirty(uint64_t vaddr, uint64_t size) {
+	auto&           st    = S();
+	const auto      start = NowNs();
+	std::lock_guard lock(st.mutex);
+	const auto      copy_overlapping = [&](Batch& batch) {
+        for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
+            const auto it = batch.chunks.find(chunk);
+            if (it == batch.chunks.end()) {
+                continue;
+            }
+            for (const auto index: it->second) {
+                auto& entry = batch.entries[index];
+                if (!entry.snapped && entry.vaddr < vaddr + size && vaddr < entry.vaddr + entry.size) {
+                    entry.snapped = true;
+                    Copy(entry.vaddr, entry.size, entry.snap, entry.snap_hash);
+                    st.snaps++;
+                }
+            }
+        }
+	};
+	copy_overlapping(*st.open);
+	for (const auto& batch: st.inflight) {
+		copy_overlapping(*batch);
+	}
+	st.hooks++;
+	st.hook_ns += NowNs() - start;
+}
+
 Scope::Scope(Site site) noexcept: m_previous(t_site) {
 	t_site = site;
 }
@@ -1581,13 +1720,17 @@ void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp) noexcept {
 	}
 	static constexpr size_t MaxLog = 1u << 20u;
 	auto&                   st     = S();
-	std::lock_guard         lock(st.log_mutex);
-	const auto              seq = st.seq.fetch_add(1, std::memory_order_acq_rel) + 1;
-	st.log.push_back({seq, vaddr, size, cp});
-	if (st.log.size() > MaxLog) {
-		st.dropped_seq = st.log.front().seq;
-		st.log.pop_front();
+	const auto              start  = NowNs();
+	{
+		std::lock_guard lock(st.log_mutex);
+		const auto      seq = st.seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+		st.log.push_back({seq, vaddr, size, cp});
+		if (st.log.size() > MaxLog) {
+			st.dropped_seq = st.log.front().seq;
+			st.log.pop_front();
+		}
 	}
+	st.backing_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
 }
 
 void Report(double seconds, uint64_t frames) {
@@ -1615,6 +1758,17 @@ void Report(double seconds, uint64_t frames) {
 	            st.checked != 0 ? static_cast<double>(st.latency_ns) / 1e6 / static_cast<double>(st.checked)
 	                            : 0.0,
 	            st.lost, st.demoted);
+	const auto backing_ns = st.backing_ns.exchange(0, std::memory_order_relaxed);
+	if (Watch() != 0) {
+		std::printf("PERF lateread_watch %.1fs mode=%d: protect=%.2fms/frame log=%.2fms/frame hooks=%.0f/frame"
+		            " hook=%.2fms/frame snaps=%.0f/frame ref_guest=%" PRIu64 " watch_guest=%" PRIu64
+		            " miss=%" PRIu64 " extra=%" PRIu64 "\n",
+		            seconds, Watch(), static_cast<double>(st.protect_ns) / 1e6 / f,
+		            static_cast<double>(backing_ns) / 1e6 / f, static_cast<double>(st.hooks) / f,
+		            static_cast<double>(st.hook_ns) / 1e6 / f, static_cast<double>(st.snaps) / f, st.ref_guest,
+		            st.watch_guest, st.miss, st.extra);
+		st.protect_ns = st.hooks = st.hook_ns = st.snaps = st.ref_guest = st.watch_guest = st.miss = st.extra = 0;
+	}
 	for (size_t p = 0; p < PathCount; p++) {
 		for (size_t s = 0; s < SiteNames.size(); s++) {
 			const auto& c = st.cells[p][s];
@@ -1652,9 +1806,9 @@ void BufferCache::SealLateReads() {
 	if (!LateRead::Enabled() || (LateRead::NetOnly() && !m_import)) {
 		return;
 	}
-	auto&                        st = LateRead::S();
-	std::vector<LateRead::Entry> batch;
-	std::vector<LateRead::Key>   demote;
+	auto&                            st = LateRead::S();
+	std::shared_ptr<LateRead::Batch> batch;
+	std::vector<LateRead::Key>       demote;
 	bool                         sampled = false;
 	{
 		std::lock_guard lock(st.mutex);
@@ -1680,16 +1834,86 @@ void BufferCache::SealLateReads() {
 	}
 	{
 		std::lock_guard lock(st.mutex);
-		batch.swap(st.pending);
+		batch = std::exchange(st.open, std::make_shared<LateRead::Batch>());
 		st.seen.clear();
 		st.batches++;
 		st.sampled = ++st.batch_index % static_cast<uint64_t>(LateRead::SamplePeriod()) == 0;
+		if (!batch->entries.empty() && !batch->chunks.empty()) {
+			st.inflight.push_back(batch);
+		}
 	}
-	if (batch.empty()) {
+	if (batch->entries.empty()) {
 		return;
 	}
 	m_scheduler.DeferPriorityOperation(
 	    [batch = std::move(batch), sealed = LateRead::NowNs()] { LateRead::Check(batch, sealed); });
+}
+
+// runtimeLinker.cpp, unhandled guest fault.
+void DescribeImportFault(const uint64_t* values, size_t count) {
+	if (auto* cache = g_import_cache.load(std::memory_order_acquire); cache != nullptr) {
+		cache->DescribeFault(values, count);
+	}
+}
+
+void BufferCache::DescribeFault(const uint64_t* values, size_t count) {
+	constexpr uint64_t Window = 0x400;
+	std::printf("import fault check (+-0x%" PRIx64 " around each value):\n", Window);
+	auto& st = LateRead::S();
+	for (size_t i = 0; i < count; i++) {
+		const auto value = values[i];
+		const auto begin = value > Window ? value - Window : 0;
+		if (!GuestRange {begin, 2 * Window}.Valid()) {
+			continue;
+		}
+		char       what[2048] = "";
+		size_t     used       = 0;
+		const auto add        = [&](const char* format, auto... args) {
+            if (used < sizeof(what)) {
+                const int n = std::snprintf(what + used, sizeof(what) - used, format, args...);
+                used        = std::min(sizeof(what), used + static_cast<size_t>(std::max(n, 0)));
+            }
+		};
+		for (auto page = begin & ~(TRACKER_PAGE_SIZE - 1); page < begin + 2 * Window; page += TRACKER_PAGE_SIZE) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner != nullptr && *owner) {
+				const auto& buffer = m_slot_buffers[*owner];
+				add(" buffer 0x%" PRIx64 "+0x%" PRIx64 "%s", buffer.CpuAddress(), buffer.Size(),
+				                       buffer.IsImported() ? " imported" : " device");
+				break;
+			}
+		}
+		if (m_memory_tracker.IsRegionGpuModified(begin, 2 * Window)) {
+			add("%s", " gpu-dirty");
+		}
+		std::vector<std::pair<uint64_t, uint32_t>> labels;
+		EopAtGpu::PendingRanges(begin, 2 * Window, labels);
+		for (const auto& [base, bytes]: labels) {
+			add(" pending-label 0x%" PRIx64 "+%u", base, bytes);
+		}
+		if (m_owned_mutex.try_lock()) {
+			for (const auto& w: m_owned_writes) {
+				if (w.vaddr < begin + 2 * Window && begin < w.vaddr + w.bytes.size() && !m_scheduler.IsFree(w.tick)) {
+					add(" pending-write-data 0x%" PRIx64 "+%zu", w.vaddr, w.bytes.size());
+				}
+			}
+			m_owned_mutex.unlock();
+		}
+		if (st.log_mutex.try_lock()) {
+			int shown = 0;
+			for (auto it = st.log.rbegin(); it != st.log.rend() && shown < 4; ++it) {
+				if (it->vaddr < begin + 2 * Window && begin < it->vaddr + it->size) {
+					add(" logged-%s-write 0x%" PRIx64 "+0x%" PRIx64 " (%" PRIu64 " ago)",
+					                       it->cp ? "cp" : "backing", it->vaddr, it->size,
+					                       st.seq.load(std::memory_order_relaxed) - it->seq);
+					shown++;
+				}
+			}
+			st.log_mutex.unlock();
+		}
+		std::printf("  0x%016" PRIx64 ":%s\n", value, used == 0 ? " nothing" : what);
+	}
+	std::fflush(stdout);
 }
 
 void BufferCache::ReadFaultMemory(uint64_t vaddr) {
@@ -2126,6 +2350,15 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (!new_buffer.IsImported()) {
 		new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 		                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+		if (overlap.IsImported() && LateRead::Watch() != 0) {
+			// The copy reads guest memory at GPU execution, unwatched: the pages the watch cleaned
+			// upload from a snapshot again, as without the watch.
+			for (auto page = overlap.CpuAddress(); page < overlap.CpuAddress() + overlap.Size(); page += TRACKER_PAGE_SIZE) {
+				if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+					m_memory_tracker.MarkRegionAsCpuModified(page, TRACKER_PAGE_SIZE);
+				}
+			}
+		}
 	} else if (!overlap.IsImported()) {
 		// The new buffer is guest memory: only the GPU-written bytes of the old one are newer (the
 		// rest is already there, or older than the guest's own writes).
@@ -2699,8 +2932,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    (m_import ? buffer.IsImported() && !m_memory_tracker.IsRegionGpuModified(vaddr, size)
 	              : !LateRead::NetOnly())) [[unlikely]] {
 		// With KYTY_MEM_IMPORT only imported ranges are checked (copies are snapshots).
-		LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed,
-		               buffer.IsImported() ? buffer.CpuAddress() : 0, buffer.IsImported() ? buffer.Size() : 0);
+		const bool added = LateRead::Bind(vaddr, size, buffer.leaped ? LateRead::PathRing : LateRead::PathFixed,
+		                                  buffer.IsImported() ? buffer.CpuAddress() : 0,
+		                                  buffer.IsImported() ? buffer.Size() : 0);
+		if (added && buffer.IsImported() && LateRead::Watch() != 0) {
+			// After the entry exists: the guest's next write to these pages faults into the hook.
+			const auto start = LateRead::NowNs();
+			m_memory_tracker.ForEachUploadRange(
+			    vaddr, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {}, LateRead::Watch() == 2);
+			auto&           st = LateRead::S();
+			std::lock_guard lock(st.mutex);
+			st.protect_ns += LateRead::NowNs() - start;
+		}
 	}
 	if (is_written) {
 		WaitPendingPublishes(vaddr, size);
