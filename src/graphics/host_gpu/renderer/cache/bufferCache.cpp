@@ -1852,10 +1852,12 @@ static uint32_t ImportOwnedReads() {
 }
 
 void BufferCache::OverlayOwnedWrites(uint64_t vaddr, void* data, uint64_t size) {
-	if (m_owned_writes.empty()) {
+	if (m_owned_count.load(std::memory_order_acquire) == 0) {
 		return;
 	}
+	std::lock_guard lock(m_owned_mutex);
 	std::erase_if(m_owned_writes, [this](const OwnedWrite& w) { return m_scheduler.IsFree(w.tick); });
+	m_owned_count.store(m_owned_writes.size(), std::memory_order_release);
 	auto* out = static_cast<uint8_t*>(data);
 	for (const auto& w: m_owned_writes) {
 		const auto begin = std::max(vaddr, w.vaddr);
@@ -1902,9 +1904,11 @@ bool BufferCache::WriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size)
 			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size); // readers wait for the GPU (PublishImported)
 		} else if (mode == 2) {
-			const auto* bytes = static_cast<const uint8_t*>(data);
+			const auto*     bytes = static_cast<const uint8_t*>(data);
+			std::lock_guard lock(m_owned_mutex);
 			std::erase_if(m_owned_writes, [this](const OwnedWrite& w) { return m_scheduler.IsFree(w.tick); });
 			m_owned_writes.push_back({vaddr, m_scheduler.CurrentTick(), {bytes, bytes + size}});
+			m_owned_count.store(m_owned_writes.size(), std::memory_order_release);
 		}
 		return true;
 	}
