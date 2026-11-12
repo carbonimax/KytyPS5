@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
@@ -758,34 +759,42 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
 		}
 	}
-	std::printf("--- Guest fault context ---\n");
-	std::printf("thread: %s, pc 0x%016" PRIx64 ", access %u at 0x%016" PRIx64 "\n", thread_name,
-	            info->exception_address, static_cast<unsigned>(info->access_violation_type),
-	            info->access_violation_vaddr);
-	std::fflush(stdout);
-	std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-	            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-	            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-	            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-	            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-	            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-	            info->r14, info->r15);
+	// Written with WriteToConsoleAndLog: with file logging std::printf reaches only the console.
+	fmt::basic_memory_buffer<char, 2048> report;
+	const auto                           out   = std::back_inserter(report);
+	const auto                           flush = [&report] {
+		Log::WriteToConsoleAndLog(std::string_view(report.data(), report.size()));
+		report.clear();
+	};
+	fmt::format_to(out, "--- Guest fault context ---\nthread: {}, pc 0x{:016x}, access {} at 0x{:016x}\n",
+	               thread_name, info->exception_address, static_cast<unsigned>(info->access_violation_type),
+	               info->access_violation_vaddr);
+	fmt::format_to(out,
+	               "rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+	               "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+	               "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+	               "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+	               info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+	               info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+	               info->r14, info->r15);
+	flush();
 	if (IsReadableRange(info->exception_address - 48, 96)) {
 		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-		std::printf("code (pc-48 .. pc+48, fault at byte 48):");
+		fmt::format_to(out, "code (pc-48 .. pc+48, fault at byte 48):");
 		for (int i = 0; i < 96; i++) {
-			std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
+			fmt::format_to(out, "{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
 		}
-		std::printf("\n");
+		report.push_back('\n');
 	}
 	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-		std::printf("stack:");
+		fmt::format_to(out, "stack:");
 		for (int i = 0; i < 32; i++) {
-			std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+			fmt::format_to(out, "{} {:016x}", (i % 4 == 0) ? "\n " : "", stack[i]);
 		}
-		std::printf("\n");
+		report.push_back('\n');
 	}
+	flush();
 	Libs::Graphics::GuestStacks::Describe(info->rsp);
 	Libs::Graphics::CmdRecord::Describe();
 	std::fflush(stdout);
@@ -794,7 +803,7 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 	// the emulator code that called into a driver or system DLL that faulted.
 	if (info->native_context != nullptr) {
 		CONTEXT context = *static_cast<const CONTEXT*>(info->native_context);
-		std::printf("host backtrace:\n");
+		fmt::format_to(out, "host backtrace:\n");
 		for (int frame = 0; frame < 48 && context.Rip != 0; frame++) {
 			HMODULE module = nullptr;
 			char    path[MAX_PATH] = "?";
@@ -803,10 +812,10 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 			                       reinterpret_cast<LPCSTR>(context.Rip), &module) &&
 			    GetModuleFileNameA(module, path, MAX_PATH) != 0) {
 				const char* name = std::strrchr(path, '\\');
-				std::printf("  #%02d %s+0x%" PRIx64 "\n", frame, name != nullptr ? name + 1 : path,
-				            static_cast<uint64_t>(context.Rip - reinterpret_cast<uint64_t>(module)));
+				fmt::format_to(out, "  #{:02} {}+0x{:x}\n", frame, name != nullptr ? name + 1 : path,
+				               static_cast<uint64_t>(context.Rip - reinterpret_cast<uint64_t>(module)));
 			} else {
-				std::printf("  #%02d 0x%016" PRIx64 "\n", frame, static_cast<uint64_t>(context.Rip));
+				fmt::format_to(out, "  #{:02} 0x{:016x}\n", frame, static_cast<uint64_t>(context.Rip));
 			}
 			DWORD64 image_base = 0;
 			auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -822,9 +831,9 @@ ReportUnhandledHostException(const Common::HostException::ExceptionInfo& excepti
 			RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context,
 			                 &handler_data, &frame_base, nullptr);
 		}
+		flush();
 	}
 #endif
-	std::fflush(stdout);
 	WriteFaultMinidump(info);
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
