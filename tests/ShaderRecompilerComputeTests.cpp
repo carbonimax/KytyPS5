@@ -26375,13 +26375,17 @@ private:
     m_mesh_task_enabled = full && available_mesh.meshShader && available_mesh.taskShader && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
     });
-    if (full) {
-      Require("VulkanHarness", "ray query",
-              available_acceleration_structure.accelerationStructure == true &&
-                  available_ray_query.rayQuery == true,
-              "acceleration structures and ray queries are not supported");
-    }
-    m_ray_query_enabled = full;
+    // Optional like mesh shaders: MoltenVK has no ray queries, so the BVH mirror case skips there.
+    m_ray_query_enabled = full && available_acceleration_structure.accelerationStructure &&
+                          available_ray_query.rayQuery &&
+                          std::ranges::all_of(std::array{VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                                                         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                                                         VK_KHR_RAY_QUERY_EXTENSION_NAME},
+                                              [&](const char *name) {
+                                                return std::ranges::any_of(extensions, [name](const vk::ExtensionProperties &extension) {
+                                                  return std::strcmp(extension.extensionName, name) == 0;
+                                                });
+                                              });
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
     Require("VulkanHarness", "dispatch",

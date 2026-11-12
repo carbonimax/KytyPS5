@@ -6,6 +6,11 @@
     constexpr const char *name = "BvhMirror";
     constexpr auto page = BufferCache::CACHING_PAGESIZE;
     constexpr u32 Empty = ~0u, Miss = ~0u;
+    if (!m_ray_query_enabled) {
+      std::printf("[host]    %-32s skipped, no ray queries\n", name);
+      m_skipped_cases++;
+      return;
+    }
     EnsureRuntimeContext();
     int64_t direct = -1;
     void *mapped = nullptr;
