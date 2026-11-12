@@ -385,6 +385,8 @@ private:
 	vk::Pipeline                          m_pssr_motion_pipeline   = nullptr;
 	VulkanImage*                          m_pssr_motion            = nullptr; // owned
 	vk::ImageView                         m_pssr_motion_view       = nullptr;
+	vk::QueryPool                         m_pssr_queries           = nullptr; // KYTY_PSSR_PROF
+	uint32_t                              m_pssr_query             = 0;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 
