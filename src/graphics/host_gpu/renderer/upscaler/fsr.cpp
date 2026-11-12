@@ -7,7 +7,9 @@
 
 #include <SDL3/SDL_loadso.h>
 #include <algorithm>
+#include <string>
 #include <string_view>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 // AMD's headers declare the DLL exports for Windows only.
@@ -37,6 +39,14 @@ struct Api {
 SDL_SharedObject*      g_module = nullptr;
 Api                    g_api {};
 ffxCreateBackendVKDesc g_backend {};
+ffxOverrideVersion     g_version {}; // the game's FSR version (Config::GetFsrVersion)
+
+// The version an empty setting picks. shortcut: FP8 (VK_EXT_shader_float8, RDNA 4) stands for
+// "FSR 4 runs natively"; without it FSR 4 takes its INT8 path (9.6 ms an upscale on RDNA 2 against
+// 1.2 ms for 3.1), so 3.1. Upgrade when a GPU without FP8 runs FSR 4 fast enough.
+std::string DefaultVersion(const GraphicContext& graphics) {
+	return graphics.shader_float8_enabled ? "4" : "3.1";
+}
 
 void Warn(std::string_view text) {
 	Log::WriteToConsoleAndLog(fmt::format("WARNING: FSR: {}; PSSR scales linearly.\n", text));
@@ -139,6 +149,10 @@ void Load() {
 	if (!Config::Ps5ProEnabled() || Config::GetPssrUpscaler() != Config::PssrUpscaler::FSR) {
 		return;
 	}
+	if (Config::GetFsrVersion() == "linear") {
+		Log::WriteToConsoleAndLog("FSR: this game's FSR version is Linear; PSSR scales linearly.\n");
+		return;
+	}
 	const auto& folder = Config::GetFsrFolder();
 	if (folder.empty()) {
 		Warn("no folder is set");
@@ -165,29 +179,59 @@ void Init(const GraphicContext& graphics, PFN_vkGetDeviceProcAddr get_device_pro
 	g_backend = {{FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK, nullptr},
 	             {static_cast<VkDevice>(graphics.device),
 	              static_cast<VkPhysicalDevice>(graphics.physical_device), get_device_proc_addr}};
-	// The first version is the one contexts get.
-	uint64_t                count   = 1;
-	const char*             version = nullptr;
+	// Contexts get the first offered version unless an override names another one.
+	uint64_t                count = 0;
 	ffxQueryDescGetVersions versions {{FFX_API_QUERY_DESC_TYPE_GET_VERSIONS, nullptr},
 	                                  FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
 	                                  &g_backend.deviceContext,
 	                                  &count,
 	                                  nullptr,
-	                                  &version};
-	if (g_api.query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0 ||
-	    version == nullptr) {
+	                                  nullptr};
+	std::vector<uint64_t>    ids;
+	std::vector<const char*> names;
+	if (g_api.query(nullptr, &versions.header) == FFX_API_RETURN_OK && count != 0) {
+		ids.resize(count);
+		names.resize(count);
+		versions.versionIds   = ids.data();
+		versions.versionNames = names.data();
+		if (g_api.query(nullptr, &versions.header) != FFX_API_RETURN_OK) {
+			count = 0;
+		}
+	}
+	if (count == 0 || names[0] == nullptr) {
 		Warn("amd_fidelityfx_upscaler_vk.dll is missing or has no upscaler for this GPU");
 		Shutdown();
 		return;
 	}
-	Log::WriteToConsoleAndLog(fmt::format("FSR: upscaling PSSR with FSR {} from the DLLs in {}\n",
-	                                      version, Common::PathToString(Config::GetFsrFolder())));
+	std::string offered;
+	for (uint64_t i = 0; i < count; ++i) {
+		offered += fmt::format("{}{}", i == 0 ? "" : ", ", names[i] != nullptr ? names[i] : "?");
+	}
+	const bool  automatic = Config::GetFsrVersion().empty();
+	const auto  wanted    = automatic ? DefaultVersion(graphics) : Config::GetFsrVersion();
+	const char* version   = names[0];
+	for (uint64_t i = 0; i < count; ++i) {
+		if (names[i] != nullptr && std::string_view(names[i]).starts_with(wanted)) {
+			version   = names[i];
+			g_version = {{FFX_API_DESC_TYPE_OVERRIDE_VERSION, nullptr}, ids[i]};
+			break;
+		}
+	}
+	if (g_version.versionId == 0) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "WARNING: FSR: no offered version starts with {}; FSR {} is used.\n", wanted, version));
+	}
+	Log::WriteToConsoleAndLog(
+	    fmt::format("FSR: upscaling PSSR with FSR {} ({} {}; offered: {}) from the DLLs in {}\n",
+	                version, automatic ? "default" : "setting", wanted, offered,
+	                Common::PathToString(Config::GetFsrFolder())));
 }
 
 void Shutdown() {
 	SDL_UnloadObject(g_module);
 	g_module  = nullptr;
 	g_backend = {};
+	g_version = {};
 }
 
 bool Enabled() {
@@ -195,8 +239,12 @@ bool Enabled() {
 }
 
 Context* CreateContext(const Creation& creation) {
+	// The override is chained after the backend for this call only.
+	ffxOverrideVersion version_override = g_version;
+	ffxCreateBackendVKDesc backend = g_backend;
+	backend.header.pNext = g_version.versionId != 0 ? &version_override.header : nullptr;
 	ffxCreateContextDescUpscaleVersion version {
-	    {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, &g_backend.header},
+	    {FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION, &backend.header},
 	    FFX_UPSCALER_VERSION};
 	ffxCreateContextDescUpscale desc {{FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, &version.header}};
 	SetCreation(desc, creation);

@@ -892,6 +892,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
 		create_info.pNext                                      = &cooperative_matrix;
 	}
+	graphics.shader_float8_enabled = float8.shaderFloat8 != VK_FALSE;
 	if (float8.shaderFloat8) {
 		float8.pNext      = const_cast<void*>(create_info.pNext);
 		float8.shaderFloat8CooperativeMatrix = float8.shaderFloat8CooperativeMatrix && cooperative_matrix.cooperativeMatrix;

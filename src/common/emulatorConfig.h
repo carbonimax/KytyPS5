@@ -72,6 +72,8 @@ struct ConfigOptions {
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0; // 0 is the model default
 	std::filesystem::path  fsr_folder;
+	// FSR version: empty picks per GPU, "linear" keeps PSSR linear, else a version prefix ("4", "3.1").
+	std::string            fsr_version;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -142,6 +144,7 @@ PssrUpscaler GetPssrUpscaler();
 const std::filesystem::path& GetDlssFolder();
 uint32_t GetDlssPreset();
 const std::filesystem::path& GetFsrFolder();
+const std::string&           GetFsrVersion();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();

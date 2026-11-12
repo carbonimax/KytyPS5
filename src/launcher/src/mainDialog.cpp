@@ -304,6 +304,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 			args << "--dlss-folder" << info.dlss_folder;
 		} else if (info.pssr_upscaler == Configuration::PssrUpscaler::FSR) {
 			args << "--fsr-folder" << info.fsr_folder;
+			if (!info.fsr_version.isEmpty()) {
+				args << "--fsr-version" << info.fsr_version;
+			}
 		}
 	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");

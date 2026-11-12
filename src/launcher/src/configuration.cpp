@@ -68,6 +68,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(pssr_upscaler);
 	KYTY_CFG_SET(dlss_folder);
 	KYTY_CFG_SET(fsr_folder);
+	KYTY_CFG_SET(fsr_version);
 	KYTY_CFG_SET(amd_cpu_enabled);
 	KYTY_CFG_SET(guest_tsc_enabled);
 #if defined(_WIN32)
@@ -140,6 +141,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(pssr_upscaler);
 	KYTY_CFG_GET(dlss_folder);
 	KYTY_CFG_GET(fsr_folder);
+	KYTY_CFG_GET(fsr_version);
 	pro_enabled     = s.value("pro_enabled", false).toBool();
 	KYTY_CFG_GET(guest_tsc_enabled);
 	amd_cpu_enabled = s.value("amd_cpu_enabled", false).toBool();
