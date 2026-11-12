@@ -619,6 +619,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext        = supported_features2.pNext;
 		supported_features2.pNext = &device_fault;
 	}
+	// KYTY_MEM_IMPORT_TYPE (diagnostic): the AMD device-coherent / uncached memory types need this feature.
+	const bool coherent_memory_extension =
+	    HasExtension(device_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+	vk::PhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory {};
+	if (coherent_memory_extension) {
+		coherent_memory.pNext     = supported_features2.pNext;
+		supported_features2.pNext = &coherent_memory;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault == VK_TRUE;
 	const bool barycentric_supported =
@@ -858,6 +866,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
 		device_fault.deviceFaultVendorBinary = VK_FALSE;
 		create_info.pNext                    = &device_fault;
+	}
+	if (coherent_memory_extension && coherent_memory.deviceCoherentMemory == VK_TRUE) {
+		coherent_memory.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext     = &coherent_memory;
+		LOGF("Vulkan: deviceCoherentMemory enabled (KYTY_MEM_IMPORT_TYPE)\n");
 	}
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
@@ -1254,6 +1267,10 @@ void WindowContext::CreateVulkan() {
 		if (DeviceFault::RequestedByEnvironment() &&
 		    HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (std::getenv("KYTY_MEM_IMPORT_TYPE") != nullptr &&
+		    HasExtension(available_extensions, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
 		}
 		if (GpuMarkers::Requested() &&
 		    HasExtension(available_extensions, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {

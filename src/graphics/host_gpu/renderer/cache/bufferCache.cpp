@@ -391,6 +391,15 @@ private:
 		const auto  bits  = properties.memoryTypeBits & buffer_bits;
 		const auto& types = m_graphics.physical_device_memory_properties;
 		uint32_t    any   = UINT32_MAX;
+		// KYTY_MEM_IMPORT_TYPE=n (diagnostic): import with memory type n when the pointer allows it.
+		if (const char* forced = std::getenv("KYTY_MEM_IMPORT_TYPE"); forced != nullptr) {
+			const auto n = static_cast<uint32_t>(std::strtoul(forced, nullptr, 10));
+			LOGF("BufferCache: KYTY_MEM_IMPORT_TYPE=%u: host pointer types 0x%x, buffer types 0x%x -> %s\n", n,
+			     properties.memoryTypeBits, buffer_bits, n < 32 && (bits & (1u << n)) != 0 ? "used" : "refused");
+			if (n < 32 && (bits & (1u << n)) != 0) {
+				return n;
+			}
+		}
 		for (uint32_t i = 0; i < types.memoryTypeCount; i++) {
 			if ((bits & (1u << i)) == 0) {
 				continue;

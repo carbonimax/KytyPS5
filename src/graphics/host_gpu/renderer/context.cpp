@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 namespace Libs::Graphics {
 
@@ -120,6 +121,17 @@ void CommandBuffer::FlushUploadPost() const {
 	m_buffer.pipelineBarrier2(dependency);
 }
 
+// KYTY_MEM_IMPORT_HOST_BARRIERS=1 (diagnostic, default 0): every command buffer starts by making host
+// writes visible to the device and ends by making device writes available to the host (GPU cache
+// invalidate / write-back around imported guest memory).
+static bool HostBarriers() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_MEM_IMPORT_HOST_BARRIERS");
+		return value != nullptr && std::strcmp(value, "0") != 0;
+	}();
+	return on;
+}
+
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
 	m_dispatch_chain.Reset();
@@ -132,6 +144,13 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (HostBarriers()) {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		buffer.pipelineBarrier(vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
 }
 
 void CommandBuffer::End() const {
@@ -141,6 +160,13 @@ void CommandBuffer::End() const {
 		FlushDispatchChain();
 	}
 	auto buffer = Handle();
+	if (HostBarriers()) {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite;
+		buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eHost,
+		                       vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	}
 
 	auto result = buffer.end();
 
