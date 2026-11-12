@@ -26,6 +26,7 @@ class Shader;
 } // namespace HW
 
 struct GraphicContext;
+struct VulkanImage;
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
@@ -343,6 +344,11 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	void                      CreatePssrPipelines();
+	// Writes the request's motion vectors with their offset applied to m_pssr_motion and points
+	// motion at it; false when the image can't be made.
+	[[nodiscard]] bool        FixMotion(vk::CommandBuffer command, const Pssr::Request& request,
+	                                    Dlss::Resource& motion);
 	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
 	                                  Dlss::Inputs& inputs);
 
@@ -373,6 +379,9 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	vk::Pipeline                          m_pssr_motion_pipeline   = nullptr;
+	VulkanImage*                          m_pssr_motion            = nullptr; // owned
+	vk::ImageView                         m_pssr_motion_view       = nullptr;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 

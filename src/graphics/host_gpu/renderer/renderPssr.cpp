@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
+#include "gpu_blit_shaders/gpu_pssr_motion_spv.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -11,6 +12,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <optional>
 
@@ -22,6 +24,27 @@ struct PssrParameters {
 	uint32_t output_size[2];
 	uint32_t output_channels[4];
 };
+
+struct MotionParameters {
+	uint32_t base[2];
+	uint32_t size[2];
+	float    scale[2];
+	float    offset[2];
+};
+static_assert(sizeof(MotionParameters) == sizeof(PssrParameters)); // one pipeline layout
+
+// KYTY_PSSR_OFFSET_SIGN=<x><y>, each + or - (default ++): the sign of motion_offset per axis.
+std::array<float, 2> OffsetSign() {
+	static const auto sign = [] {
+		const char* value = std::getenv("KYTY_PSSR_OFFSET_SIGN");
+		std::array<float, 2> out {1.0f, 1.0f};
+		for (size_t i = 0; value != nullptr && i < 2 && value[i] != 0; ++i) {
+			out[i] = value[i] == '-' ? -1.0f : 1.0f;
+		}
+		return out;
+	}();
+	return sign;
+}
 
 // Upscalers read and write with stages and accesses of their own.
 void MemoryBarrier(vk::CommandBuffer command) {
@@ -37,10 +60,145 @@ void MemoryBarrier(vk::CommandBuffer command) {
 } // namespace
 
 RenderExecutor::~RenderExecutor() {
-	const auto device = m_context.GetGraphics().device;
+	auto&      graphics = m_context.GetGraphics();
+	const auto device   = graphics.device;
+	if (m_pssr_motion != nullptr) {
+		device.destroyImageView(m_pssr_motion_view, nullptr);
+		graphics.DeleteImage(*m_pssr_motion);
+		delete m_pssr_motion;
+	}
+	device.destroyPipeline(m_pssr_motion_pipeline, nullptr);
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
+}
+
+void RenderExecutor::CreatePssrPipelines() {
+	if (m_pssr_pipeline != nullptr) {
+		return;
+	}
+	auto&      graphics = m_context.GetGraphics();
+	const std::array bindings {
+	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
+	                                    vk::ShaderStageFlagBits::eCompute},
+	    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
+	                                    vk::ShaderStageFlagBits::eCompute}};
+	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+	descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	descriptor_info.bindingCount = bindings.size();
+	descriptor_info.pBindings = bindings.data();
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
+	                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
+	                     "create upscaling descriptor layout");
+	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
+	                                  sizeof(PssrParameters)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount = 1;
+	layout_info.pSetLayouts = &m_pssr_descriptor_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges = &push;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(
+	                         &layout_info, nullptr, &m_pssr_pipeline_layout),
+	                     "create upscaling pipeline layout");
+	const auto create = [&](std::span<const uint32_t> code, vk::Pipeline& pipeline) {
+		const auto shader = CompileSPV(code, graphics.device);
+		vk::ComputePipelineCreateInfo create {};
+		create.stage.stage = vk::ShaderStageFlagBits::eCompute;
+		create.stage.module = shader;
+		create.stage.pName = "main";
+		create.layout = m_pssr_pipeline_layout;
+		const auto result = graphics.device.createComputePipelines(
+		    nullptr, 1, &create, nullptr, &pipeline);
+		graphics.device.destroyShaderModule(shader, nullptr);
+		RequireVulkanSuccess(result, "create upscaling pipeline");
+	};
+	create(GPU_PSSR_LINEAR_SPV, m_pssr_pipeline);
+	create(GPU_PSSR_MOTION_SPV, m_pssr_motion_pipeline);
+}
+
+bool RenderExecutor::FixMotion(vk::CommandBuffer command, const Pssr::Request& request,
+                               Dlss::Resource& motion) {
+	auto& graphics = m_context.GetGraphics();
+	if (m_pssr_motion == nullptr || m_pssr_motion->extent.width != motion.width ||
+	    m_pssr_motion->extent.height != motion.height) {
+		if (m_pssr_motion != nullptr) {
+			m_context.GetCommandScheduler().DeferOperation(
+			    [&graphics, image = m_pssr_motion, view = m_pssr_motion_view] {
+				    graphics.device.destroyImageView(view, nullptr);
+				    graphics.DeleteImage(*image);
+				    delete image;
+			    });
+			m_pssr_motion      = nullptr;
+			m_pssr_motion_view = nullptr;
+		}
+		vk::ImageCreateInfo info {};
+		info.imageType   = vk::ImageType::e2D;
+		info.format      = vk::Format::eR16G16Sfloat;
+		info.extent      = vk::Extent3D {motion.width, motion.height, 1};
+		info.mipLevels   = 1;
+		info.arrayLayers = 1;
+		info.samples     = vk::SampleCountFlagBits::e1;
+		info.tiling      = vk::ImageTiling::eOptimal;
+		info.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+		info.initialLayout = vk::ImageLayout::eUndefined;
+		auto* image        = new VulkanImage;
+		if (!graphics.CreateImage(info, *image)) {
+			delete image;
+			return false;
+		}
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = image->image;
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = info.format;
+		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(graphics.device.createImageView(&view_info, nullptr,
+		                                                     &m_pssr_motion_view),
+		                     "create motion vector view");
+		m_pssr_motion = image;
+		const vk::ImageMemoryBarrier2 barrier {
+		    .srcStageMask     = vk::PipelineStageFlagBits2::eNone,
+		    .dstStageMask     = vk::PipelineStageFlagBits2::eComputeShader,
+		    .dstAccessMask    = vk::AccessFlagBits2::eShaderWrite,
+		    .oldLayout        = vk::ImageLayout::eUndefined,
+		    .newLayout        = vk::ImageLayout::eGeneral,
+		    .image            = image->image,
+		    .subresourceRange = view_info.subresourceRange};
+		command.pipelineBarrier2(
+		    vk::DependencyInfo {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+	}
+	const auto             sign = OffsetSign();
+	const MotionParameters parameters {
+	    {request.x, request.y},
+	    {request.width, request.height},
+	    {request.motion_scale[0], request.motion_scale[1]},
+	    {sign[0] * request.motion_offset[0], sign[1] * request.motion_offset[1]}};
+	const std::array images {
+	    vk::DescriptorImageInfo {nullptr, static_cast<vk::ImageView>(motion.view),
+	                             vk::ImageLayout::eGeneral},
+	    vk::DescriptorImageInfo {nullptr, m_pssr_motion_view, vk::ImageLayout::eGeneral}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); ++i) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = i == 0 ? vk::DescriptorType::eSampledImage
+		                                   : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo      = &images[i];
+	}
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout, 0,
+	                             writes.size(), writes.data());
+	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_motion_pipeline);
+	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                      sizeof(parameters), &parameters);
+	command.dispatch((request.width + 7) / 8, (request.height + 7) / 8, 1);
+	MemoryBarrier(command);
+	motion = Dlss::Resource {
+	    .view   = static_cast<VkImageView>(m_pssr_motion_view),
+	    .image  = static_cast<VkImage>(m_pssr_motion->image),
+	    .range  = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    .format = VK_FORMAT_R16G16_SFLOAT,
+	    .width  = motion.width,
+	    .height = motion.height};
+	return true;
 }
 
 bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& request,
@@ -246,46 +404,21 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		    !Fsr::Enabled() || (Fsr::Reads(request, inputs) && raw(input, 3) &&
 		                        raw(*dlss_bindings[0], 1) && raw(*dlss_bindings[1], 2) &&
 		                        (!dlss_bindings[2] || raw(*dlss_bindings[2], 1)) && raw(output, 3));
-		if (readable && Upscale(command, request, inputs)) {
+		// Neither upscaler takes a motion offset: fold it into pixel vectors first.
+		Pssr::Request upscaled = request;
+		bool          ready    = readable;
+		if (ready && (request.motion_offset[0] != 0.0f || request.motion_offset[1] != 0.0f)) {
+			CreatePssrPipelines();
+			ready                     = FixMotion(command, request, inputs.motion);
+			upscaled.motion_scale[0]  = upscaled.motion_scale[1] = 1.0f;
+			upscaled.motion_offset[0] = upscaled.motion_offset[1] = 0.0f;
+		}
+		if (ready && Upscale(command, upscaled, inputs)) {
 			ResetBindings();
 			return;
 		}
 	}
-	auto& graphics = m_context.GetGraphics();
-	if (m_pssr_pipeline == nullptr) {
-		const std::array bindings {
-		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute},
-		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute}};
-		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptor_info.bindingCount = bindings.size();
-		descriptor_info.pBindings = bindings.data();
-		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
-		                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
-		                     "create upscaling descriptor layout");
-		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
-		                                  sizeof(PssrParameters)};
-		vk::PipelineLayoutCreateInfo layout_info {};
-		layout_info.setLayoutCount = 1;
-		layout_info.pSetLayouts = &m_pssr_descriptor_layout;
-		layout_info.pushConstantRangeCount = 1;
-		layout_info.pPushConstantRanges = &push;
-		RequireVulkanSuccess(graphics.device.createPipelineLayout(
-		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
-		                     "create upscaling pipeline layout");
-		const auto shader = CompileSPV(GPU_PSSR_LINEAR_SPV, graphics.device);
-		vk::ComputePipelineCreateInfo create {};
-		create.stage.stage = vk::ShaderStageFlagBits::eCompute;
-		create.stage.module = shader;
-		create.stage.pName = "main";
-		create.layout = m_pssr_pipeline_layout;
-		const auto result = graphics.device.createComputePipelines(
-		    nullptr, 1, &create, nullptr, &m_pssr_pipeline);
-		graphics.device.destroyShaderModule(shader, nullptr);
-		RequireVulkanSuccess(result, "create upscaling pipeline");
-	}
+	CreatePssrPipelines();
 	const std::array images {
 	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},
 	    vk::DescriptorImageInfo {nullptr, output.image_view, vk::ImageLayout::eGeneral}};
