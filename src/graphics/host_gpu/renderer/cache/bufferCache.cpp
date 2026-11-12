@@ -2625,7 +2625,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				g_import_stats.snaps.fetch_add(1, std::memory_order_relaxed);
 				g_import_stats.snap_bytes.fetch_add(size, std::memory_order_relaxed);
 			}
-			GpuMarkers::NoteBinding(vaddr, size, false, 2);
+			GpuMarkers::NoteBinding(vaddr, size, false, 2, 0, 0, static_cast<VkBuffer>(m_stream_buffer.Handle()), offset);
 			return {&m_stream_buffer, offset};
 		}
 	}
@@ -2692,7 +2692,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		NoteBufferWrite(vaddr, size);
 	}
 	GpuMarkers::NoteBinding(vaddr, size, is_written, buffer.IsImported() ? 1 : 0, buffer.CpuAddress(),
-	                        buffer.Size());
+	                        buffer.Size(), static_cast<VkBuffer>(buffer.Handle()), buffer.Offset(vaddr));
 	return {&buffer, buffer.Offset(vaddr)};
 }
 

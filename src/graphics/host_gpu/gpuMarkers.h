@@ -26,8 +26,15 @@ void               SetShader(uint64_t address) noexcept;
 [[nodiscard]] uint64_t Shader() noexcept;
 // kind: 0 device memory, 1 imported guest memory, 2 stream copy.
 // buffer/buffer_size: the cache buffer bound (its guest base), 0 for a stream copy.
+// handle/offset: the host buffer and byte offset the shader reads (KYTY_GPU_MARKERS_CAP copies).
 void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer = 0,
-                 uint64_t buffer_size = 0) noexcept;
+                 uint64_t buffer_size = 0, VkBuffer handle = VK_NULL_HANDLE, uint64_t offset = 0) noexcept;
+
+// KYTY_GPU_MARKERS_CAP=addr[,addr...] (hex compute shaders, diagnostic): each of their dispatches copies
+// every binding (up to 128 KiB each) on the GPU right before it runs and right after, into a 128 MiB
+// host ring, with its first 16 user SGPRs. Written to <markers file>.cap at the loss, and every
+// KYTY_GPU_MARKERS_CAP_PERIOD seconds (default 0: never) to <markers file>.cap<n> (at most 6).
+void SetUserData(const uint32_t* sgprs) noexcept;
 
 // A command-processor write of guest memory (DMA fill/copy, WRITE_DATA): kind 'F'/'C'/'W' on the CPU
 // at record time, 'f'/'c' through the command stream. Kept in a ring, printed against the hung reads.

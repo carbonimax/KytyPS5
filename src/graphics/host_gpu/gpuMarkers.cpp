@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::GpuMarkers {
@@ -25,6 +27,8 @@ constexpr uint32_t HeadBytes   = 32; // first bytes of each imported read, at bi
 
 struct Binding {
 	uint64_t vaddr = 0, size = 0, buffer = 0, buffer_size = 0;
+	VkBuffer handle = VK_NULL_HANDLE; // host buffer bound, at `offset` (CAP copies)
+	uint64_t offset = 0;
 	uint8_t  written = 0, kind = 0, head_ok = 0;
 	std::array<uint8_t, HeadBytes> head {};
 };
@@ -95,6 +99,192 @@ constexpr uint32_t CpWrites = 1u << 14u;
 CpWrite*              g_cp_writes = nullptr;
 std::atomic<uint32_t> g_cp_count {0};
 
+// KYTY_GPU_MARKERS_CAP: GPU copies of the listed shaders' bindings before and after each dispatch.
+constexpr uint64_t CapRing       = 128ull << 20u;
+constexpr uint64_t CapBindingMax = 128ull << 10u;
+constexpr uint32_t CapMetas      = 4096;
+constexpr uint32_t CapUser       = 16;
+struct CapMeta {
+	std::atomic<uint32_t> seq {0}; // 0 while being filled
+	uint32_t              x = 0, y = 0, z = 0, count = 0;
+	uint64_t              shader = 0, start = 0, bytes = 0; // ring cursor of the pre copies, total bytes
+	std::array<uint32_t, CapUser>    user {};
+	std::array<Binding, MaxBindings> bindings {};
+	std::array<uint32_t, MaxBindings> copied {}, pre {}, post {}; // bytes copied, ring offsets
+};
+VkBuffer          g_cap_buffer = VK_NULL_HANDLE;
+VmaAllocation     g_cap_allocation = nullptr;
+const uint8_t*    g_cap_mapped = nullptr;
+CapMeta*          g_caps       = nullptr;
+std::mutex        g_cap_mutex;
+uint64_t          g_cap_cursor = 0; // bytes ever allocated in the ring (g_cap_mutex)
+uint32_t          g_cap_count  = 0; // captures ever started (g_cap_mutex)
+thread_local std::array<uint32_t, CapUser> t_user {};
+thread_local CapMeta* t_cap = nullptr; // capture whose after-copies End records
+
+const std::vector<uint64_t>& CapShaders() {
+	static const std::vector<uint64_t> list = [] {
+		std::vector<uint64_t> out;
+		const char*           value = std::getenv("KYTY_GPU_MARKERS_CAP");
+		for (const char* at = value; at != nullptr && *at != '\0';) {
+			char*      next    = nullptr;
+			const auto address = std::strtoull(at, &next, 16);
+			if (next == at) {
+				break;
+			}
+			out.push_back(address);
+			at = *next == ',' ? next + 1 : next;
+		}
+		return out;
+	}();
+	return list;
+}
+
+void CapBarrier(vk::CommandBuffer cmd) {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eShaderWrite |
+	                        vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+	                    &barrier, 0, nullptr, 0, nullptr);
+}
+
+void CapAfterCopies(vk::CommandBuffer cmd) {
+	// The dispatch may write what the copies read; the host reads the ring once the marker says finished.
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                        vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
+	                        vk::AccessFlagBits::eHostRead;
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 1, &barrier,
+	                    0, nullptr, 0, nullptr);
+}
+
+void CapCopies(vk::CommandBuffer cmd, const CapMeta& m, bool post) {
+	CapBarrier(cmd);
+	for (uint32_t i = 0; i < std::min(m.count, MaxBindings); i++) {
+		const auto& b = m.bindings[i];
+		if (b.handle == VK_NULL_HANDLE || m.copied[i] == 0) {
+			continue;
+		}
+		vk::BufferCopy region {b.offset, (post ? m.post[i] : m.pre[i]), m.copied[i]};
+		cmd.copyBuffer(vk::Buffer(b.handle), vk::Buffer(g_cap_buffer), 1, &region);
+	}
+	CapAfterCopies(cmd);
+}
+
+// Before the dispatch `e` (its bindings are final): reserves ring space and records the before-copies.
+void CapBegin(vk::CommandBuffer cmd, const Entry& e) {
+	t_cap = nullptr;
+	if (g_caps == nullptr || (e.type != 'C' && e.type != 'I')) {
+		return;
+	}
+	const auto& list = CapShaders();
+	if (std::find(list.begin(), list.end(), e.shader) == list.end()) {
+		return;
+	}
+	const auto aligned = [](uint64_t n) { return (n + 255u) & ~uint64_t {255}; };
+	uint64_t   half    = 0;
+	for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
+		half += aligned(std::min(e.bindings[i].size, CapBindingMax));
+	}
+	CapMeta* m = nullptr;
+	{
+		std::lock_guard lock(g_cap_mutex);
+		if (g_cap_cursor % CapRing + 2 * half > CapRing) {
+			g_cap_cursor += CapRing - g_cap_cursor % CapRing;
+		}
+		m = &g_caps[g_cap_count++ % CapMetas];
+		m->seq.store(0);
+		m->start = g_cap_cursor;
+		g_cap_cursor += 2 * half;
+	}
+	m->bytes  = 2 * half;
+	m->shader = e.shader;
+	m->x      = e.x;
+	m->y      = e.y;
+	m->z      = e.z;
+	m->count  = std::min(e.count, MaxBindings);
+	m->user   = t_user;
+	uint64_t at = m->start % CapRing;
+	for (uint32_t i = 0; i < m->count; i++) {
+		m->bindings[i] = e.bindings[i];
+		m->copied[i]   = static_cast<uint32_t>(std::min(e.bindings[i].size, CapBindingMax));
+		m->pre[i]      = static_cast<uint32_t>(at);
+		m->post[i]     = static_cast<uint32_t>(at + half);
+		at += aligned(m->copied[i]);
+	}
+	CapCopies(cmd, *m, false);
+	m->seq.store(e.seq);
+	t_cap = m;
+}
+
+// Captures still in the ring, oldest first; `done_only`: their dispatch finished on the GPU.
+void WriteCaps(const char* path, uint32_t finished, bool done_only, uint32_t newest) {
+	if (g_caps == nullptr) {
+		return;
+	}
+	std::FILE* f = std::fopen(path, "wb");
+	if (f == nullptr) {
+		return;
+	}
+	uint64_t cursor = 0;
+	uint32_t total  = 0;
+	{
+		std::lock_guard lock(g_cap_mutex);
+		cursor = g_cap_cursor;
+		total  = g_cap_count;
+	}
+	const uint32_t recorded = g_seq.load(std::memory_order_relaxed);
+	std::fwrite("KCAP1\0\0\0", 1, 8, f);
+	std::fwrite(&recorded, 4, 1, f);
+	std::fwrite(&finished, 4, 1, f);
+	std::vector<uint8_t> data;
+	const uint32_t       first = total > std::min(newest, CapMetas) ? total - std::min(newest, CapMetas) : 0;
+	for (uint32_t n = first; n < total; n++) {
+		const auto&    m   = g_caps[n % CapMetas];
+		const uint32_t seq = m.seq.load();
+		if (seq == 0 || cursor > m.start + CapRing || (done_only && static_cast<int32_t>(seq - finished) > 0)) {
+			continue;
+		}
+		const uint32_t done = static_cast<int32_t>(seq - finished) <= 0 ? 1 : 0;
+		data.assign(g_cap_mapped + m.start % CapRing, g_cap_mapped + m.start % CapRing + m.bytes);
+		if (m.seq.load() != seq) {
+			continue; // reused while copying
+		}
+		std::fwrite(&seq, 4, 1, f);
+		std::fwrite(&done, 4, 1, f);
+		std::fwrite(&m.shader, 8, 1, f);
+		std::fwrite(&m.x, 4, 1, f);
+		std::fwrite(&m.y, 4, 1, f);
+		std::fwrite(&m.z, 4, 1, f);
+		std::fwrite(m.user.data(), 4, CapUser, f);
+		std::fwrite(&m.count, 4, 1, f);
+		for (uint32_t i = 0; i < m.count; i++) {
+			const auto& b = m.bindings[i];
+			const uint8_t flags[4] = {b.written, b.kind, 0, 0};
+			std::fwrite(&b.vaddr, 8, 1, f);
+			std::fwrite(&b.size, 8, 1, f);
+			std::fwrite(&b.buffer, 8, 1, f);
+			std::fwrite(&m.copied[i], 4, 1, f);
+			std::fwrite(flags, 1, 4, f);
+		}
+		for (uint32_t i = 0; i < m.count; i++) {
+			std::fwrite(data.data() + (m.pre[i] - m.start % CapRing), 1, m.copied[i], f);
+		}
+		for (uint32_t i = 0; i < m.count; i++) {
+			std::fwrite(data.data() + (m.post[i] - m.start % CapRing), 1, m.copied[i], f);
+		}
+	}
+	std::fclose(f);
+}
+
+const char* MarkersPath() {
+	const char* path = std::getenv("KYTY_GPU_MARKERS_FILE");
+	return path != nullptr ? path : "gpu_markers.txt";
+}
+
 void Words(std::FILE* f, const char* tag, uint64_t vaddr, const uint8_t* bytes, uint64_t size) {
 	std::fprintf(f, "  %s 0x%016" PRIx64 " (%" PRIu64 " bytes):", tag, vaddr, size);
 	for (uint64_t k = 0; k < size; k += 4) {
@@ -160,6 +350,59 @@ void Print(std::FILE* f, const Entry& e, const char* tag) {
 	}
 }
 
+bool Overlaps(const Binding& a, const Binding& b) {
+	return a.vaddr < b.vaddr + b.size && b.vaddr < a.vaddr + a.size;
+}
+
+// The latest kept commands before `from` that wrote bytes of `in` (up to 3, with their bindings), and the
+// command-processor writes over it before `from`; at depth 2, the same for each read of the latest writer.
+void EarlierWriters(std::FILE* f, uint32_t from, const Binding& in, int depth) {
+	const char* indent = depth > 1 ? "      " : "          ";
+	uint32_t    shown  = 0;
+	for (uint32_t back = 1; back < TableSize && shown < 3; back++) {
+		const auto& o = g_table[(from - back) & (TableSize - 1)];
+		if (o.seq != from - back) {
+			break;
+		}
+		for (uint32_t k = 0; k < std::min(o.count, MaxBindings); k++) {
+			const auto& w = o.bindings[k];
+			if (w.written == 0 || !Overlaps(w, in)) {
+				continue;
+			}
+			std::fprintf(f, "%searlier GPU write of 0x%016" PRIx64 "+0x%" PRIx64 " (depth %d): seq=%u (-%u) 0x%016" PRIx64
+			                "+0x%" PRIx64 " kind=%u buffer=0x%" PRIx64 "+0x%" PRIx64 "\n",
+			             indent, in.vaddr, in.size, depth, o.seq, back, w.vaddr, w.size, w.kind, w.buffer, w.buffer_size);
+			Print(f, o, depth > 1 ? "      prior" : "          prior2");
+			if (depth > 1 && shown == 0) {
+				for (uint32_t j = 0; j < std::min(o.count, MaxBindings); j++) {
+					if (o.bindings[j].written == 0) {
+						EarlierWriters(f, o.seq, o.bindings[j], depth - 1);
+					}
+				}
+			}
+			shown++;
+			break;
+		}
+	}
+	if (shown == 0) {
+		std::fprintf(f, "%sno earlier GPU write of 0x%016" PRIx64 "+0x%" PRIx64 " kept (depth %d)\n", indent, in.vaddr,
+		             in.size, depth);
+	}
+	const uint32_t total = g_cp_count.load(std::memory_order_relaxed);
+	uint32_t       cps   = 0;
+	for (uint32_t back = 1; g_cp_writes != nullptr && back <= std::min(total, CpWrites) && cps < 4; back++) {
+		const auto& w = g_cp_writes[(total - back) & (CpWrites - 1)];
+		if (static_cast<int32_t>(w.seq - from) >= 0) {
+			continue;
+		}
+		if (w.vaddr < in.vaddr + in.size && in.vaddr < w.vaddr + w.size) {
+			std::fprintf(f, "%searlier cp %c over 0x%016" PRIx64 ": 0x%016" PRIx64 "+0x%" PRIx64 " after seq=%u (%d)\n",
+			             indent, w.kind, in.vaddr, w.vaddr, w.size, w.seq, static_cast<int>(w.seq) - static_cast<int>(from));
+			cps++;
+		}
+	}
+}
+
 } // namespace
 
 bool Requested() noexcept {
@@ -197,6 +440,19 @@ void Init(GraphicContext& graphics) {
 	g_table  = new Entry[TableSize];
 	g_snaps  = !SnapShaders().empty() ? new Snap[SnapSlots] : nullptr;
 	g_cp_writes = new CpWrite[CpWrites];
+	if (!CapShaders().empty()) {
+		buffer_info.size  = CapRing;
+		buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VmaAllocationInfo cap_info {};
+		if (vmaCreateBuffer(graphics.allocator, &buffer_info, &alloc_info, &g_cap_buffer, &g_cap_allocation,
+		                    &cap_info) == VK_SUCCESS &&
+		    cap_info.pMappedData != nullptr) {
+			g_cap_mapped = static_cast<const uint8_t*>(cap_info.pMappedData);
+			g_caps       = new CapMeta[CapMetas];
+		}
+		LOGF("GpuMarkers: KYTY_GPU_MARKERS_CAP %zu shaders, ring %s\n", CapShaders().size(),
+		     g_caps != nullptr ? "on" : "NOT created");
+	}
 	g_mapped = static_cast<const volatile uint32_t*>(allocation_info.pMappedData);
 	LOGF("GpuMarkers: on (VK_AMD_buffer_marker, %u commands kept)\n", TableSize);
 }
@@ -215,8 +471,14 @@ uint64_t Shader() noexcept {
 	return t_shader;
 }
 
+void SetUserData(const uint32_t* sgprs) noexcept {
+	if (g_caps != nullptr) {
+		std::copy_n(sgprs, CapUser, t_user.begin());
+	}
+}
+
 void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t buffer,
-                 uint64_t buffer_size) noexcept {
+                 uint64_t buffer_size, VkBuffer handle, uint64_t offset) noexcept {
 	if (!Active()) {
 		return;
 	}
@@ -227,6 +489,8 @@ void NoteBinding(uint64_t vaddr, uint64_t size, bool written, int kind, uint64_t
 		b.size        = size;
 		b.buffer      = buffer;
 		b.buffer_size = buffer_size;
+		b.handle      = handle;
+		b.offset      = offset;
 		b.written = written ? 1 : 0;
 		b.kind    = static_cast<uint8_t>(kind);
 		b.head_ok = kind == 1 && !written && size >= HeadBytes &&
@@ -284,6 +548,7 @@ uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shade
 		slot.finished = g_mapped[1];
 		t_snap.count = 0;
 	}
+	CapBegin(cmd, e);
 	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, vk::Buffer(g_buffer), 0, seq);
 	return seq;
 }
@@ -292,6 +557,10 @@ void End(vk::CommandBuffer cmd, uint32_t seq) noexcept {
 	if (seq == 0 || !cmd) {
 		return;
 	}
+	if (t_cap != nullptr && t_cap->seq.load() == seq) {
+		CapCopies(cmd, *t_cap, true); // before the finished marker: a finished capture is complete
+	}
+	t_cap = nullptr;
 	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, vk::Buffer(g_buffer), 4, seq);
 }
 
@@ -301,6 +570,19 @@ void Report(double seconds) {
 	}
 	std::printf("PERF gpumark %.1fs: recorded=%u begun=%u finished=%u\n", seconds,
 	            g_seq.load(std::memory_order_relaxed), g_mapped[0], g_mapped[1]);
+	static const double period = [] {
+		const char* value = std::getenv("KYTY_GPU_MARKERS_CAP_PERIOD");
+		return value != nullptr ? std::strtod(value, nullptr) : 0.0;
+	}();
+	static double   elapsed = 0;
+	static uint32_t written = 0;
+	if (g_caps != nullptr && period > 0 && written < 6 && (elapsed += seconds) >= period) {
+		elapsed = 0;
+		char path[512];
+		std::snprintf(path, sizeof(path), "%s.cap%u", MarkersPath(), written++);
+		WriteCaps(path, g_mapped[1], true, 1200);
+		std::printf("PERF gpumark cap: wrote %s\n", path);
+	}
 }
 
 void Dump(const char* site) noexcept {
@@ -310,10 +592,14 @@ void Dump(const char* site) noexcept {
 	const uint32_t recorded = g_seq.load(std::memory_order_relaxed);
 	const uint32_t begun    = g_mapped[0];
 	const uint32_t finished = g_mapped[1];
-	const char*    path     = std::getenv("KYTY_GPU_MARKERS_FILE");
-	std::FILE*     f        = std::fopen(path != nullptr ? path : "gpu_markers.txt", "w");
+	std::FILE*     f        = std::fopen(MarkersPath(), "w");
 	LOGF("GpuMarkers: device lost at %s: recorded=%u begun=%u finished=%u (hung: seq %u)\n", site, recorded,
 	     begun, finished, finished + 1);
+	if (g_caps != nullptr) {
+		const std::string cap = std::string(MarkersPath()) + ".cap";
+		WriteCaps(cap.c_str(), finished, false, CapMetas);
+		LOGF("GpuMarkers: captures written to %s\n", cap.c_str());
+	}
 	if (f == nullptr) {
 		return;
 	}
@@ -395,6 +681,9 @@ void Dump(const char* site) noexcept {
 								}
 								std::fprintf(f, "      read 0x%016" PRIx64 "+0x%" PRIx64 ": %u later GPU writes shown\n", in.vaddr,
 								             in.size, later);
+								if (writers_shown == 1) {
+									EarlierWriters(f, o.seq, in, 2);
+								}
 							}
 						}
 					}

@@ -764,6 +764,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer,
 	}
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	GpuMarkers::SetUserData(sh_ctx.GetCs().cs_user_sgpr.value);
 	const uint32_t marker = GpuMarkers::Begin(
 	    vk_buffer, 'C', sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash, thread_group_x, thread_group_y,
 	    thread_group_z, m_context.GetCommandScheduler().CurrentTick(),
@@ -894,6 +895,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer,
 	if (GpuMarkers::Active()) {
 		(void)LibKernel::Memory::TryReadBacking(args_addr, &guest_args, sizeof(guest_args));
 	}
+	GpuMarkers::SetUserData(cs_regs.cs_user_sgpr.value);
 	const uint32_t marker = GpuMarkers::Begin(
 	    vk_buffer, 'I', cs_regs.cs_regs.data_addr, program.shader_hash, guest_args.x, guest_args.y, guest_args.z,
 	    m_context.GetCommandScheduler().CurrentTick(),
