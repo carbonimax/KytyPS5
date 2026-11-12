@@ -169,7 +169,7 @@ void NoteDefer(uint64_t bytes, bool first) noexcept {
 }
 
 uint32_t SkipSameMode() noexcept {
-	static const uint32_t mode = std::min(EnvU32("KYTY_REFRESH_SKIP_SAME", 0), 2u);
+	static const uint32_t mode = std::min(EnvU32("KYTY_REFRESH_SKIP_SAME", 1), 2u);
 	return mode;
 }
 

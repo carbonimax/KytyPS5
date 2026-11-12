@@ -32,7 +32,7 @@ enum Reason : uint8_t {
 [[nodiscard]] bool Enabled() noexcept;
 // KYTY_REFRESH_PROF=2: also hash the guest bytes of every upload ("dirty but same bytes").
 [[nodiscard]] bool HashEnabled() noexcept;
-// KYTY_REFRESH_SKIP_SAME: 0 off; 1 a texture lookup keeps the native image while every byte that
+// KYTY_REFRESH_SKIP_SAME: 0 off; 1 (default) a texture lookup keeps the native image while every byte that
 // may have changed since its last upload lies in mips its view cannot sample (below base_level +
 // floor(min_lod)); 2 verify: decide the same, upload anyway, and count a mismatch when a sampled
 // mip's guest bytes differ from that upload.
