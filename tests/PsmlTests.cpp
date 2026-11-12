@@ -366,7 +366,9 @@ TEST_F(PsmlTest, DispatchCarriesTemporalInputs) {
   EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
   params.motion_gamma = 0.0f;
   params.motion_offset[1] = -1.0f;
-  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  request = dispatch();
+  EXPECT_EQ(request.flags, 0u);
+  EXPECT_EQ(std::to_array(request.motion_offset), std::to_array(params.motion_offset));
   params.motion_offset[1] = 0.0f;
   params.flags = 1u << 14;
   EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
@@ -769,7 +771,9 @@ TEST_F(PsmlMfsr2Test, DispatchCarriesTemporalInputs) {
   EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
   params.flags = 0;
   params.motion_offset[0] = 1.0f;
-  EXPECT_EQ(dispatch().flags, Pssr::kSpatialOnly);
+  request = dispatch();
+  EXPECT_EQ(request.flags, 0u);
+  EXPECT_EQ(request.motion_offset[0], 1.0f);
   EXPECT_EQ(Function<Release>("Kyy1baXgaVU")(context), 0);
 }
 
