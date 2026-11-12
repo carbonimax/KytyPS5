@@ -11,6 +11,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "gpu_test_shaders/gpu_test_ms_depth_spv.h"
+#include "gpu_test_shaders/gpu_test_ray_query_spv.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
@@ -38,6 +39,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStore.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -26058,6 +26060,7 @@ public:
 
 
 #include "PssrGpuTests.inc"
+#include "BvhMirrorGpuTests.inc"
 
 private:
   Mode m_mode = Mode::Full;
@@ -26082,6 +26085,7 @@ private:
   bool m_conditional_rendering_enabled = false; // Full mode, when the device supports it.
   // Full rasterization mode with VK_EXT_mesh_shader mesh and task shaders.
   bool m_mesh_task_enabled = false;
+  bool m_ray_query_enabled = false;
   u32 m_robust_storage_alignment = 0;           // Full mode with robustBufferAccess2 (as the emulator).
   u32   m_skipped_cases          = 0;
 
@@ -26336,6 +26340,9 @@ private:
     available_clock.pNext = &available_maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
     available_robustness2.pNext = &available_clock;
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR available_acceleration_structure{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR available_ray_query{};
+    available_ray_query.pNext = &available_acceleration_structure;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR available_barycentric{};
@@ -26344,7 +26351,8 @@ private:
     available_barycentric.pNext = &available_conditional_rendering;
     vk::PhysicalDeviceMeshShaderFeaturesEXT available_mesh{};
     available_mesh.pNext = &available_barycentric;
-    available_features2.pNext = &available_mesh;
+    available_acceleration_structure.pNext = &available_mesh;
+    available_features2.pNext = &available_ray_query;
     m_physical_device.getFeatures2(&available_features2);
     uint32_t extension_count = 0;
     RequireVk("VulkanHarness", "extensions", m_physical_device.enumerateDeviceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateDeviceExtensionProperties");
@@ -26367,6 +26375,13 @@ private:
     m_mesh_task_enabled = full && available_mesh.meshShader && available_mesh.taskShader && std::ranges::any_of(extensions, [](const vk::ExtensionProperties &extension) {
       return std::strcmp(extension.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME) == 0;
     });
+    if (full) {
+      Require("VulkanHarness", "ray query",
+              available_acceleration_structure.accelerationStructure == true &&
+                  available_ray_query.rayQuery == true,
+              "acceleration structures and ray queries are not supported");
+    }
+    m_ray_query_enabled = full;
     Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
             "shaderInt64 is not supported");
     Require("VulkanHarness", "dispatch",
@@ -26602,6 +26617,15 @@ private:
       mesh.pNext = const_cast<void *>(device_info.pNext);
       device_info.pNext = &mesh;
     }
+    vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure{};
+    vk::PhysicalDeviceRayQueryFeaturesKHR ray_query{};
+    if (m_ray_query_enabled) {
+      acceleration_structure.accelerationStructure = true;
+      acceleration_structure.pNext = const_cast<void *>(device_info.pNext);
+      ray_query.rayQuery = true;
+      ray_query.pNext = &acceleration_structure;
+      device_info.pNext = &ray_query;
+    }
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = full;
     device_features.shaderStorageImageMultisample = full && available_features.shaderStorageImageMultisample;
@@ -26637,6 +26661,11 @@ private:
     }
     if (m_mesh_task_enabled) {
       device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    }
+    if (m_ray_query_enabled) {
+      device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+      device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+      device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
     if (relaxed) {
       const auto has_extension = [&](const char *name) {
@@ -61256,6 +61285,11 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-mirror-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBvhMirror();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPssr();
@@ -61670,6 +61704,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();
+  vulkan.CheckBvhMirror();
   vulkan.CheckFaultBufferScan();
   vulkan.CheckFaultRecordsOverflow();
   vulkan.CheckLargeSparseImageUpload();

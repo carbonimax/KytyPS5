@@ -618,8 +618,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext        = supported_features2.pNext;
 		supported_features2.pNext = &device_fault;
 	}
+	const bool ray_query_extensions =
+	    HasExtension(device_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+	    HasExtension(device_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR acceleration_structure {};
+	vk::PhysicalDeviceRayQueryFeaturesKHR              ray_query {};
+	if (ray_query_extensions) {
+		ray_query.pNext              = supported_features2.pNext;
+		acceleration_structure.pNext = &ray_query;
+		supported_features2.pNext    = &acceleration_structure;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault == VK_TRUE;
+	const bool ray_query_enabled = ray_query_extensions &&
+	                               acceleration_structure.accelerationStructure && ray_query.rayQuery;
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -775,6 +787,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    graphics.occlusion_queries_enabled && supported_features2.features.occlusionQueryPrecise;
 	features12.hostQueryReset             = graphics.occlusion_queries_enabled;
 	device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+	LOGF("Vulkan ray query: %s\n", ray_query_enabled ? "true" : "false");
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
@@ -857,6 +870,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext                   = const_cast<void*>(create_info.pNext);
 		device_fault.deviceFaultVendorBinary = VK_FALSE;
 		create_info.pNext                    = &device_fault;
+	}
+	vk::PhysicalDeviceAccelerationStructureFeaturesKHR enabled_acceleration_structure {};
+	vk::PhysicalDeviceRayQueryFeaturesKHR              enabled_ray_query {};
+	if (ray_query_enabled) {
+		enabled_acceleration_structure.accelerationStructure = VK_TRUE;
+		enabled_ray_query.rayQuery                           = VK_TRUE;
+		enabled_ray_query.pNext              = const_cast<void*>(create_info.pNext);
+		enabled_acceleration_structure.pNext = &enabled_ray_query;
+		create_info.pNext                    = &enabled_acceleration_structure;
 	}
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
@@ -1279,6 +1301,15 @@ void WindowContext::CreateVulkan() {
 			                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 			}
+		}
+		// Ray queries take all three extensions or none.
+		if (Config::NativeRtEnabled() &&
+		    HasExtension(available_extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}
