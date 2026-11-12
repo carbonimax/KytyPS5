@@ -3,6 +3,7 @@
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "gpu_blit_shaders/gpu_pssr_motion_spv.h"
 #include "graphics/guest_gpu/pssr.h"
+#include "graphics/guest_gpu/pssrProf.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cmdRecord.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -33,6 +34,8 @@ struct MotionParameters {
 	float    offset[2];
 };
 static_assert(sizeof(MotionParameters) == sizeof(PssrParameters)); // one pipeline layout
+
+constexpr uint32_t PSSR_QUERY_PAIRS = 64;
 
 // KYTY_PSSR_OFFSET_SIGN=<x><y>, each + or - (default ++): the sign of motion_offset per axis.
 std::array<float, 2> OffsetSign() {
@@ -68,6 +71,7 @@ RenderExecutor::~RenderExecutor() {
 		graphics.DeleteImage(*m_pssr_motion);
 		delete m_pssr_motion;
 	}
+	device.destroyQueryPool(m_pssr_queries, nullptr);
 	device.destroyPipeline(m_pssr_motion_pipeline, nullptr);
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
@@ -353,6 +357,40 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	const auto range   = [](const ImageViewInfo& view) {
 		return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
 	};
+	// KYTY_PSSR_PROF: a timestamp pair around the pass; a pair is read back when its slot comes
+	// round again, so each sample is the pass recorded PSSR_QUERY_PAIRS requests earlier.
+	auto&          graphics  = m_context.GetGraphics();
+	const bool     timed     = Pssr::Prof::Enabled();
+	uint64_t       gpu_ns    = 0;
+	bool           gpu_ready = false;
+	const uint32_t query     = 2 * (m_pssr_query++ % PSSR_QUERY_PAIRS);
+	if (timed) {
+		if (m_pssr_queries == nullptr) {
+			const vk::QueryPoolCreateInfo info {.queryType  = vk::QueryType::eTimestamp,
+			                                    .queryCount = 2 * PSSR_QUERY_PAIRS};
+			RequireVulkanSuccess(graphics.device.createQueryPool(&info, nullptr, &m_pssr_queries),
+			                     "create upscaling query pool");
+			command.resetQueryPool(m_pssr_queries, 0, 2 * PSSR_QUERY_PAIRS);
+		} else if (m_pssr_query > PSSR_QUERY_PAIRS) {
+			std::array<uint64_t, 2> stamps {};
+			gpu_ready = graphics.device.getQueryPoolResults(m_pssr_queries, query, 2, sizeof(stamps),
+			                                                stamps.data(), sizeof(uint64_t),
+			                                                vk::QueryResultFlagBits::e64) ==
+			            vk::Result::eSuccess;
+			gpu_ns = static_cast<uint64_t>(
+			    static_cast<double>(stamps[1] - stamps[0]) *
+			    graphics.physical_device_properties.limits.timestampPeriod);
+			command.resetQueryPool(m_pssr_queries, query, 2);
+		}
+		command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_pssr_queries, query);
+	}
+	const auto finish = [&](Pssr::Prof::Path path) {
+		if (timed) {
+			command.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, m_pssr_queries,
+			                        query + 1);
+			Pssr::Prof::Upscaled(path, gpu_ns, gpu_ready);
+		}
+	};
 	source.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, range(source_view),
 	               command);
 	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
@@ -417,6 +455,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 			upscaled.motion_offset[0] = upscaled.motion_offset[1] = 0.0f;
 		}
 		if (ready && Upscale(command, upscaled, inputs)) {
+			finish(Fsr::Enabled() ? Pssr::Prof::Path::Fsr : Pssr::Prof::Path::Dlss);
 			ResetBindings();
 			return;
 		}
@@ -441,6 +480,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	command.dispatch((parameters.output_size[0] + 7) / 8,
 	                 (parameters.output_size[1] + 7) / 8, 1);
 	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+	finish(Pssr::Prof::Path::Linear);
 	ResetBindings();
 }
 
