@@ -51,10 +51,12 @@ thread_local Pending    t_pending;
 
 // KYTY_GPU_MARKERS_SNAP=address (hex, one compute shader): full copies of its imported reads at bind
 // time, kept for its last SnapSlots commands and printed next to the bytes at the loss.
-constexpr uint64_t SnapMax   = 16384;
+constexpr uint64_t SnapMax   = 65536;
+constexpr uint64_t PrintMax  = 16384; // words printed per hung binding
 constexpr uint32_t SnapSlots = 256;
 struct Snap {
 	uint32_t                            seq = 0, count = 0;
+	uint32_t                            finished = 0; // last finished command at bind
 	std::array<uint64_t, 4>             vaddr {};
 	std::array<std::vector<uint8_t>, 4> bytes {};
 };
@@ -122,8 +124,10 @@ void SnapDiff(std::FILE* f, uint32_t seq) {
 				first = std::min<uint32_t>(first, static_cast<uint32_t>(k / 4));
 			}
 		}
-		std::fprintf(f, "      snap 0x%016" PRIx64 " (%zu bytes): %u words changed bind->now, first %d\n",
-		             snap->vaddr[i], bytes.size(), changed, first == UINT32_MAX ? -1 : static_cast<int>(first));
+		std::fprintf(f, "      snap 0x%016" PRIx64 " (%zu bytes): %u words changed bind->now, first %d;"
+		                " finished@bind=%u (%u behind)\n",
+		             snap->vaddr[i], bytes.size(), changed, first == UINT32_MAX ? -1 : static_cast<int>(first),
+		             snap->finished, seq - snap->finished);
 	}
 }
 
@@ -277,6 +281,7 @@ uint32_t Begin(vk::CommandBuffer cmd, char type, uint64_t shader, uint64_t shade
 		auto& slot = g_snaps[seq % SnapSlots];
 		std::swap(slot, t_snap);
 		slot.seq     = seq;
+		slot.finished = g_mapped[1];
 		t_snap.count = 0;
 	}
 	cmd.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eTopOfPipe, vk::Buffer(g_buffer), 0, seq);
@@ -412,7 +417,7 @@ void Dump(const char* site) noexcept {
 		std::vector<uint8_t> now(SnapMax);
 		for (uint32_t i = 0; i < std::min(e.count, MaxBindings); i++) {
 			const auto& bind = e.bindings[i];
-			const auto  size = std::min<uint64_t>(bind.size, SnapMax);
+			const auto  size = std::min<uint64_t>(bind.size, PrintMax);
 			if (LibKernel::Memory::TryReadBacking(bind.vaddr, now.data(), size)) {
 				Words(f, "now", bind.vaddr, now.data(), size);
 			}
