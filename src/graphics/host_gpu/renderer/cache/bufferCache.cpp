@@ -901,7 +901,7 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 		flushed = true;
 		PublishFaultWindow(vaddr, true);
 	});
-	QueueBdaSync(vaddr, 1);
+	QueueBdaSync(vaddr, 1, true);
 	// KYTY_WRITE_FAULT_READAHEAD=N (pages, default 15; 0 disables): a guest thread that write-
 	// faults on the page after its previous write fault (a sequential writer, e.g. a constant
 	// ring) also gets the next N CPU-clean pages unprotected and marked CPU-modified, up to the
@@ -925,7 +925,7 @@ void BufferCache::InvalidateFaultMemory(uint64_t vaddr) {
 	const auto marked = m_memory_tracker.ExtendCpuModified((page + 1) * TRACKER_PAGE_SIZE,
 	                                                       readahead * TRACKER_PAGE_SIZE);
 	if (marked != 0) {
-		QueueBdaSync((page + 1) * TRACKER_PAGE_SIZE, marked);
+		QueueBdaSync((page + 1) * TRACKER_PAGE_SIZE, marked, true);
 	}
 	next_page         = page + 1 + marked / TRACKER_PAGE_SIZE;
 }
@@ -1014,7 +1014,7 @@ void BufferCache::PublishFaultWindow(uint64_t vaddr, bool is_write) {
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, 1);
-			QueueBdaSync(vaddr, 1);
+			QueueBdaSync(vaddr, 1, true);
 		}
 	});
 }
@@ -1059,7 +1059,7 @@ bool BufferCache::InvalidateCompletedWrite(uint64_t vaddr, uint64_t size) {
 	if (gpu_owned) {
 		return false;
 	}
-	QueueBdaSync(vaddr, size);
+	QueueBdaSync(vaddr, size, true);
 	return true;
 }
 
