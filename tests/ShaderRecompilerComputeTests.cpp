@@ -60107,6 +60107,7 @@ int main(int argc, char **argv) {
     if (name == "mad32x16") RunCase(&vulkan, Vop3Mad32x16());
     else if (name == "negative-offset") RunCase(&vulkan, BufferNegativeDynamicOffsetReadsZero());
     else if (name == "div-f32") RunCase(&vulkan, DivideF32Precise());
+    else if (name == "omod-negative-zero") RunCase(&vulkan, Vop3OutputModifierFlushesNegativeZero());
     else if (name == "ds-minmax") {
       RunCase(&vulkan, DsFloatMinMaxClasses(false));
       RunCase(&vulkan, DsFloatMinMaxClasses(true));
