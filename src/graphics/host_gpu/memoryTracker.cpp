@@ -87,8 +87,11 @@ uint64_t MemoryTracker::ExtendCpuModified(uint64_t vaddr, uint64_t size) noexcep
 	return marked;
 }
 
-// Queries take no lock: dirty words are read atomically, and a query runs on the GPU thread, which
-// alone writes GPU-dirty bits while other threads only set CPU-dirty ones, so it sees one instant.
+// Queries take no lock: dirty words are read atomically. Only the GPU thread (or the CP back thread,
+// handed over with acquire/release) sets GPU-dirty bits and clears CPU-dirty ones; other threads
+// only set CPU-dirty bits or clear GPU-dirty ones after publishing the bytes (fault readbacks,
+// priority operations). A stale GPU answer is then "dirty", a stale CPU one "clean" (the caller
+// then takes the locked upload), and an acquire load that sees a cleared bit sees the published bytes.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
