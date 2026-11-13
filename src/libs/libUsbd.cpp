@@ -91,6 +91,7 @@ constexpr uint8_t TRANSFER_FLAG_FREE_TRANSFER = 4;
 
 static int KYTY_SYSV_ABI UsbdInit() {
 	PRINT_NAME();
+	USB_LOG("Init\n");
 
 	return OK;
 }
@@ -114,9 +115,14 @@ static int KYTY_SYSV_ABI UsbdHandleEventsTimeout(const TimeVal* tv) {
 		Common::Thread::SleepMicro(POLL_INTERVAL_MS * 1000);
 		return OK;
 	}
-	const uint32_t timeout_ms = tv != nullptr
-	                                ? static_cast<uint32_t>(tv->tv_sec * 1000 + tv->tv_usec / 1000)
-	                                : POLL_INTERVAL_MS;
+	const uint32_t  timeout_ms = tv != nullptr
+	                                 ? static_cast<uint32_t>(tv->tv_sec * 1000 + tv->tv_usec / 1000)
+	                                 : POLL_INTERVAL_MS;
+	static uint32_t last_timeout_ms = UINT32_MAX; // logged on change: a 0 here spins the caller
+	if (timeout_ms != last_timeout_ms) {
+		last_timeout_ms = timeout_ms;
+		USB_LOG("HandleEventsTimeout timeout=%u ms\n", timeout_ms);
+	}
 	std::vector<Host::Completion> done;
 	Host::Wait(timeout_ms, &done);
 	for (const auto& c: done) {
@@ -141,6 +147,7 @@ static int KYTY_SYSV_ABI UsbdHandleEventsTimeout(const TimeVal* tv) {
 
 static int KYTY_SYSV_ABI UsbdEventHandlingOk() {
 	PRINT_NAME();
+	USB_LOG("EventHandlingOk\n");
 
 	return 1;
 }
