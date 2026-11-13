@@ -1413,7 +1413,7 @@ struct State {
 	// guest verdicts of the copy at bind (with KYTY_LATE_READ_PROF) and of the watch; watched ranges new,
 	// extended (bound again before any write) and checked.
 	uint64_t protect_ns = 0, hooks = 0, hook_ns = 0, snaps = 0, ref_guest = 0, watch_guest = 0, fresh = 0,
-	         extended = 0, judged = 0, dropped_armed = 0;
+	         extended = 0, judged = 0, dropped_armed = 0, bind_calls = 0;
 	std::atomic<uint64_t> backing_ns {0}; // NoteBackingWrite
 	std::vector<Key> demote; // imported buffers the guest rewrote under the GPU (back to copies)
 	uint64_t         demoted = 0;
@@ -1490,8 +1490,9 @@ void Drop(State& st, const std::shared_ptr<Live>& live) {
 	}
 }
 
-bool Track(State& st, const Entry& entry) {
-	auto& slot = st.live[{entry.vaddr, entry.size}];
+template <typename Make>
+bool Track(State& st, uint64_t vaddr, uint64_t size, Make&& make) {
+	auto& slot = st.live[{vaddr, size}];
 	if (slot != nullptr && !slot->entry.snapped) {
 		if (!slot->pending) {
 			// Armed: only writes logged from now matter (a later copy holds the earlier ones).
@@ -1506,9 +1507,9 @@ bool Track(State& st, const Entry& entry) {
 		return false;
 	}
 	// A snapped one keeps its pending check (which then drops it); the range is watched again from here.
-	slot             = std::make_shared<Live>(Live {entry, st.open->index});
-	slot->entry.seq  = st.seq.load(std::memory_order_acquire);
-	for (auto chunk = entry.vaddr >> 16u; chunk <= (entry.vaddr + entry.size - 1) >> 16u; chunk++) {
+	slot            = std::make_shared<Live>(Live {make(), st.open->index});
+	slot->entry.seq = st.seq.load(std::memory_order_acquire);
+	for (auto chunk = vaddr >> 16u; chunk <= (vaddr + size - 1) >> 16u; chunk++) {
 		st.chunks[chunk].push_back(slot.get());
 	}
 	st.open->touched.push_back(slot);
@@ -1521,18 +1522,26 @@ bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, u
 	if (t_site == Site::None) {
 		return false;
 	}
-	auto&      st    = S();
-	const auto start = NowNs();
-	Entry      entry {vaddr, size, 0, 0, path, t_site, {}, buffer_vaddr, buffer_size, GpuMarkers::Shader()};
-	bool       fresh = false;
+	auto&      st   = S();
+	const auto make = [&] {
+		return Entry {vaddr, size, 0, 0, path, t_site, {}, buffer_vaddr, buffer_size, GpuMarkers::Shader()};
+	};
+	// The watch alone times one call in TimedCalls: two clock reads would weigh on every binding.
+	constexpr uint32_t          TimedCalls = 16;
+	thread_local uint32_t       t_calls    = 0;
+	const bool                  timed      = !NetOnly() || ++t_calls % TimedCalls == 0;
+	const auto                  start      = timed ? NowNs() : 0;
+	bool                        fresh      = false;
 	if (Watch() != 0 && buffer_size != 0) {
 		std::lock_guard lock(st.mutex);
-		fresh = Track(st, entry);
+		st.bind_calls++;
+		fresh = Track(st, vaddr, size, make);
 		if (NetOnly()) {
-			st.bind_ns += NowNs() - start;
+			st.bind_ns += timed ? (NowNs() - start) * TimedCalls : 0;
 			return fresh;
 		}
 	}
+	Entry entry = make();
 	{
 		std::lock_guard lock(st.mutex);
 		if (!st.sampled || !st.seen.insert({vaddr, size}).second) {
@@ -1791,7 +1800,10 @@ void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp) noexcept {
 	}
 	static constexpr size_t MaxLog = 1u << 20u;
 	auto&                   st     = S();
-	const auto              start  = NowNs();
+	// Timed one call in 16 (as Bind).
+	thread_local uint32_t   t_calls = 0;
+	const bool              timed   = ++t_calls % 16 == 0;
+	const auto              start   = timed ? NowNs() : 0;
 	{
 		std::lock_guard lock(st.log_mutex);
 		const auto      seq = st.seq.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -1801,7 +1813,9 @@ void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp) noexcept {
 			st.log.pop_front();
 		}
 	}
-	st.backing_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+	if (timed) {
+		st.backing_ns.fetch_add((NowNs() - start) * 16, std::memory_order_relaxed);
+	}
 }
 
 void Report(double seconds, uint64_t frames) {
@@ -1833,14 +1847,15 @@ void Report(double seconds, uint64_t frames) {
 	if (Watch() != 0) {
 		std::printf("PERF lateread_watch %.1fs mode=%d: protect=%.2fms/frame log=%.2fms/frame hooks=%.0f/frame"
 		            " hook=%.2fms/frame snaps=%.0f/frame ref_guest=%" PRIu64 " watch_guest=%" PRIu64
-		            " fresh=%.0f/frame extended=%.0f/frame judged=%.0f/frame dropped=%.0f/frame live=%zu\n",
+		            " fresh=%.0f/frame extended=%.0f/frame judged=%.0f/frame dropped=%.0f/frame calls=%.0f/frame live=%zu\n",
 		            seconds, Watch(), static_cast<double>(st.protect_ns) / 1e6 / f,
 		            static_cast<double>(backing_ns) / 1e6 / f, static_cast<double>(st.hooks) / f,
 		            static_cast<double>(st.hook_ns) / 1e6 / f, static_cast<double>(st.snaps) / f, st.ref_guest,
 		            st.watch_guest, static_cast<double>(st.fresh) / f, static_cast<double>(st.extended) / f,
-		            static_cast<double>(st.judged) / f, static_cast<double>(st.dropped_armed) / f, st.live.size());
+		            static_cast<double>(st.judged) / f, static_cast<double>(st.dropped_armed) / f, static_cast<double>(st.bind_calls) / f,
+		            st.live.size());
 		st.protect_ns = st.hooks = st.hook_ns = st.snaps = st.ref_guest = st.watch_guest = 0;
-		st.fresh = st.extended = st.judged = st.dropped_armed = 0;
+		st.fresh = st.extended = st.judged = st.dropped_armed = st.bind_calls = 0;
 	}
 	for (size_t p = 0; p < PathCount; p++) {
 		for (size_t s = 0; s < SiteNames.size(); s++) {
