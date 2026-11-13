@@ -655,6 +655,19 @@ add_executable(wheel_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/WheelCheck.cpp"
 target_link_libraries(wheel_check common fmt::fmt SDL3::SDL3-static)
 target_include_directories(wheel_check PRIVATE ${inc_headers})
 
+add_executable(usb_host_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/UsbHostTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/usbHost.cpp")
+target_include_directories(usb_host_tests PRIVATE ${inc_headers})
+
+# Reads a KYTY_USB_PASSTHRU device through the WinUSB backend; needs the device, so not a ctest case.
+add_executable(usb_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/UsbCheck.cpp"
+	"${KYTY_SOURCE_DIR}/libs/usbHost.cpp")
+target_include_directories(usb_check PRIVATE ${inc_headers})
+if (WIN32)
+	target_link_libraries(usb_host_tests winusb setupapi cfgmgr32)
+	target_link_libraries(usb_check winusb setupapi cfgmgr32)
+endif()
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -869,6 +882,7 @@ if(BUILD_TESTING)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME wheel COMMAND $<TARGET_FILE:wheel_tests>)
+	add_test(NAME usb_host COMMAND $<TARGET_FILE:usb_host_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
@@ -1047,6 +1061,7 @@ if(BUILD_TESTING)
 		controller_settings_tests
 		host_input_tests
 		wheel_tests
+		usb_host_tests
 		save_data_memory_tests
 		png_enc_tests
 		jpeg_dec_tests
@@ -1101,6 +1116,7 @@ if (WIN32)
 	target_link_libraries(kyty_emulator opengl32)
 	target_link_libraries(kyty_emulator iphlpapi)
 	target_link_libraries(kyty_emulator setupapi)
+	target_link_libraries(kyty_emulator winusb cfgmgr32)
 	target_link_libraries(kyty_emulator ws2_32)
 	target_link_libraries(kyty_emulator dxgi)
 endif()

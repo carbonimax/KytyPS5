@@ -1010,6 +1010,16 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		     magic_enum::enum_name(ri.type), magic_enum::enum_name(ri.bind),
 		     Common::PathToString(program->file_name).c_str());
 	}
+	if (patched && !stubbed && (ri.bind == BindType::Global || ri.bind == BindType::Weak)) {
+		// A module loaded later can export what an earlier relocation pass stubbed.
+		for (const auto& record: g_stubbed_imports) {
+			if (record.patch_vaddr == ri.vaddr) {
+				LOGF("Relocate: stubbed import re-bound [%016" PRIx64 "] <- %016" PRIx64 ", %s, %s\n",
+				     ri.vaddr, value, record.name.c_str(), ri.dbg_name.c_str());
+				break;
+			}
+		}
+	}
 
 	if (program->dbg_print_reloc && patched && !ri.bind_self &&
 	    (ri.bind == BindType::Global || ri.bind == BindType::Weak ||
