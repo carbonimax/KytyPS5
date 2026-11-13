@@ -55,6 +55,10 @@ namespace Libs::LibKernel {
 void SetProgName(const std::string& name);
 } // namespace Libs::LibKernel
 
+namespace Libs::Graphics {
+void DescribeImportFault(const uint64_t* values, size_t count); // bufferCache.h
+} // namespace Libs::Graphics
+
 namespace Loader {
 
 Program::Program() = default;
@@ -813,6 +817,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		Libs::Graphics::GuestStacks::Describe(info->rsp);
 		Libs::Graphics::CmdRecord::Describe();
+		{
+			const uint64_t values[] = {info->access_violation_vaddr, info->rax, info->rbx, info->rcx, info->rdx,
+			                           info->rsi, info->rdi, info->rbp, info->r8, info->r9, info->r10,
+			                           info->r11, info->r12, info->r13, info->r14, info->r15};
+			Libs::Graphics::DescribeImportFault(values, sizeof(values) / sizeof(values[0]));
+		}
 		std::fflush(stdout);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		// Host call stack from the faulting context (unwind data only, no symbols): identifies

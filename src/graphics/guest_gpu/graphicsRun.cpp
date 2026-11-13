@@ -170,6 +170,14 @@ public:
 		return hit;
 	}
 
+	void Ranges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) {
+		if (!AnyPending()) {
+			return;
+		}
+		std::lock_guard lock(m_mutex);
+		ForEachPending(address, size, [&out](uint64_t base, const Entry& entry) { out.emplace_back(base, entry.size); });
+	}
+
 	// Overlays the pending label bytes on `bytes`, a copy of guest memory [address, address + size).
 	[[nodiscard]] bool Overlay(uint64_t address, uint64_t size, uint8_t* bytes) {
 		if (!AnyPending()) {
@@ -280,6 +288,13 @@ T ReadFrontValue(const volatile T* address, bool* from_pending) {
 } // namespace
 
 namespace EopAtGpu {
+
+void PendingRanges(uint64_t address, uint64_t size, std::vector<std::pair<uint64_t, uint32_t>>& out) noexcept {
+	if (EopAtGpuMode() != 1) {
+		return;
+	}
+	g_pending_labels.Ranges(address, size, out);
+}
 
 bool OverlayPending(uint64_t address, void* bytes, uint64_t size) noexcept {
 	if (EopAtGpuMode() == 0 || !g_pending_labels.AnyPending()) {

@@ -70,6 +70,10 @@ public:
 	// KYTY_LATE_READ_PROF (see LateRead): queues the check of the ranges bound since the last seal,
 	// to run once the GPU completed the work recorded so far, before any label released later.
 	void                   SealLateReads();
+	// Unhandled guest fault (KYTY_MEM_IMPORT_LOG, diagnostic): what the import knows about the bytes around
+	// each value (imported buffer, GPU-dirty, pending label or WRITE_DATA, logged CP writes). Best effort,
+	// no blocking lock.
+	void                   DescribeFault(const uint64_t* values, size_t count);
 	// GPU thread: like ReadMemory, but publishes the GPU-written bytes of the whole readback window
 	// around the range, as guest faults do, so neighbouring reads no longer need the GPU.
 	// KYTY_BACKING_READ_WINDOW=0 reads only the range.
@@ -392,6 +396,9 @@ private:
 // is checked. "PERF lateread" lines (KYTY_PERF_STATS=1).
 // KYTY_WFAULT_DELAY_US=N (measurement, default 0): every guest-thread write fault spins N us before it
 // is resolved (slope test, "PERF wfault" lines).
+// Unhandled guest fault with KYTY_MEM_IMPORT_LOG: BufferCache::DescribeFault of the import cache, if any.
+void DescribeImportFault(const uint64_t* values, size_t count);
+
 namespace LateRead {
 enum class Site : uint8_t { None, Vertex, Index, Descriptor, Indirect, Count };
 [[nodiscard]] bool Enabled() noexcept;
@@ -410,6 +417,13 @@ private:
 // end-of-pipe labels written at release).
 void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp = false) noexcept;
 void Report(double seconds, uint64_t frames);
+// KYTY_MEM_IMPORT_WATCH=1 (with KYTY_MEM_IMPORT; 0 = off): the safety net checks every batch, but a
+// bound imported range is copied only when the guest is about to write one of its pages, which are
+// write-protected at bind.
+// With KYTY_LATE_READ_PROF also set, the copy at bind runs too and both verdicts are compared.
+[[nodiscard]] int WatchMode() noexcept;
+// g_cpu_dirty_hook (region lock held): the guest is about to write [vaddr, vaddr + size).
+void BeforeCpuDirty(uint64_t vaddr, uint64_t size);
 } // namespace LateRead
 
 } // namespace Libs::Graphics
