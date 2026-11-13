@@ -16,6 +16,7 @@ struct WheelMap {
 	int   steer_axis    = 0;
 	float gain          = 1.0f; // steering: guest stick = clamp(raw * gain)
 	float deadzone      = 0.0f; // steering, fraction of half travel
+	float anti_deadzone = 0.0f; // steering: smallest stick deflection sent once the wheel moves
 	int   throttle_axis = 3;    // -> R2, -1 for none
 	int   brake_axis    = 4;    // -> L2, -1 for none
 	int   clutch_axis   = 5;

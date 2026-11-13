@@ -59,6 +59,12 @@ int main() {
 	Check(WheelSteer(plain, 16000) == 128 && WheelSteer(plain, 32767) == 255 &&
 	          WheelSteer(plain, -24576) == 64,
 	      "steer deadzone");
+	plain.deadzone      = 0.0f;
+	plain.anti_deadzone = 0.5f;
+	Check(WheelSteer(plain, 0) == 128 && WheelSteer(plain, 32767) == 255 &&
+	          WheelSteer(plain, -16384) == 32 && WheelSteer(plain, 1) > 190,
+	      "steer anti-deadzone");
+	Check(ParseWheelMap("adz=0.2", &map, &error) && map.anti_deadzone == 0.2f, "adz parse");
 
 	Check(WheelPedal(-32768, 0) == 0 && WheelPedal(32767, 0) == 255 && WheelPedal(0, 0) == 127,
 	      "pedal range");

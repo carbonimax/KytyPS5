@@ -108,6 +108,8 @@ bool ParseItems(std::string_view text, WheelMap* map, std::string* error) {
 			ok = ParseFloat(value, -100.0f, 100.0f, &map->gain);
 		} else if (key == "dz") {
 			ok = ParseFloat(value, 0.0f, 0.9f, &map->deadzone);
+		} else if (key == "adz") {
+			ok = ParseFloat(value, 0.0f, 0.9f, &map->anti_deadzone);
 		} else if (key == "throttle") {
 			ok = ParseInt(value, -1, 63, &map->throttle_axis);
 		} else if (key == "brake") {
@@ -138,7 +140,8 @@ bool ParseWheelMap(std::string_view text, WheelMap* map, std::string* error) {
 
 std::string DescribeWheelMap(const WheelMap& map) {
 	auto text = "steer=" + std::to_string(map.steer_axis) + " gain=" + std::to_string(map.gain) +
-	            " dz=" + std::to_string(map.deadzone) + " throttle=" +
+	            " dz=" + std::to_string(map.deadzone) + " adz=" + std::to_string(map.anti_deadzone) +
+	            " throttle=" +
 	            std::to_string(map.throttle_axis) + " brake=" + std::to_string(map.brake_axis) +
 	            " clutch=" + std::to_string(map.clutch_axis) + " clutchto=" +
 	            std::string(ButtonName(map.clutch_button)) +
@@ -159,6 +162,10 @@ int WheelSteer(const WheelMap& map, int raw) {
 	}
 	x = std::clamp(std::copysign((a - map.deadzone) / (1.0f - map.deadzone), x) * map.gain, -1.0f,
 	               1.0f);
+	// adz: start just past the game's own stick deadzone, so a small turn already steers.
+	if (map.anti_deadzone > 0.0f && x != 0.0f) {
+		x = std::copysign(map.anti_deadzone + (1.0f - map.anti_deadzone) * std::abs(x), x);
+	}
 	// 0 is full left and 255 full right, as on a pad stick.
 	return static_cast<int>(std::lround(128.0f + x * (x < 0.0f ? 128.0f : 127.0f)));
 }
