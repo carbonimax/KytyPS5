@@ -1098,6 +1098,7 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			LateRead::NoteFrame();
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(

@@ -424,6 +424,8 @@ void Report(double seconds, uint64_t frames);
 [[nodiscard]] int WatchMode() noexcept;
 // g_cpu_dirty_hook (region lock held): the guest is about to write [vaddr, vaddr + size).
 void BeforeCpuDirty(uint64_t vaddr, uint64_t size);
+// GPU thread, at each guest frame (suspend point): the frame clock of KYTY_LATE_READ_SUB.
+void NoteFrame() noexcept;
 } // namespace LateRead
 
 } // namespace Libs::Graphics

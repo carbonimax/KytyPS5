@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/memTrackProf.h"
+#include "graphics/host_gpu/renderer/cache/lateReadSub.h"
 
 #include "common/alignment.h"
 #include "graphics/guest_gpu/gpuCapture.h"
@@ -29,8 +30,12 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <map>
 #include <memory>
+#include <string>
+#include <tuple>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -1331,11 +1336,30 @@ struct Live {
 	bool     pending    = true;
 };
 
+// KYTY_LATE_READ_SUB=N (measurement, with KYTY_LATE_READ_PROF, copy mode; default off): one batch in N
+// keeps a full copy of each KYTY_LATE_READ_SUB_RANGES range ("0xA+0xS,...") at its first binding, the
+// blocks of it the batch's bindings cover (the read set: each binding's descriptor extent, clamped to the
+// range) and, when the GPU completed the batch, the 256-byte blocks rewritten since the copy.
+// "PERF latesub" lines per report, "PERF latesub_ev" per check with a rewritten block.
+struct SubEntry {
+	size_t               range = 0;
+	uint64_t             seq = 0, bind_ns = 0, bind_frame = 0, binds = 0;
+	std::vector<uint8_t> bytes; // empty: not copied (cap or unreadable)
+	LateReadSub::Bits    read;
+};
+
 // The ranges bound since a seal: copied at bind (period net, reference) or watched.
 struct Batch {
 	uint64_t                           index = 0;
 	std::deque<Entry>                  entries;
 	std::vector<std::shared_ptr<Live>> touched;
+	std::vector<SubEntry>              subs; // State::sub_mutex
+	uint64_t                           seal_frame = 0;
+};
+
+struct SubTotals {
+	uint64_t checks = 0, binds = 0, a = 0, b = 0, c = 0, rw = 0, a_rw = 0, c_rw = 0, logged = 0, skipped = 0,
+	         unread = 0, lost = 0, lag_bind = 0, lag_seal = 0, lag_max = 0, bind_check_ns = 0, seal_check_ns = 0;
 };
 
 struct Key {
@@ -1388,6 +1412,14 @@ struct State {
 	std::vector<Key> demote; // imported buffers the guest rewrote under the GPU (back to copies)
 	uint64_t         demoted = 0;
 
+	// KYTY_LATE_READ_SUB (lock order: sub_mutex, then mutex). Extents: (range, offset, size, site, path).
+	std::mutex                                                            sub_mutex;
+	bool                                                                  sub_sampled = true; // mutex
+	std::vector<SubTotals>                                                sub_totals;
+	std::vector<LateReadSub::Bits>                                        ever_b, ever_c;
+	std::map<std::tuple<size_t, uint64_t, uint64_t, uint8_t, uint8_t>, uint64_t> sub_extents;
+	uint64_t                                                              sub_bytes = 0; // copies held
+
 	std::mutex            log_mutex;
 	std::deque<Write>     log;
 	std::atomic<uint64_t> seq {0};
@@ -1401,6 +1433,24 @@ State& S() {
 
 thread_local Site     t_site = Site::None;
 std::atomic<uint64_t> g_wfault_delayed {0};
+std::atomic<uint64_t> g_frames {0}; // NoteFrame
+
+int SubPeriod() {
+	static const int period = [] {
+		const char* value = std::getenv("KYTY_LATE_READ_SUB");
+		return value != nullptr && !NetOnly() ? std::max(0, static_cast<int>(std::strtol(value, nullptr, 10)))
+		                                      : 0;
+	}();
+	return period;
+}
+
+const std::vector<std::pair<uint64_t, uint64_t>>& SubRanges() {
+	static const auto ranges = LateReadSub::ParseRanges(std::getenv("KYTY_LATE_READ_SUB_RANGES"));
+	return ranges;
+}
+
+// Copies held by batches not checked yet; a first binding beyond it is counted as skipped.
+constexpr uint64_t MaxSubBytes = 512ull << 20u;
 
 // XXH3 of guest bytes read from the backing (never faults); `overlay`: with the pending labels, as an
 // upload recorded now sees them. 0 when unreadable.
@@ -1487,10 +1537,69 @@ bool Track(State& st, uint64_t vaddr, uint64_t size, Make&& make) {
 	return true;
 }
 
+// KYTY_LATE_READ_SUB: a read binding of [vaddr, vaddr + size).
+void SubBind(uint64_t vaddr, uint64_t size, Path path) {
+	const auto& ranges = SubRanges();
+	auto&       st     = S();
+	for (size_t r = 0; r < ranges.size(); r++) {
+		const auto [base, range_size] = ranges[r];
+		if (vaddr >= base + range_size || base >= vaddr + size) {
+			continue;
+		}
+		std::lock_guard        sub_lock(st.sub_mutex);
+		std::shared_ptr<Batch> batch;
+		{
+			std::lock_guard lock(st.mutex);
+			if (!st.sub_sampled) {
+				return;
+			}
+			batch = st.open;
+		}
+		const auto begin = std::max(vaddr, base) - base;
+		const auto end   = std::min(vaddr + size, base + range_size) - base;
+		st.sub_extents[{r, begin, end - begin, static_cast<uint8_t>(t_site), static_cast<uint8_t>(path)}]++;
+		auto it = std::find_if(batch->subs.begin(), batch->subs.end(), [r](const auto& e) { return e.range == r; });
+		if (it == batch->subs.end()) {
+			if (st.sub_totals.size() < ranges.size()) {
+				st.sub_totals.resize(ranges.size());
+				st.ever_b.resize(ranges.size());
+				st.ever_c.resize(ranges.size());
+				for (size_t i = 0; i < ranges.size(); i++) {
+					LateReadSub::Reset(st.ever_b[i], ranges[i].second);
+					LateReadSub::Reset(st.ever_c[i], ranges[i].second);
+				}
+			}
+			SubEntry e {r, st.seq.load(std::memory_order_acquire), NowNs(), g_frames.load(std::memory_order_relaxed)};
+			LateReadSub::Reset(e.read, range_size);
+			if (st.sub_bytes + range_size > MaxSubBytes) {
+				st.sub_totals[r].skipped++;
+			} else {
+				e.bytes.resize(range_size);
+				if (LibKernel::Memory::TryReadBacking(base, e.bytes.data(), range_size)) {
+					if (EopAtGpu::Enabled()) {
+						(void)EopAtGpu::OverlayPending(base, e.bytes.data(), range_size);
+					}
+					st.sub_bytes += range_size;
+				} else {
+					e.bytes = {};
+					st.sub_totals[r].unread++;
+				}
+			}
+			batch->subs.push_back(std::move(e));
+			it = std::prev(batch->subs.end());
+		}
+		it->binds++;
+		LateReadSub::Mark(it->read, begin, end);
+	}
+}
+
 // GPU thread or CP back thread, inside ObtainBuffer of a read. True: a new watched range (protect it).
 bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, uint64_t buffer_size = 0) {
 	if (t_site == Site::None) {
 		return false;
+	}
+	if (SubPeriod() != 0) [[unlikely]] {
+		SubBind(vaddr, size, path);
 	}
 	auto&      st   = S();
 	const auto make = [&] {
@@ -1538,6 +1647,111 @@ bool WritesSince(const Entry& entry, std::vector<Write>& writes) {
 		}
 	}
 	return entry.seq >= st.dropped_seq;
+}
+
+// Block runs "first+count,..." (decimal), or "x" and the 64-bit words in hex past 64 runs.
+std::string DescribeBlocks(const LateReadSub::Bits& bits) {
+	const auto  runs = LateReadSub::Runs(bits);
+	std::string out;
+	char        item[40];
+	if (runs.size() <= 64) {
+		for (const auto& [first, count]: runs) {
+			std::snprintf(item, sizeof(item), "%s%" PRIu64 "+%" PRIu64, out.empty() ? "" : ",", first, count);
+			out += item;
+		}
+		return out.empty() ? "-" : out;
+	}
+	out = "x";
+	for (const auto w: bits) {
+		std::snprintf(item, sizeof(item), "%016" PRIx64, w);
+		out += item;
+	}
+	return out;
+}
+
+// Priority runner, the GPU completed the batch: the rewritten blocks of each copied range.
+void SubCheck(Batch& batch, uint64_t sealed_ns) {
+	auto&                 st = S();
+	std::vector<SubEntry> subs;
+	{
+		std::lock_guard sub_lock(st.sub_mutex);
+		subs.swap(batch.subs);
+	}
+	if (subs.empty()) {
+		return;
+	}
+	const auto                        now_ns = NowNs();
+	const auto                        frame  = g_frames.load(std::memory_order_relaxed);
+	thread_local std::vector<uint8_t> now;
+	thread_local std::vector<Write>   writes;
+	for (auto& e: subs) {
+		if (e.bytes.empty()) {
+			continue;
+		}
+		const auto [base, range_size] = SubRanges()[e.range];
+		LateReadSub::Bits changed, logged, hot;
+		LateReadSub::Reset(changed, range_size);
+		LateReadSub::Reset(logged, range_size);
+		now.resize(range_size);
+		const bool readable = LibKernel::Memory::TryReadBacking(base, now.data(), range_size);
+		if (readable) {
+			LateReadSub::Diff(e.bytes.data(), now.data(), range_size, changed);
+		}
+		Entry probe {base, range_size};
+		probe.seq           = e.seq;
+		const bool complete = WritesSince(probe, writes);
+		for (const auto& w: writes) {
+			LateReadSub::Mark(logged, std::max(w.vaddr, base) - base, std::min(w.vaddr + w.size, base + range_size) - base);
+		}
+		hot = e.read;
+		for (size_t i = 0; i < hot.size(); i++) {
+			hot[i] &= changed[i];
+		}
+		const auto a = LateReadSub::Count(e.read), b = LateReadSub::Count(changed), c = LateReadSub::Count(hot);
+		const auto lg       = LateReadSub::CountAnd(changed, logged);
+		const auto lag_bind = frame - e.bind_frame, lag_seal = frame - batch.seal_frame;
+		{
+			std::lock_guard sub_lock(st.sub_mutex);
+			st.sub_bytes -= range_size;
+			auto& t = st.sub_totals[e.range];
+			t.unread += readable ? 0 : 1;
+			t.checks++;
+			t.binds += e.binds;
+			t.a += a;
+			t.b += b;
+			t.c += c;
+			t.logged += lg;
+			t.lost += complete ? 0 : 1;
+			t.lag_bind += lag_bind;
+			t.lag_seal += lag_seal;
+			t.lag_max = std::max(t.lag_max, lag_bind);
+			t.bind_check_ns += now_ns - e.bind_ns;
+			t.seal_check_ns += now_ns - sealed_ns;
+			if (b != 0) {
+				t.rw++;
+				t.a_rw += a;
+				t.c_rw += c;
+				LateReadSub::Or(st.ever_b[e.range], changed);
+				LateReadSub::Or(st.ever_c[e.range], hot);
+			}
+		}
+		if (b != 0) {
+			const auto wall = std::time(nullptr);
+			std::tm    tm {};
+#ifdef _WIN32
+			localtime_s(&tm, &wall);
+#else
+			localtime_r(&wall, &tm);
+#endif
+			std::printf("PERF latesub_ev %02d:%02d:%02d r=%zu bf=%" PRIu64 " sf=%" PRIu64 " cf=%" PRIu64
+			            " bind_check=%.2fms seal_check=%.2fms binds=%" PRIu64 " a=%" PRIu64 " b=%" PRIu64
+			            " c=%" PRIu64 " logged=%" PRIu64 " lost=%d changed=%s read=%s\n",
+			            tm.tm_hour, tm.tm_min, tm.tm_sec, e.range, e.bind_frame, batch.seal_frame, frame,
+			            static_cast<double>(now_ns - e.bind_ns) / 1e6, static_cast<double>(now_ns - sealed_ns) / 1e6,
+			            e.binds, a, b, c, lg, complete ? 0 : 1, DescribeBlocks(changed).c_str(),
+			            DescribeBlocks(e.read).c_str());
+		}
+	}
 }
 
 enum Kind : uint8_t { Same, Guest, Cp, Backing, Big, Unreadable };
@@ -1609,6 +1823,9 @@ Kind Judge(const Entry& entry, const std::vector<uint8_t>& before, uint64_t befo
 // Priority runner: the GPU completed the batch's work; no label released after it was delivered yet.
 void Check(const std::shared_ptr<Batch>& shared, uint64_t sealed_ns) {
 	auto& st = S();
+	if (SubPeriod() != 0) [[unlikely]] {
+		SubCheck(*shared, sealed_ns);
+	}
 	// Watched ranges last bound in this batch: the snapped ones leave the indexes, the others stay armed
 	// (a write from now drops them without a copy: the GPU completed the batch).
 	std::vector<std::shared_ptr<Live>> due;
@@ -1719,6 +1936,10 @@ int WatchMode() noexcept {
 	return Watch();
 }
 
+void NoteFrame() noexcept {
+	g_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
 void BeforeCpuDirty(uint64_t vaddr, uint64_t size) {
 	auto&           st    = S();
 	const auto      start = NowNs();
@@ -1788,6 +2009,40 @@ void NoteBackingWrite(uint64_t vaddr, uint64_t size, bool cp) noexcept {
 	}
 }
 
+// KYTY_LATE_READ_SUB: called before State::mutex is taken (lock order).
+void SubReport(double seconds) {
+	auto& st = S();
+	std::lock_guard sub_lock(st.sub_mutex);
+	for (size_t r = 0; r < st.sub_totals.size(); r++) {
+		auto&      t   = st.sub_totals[r];
+		const auto n   = static_cast<double>(std::max<uint64_t>(t.checks, 1));
+		std::printf("PERF latesub %.1fs period=%d r=%zu 0x%016" PRIx64 "+0x%" PRIx64 ": checks=%" PRIu64
+		            " binds=%" PRIu64 " a=%" PRIu64 " b=%" PRIu64 " c=%" PRIu64 " rw=%" PRIu64 " a_rw=%" PRIu64
+		            " c_rw=%" PRIu64 " logged=%" PRIu64 " skipped=%" PRIu64 " unread=%" PRIu64 " lost=%" PRIu64
+		            " lag_bind=%.2f lag_seal=%.2f lag_max=%" PRIu64 " bind_check=%.2fms seal_check=%.2fms"
+		            " ever_b=%" PRIu64 " ever_c=%" PRIu64 " held=%" PRIu64 "MB\n",
+		            seconds, SubPeriod(), r, SubRanges()[r].first, SubRanges()[r].second, t.checks, t.binds,
+		            t.a, t.b, t.c, t.rw, t.a_rw, t.c_rw, t.logged, t.skipped, t.unread, t.lost,
+		            static_cast<double>(t.lag_bind) / n, static_cast<double>(t.lag_seal) / n, t.lag_max,
+		            static_cast<double>(t.bind_check_ns) / 1e6 / n, static_cast<double>(t.seal_check_ns) / 1e6 / n,
+		            LateReadSub::Count(st.ever_b[r]), LateReadSub::Count(st.ever_c[r]), st.sub_bytes >> 20u);
+		t = {};
+	}
+	// The 16 most bound extents (binding counts), and how many distinct ones.
+	std::vector<std::pair<uint64_t, std::tuple<size_t, uint64_t, uint64_t, uint8_t, uint8_t>>> top;
+	for (const auto& [key, count]: st.sub_extents) {
+		top.emplace_back(count, key);
+	}
+	std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+	for (size_t i = 0; i < std::min<size_t>(top.size(), 16); i++) {
+		const auto& [r, offset, size, site, path] = top[i].second;
+		std::printf("PERF latesub_ext r=%zu off=0x%" PRIx64 " size=0x%" PRIx64 " %s/%s count=%" PRIu64
+		            " distinct=%zu\n",
+		            r, offset, size, PathNames[path], SiteNames[site], top[i].first, top.size());
+	}
+	st.sub_extents.clear();
+}
+
 void Report(double seconds, uint64_t frames) {
 	if (seconds <= 0.0) {
 		return;
@@ -1802,6 +2057,9 @@ void Report(double seconds, uint64_t frames) {
 	}
 	if (!Enabled()) {
 		return;
+	}
+	if (SubPeriod() != 0) {
+		SubReport(seconds);
 	}
 	auto&           st  = S();
 	std::lock_guard lock(st.mutex);
@@ -1890,15 +2148,21 @@ void BufferCache::SealLateReads() {
 			st.demoted++;
 		}
 	}
+	bool subs = false;
 	{
+		std::lock_guard sub_lock(st.sub_mutex);
 		std::lock_guard lock(st.mutex);
 		batch = std::exchange(st.open, std::make_shared<LateRead::Batch>());
 		st.seen.clear();
 		st.batches++;
 		st.sampled     = ++st.batch_index % static_cast<uint64_t>(LateRead::SamplePeriod()) == 0;
 		st.open->index = st.batch_index;
+		const auto sub_period = static_cast<uint64_t>(LateRead::SubPeriod());
+		st.sub_sampled        = sub_period != 0 && st.batch_index % sub_period == 0;
+		batch->seal_frame     = LateRead::g_frames.load(std::memory_order_relaxed);
+		subs                  = !batch->subs.empty();
 	}
-	if (batch->entries.empty() && batch->touched.empty()) {
+	if (batch->entries.empty() && batch->touched.empty() && !subs) {
 		return;
 	}
 	m_scheduler.DeferPriorityOperation(
