@@ -1,16 +1,20 @@
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/usbHost.h"
+#include "libs/usbPad.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace Libs {
 
@@ -152,13 +156,8 @@ static int KYTY_SYSV_ABI UsbdEventHandlingOk() {
 	return 1;
 }
 
-static int64_t KYTY_SYSV_ABI UsbdGetDeviceList(Device*** list) {
-	PRINT_NAME();
-
-	if (Opts().ids.empty()) {
-		return 0;
-	}
-	// Enumerated once: walking every USB devnode per call could hitch a polling game (no hot-plug).
+// Enumerated once: walking every USB devnode per call could hitch a polling game (no hot-plug).
+static const std::vector<Device*>& Devices() {
 	static const std::vector<Device*> devices = [] {
 		std::string diagnostics;
 		auto        found = Host::List(Opts().ids, &diagnostics);
@@ -166,7 +165,17 @@ static int64_t KYTY_SYSV_ABI UsbdGetDeviceList(Device*** list) {
 		g_have_devices = !found.empty();
 		return found;
 	}();
-	auto* out = new Device*[devices.size() + 1];
+	return devices;
+}
+
+static int64_t KYTY_SYSV_ABI UsbdGetDeviceList(Device*** list) {
+	PRINT_NAME();
+
+	if (Opts().ids.empty()) {
+		return 0;
+	}
+	const auto& devices = Devices();
+	auto*       out     = new Device*[devices.size() + 1];
 	std::copy(devices.begin(), devices.end(), out);
 	out[devices.size()] = nullptr;
 	if (list != nullptr) {
@@ -368,6 +377,270 @@ static int KYTY_SYSV_ABI UsbdCancelTransfer(Transfer* t) {
 }
 
 } // namespace Usbd
+
+namespace UsbPad {
+
+namespace Host = UsbHost;
+using Host::Device;
+using Usbd::Opts;
+
+constexpr int PAD_DEVICE_CLASS_STEERING_WHEEL = 6;
+
+// The ext pad: the first passed-through device matching an scePadOpenExt filter. Its input comes
+// from the interrupt IN endpoint of the device's first interface (its main HID one).
+// shortcut: one ext pad; a second wheel would need a table of these.
+struct WheelPad {
+	Device*    dev              = nullptr;
+	uint16_t   vid              = 0;
+	uint16_t   pid              = 0;
+	uint8_t    interface_number = 0;
+	uint8_t    in_endpoint      = 0;
+	uint8_t    out_endpoint     = 0;
+	int        in_size          = 64;
+	std::mutex mutex;
+	uint8_t    report[64] {}; // latest input report (the device only reports changes)
+};
+static WheelPad g_pad;
+
+bool Enabled() {
+	return !Opts().ids.empty();
+}
+
+bool IsHandle(int handle) {
+	return handle == HANDLE && g_pad.dev != nullptr;
+}
+
+static void ReadReports() {
+	uint8_t buf[64] {};
+	for (;;) {
+		int       actual = 0;
+		const int r =
+		    Host::Transfer(g_pad.dev, g_pad.in_endpoint, buf, g_pad.in_size, 100, &actual);
+		if (r == Host::USB_ERROR_NO_DEVICE) {
+			LOGF("KYTY_USB pad: device lost\n");
+			return;
+		}
+		if (r == Host::USB_OK && actual > 0) {
+			std::lock_guard lock(g_pad.mutex);
+			std::memcpy(g_pad.report, buf, static_cast<size_t>(std::min(actual, 64)));
+		} else if (r != Host::USB_ERROR_TIMEOUT) {
+			Common::Thread::SleepMicro(10000); // a failing pipe must not spin
+		}
+	}
+}
+
+static bool Attach(Device* dev) {
+	const auto& raw    = Host::RawConfig(dev);
+	auto*       config = Host::ParseConfig(raw.data(), raw.size());
+	if (config == nullptr || config->bNumInterfaces == 0 ||
+	    config->interface[0].num_altsetting == 0) {
+		Host::FreeConfig(config);
+		return false;
+	}
+	const auto& itf        = config->interface[0].altsetting[0];
+	g_pad.interface_number = itf.bInterfaceNumber;
+	for (int e = 0; e < itf.bNumEndpoints; e++) {
+		const auto& ep = itf.endpoint[e];
+		if ((ep.bmAttributes & 3u) != 3) {
+			continue;
+		}
+		if ((ep.bEndpointAddress & 0x80u) != 0) {
+			g_pad.in_endpoint = ep.bEndpointAddress;
+			g_pad.in_size     = std::min<int>(ep.wMaxPacketSize, 64);
+		} else {
+			g_pad.out_endpoint = ep.bEndpointAddress;
+		}
+	}
+	Host::FreeConfig(config);
+	if (g_pad.in_endpoint == 0) {
+		return false;
+	}
+	// Until the first report: sticks and steering centred, d-pad neutral, pedals released.
+	std::memset(g_pad.report + 1, 0x80, 4);
+	g_pad.report[8]  = 0x08;
+	g_pad.report[41] = 0x80;
+	std::memset(g_pad.report + 42, 0xff, 6);
+	g_pad.dev = dev;
+	std::thread(ReadReports).detach();
+	return true;
+}
+
+int OpenExt(int type, const void* param) {
+	if (!Enabled() || type != 2 || param == nullptr) {
+		return Controller::PAD_ERROR_DEVICE_NOT_CONNECTED;
+	}
+	uint16_t filter[3]; // vendor id, first and last product id
+	std::memcpy(filter, param, sizeof(filter));
+	auto matches = [&](uint16_t vid, uint16_t pid) {
+		return vid == filter[0] && pid >= filter[1] && pid <= filter[2];
+	};
+	static std::mutex open_mutex;
+	std::lock_guard   lock(open_mutex);
+	for (Device* dev: Usbd::Devices()) {
+		if (g_pad.dev != nullptr) {
+			break;
+		}
+		const uint8_t* dd  = Host::DeviceDescriptor(dev);
+		const auto     vid = static_cast<uint16_t>(dd[8] | (dd[9] << 8u));
+		const auto     pid = static_cast<uint16_t>(dd[10] | (dd[11] << 8u));
+		if (matches(vid, pid) && Attach(dev)) {
+			g_pad.vid = vid;
+			g_pad.pid = pid;
+			LOGF("KYTY_USB pad: %04x:%04x as ext pad, interface %u, in %02x out %02x\n", vid, pid,
+			     g_pad.interface_number, g_pad.in_endpoint, g_pad.out_endpoint);
+			break;
+		}
+	}
+	const bool ok     = g_pad.dev != nullptr && matches(g_pad.vid, g_pad.pid);
+	static int logged = 0;
+	if (ok || logged++ < 4) {
+		USB_LOG("PadOpenExt type=%d filter=%04x:%04x-%04x -> %d\n", type, filter[0], filter[1],
+		        filter[2], ok ? HANDLE : -1);
+	}
+	return ok ? HANDLE : Controller::PAD_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+int Close(int handle) {
+	USB_LOG("PadClose %d\n", handle);
+	return OK;
+}
+
+// shortcut: DualSense USB layout assumed for bytes 1-10 (only the neutral hat byte is confirmed);
+// check the reports logged under KYTY_USB_LOG if a button is wrong.
+static uint32_t Buttons(const uint8_t* r) {
+	namespace C                  = Controller;
+	static const uint32_t hat[8] = {C::PAD_BUTTON_UP,    C::PAD_BUTTON_UP | C::PAD_BUTTON_RIGHT,
+	                                C::PAD_BUTTON_RIGHT, C::PAD_BUTTON_RIGHT | C::PAD_BUTTON_DOWN,
+	                                C::PAD_BUTTON_DOWN,  C::PAD_BUTTON_DOWN | C::PAD_BUTTON_LEFT,
+	                                C::PAD_BUTTON_LEFT,  C::PAD_BUTTON_LEFT | C::PAD_BUTTON_UP};
+	static const uint32_t bits[3][8] = {{0, 0, 0, 0, C::PAD_BUTTON_SQUARE, C::PAD_BUTTON_CROSS,
+	                                     C::PAD_BUTTON_CIRCLE, C::PAD_BUTTON_TRIANGLE},
+	                                    {C::PAD_BUTTON_L1, C::PAD_BUTTON_R1, C::PAD_BUTTON_L2,
+	                                     C::PAD_BUTTON_R2, 0, C::PAD_BUTTON_OPTIONS,
+	                                     C::PAD_BUTTON_L3, C::PAD_BUTTON_R3},
+	                                    {0, C::PAD_BUTTON_TOUCH_PAD, 0, 0, 0, 0, 0, 0}};
+	uint32_t              buttons    = (r[8] & 0x0fu) < 8 ? hat[r[8] & 0x0fu] : 0;
+	for (int byte = 0; byte < 3; byte++) {
+		for (int bit = 0; bit < 8; bit++) {
+			buttons |= (r[8 + byte] >> bit & 1u) != 0 ? bits[byte][bit] : 0;
+		}
+	}
+	return buttons;
+}
+
+int Read(int handle, Controller::PadData* data, int num) {
+	uint8_t r[64];
+	{
+		std::lock_guard lock(g_pad.mutex);
+		std::memcpy(r, g_pad.report, sizeof(r));
+	}
+	std::memset(data, 0, sizeof(*data) * static_cast<size_t>(num < 1 ? 1 : num));
+	auto& d             = data[0];
+	d.buttons           = Buttons(r);
+	d.left_stick_x      = r[1];
+	d.left_stick_y      = r[2];
+	d.right_stick_x     = r[3];
+	d.right_stick_y     = r[4];
+	d.analog_buttons_l2 = r[5];
+	d.analog_buttons_r2 = r[6];
+	d.orientation_w     = 1.0f;
+	d.connected         = true;
+	d.connected_count   = 1;
+	d.timestamp = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                        std::chrono::steady_clock::now().time_since_epoch())
+	                                        .count());
+	// Steering, accelerator, brake, clutch: what DeviceClassParseData decodes.
+	d.device_unique_data_len = 12;
+	std::memcpy(d.device_unique_data, r + 40, 12);
+	static uint16_t last_steer = 0;
+	const auto      steer      = static_cast<uint16_t>(r[40] | (r[41] << 8u));
+	if (Opts().log && steer / 1024 != last_steer / 1024) {
+		last_steer = steer;
+		LOGF("KYTY_USB PadRead %d: buttons=%08x steer=%u pedals=%02x%02x %02x%02x %02x%02x\n",
+		     handle, d.buttons, steer, r[43], r[42], r[45], r[44], r[47], r[46]);
+	}
+	return 1;
+}
+
+int GetExtControllerInformation(int handle, void* info) {
+	auto* p = static_cast<uint8_t*>(info);
+	if (p == nullptr) {
+		return Controller::PAD_ERROR_INVALID_ARG;
+	}
+	// ScePadControllerInformation (0x1c bytes), then the device's vendor and product ids.
+	const int32_t device_class = PAD_DEVICE_CLASS_STEERING_WHEEL;
+	p[0x0b]                    = 1; // connected count
+	p[0x0c]                    = 1; // connected
+	std::memcpy(p + 0x10, &device_class, 4);
+	std::memcpy(p + 0x1c, &g_pad.vid, 2);
+	std::memcpy(p + 0x1e, &g_pad.pid, 2);
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		USB_LOG("PadGetExtControllerInformation %d -> %04x:%04x class %d\n", handle, g_pad.vid,
+		        g_pad.pid, device_class);
+	}
+	return OK;
+}
+
+// shortcut: a 900-degree lock is assumed for the angle; pedals read 0 released .. 65535 pressed
+// (the device sends them inverted).
+int ParseData(int /*handle*/, const Controller::PadData* data, void* class_data) {
+	if (data == nullptr || class_data == nullptr) {
+		return Controller::PAD_ERROR_INVALID_ARG;
+	}
+	auto*          out = static_cast<uint8_t*>(class_data);
+	const uint8_t* u   = data->device_unique_data;
+	auto           u16 = [&](int i) { return static_cast<uint16_t>(u[i] | (u[i + 1] << 8u)); };
+	std::memset(out, 0, 24);
+	const int32_t  device_class = PAD_DEVICE_CLASS_STEERING_WHEEL;
+	const uint16_t steer        = u16(0);
+	const float    angle        = (static_cast<float>(steer) - 32768.0f) / 32768.0f * 450.0f;
+	const uint16_t pedals[3]    = {static_cast<uint16_t>(0xffffu - u16(2)),
+	                               static_cast<uint16_t>(0xffffu - u16(4)),
+	                               static_cast<uint16_t>(0xffffu - u16(6))};
+	std::memcpy(out, &device_class, 4);
+	out[4] = data->connected ? 1 : 0;
+	std::memcpy(out + 8, &angle, 4);
+	std::memcpy(out + 12, &steer, 2);
+	std::memcpy(out + 14, pedals, sizeof(pedals)); // accelerator, brake, clutch
+	return OK;
+}
+
+int GetFeatureReport(int handle, int report_id, uint8_t* data, int length) {
+	const int r =
+	    Host::Control(g_pad.dev, 0xa1, 0x01, static_cast<uint16_t>(0x0300u | (report_id & 0xffu)),
+	                  g_pad.interface_number, data, static_cast<uint16_t>(length), 500);
+	USB_LOG("PadGetFeatureReport %d id=%02x len=%d -> %d first=%02x\n", handle, report_id, length,
+	        r, r > 0 ? data[0] : 0);
+	return r > 0 ? OK : Controller::PAD_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// The data may or may not start with the report id; the device expects it first.
+int OutputReport(int handle, int report_id, const uint8_t* data, int length) {
+	uint8_t buf[64] {};
+	int     n = 0;
+	if (length <= 0 || data[0] != report_id) {
+		buf[n++] = static_cast<uint8_t>(report_id);
+	}
+	const int copy = std::min(length, static_cast<int>(sizeof(buf)) - n);
+	std::memcpy(buf + n, data, static_cast<size_t>(std::max(copy, 0)));
+	n += std::max(copy, 0);
+	int r      = 0;
+	int actual = 0;
+	if (g_pad.out_endpoint != 0) {
+		r = Host::Transfer(g_pad.dev, g_pad.out_endpoint, buf, n, 100, &actual);
+	} else {
+		r = Host::Control(g_pad.dev, 0x21, 0x09, static_cast<uint16_t>(0x0200u | buf[0]),
+		                  g_pad.interface_number, buf, static_cast<uint16_t>(n), 100);
+	}
+	USB_LOG("PadOutputReport %d id=%02x len=%d -> %d [%02x %02x %02x %02x %02x %02x %02x %02x]\n",
+	        handle, report_id, length, r, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6],
+	        buf[7]);
+	return r >= 0 ? OK : Controller::PAD_ERROR_DEVICE_NOT_CONNECTED;
+}
+
+} // namespace UsbPad
 
 LIB_DEFINE(InitUsbd_1) {
 	LIB_FUNC("TOhg7P6kTH4", Usbd::UsbdInit);

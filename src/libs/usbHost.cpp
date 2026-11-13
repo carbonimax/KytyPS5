@@ -504,8 +504,12 @@ bool Connected(const Device* dev) {
 
 int GetStringDescriptor(Device* dev, uint8_t index, uint16_t lang, uint8_t* data, int length) {
 	ULONG got = 0;
-	if (!WinUsb_GetDescriptor(dev->functions[0].usb, 3, index, lang, data,
-	                          static_cast<ULONG>(length), &got)) {
+	auto  get = [&](uint16_t id) {
+		return WinUsb_GetDescriptor(dev->functions[0].usb, 3, index, id, data,
+		                            static_cast<ULONG>(length), &got) != FALSE;
+	};
+	// Guests ask with langid 0 (libusb style); a device may only answer its own language.
+	if (!get(lang) && !(lang == 0 && index != 0 && get(0x0409))) {
 		return MapError(dev, GetLastError());
 	}
 	return static_cast<int>(got);

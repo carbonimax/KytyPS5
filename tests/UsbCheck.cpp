@@ -74,6 +74,23 @@ int main(int argc, char** argv) {
 		std::printf(" %02x", b);
 	}
 	std::printf("\n");
+	// HID report descriptors and feature report 0x31 (the serial the guest's wheel library asks
+	// for).
+	for (int i = 0; i < config->bNumInterfaces; i++) {
+		const uint16_t number = config->interface[i].altsetting[0].bInterfaceNumber;
+		uint8_t        buf[512] {};
+		const int      n = Control(dev, 0x81, 6, 0x2200, number, buf, sizeof(buf), 500);
+		std::printf("interface %u report descriptor (%d):", number, n);
+		for (int k = 0; k < n; k++) {
+			std::printf(" %02x", buf[k]);
+		}
+		const int f = Control(dev, 0xa1, 1, 0x0331, number, buf, 64, 500);
+		std::printf("\ninterface %u feature 0x31 (%d):", number, f);
+		for (int k = 0; k < f; k++) {
+			std::printf(" %02x", buf[k]);
+		}
+		std::printf("\n");
+	}
 	struct Reader {
 		uint8_t              endpoint = 0;
 		int                  size     = 0;

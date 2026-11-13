@@ -4,6 +4,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "libs/usbPad.h"
 #include "loader/symbolDatabase.h"
 
 #include <cstring>
@@ -91,6 +92,9 @@ static int KYTY_SYSV_ABI PadDeviceClassParseData(int handle, const Controller::P
 	     "\t class_data = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(data), reinterpret_cast<uint64_t>(class_data));
 
+	if (UsbPad::IsHandle(handle)) {
+		return UsbPad::ParseData(handle, data, class_data);
+	}
 	if (const auto error = Controller::PadCheckHandle(handle); error != OK) {
 		return error;
 	}
@@ -131,7 +135,22 @@ static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* in
 	     "\t info   = 0x%016" PRIx64 "\n",
 	     handle, reinterpret_cast<uint64_t>(info));
 
+	if (UsbPad::IsHandle(handle)) {
+		return UsbPad::GetExtControllerInformation(handle, info);
+	}
 	return Controller::PadCheckHandle(handle);
+}
+
+// Only registered under KYTY_USB_PASSTHRU: the passed-through wheel's HID reports.
+static int KYTY_SYSV_ABI PadGetFeatureReport(int handle, int report_id, uint8_t* data, int length) {
+	return UsbPad::IsHandle(handle) ? UsbPad::GetFeatureReport(handle, report_id, data, length)
+	                                : Controller::PAD_ERROR_INVALID_HANDLE;
+}
+
+static int KYTY_SYSV_ABI PadOutputReport(int handle, int report_id, const uint8_t* data,
+                                         int length) {
+	return UsbPad::IsHandle(handle) ? UsbPad::OutputReport(handle, report_id, data, length)
+	                                : Controller::PAD_ERROR_INVALID_HANDLE;
 }
 
 static int KYTY_SYSV_ABI PadUnknownN3kSX62fgNo(uint64_t arg0, uint64_t arg1, uint64_t arg2,
@@ -178,6 +197,10 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
 	LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
 	LIB_FUNC("v8P+9PRqg10", Controller::PadVrControllerSetTriggerEffects);
+	if (UsbPad::Enabled()) {
+		LIB_FUNC("PZSoY8j0Pko", PadGetFeatureReport);
+		LIB_FUNC("DrUu8cPrje8", PadOutputReport);
+	}
 }
 
 namespace LibMouse {

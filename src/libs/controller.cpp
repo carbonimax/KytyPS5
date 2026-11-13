@@ -12,6 +12,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
+#include "libs/usbPad.h"
 
 #include <algorithm>
 #include <array>
@@ -1287,7 +1288,7 @@ int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
-	return PAD_ERROR_DEVICE_NOT_CONNECTED;
+	return UsbPad::OpenExt(type, param); // a KYTY_USB_PASSTHRU wheel, else not connected
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
@@ -1311,6 +1312,9 @@ int KYTY_SYSV_ABI PadClose(int handle) {
 	LOGF("\t handle = %d\n", handle);
 	if (PadVrHand(handle) >= 0) {
 		return PadVrClose(handle);
+	}
+	if (UsbPad::IsHandle(handle)) {
+		return UsbPad::Close(handle);
 	}
 	auto* player = PlayerForHandle(handle);
 	if (player == nullptr) {
@@ -1401,6 +1405,13 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 
+	if (UsbPad::IsHandle(handle)) {
+		if (data == nullptr) {
+			return PAD_ERROR_INVALID_ARG;
+		}
+		UsbPad::Read(handle, data, 1);
+		return OK;
+	}
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
 	}
@@ -1423,6 +1434,9 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
+	if (UsbPad::IsHandle(handle)) {
+		return data != nullptr ? UsbPad::Read(handle, data, num) : PAD_ERROR_INVALID_ARG;
+	}
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
 	}
