@@ -18,6 +18,7 @@
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/wheel.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
@@ -139,7 +140,60 @@ std::unique_ptr<WindowContext> g_window;
 Common::Mutex                  g_luminance_mutex;
 DisplayLuminance               g_luminance;
 
+// KYTY_WHEEL: null when the option is off. The wheel feeds the keyboard's player (player 1 by
+// default) through the host input id, so it merges with the keyboard and that player's pad.
+std::unique_ptr<WheelInput> g_wheel;
+WheelPad                    g_wheel_sent;
+
 } // namespace
+
+// full: the player's state was just reset (SetDevices), so resend everything that is not neutral.
+static void PushWheel(bool full) {
+	if (g_wheel == nullptr) {
+		return;
+	}
+	if (full) {
+		g_wheel_sent = {};
+	}
+	const auto& pad = g_wheel->Pad();
+	const int   id  = Controller::HOST_INPUT_CONTROLLER_ID;
+	for (uint32_t bits = pad.buttons ^ g_wheel_sent.buttons; bits != 0; bits &= bits - 1) {
+		const uint32_t bit  = bits & (~bits + 1);
+		const bool     down = (pad.buttons & bit) != 0;
+		if (bit == Controller::PAD_BUTTON_TOUCH_PAD) {
+			Controller::SetTouchPad(id, 0, down, 0.25f, 0.5f);
+		} else {
+			Controller::SetButton(id, bit, down);
+		}
+	}
+	if (pad.left_x != g_wheel_sent.left_x) {
+		Controller::SetAxis(id, Controller::Axis::LeftX, pad.left_x);
+	}
+	if (pad.l2 != g_wheel_sent.l2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerLeft, pad.l2);
+	}
+	if (pad.r2 != g_wheel_sent.r2) {
+		Controller::SetAxis(id, Controller::Axis::TriggerRight, pad.r2);
+	}
+	g_wheel_sent = pad;
+}
+
+static void WheelInit() {
+	const char* option = std::getenv("KYTY_WHEEL");
+	if (option == nullptr || *option == '\0' || std::string_view(option) == "0") {
+		return;
+	}
+	const char* text = std::getenv("KYTY_WHEEL_MAP");
+	const char* log  = std::getenv("KYTY_WHEEL_LOG");
+	WheelMap    map;
+	std::string error;
+	if (!ParseWheelMap(text != nullptr ? text : "", &map, &error)) {
+		EXIT("KYTY_WHEEL_MAP: invalid item '%s'\n", error.c_str());
+	}
+	LOGF("KYTY_WHEEL=%s map: %s\n", option, DescribeWheelMap(map).c_str());
+	g_wheel = std::make_unique<WheelInput>(option, map,
+	                                       log != nullptr && std::string_view(log) == "1");
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 // A factory caches output descriptions, so each query creates a new one.
@@ -343,6 +397,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		}
 		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
 		Controller::Connect(id);
+		PushWheel(true);
 	}
 
 	if (f.removed) {
@@ -350,7 +405,17 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
 			Controller::Disconnect(f.id);
 			SDL_CloseGamepad(pad);
+			PushWheel(true);
 		}
+	}
+
+	// The pad and the wheel share the player's state: a resting pad must not recentre the
+	// steering, nor release a pressed pedal.
+	if (f.axis && g_wheel != nullptr && g_wheel->Connected() &&
+	    (f.axis_id == SDL_GAMEPAD_AXIS_LEFTX ||
+	     (f.axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER && g_wheel->Pad().l2 != 0) ||
+	     (f.axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER && g_wheel->Pad().r2 != 0))) {
+		return;
 	}
 
 	if (f.down || f.up) {
@@ -492,6 +557,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			case SDLK_F8:
 				if (pressed) {
 					Controller::CycleKeyboardPlayer();
+					PushWheel(true);
 				}
 				return;
 #if defined(__APPLE__)
@@ -523,6 +589,11 @@ void WindowContext::ProcessEvent(double time_s) {
 	if (event->type >= SDL_EVENT_DISPLAY_FIRST && event->type <= SDL_EVENT_DISPLAY_LAST) {
 		ProcessDisplayEvent(event->display);
 		return;
+	}
+
+	if (g_wheel != nullptr && event->type >= SDL_EVENT_JOYSTICK_AXIS_MOTION &&
+	    event->type <= SDL_EVENT_JOYSTICK_REMOVED && g_wheel->OnEvent(*event)) {
+		PushWheel(false);
 	}
 
 	switch (event->type) {
@@ -836,6 +907,7 @@ static void WindowCreate(WindowContext& context) {
 	RefreshDisplayLuminance(context.window);
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
+	WheelInit();
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
 }
@@ -876,6 +948,7 @@ void WindowRun() {
 void WindowShutdown() {
 	if (g_window != nullptr) {
 		HostInputShutdown();
+		g_wheel.reset();
 		Controller::EmergencyShutdown();
 		g_window.reset();
 	}

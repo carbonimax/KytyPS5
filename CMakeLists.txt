@@ -644,6 +644,17 @@ add_executable(host_input_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputTes
 target_link_libraries(host_input_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(host_input_tests PRIVATE ${inc_headers})
 
+add_executable(wheel_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/WheelTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/window/wheel.cpp")
+target_link_libraries(wheel_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(wheel_tests PRIVATE ${inc_headers})
+
+# Opens a connected wheel through the KYTY_WHEEL code path; needs the device, so not a ctest case.
+add_executable(wheel_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/WheelCheck.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/window/wheel.cpp")
+target_link_libraries(wheel_check common fmt::fmt SDL3::SDL3-static)
+target_include_directories(wheel_check PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
@@ -857,6 +868,7 @@ if(BUILD_TESTING)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
+	add_test(NAME wheel COMMAND $<TARGET_FILE:wheel_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
@@ -1034,6 +1046,7 @@ if(BUILD_TESTING)
 		pad_haptics_tests
 		controller_settings_tests
 		host_input_tests
+		wheel_tests
 		save_data_memory_tests
 		png_enc_tests
 		jpeg_dec_tests
