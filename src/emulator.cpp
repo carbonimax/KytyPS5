@@ -92,7 +92,7 @@ static void SetEnvIfUnset(const char* name, const char* value) {
 
 // Per-title guest memory import: an explicit KYTY_MEM_IMPORT wins; a listed title gets its mode, the
 // labels/EOP mode it needs (KYTY_EOP_AT_GPU=1), GPU-written buffers kept imported
-// (KYTY_MEM_IMPORT_GPU_WRITES=1) and the safety net checking every batch (KYTY_MEM_IMPORT_NET=1),
+// (KYTY_MEM_IMPORT_GPU_WRITES=1) and the write-watch safety net (KYTY_MEM_IMPORT_WATCH=1),
 // before the GPU device is created. Each stays overridable by its own variable.
 static void ApplyPerTitleMemImport(const std::string& title_id) {
 	EXIT_IF(MemImportModeForTitle("A1,B2=2", "B2") == nullptr || std::string(MemImportModeForTitle("A1,B2=2", "B2")) != "2" ||
@@ -105,7 +105,7 @@ static void ApplyPerTitleMemImport(const std::string& title_id) {
 	SetEnvIfUnset("KYTY_MEM_IMPORT", mode);
 	SetEnvIfUnset("KYTY_EOP_AT_GPU", "1");
 	SetEnvIfUnset("KYTY_MEM_IMPORT_GPU_WRITES", "1");
-	SetEnvIfUnset("KYTY_MEM_IMPORT_NET", "1");
+	SetEnvIfUnset("KYTY_MEM_IMPORT_WATCH", "1");
 	Log::WriteToConsoleAndLog(fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES\n", title_id, mode));
 }
 
