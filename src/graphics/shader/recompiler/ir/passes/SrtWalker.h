@@ -76,6 +76,10 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // one DWORD range per guest load. False when a reachable read is unknown.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads);
+// KYTY_CP_ORDER_CHECK (measurement): once set, called after each successful walk with its guest loads
+// (one DWORD range each), whether or not the caller asked for `reads`.
+using WalkReadObserver = void (*)(std::span<const std::pair<uint64_t, uint64_t>> reads);
+void SetWalkReadObserver(WalkReadObserver observer) noexcept;
 // Results of the last walk; false when unknown.
 bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
 bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);

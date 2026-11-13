@@ -131,6 +131,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// KYTY_CP_ORDER_CHECK: a pipelined lookup read the range with no drain (CpPipeline::OrderNoteRead).
+	void NoteOrderRead(uint64_t vaddr, uint64_t size);
 	// GPU thread: the tracker page of vaddr may hold GPU-written bytes (page bits only).
 	[[nodiscard]] bool MaybeGpuModifiedPage(uint64_t vaddr) {
 		return m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, sizeof(uint32_t));

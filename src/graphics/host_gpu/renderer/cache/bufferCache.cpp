@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1495,6 +1496,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
+		CpPipeline::OrderNoteWrite(vaddr, size, CpPipeline::OrderWrite::Buffer);
 		ForgetColorMetadataChecks(vaddr, size);
 		NoteBufferWrite(vaddr, size);
 	}
@@ -1650,6 +1652,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// Dirty bytes only exist on GPU-dirty tracker pages; the page bits are cheaper to test.
 	if (GuestGpu::IsGpuThread() && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size)) {
+		if (CpPipeline::OrderActive()) [[unlikely]] {
+			NoteOrderRead(vaddr, size);
+		}
 		return false;
 	}
 	// Bytes of a fault readback still in flight left the dirty set but are not published yet.
@@ -1658,8 +1663,23 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 		std::lock_guard ranges_lock(m_gpu_ranges_mutex);
 		intersects = m_gpu_modified_ranges.Intersects(vaddr, size);
 	}
-	return intersects ||
-	       (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
+	const bool dirty = intersects || (AsyncFaultReadbacks() && FindPendingPublish(vaddr, size) != nullptr);
+	if (!dirty && CpPipeline::OrderActive()) [[unlikely]] {
+		NoteOrderRead(vaddr, size);
+	}
+	return dirty;
+}
+
+void BufferCache::NoteOrderRead(uint64_t vaddr, uint64_t size) {
+	bool dirty_set = false;
+	if (GuestRange {vaddr, size}.Valid()) {
+		{
+			std::lock_guard ranges_lock(m_gpu_ranges_mutex);
+			dirty_set = m_gpu_modified_ranges.Intersects(vaddr, size);
+		}
+		dirty_set = dirty_set && !m_memory_tracker.MaybeGpuModifiedOnGpuThread(vaddr, size);
+	}
+	CpPipeline::OrderNoteRead(vaddr, size, dirty_set);
 }
 
 bool BufferCache::HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size) {

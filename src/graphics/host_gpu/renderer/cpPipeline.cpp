@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cpOrderLedger.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
 
 #include <atomic>
@@ -10,9 +11,12 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::CpPipeline {
 
@@ -64,7 +68,37 @@ State& S() noexcept {
 thread_local bool t_back        = false;
 thread_local bool t_in_lookup   = false;
 thread_local bool t_heap_inline = false;
+thread_local bool t_serving     = false;
 HeapFn            g_heap_hook   = nullptr;
+
+// KYTY_CP_ORDER_CHECK state. The mutex serializes the front's reads and the back's writes.
+struct OrderHazard {
+	CpOrderLedger::Hit hit;
+	OrderWrite         kind;
+	bool               window;
+	uint64_t           reader_hash, writer_hash;
+	bool               printed;
+};
+struct Order {
+	std::mutex                  mutex;
+	CpOrderLedger               ledger;
+	std::atomic<uint64_t>       serial {0}; // ledger.Serial(), for lookups to snapshot
+	std::vector<OrderHazard>    first;      // the first 20
+	std::array<std::pair<uint64_t, uint64_t>, Slots * 2> reader_hash {}; // reader + 1, hash
+	enum Counter : uint32_t {
+		Lookups, LookupsQueued, DepthSum, Reads, DirtySet, BufferWrites, ImageWrites, HzBuffer, HzImage,
+		WinBuffer, WinImage, FrontNs, BackNs, CounterCount
+	};
+	std::array<std::atomic<uint64_t>, CounterCount> n {};
+	std::array<uint64_t, CounterCount>              total {};
+	std::atomic<uint64_t>                           max_depth {0}; // since launch
+};
+Order&                O() noexcept {
+	static Order order;
+	return order;
+}
+thread_local uint64_t t_lookup_serial = 0;
+thread_local uint64_t t_back_hash     = 0;
 
 DrawRecord& Slot(uint64_t index) noexcept {
 	return (*S().slots)[index % Slots];
@@ -74,7 +108,9 @@ void Serve() noexcept {
 	auto& s   = S();
 	auto* rec = s.request.load(std::memory_order_acquire);
 	if (rec == nullptr) return;
+	t_serving = true; // its reads belong to the parked record, not to the next one
 	s.relookup(s.context, *rec);
+	t_serving = false;
 	s.request.store(nullptr, std::memory_order_seq_cst);
 	s.request.notify_one();
 }
@@ -240,6 +276,17 @@ void Poll() noexcept {
 
 void SetInLookup(bool on) noexcept {
 	t_in_lookup = on;
+	if (on && OrderCheck() && !t_serving && !t_back && S().slots != nullptr) [[unlikely]] {
+		auto&      o     = O();
+		const auto depth = Published() - Finished();
+		t_lookup_serial  = o.serial.load(std::memory_order_acquire);
+		o.n[Order::Lookups].fetch_add(1, std::memory_order_relaxed);
+		if (depth != 0) {
+			o.n[Order::LookupsQueued].fetch_add(1, std::memory_order_relaxed);
+			o.n[Order::DepthSum].fetch_add(depth, std::memory_order_relaxed);
+			if (depth > o.max_depth.load(std::memory_order_relaxed)) o.max_depth.store(depth, std::memory_order_relaxed);
+		}
+	}
 }
 
 bool InLookup() noexcept {
@@ -310,6 +357,92 @@ void Note(Stat stat) noexcept {
 	S().stats[static_cast<size_t>(stat)].fetch_add(1, std::memory_order_relaxed);
 }
 
+bool OrderCheck() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CP_ORDER_CHECK");
+		const bool  set   = value != nullptr && std::strcmp(value, "1") == 0 && Mode() == 1;
+		if (set) {
+			std::printf("KYTY_CP_ORDER_CHECK=1: pipelined lookup reads paired with queued draw writes\n");
+		}
+		return set;
+	}();
+	return on;
+}
+
+bool OrderActive() noexcept {
+	return OrderCheck() && t_in_lookup && !t_serving && !t_back && S().slots != nullptr &&
+	       Finished() < Published();
+}
+
+namespace {
+
+uint64_t OrderReaderHash(const Order& o, uint64_t reader) noexcept {
+	const auto& entry = o.reader_hash[reader % o.reader_hash.size()];
+	return entry.first == reader + 1 ? entry.second : 0;
+}
+
+// Under o.mutex.
+void OrderHazardHit(Order& o, const CpOrderLedger::Hit& hit, OrderWrite kind, bool window,
+                    uint64_t writer_hash) noexcept {
+	const bool image = kind == OrderWrite::Image;
+	o.n[window ? (image ? Order::WinImage : Order::WinBuffer) : (image ? Order::HzImage : Order::HzBuffer)]
+	    .fetch_add(1, std::memory_order_relaxed);
+	if (o.first.size() < 20) {
+		o.first.push_back({hit, kind, window, OrderReaderHash(o, hit.reader), writer_hash, false});
+	}
+}
+
+} // namespace
+
+void OrderNoteRead(uint64_t vaddr, uint64_t size, bool dirty_set) noexcept {
+	auto&      o     = O();
+	const auto start = NowNs();
+	o.n[Order::Reads].fetch_add(1, std::memory_order_relaxed);
+	if (dirty_set) {
+		o.n[Order::DirtySet].fetch_add(1, std::memory_order_relaxed);
+	}
+	{
+		std::lock_guard lock(o.mutex);
+		const auto finished = Finished();
+		o.ledger.Prune(finished);
+		o.ledger.AddRead(vaddr, vaddr + size, Published(), finished, t_lookup_serial,
+		                 [&](const CpOrderLedger::Hit& hit) {
+			                 OrderHazardHit(o, hit, static_cast<OrderWrite>(hit.tag), true, 0);
+		                 });
+	}
+	o.n[Order::FrontNs].fetch_add(NowNs() - start, std::memory_order_relaxed);
+}
+
+void OrderLookupDone(uint64_t shader_hash) noexcept {
+	if (!OrderCheck() || t_serving || S().slots == nullptr) return;
+	auto&           o      = O();
+	const auto      reader = Published();
+	std::lock_guard lock(o.mutex);
+	o.reader_hash[reader % o.reader_hash.size()] = {reader + 1, shader_hash};
+	for (auto& hazard: o.first) {
+		if (hazard.hit.reader == reader && hazard.reader_hash == 0) hazard.reader_hash = shader_hash;
+	}
+}
+
+void OrderSetBackDraw(uint64_t shader_hash) noexcept {
+	t_back_hash = shader_hash;
+}
+
+void OrderNoteWrite(uint64_t vaddr, uint64_t size, OrderWrite kind) noexcept {
+	if (!OrderCheck() || !t_back) return;
+	auto&      o     = O();
+	const auto start = NowNs();
+	o.n[kind == OrderWrite::Image ? Order::ImageWrites : Order::BufferWrites].fetch_add(1, std::memory_order_relaxed);
+	{
+		std::lock_guard lock(o.mutex);
+		// On the back thread, the tail is the index of the record it runs.
+		o.ledger.Write(vaddr, vaddr + size, S().tail.load(std::memory_order_relaxed), static_cast<uint32_t>(kind),
+		               [&](const CpOrderLedger::Hit& hit) { OrderHazardHit(o, hit, kind, false, t_back_hash); });
+		o.serial.store(o.ledger.Serial(), std::memory_order_release);
+	}
+	o.n[Order::BackNs].fetch_add(NowNs() - start, std::memory_order_relaxed);
+}
+
 void Report(double seconds) noexcept {
 	if (Mode() == 0) return;
 	auto&      s    = S();
@@ -327,6 +460,39 @@ void Report(double seconds) noexcept {
 	            " back_busy=%.0fms\n",
 	            seconds, st[0], st[1], st[2], st[3], st[4], st[5], st[6], drains, ms(drain), fulls, ms(full),
 	            take(s.relookups), ms(take(s.back_busy_ns)));
+	if (!OrderCheck()) return;
+	auto&    o = O();
+	uint64_t n[Order::CounterCount];
+	for (uint32_t i = 0; i < Order::CounterCount; i++) {
+		n[i] = take(o.n[i]);
+		o.total[i] += n[i];
+	}
+	size_t ledger = 0;
+	{
+		std::lock_guard lock(o.mutex);
+		ledger = o.ledger.Reads();
+		for (size_t i = 0; i < o.first.size(); i++) {
+			auto& h = o.first[i];
+			if (h.printed) continue;
+			h.printed = true;
+			std::printf("CP-ORDER hazard %zu: %s%s addr=0x%" PRIx64 " size=0x%" PRIx64 " reader=%" PRIu64
+			            " writer=%" PRIu64 " distance=%" PRIu64 " reader_hash=0x%016" PRIx64 " writer_hash=0x%016" PRIx64 "\n",
+			            i + 1, h.kind == OrderWrite::Image ? "image" : "buffer", h.window ? " window" : "", h.hit.address,
+			            h.hit.size, h.hit.reader, h.hit.writer, h.hit.reader - h.hit.writer, h.reader_hash, h.writer_hash);
+		}
+	}
+	const auto& t = o.total;
+	std::printf("PERF cporder %.1fs: lookups=%" PRIu64 " queued_lookups=%" PRIu64 " avg_depth=%.1f max_depth=%" PRIu64
+	            " reads=%" PRIu64 " buffer_writes=%" PRIu64 " image_writes=%" PRIu64 " hz_buffer=%" PRIu64
+	            " hz_image=%" PRIu64 " hz_dirty_set=%" PRIu64 " win_buffer=%" PRIu64 " win_image=%" PRIu64
+	            " ledger=%zu front=%.2fms back=%.2fms | total hz_buffer=%" PRIu64 " hz_image=%" PRIu64
+	            " hz_dirty_set=%" PRIu64 " win_buffer=%" PRIu64 " win_image=%" PRIu64 " queued_lookups=%" PRIu64 "\n",
+	            seconds, n[Order::Lookups], n[Order::LookupsQueued],
+	            n[Order::LookupsQueued] != 0 ? static_cast<double>(n[Order::DepthSum]) / n[Order::LookupsQueued] : 0.0,
+	            o.max_depth.load(std::memory_order_relaxed), n[Order::Reads], n[Order::BufferWrites], n[Order::ImageWrites], n[Order::HzBuffer],
+	            n[Order::HzImage], n[Order::DirtySet], n[Order::WinBuffer], n[Order::WinImage], ledger, ms(n[Order::FrontNs]),
+	            ms(n[Order::BackNs]), t[Order::HzBuffer], t[Order::HzImage], t[Order::DirtySet], t[Order::WinBuffer],
+	            t[Order::WinImage], t[Order::LookupsQueued]);
 }
 
 } // namespace Libs::Graphics::CpPipeline

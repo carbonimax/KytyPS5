@@ -1562,9 +1562,25 @@ void LogReuseMismatch(const ResourcePlan& plan, const char* what, size_t index, 
 
 } // namespace
 
+static std::atomic<WalkReadObserver> g_read_observer {nullptr};
+
+void SetWalkReadObserver(WalkReadObserver observer) noexcept {
+	g_read_observer.store(observer, std::memory_order_relaxed);
+}
+
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads) {
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+	const auto observer = g_read_observer.load(std::memory_order_relaxed);
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> observed;
+	if (observer != nullptr && reads == nullptr) {
+		observed.clear();
+		reads = &observed;
+	}
+	const size_t first   = reads != nullptr ? reads->size() : 0;
+	const auto   observe = [&] {
+		if (observer != nullptr) observer({reads->data() + first, reads->size() - first});
+	};
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	const bool     timed  = g_walk_stats.load(std::memory_order_relaxed);
 	const uint32_t reuse  = WalkReuseMode();
@@ -1587,6 +1603,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 				for (uint32_t load = 0; load < plan.srt_memo_loads; ++load)
 					reads->emplace_back(captures[load * 2u], sizeof(uint32_t));
 			}
+			observe();
 			return true;
 		}
 		if (hold) {
@@ -1647,6 +1664,7 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 			plan.srt_memo_loads       = loads;
 		}
 	}
+	observe();
 	return true;
 }
 

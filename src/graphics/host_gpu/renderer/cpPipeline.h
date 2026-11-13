@@ -115,6 +115,24 @@ enum class Stat : uint32_t {
 void Note(Stat stat) noexcept;
 void Report(double seconds) noexcept;
 
+// KYTY_CP_ORDER_CHECK=1 (measurement, default off): counts hazards of pipelined lookups, i.e. guest
+// bytes a lookup read with no drain (walker loads, clean answers of BufferCache::HasGpuDirtyBytes)
+// that a draw queued before it then writes: buffer bytes it marks GPU-written (ObtainBuffer), or
+// images it renders or stores into (color/depth targets, storage images). Also counts reads covered
+// by the exact GPU-dirty set while the page bits are clean. "PERF cporder" line, first 20 hazards.
+[[nodiscard]] bool OrderCheck() noexcept;
+// Front, inside a pipelined lookup (not a re-lookup) while records are queued.
+[[nodiscard]] bool OrderActive() noexcept;
+// Front: the lookup read [vaddr, vaddr + size); `dirty_set`: the exact GPU-dirty set covers it while
+// the page bits are clean.
+void OrderNoteRead(uint64_t vaddr, uint64_t size, bool dirty_set) noexcept;
+// Front: the lookup of the next record to publish is done (shader hash for the hazard log).
+void OrderLookupDone(uint64_t shader_hash) noexcept;
+// Back thread: the record it runs (shader hash), then what it writes.
+enum class OrderWrite : uint32_t { Buffer, Image };
+void OrderSetBackDraw(uint64_t shader_hash) noexcept;
+void OrderNoteWrite(uint64_t vaddr, uint64_t size, OrderWrite kind) noexcept;
+
 } // namespace Libs::Graphics::CpPipeline
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CPPIPELINE_H_

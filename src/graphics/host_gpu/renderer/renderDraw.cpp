@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -2358,6 +2359,32 @@ static void CopySnapshots(CpPipeline::DrawRecord& record) {
 	}
 }
 
+// KYTY_CP_ORDER_CHECK: the pixel program's hash, else the first vertex stage's.
+static uint64_t OrderDrawHash(const DrawRenderState& state) {
+	const auto& stage = state.ps_active && state.ps_input_info.stage ? state.ps_input_info.stage
+	                                                                 : state.vertex_info[0].stage;
+	return stage ? stage.program->shader_hash : 0;
+}
+
+// KYTY_CP_ORDER_CHECK: walker loads of a pipelined lookup, merged into ranges.
+static BufferCache* g_order_buffers = nullptr;
+static void         OrderObserveWalk(std::span<const std::pair<uint64_t, uint64_t>> reads) {
+	if (reads.empty() || !CpPipeline::OrderActive()) return;
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> merged;
+	merged.assign(reads.begin(), reads.end());
+	std::ranges::sort(merged);
+	size_t count = 0;
+	for (const auto& [address, size]: merged) {
+		auto& last = merged[count == 0 ? 0 : count - 1];
+		if (count != 0 && address <= last.first + last.second) {
+			last.second = std::max(last.second, address + size - last.first);
+		} else {
+			merged[count++] = {address, size};
+		}
+	}
+	for (size_t i = 0; i < count; i++) g_order_buffers->NoteOrderRead(merged[i].first, merged[i].second);
+}
+
 static bool DrawWritesMemory(const DrawRenderState& state) {
 	return std::ranges::any_of(state.VertexStages(),
 	                           [](const auto& vs) { return HasShaderBufferWrites(vs.stage); }) ||
@@ -2401,6 +2428,10 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		m_context.GetPipelineCache().SetPrefetchHook(PipelinePrefetch, this);
 		CpPipeline::Init(this, PipelineExecute, PipelineRelookup, PipelineFeedback);
 		CpPipeline::SetHeapHook(PipelineHeap);
+		if (CpPipeline::OrderCheck()) {
+			g_order_buffers = &m_context.GetBufferCache();
+			ShaderRecompiler::IR::SetWalkReadObserver(OrderObserveWalk);
+		}
 		return true;
 	}();
 	(void)initialized;
@@ -2415,6 +2446,7 @@ bool RenderExecutor::PipelineDraw(CommandBuffer& buffer,
 		RefreshShaders(buffer, record.state, guessed);
 	}
 	CpPipeline::SetInLookup(false);
+	CpPipeline::OrderLookupDone(OrderDrawHash(record.state));
 	const bool heap = CpPipeline::TakeHeapInline();
 	// A draw without a compiled vertex program is skipped inline, like the unqueued path does.
 	if (heap || !record.state.vertex_info[0].stage || DrawWritesMemory(record.state)) {
@@ -2450,12 +2482,28 @@ void RenderExecutor::PipelineExecute(void* context, CpPipeline::DrawRecord& reco
 	auto&                  scheduler = self->m_context.GetCommandScheduler();
 	ScopedRegisterOverride registers(record.registers, record.user_config, record.shaders);
 	auto&                  buffer = scheduler.Current();
+	static const bool order_check = CpPipeline::OrderCheck();
+	if (order_check) [[unlikely]] {
+		CpPipeline::OrderSetBackDraw(OrderDrawHash(record.state));
+	}
 	if (record.indexed) {
 		self->DrawIndexBody(buffer, record.index_args, &record.state, &record,
 		                    DrawPrepared::LookedUp);
 	} else {
 		self->DrawAutoBody(buffer, record.auto_args, &record.state, &record,
 		                   DrawPrepared::LookedUp);
+	}
+	if (order_check) [[unlikely]] {
+		// The resolved targets, also when target reuse skipped their find (and its GPU-write mark).
+		const auto& state = record.state;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& data = state.color_info[i].desc.info.data;
+			CpPipeline::OrderNoteWrite(data.address, data.size, CpPipeline::OrderWrite::Image);
+		}
+		if (state.depth_info.image_id) {
+			const auto& data = state.depth_info.desc.info.data;
+			CpPipeline::OrderNoteWrite(data.address, data.size, CpPipeline::OrderWrite::Image);
+		}
 	}
 	// KYTY_IDLE_SUBMIT: the GPU thread only checks it between packets with an idle back thread.
 	static const bool idle_submit = CommandScheduler::IdleSubmitEnabled();
