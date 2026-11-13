@@ -87,17 +87,19 @@ struct Order {
 	std::array<std::pair<uint64_t, uint64_t>, Slots * 2> reader_hash {}; // reader + 1, hash
 	enum Counter : uint32_t {
 		Lookups, LookupsQueued, DepthSum, Reads, DirtySet, BufferWrites, ImageWrites, HzBuffer, HzImage,
-		WinBuffer, WinImage, FrontNs, BackNs, CounterCount
+		WinBuffer, WinImage, FrontNs, BackNs, ReadsEmpty, WinOverflow, LedgerSum, CounterCount
 	};
 	std::array<std::atomic<uint64_t>, CounterCount> n {};
 	std::array<uint64_t, CounterCount>              total {};
 	std::atomic<uint64_t>                           max_depth {0}; // since launch
+	uint64_t                                        reported_meets = 0; // under mutex
 };
 Order&                O() noexcept {
 	static Order order;
 	return order;
 }
 thread_local uint64_t t_lookup_serial = 0;
+thread_local bool     t_order_queued  = false; // records were queued when the lookup began
 thread_local uint64_t t_back_hash     = 0;
 
 DrawRecord& Slot(uint64_t index) noexcept {
@@ -275,11 +277,14 @@ void Poll() noexcept {
 }
 
 void SetInLookup(bool on) noexcept {
-	t_in_lookup = on;
+	t_in_lookup    = on;
+	t_order_queued = false;
 	if (on && OrderCheck() && !t_serving && !t_back && S().slots != nullptr) [[unlikely]] {
-		auto&      o     = O();
-		const auto depth = Published() - Finished();
+		auto& o = O();
+		// Serial first: a write noted before the depth is read is then still in the window.
 		t_lookup_serial  = o.serial.load(std::memory_order_acquire);
+		const auto depth = Published() - Finished();
+		t_order_queued   = depth != 0;
 		o.n[Order::Lookups].fetch_add(1, std::memory_order_relaxed);
 		if (depth != 0) {
 			o.n[Order::LookupsQueued].fetch_add(1, std::memory_order_relaxed);
@@ -370,8 +375,9 @@ bool OrderCheck() noexcept {
 }
 
 bool OrderActive() noexcept {
-	return OrderCheck() && t_in_lookup && !t_serving && !t_back && S().slots != nullptr &&
-	       Finished() < Published();
+	// The queue at lookup start: the back may empty it during the walk, and its writes then are the
+	// window hits.
+	return OrderCheck() && t_in_lookup && !t_serving && !t_back && t_order_queued;
 }
 
 namespace {
@@ -404,6 +410,12 @@ void OrderNoteRead(uint64_t vaddr, uint64_t size, bool dirty_set) noexcept {
 	{
 		std::lock_guard lock(o.mutex);
 		const auto finished = Finished();
+		if (finished >= Published()) {
+			o.n[Order::ReadsEmpty].fetch_add(1, std::memory_order_relaxed);
+		}
+		if (o.ledger.WindowOverflow(t_lookup_serial)) {
+			o.n[Order::WinOverflow].fetch_add(1, std::memory_order_relaxed);
+		}
 		o.ledger.Prune(finished);
 		o.ledger.AddRead(vaddr, vaddr + size, Published(), finished, t_lookup_serial,
 		                 [&](const CpOrderLedger::Hit& hit) {
@@ -439,6 +451,7 @@ void OrderNoteWrite(uint64_t vaddr, uint64_t size, OrderWrite kind) noexcept {
 		o.ledger.Write(vaddr, vaddr + size, S().tail.load(std::memory_order_relaxed), static_cast<uint32_t>(kind),
 		               [&](const CpOrderLedger::Hit& hit) { OrderHazardHit(o, hit, kind, false, t_back_hash); });
 		o.serial.store(o.ledger.Serial(), std::memory_order_release);
+		o.n[Order::LedgerSum].fetch_add(o.ledger.Reads(), std::memory_order_relaxed);
 	}
 	o.n[Order::BackNs].fetch_add(NowNs() - start, std::memory_order_relaxed);
 }
@@ -467,10 +480,13 @@ void Report(double seconds) noexcept {
 		n[i] = take(o.n[i]);
 		o.total[i] += n[i];
 	}
-	size_t ledger = 0;
+	size_t   ledger = 0;
+	uint64_t meets  = 0;
 	{
 		std::lock_guard lock(o.mutex);
-		ledger = o.ledger.Reads();
+		ledger           = o.ledger.Reads();
+		meets            = o.ledger.GranuleMeets() - o.reported_meets;
+		o.reported_meets = o.ledger.GranuleMeets();
 		for (size_t i = 0; i < o.first.size(); i++) {
 			auto& h = o.first[i];
 			if (h.printed) continue;
@@ -485,12 +501,17 @@ void Report(double seconds) noexcept {
 	std::printf("PERF cporder %.1fs: lookups=%" PRIu64 " queued_lookups=%" PRIu64 " avg_depth=%.1f max_depth=%" PRIu64
 	            " reads=%" PRIu64 " buffer_writes=%" PRIu64 " image_writes=%" PRIu64 " hz_buffer=%" PRIu64
 	            " hz_image=%" PRIu64 " hz_dirty_set=%" PRIu64 " win_buffer=%" PRIu64 " win_image=%" PRIu64
-	            " ledger=%zu front=%.2fms back=%.2fms | total hz_buffer=%" PRIu64 " hz_image=%" PRIu64
+	            " ledger=%zu reads_empty=%" PRIu64 " win_overflow=%" PRIu64 " avg_ledger_at_write=%.1f granule_meets=%" PRIu64
+	            " front=%.2fms back=%.2fms | total hz_buffer=%" PRIu64 " hz_image=%" PRIu64
 	            " hz_dirty_set=%" PRIu64 " win_buffer=%" PRIu64 " win_image=%" PRIu64 " queued_lookups=%" PRIu64 "\n",
 	            seconds, n[Order::Lookups], n[Order::LookupsQueued],
 	            n[Order::LookupsQueued] != 0 ? static_cast<double>(n[Order::DepthSum]) / n[Order::LookupsQueued] : 0.0,
 	            o.max_depth.load(std::memory_order_relaxed), n[Order::Reads], n[Order::BufferWrites], n[Order::ImageWrites], n[Order::HzBuffer],
-	            n[Order::HzImage], n[Order::DirtySet], n[Order::WinBuffer], n[Order::WinImage], ledger, ms(n[Order::FrontNs]),
+	            n[Order::HzImage], n[Order::DirtySet], n[Order::WinBuffer], n[Order::WinImage], ledger, n[Order::ReadsEmpty], n[Order::WinOverflow],
+	            n[Order::BufferWrites] + n[Order::ImageWrites] != 0
+	                ? static_cast<double>(n[Order::LedgerSum]) / (n[Order::BufferWrites] + n[Order::ImageWrites])
+	                : 0.0,
+	            meets, ms(n[Order::FrontNs]),
 	            ms(n[Order::BackNs]), t[Order::HzBuffer], t[Order::HzImage], t[Order::DirtySet], t[Order::WinBuffer],
 	            t[Order::WinImage], t[Order::LookupsQueued]);
 }

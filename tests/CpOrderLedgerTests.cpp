@@ -67,6 +67,22 @@ int main() {
 	// A write before the lookup began is not a window hit.
 	window.AddRead(0x10000, 0x10004, 6, 1, window.Serial(), never);
 
+	// The back finished every draw while the lookup ran: no read is kept, the window still pairs.
+	CpOrderLedger drained;
+	const auto start = drained.Serial();
+	Check(drained.Write(0x10000, 0x10040, 3, 1, keep) == 0, "a write before any read hit (drained)");
+	windows.clear();
+	drained.AddRead(0x10000, 0x10004, 4, 4, start, note);
+	Check(windows.size() == 1 && windows[0].writer == 3 && drained.Reads() == 0,
+	      "a write during a lookup that ended with an empty queue was missed");
+	Check(!drained.WindowOverflow(start), "a short window overflowed");
+	for (uint32_t i = 0; i <= CpOrderLedger::RecentWrites; i++) (void)drained.Write(0x90000, 0x90004, 9, 0, keep);
+	Check(drained.WindowOverflow(start), "a full ring did not overflow");
+	// Granule meets: a write in the 64 KiB granule of a kept read, even without overlap.
+	CpOrderLedger meets;
+	meets.AddRead(0x10000, 0x10004, 5, 0, meets.Serial(), never);
+	Check(meets.Write(0x10100, 0x10200, 2, 0, keep) == 0 && meets.GranuleMeets() == 1, "a granule meet was not counted");
+
 	std::printf("CpOrderLedgerTests: all cases passed\n");
 	return 0;
 }

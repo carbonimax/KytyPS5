@@ -28,14 +28,14 @@ public:
 	static constexpr uint32_t RecentWrites = 256;
 
 	// Front: draw `reader` read [begin, end). `finished`: records the back has finished (reads of a
-	// reader <= finished can no longer be hazards). `since`: Serial() when the lookup began; writes
-	// noted after it, by a draw before `reader`, are reported through `window` (the read may have
-	// happened before or after them: the walker loads before the read is inserted). One window hit per
-	// write and reader.
+	// reader <= finished can no longer be hazards, so they are not kept). `since`: Serial() when the
+	// lookup began; writes noted after it, by a draw before `reader`, are reported through `window`
+	// (the read may have happened before or after them: the walker loads before the read is
+	// inserted), also when the back finished everything meanwhile. One window hit per write and reader.
 	template <typename Window>
 	void AddRead(uint64_t begin, uint64_t end, uint64_t reader, uint64_t finished, uint64_t since,
 	             Window&& window) {
-		if (end <= begin || reader <= finished) return;
+		if (end <= begin) return;
 		for (uint64_t serial = std::max(since, m_serial > RecentWrites ? m_serial - RecentWrites : 0);
 		     serial < m_serial; serial++) {
 			auto& write = m_recent[serial % RecentWrites];
@@ -46,6 +46,7 @@ public:
 				window(Hit {from, std::min(end, write.end) - from, reader, write.writer, write.tag});
 			}
 		}
+		if (reader <= finished) return;
 		m_reads.push_back({begin, end, reader});
 		ForGranules(begin, end, [&](uint64_t granule) { m_granules[granule]++; });
 	}
@@ -62,6 +63,7 @@ public:
 		bool any = false;
 		ForGranules(begin, end, [&](uint64_t granule) { any = any || m_granules.contains(granule); });
 		if (!any) return 0;
+		m_granule_meets++;
 		uint32_t hits        = 0;
 		uint64_t last_reader = UINT64_MAX;
 		for (const auto& read: m_reads) {
@@ -90,6 +92,10 @@ public:
 	}
 
 	[[nodiscard]] uint64_t Serial() const noexcept { return m_serial; }
+	// Writes since `since` older than the ring (window hits among them are lost).
+	[[nodiscard]] bool WindowOverflow(uint64_t since) const noexcept { return m_serial - since > RecentWrites; }
+	// Writes whose 64 KiB granules held a recorded read (proof that reads and writes meet).
+	[[nodiscard]] uint64_t GranuleMeets() const noexcept { return m_granule_meets; }
 	[[nodiscard]] size_t   Reads() const noexcept { return m_reads.size(); }
 
 private:
@@ -113,6 +119,7 @@ private:
 	std::unordered_map<uint64_t, uint32_t> m_granules;
 	std::array<RecentWrite, RecentWrites>  m_recent {};
 	uint64_t                               m_serial = 0;
+	uint64_t                               m_granule_meets = 0;
 };
 
 } // namespace Libs::Graphics
