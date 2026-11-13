@@ -109,6 +109,20 @@ static void ApplyPerTitleMemImport(const std::string& title_id) {
 	Log::WriteToConsoleAndLog(fmt::format("Title {}: KYTY_MEM_IMPORT={} from KYTY_MEM_IMPORT_TITLES\n", title_id, mode));
 }
 
+// TITLE_ID of param.json, else the one inside CONTENT_ID; empty when neither is there.
+static std::string TitleId() {
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	if (title_id.empty()) {
+		std::string content_id;
+		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
+		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
+			title_id = content_id.substr(7, 9);
+		}
+	}
+	return title_id;
+}
+
 static void KytyClose() {
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -153,6 +167,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
 	}
+	// Before the splash screen and the graphics subsystem create the GPU device, which reads it.
+	ApplyPerTitleMemImport(TitleId());
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
 	}
@@ -207,19 +223,10 @@ void Run(const RunOptions& options) {
 	Init(options.config, param_json, subsystems);
 
 	PrintSystemInfo();
-	std::string title_id;
-	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
-	if (title_id.empty()) {
-		std::string content_id;
-		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
-		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
-			title_id = content_id.substr(7, 9);
-		}
-	}
+	const auto title_id = TitleId();
 	if (!title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
-	ApplyPerTitleMemImport(title_id);
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
