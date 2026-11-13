@@ -1523,7 +1523,7 @@ bool Bind(uint64_t vaddr, uint64_t size, Path path, uint64_t buffer_vaddr = 0, u
 	Copy(vaddr, size, entry.bytes, entry.hash);
 	std::lock_guard lock(st.mutex);
 	st.open->entries.push_back(std::move(entry));
-	st.bind_ns += NowNs() - start;
+	st.bind_ns += timed ? (NowNs() - start) * (NetOnly() ? TimedCalls : 1) : 0;
 	return fresh;
 }
 
