@@ -1160,22 +1160,31 @@ bool TextureCache::DeferRefresh(Image& image, const ImageViewInfo& view) {
 	return mode == 1;
 }
 
-void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer) {
+static bool SameMetadata(const ImageMetadataInfo& a, const ImageMetadataInfo& b) {
+	return a.range == b.range && a.kind == b.kind && a.clear_word == b.clear_word &&
+	       a.compression == b.compression && a.stencil_compressed == b.stencil_compressed &&
+	       a.clear_register_valid == b.clear_register_valid && a.dcc_alpha_msb == b.dcc_alpha_msb;
+}
+
+TextureCache::ColorClearResult TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
+                                                                   uint32_t metadata_base_layer) {
+	ColorClearResult result {};
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
-		return;
+		return result;
 	}
 	const auto  range = desc.info.metadata.range;
 	const auto& view  = desc.view_info;
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
+		result.meta_changed = !SameMetadata(image.info.metadata, desc.info.metadata);
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile clear flag.
-		m_surface_metas.erase(range.address);
+		result.erased = m_surface_metas.erase(range.address) != 0;
 		if (range.size == 0 || view.level_count != 1) {
-			return;
+			result.path = ColorClearResult::NoRange;
+			return result;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
@@ -1206,7 +1215,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		mip = mips[view.base_level];
 	}
 	if (mip.size == 0) {
-		return;
+		result.path = ColorClearResult::NoMip;
+		return result;
 	}
 	const GuestRange viewed {range.address + slice_size * first + mip.offset,
 	                         slice_size * (count - 1) + mip.size};
@@ -1229,7 +1239,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		{
 			std::scoped_lock lock {m_lock};
 			if (m_slot_images[id].color_clear_check == check) {
-				return;
+				result.path  = ColorClearResult::SameCheck;
+				result.check = check;
+				return result;
 			}
 		}
 		bool checked = true;
@@ -1239,7 +1251,9 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (checked) {
 			std::scoped_lock lock {m_lock};
 			m_slot_images[id].color_clear_check = check;
-			return;
+			result.path  = ColorClearResult::Checked;
+			result.check = check;
+			return result;
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -1285,9 +1299,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 				}
 				command.endRendering();
 				CommitGpuWrite(image);
-				return;
+				result.path = ColorClearResult::GpuClear;
+				return result;
 			}
 		}
+		result.path = ColorClearResult::ReadMemory;
 		// Finish native metadata writes before reading backing bytes. This can submit the
 		// scheduler, so discovery runs before final draw uploads and never holds the texture
 		// lock across it.
@@ -1295,6 +1311,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
+	} else {
+		result.path  = ColorClearResult::Plain;
+		result.quiet = count <= 4;
+		result.check = {.address = viewed.address, .stride = slice_size, .size = mip.size, .count = count};
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = run(slice);
@@ -1303,10 +1323,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
+		if (slice < 4) {
+			result.codes |= uint32_t {code} << (8u * slice);
+		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
+		result.quiet = false;
 		std::vector<uint8_t> bytes(mip.size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
 			EXIT("TextureCache: failed to read color metadata slice\n");
@@ -1326,6 +1350,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
 			            view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
+			result.cleared = true;
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -1335,6 +1360,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
+	return result;
 }
 
 void TextureCache::RefreshImage(ImageId id, const ImageViewInfo* view) {
@@ -1484,7 +1510,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
 	}
-	MaterializeColorClear(result, desc, metadata_base_layer);
+	const auto clear = MaterializeColorClear(result, desc, metadata_base_layer);
+	if (memo != nullptr) {
+		memo->clear = clear;
+	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
@@ -1498,6 +1527,118 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format, FindImageMem
 		}
 	}
 	return result;
+}
+
+bool TextureCache::ReplayKeptFinds(std::span<const KeptFind> finds, uint64_t epoch, uint32_t& keep) {
+	std::scoped_lock lock {m_lock};
+	keep = 0;
+	if (epoch != m_image_index_epoch) {
+		return false;
+	}
+	for (const auto& find: finds) {
+		const auto* image = m_slot_images.try_get(find.id);
+		if (image == nullptr || !image->registered) {
+			return false;
+		}
+	}
+	for (uint32_t i = 0; i < finds.size(); i++) {
+		auto& image              = m_slot_images[finds[i].id];
+		image.tick_accessed_last = m_gc_tick;
+		TouchImage(image);
+		if (KeepColorClear(finds[i])) {
+			keep |= 1u << i;
+		}
+	}
+	return true;
+}
+
+bool TextureCache::KeepColorClear(const KeptFind& find) {
+	if (find.clear == nullptr) {
+		return false;
+	}
+	const auto& kept = *find.clear;
+	switch (kept.path) {
+		case ColorClearResult::NoMeta: return true; // the description has no color metadata
+		case ColorClearResult::NoRange:
+		case ColorClearResult::NoMip:
+		case ColorClearResult::SameCheck:
+		case ColorClearResult::Checked: break;
+		case ColorClearResult::Plain:
+			if (!kept.quiet) return false;
+			break;
+		default: return false; // a clear, or metadata read after a GPU write: run again
+	}
+	// The same description sets the same metadata, and no surface metadata entry came back.
+	const auto& metadata = find.desc->info.metadata;
+	const auto& image    = m_slot_images[find.id];
+	if (!SameMetadata(image.info.metadata, metadata) || m_surface_metas.contains(metadata.range.address)) {
+		return false;
+	}
+	if (kept.path == ColorClearResult::NoRange || kept.path == ColorClearResult::NoMip ||
+	    kept.path == ColorClearResult::Plain) {
+		return true; // decided by the description alone; Plain by the bytes (KeptClearHolds)
+	}
+	// The check this description computes is the kept one while the epoch holds; it must still be
+	// the stored one (another view of the image may have replaced it).
+	return kept.check.epoch == m_buffer_cache.ColorMetadataEpoch() && image.color_clear_check == kept.check;
+}
+
+bool TextureCache::KeptClearHolds(const ColorClearResult& kept) {
+	const bool plain = kept.path == ColorClearResult::Plain;
+	if (!plain && kept.path != ColorClearResult::SameCheck && kept.path != ColorClearResult::Checked) {
+		return true;
+	}
+	const auto& check = kept.check;
+	if (m_buffer_cache.IsRegionGpuModified(check.address, check.stride * (check.count - 1) + check.size) == plain) {
+		return false;
+	}
+	// The read finds the same code bytes, which decoded to no clear for this description.
+	for (uint32_t slice = 0; plain && slice < check.count; slice++) {
+		const auto address = check.address + check.stride * slice;
+		uint8_t    code    = 0;
+		GpuCapture::Touch(address, sizeof(code));
+		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code)) ||
+		    code != static_cast<uint8_t>(kept.codes >> (8u * slice))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void TextureCache::ReplayColorClear(const KeptFind& find, bool keep, ColorClearResult& result) {
+	if (keep && KeptClearHolds(*find.clear)) {
+		if (&result != find.clear) {
+			result = *find.clear;
+		}
+		result.meta_changed = false;
+		result.erased       = false;
+		result.cleared      = false;
+		result.kept         = true;
+		if (result.path == ColorClearResult::Checked) {
+			result.path = ColorClearResult::SameCheck; // the check is stored now
+		}
+		return;
+	}
+	result = MaterializeColorClear(find.id, *find.desc, find.metadata_base_layer);
+}
+
+uint32_t TextureCache::KeptColorClears(std::span<const KeptFind> finds) {
+	uint32_t keep = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		for (uint32_t i = 0; i < finds.size(); i++) {
+			const auto* image = m_slot_images.try_get(finds[i].id);
+			if (image != nullptr && KeepColorClear(finds[i])) {
+				keep |= 1u << i;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < finds.size(); i++) {
+		if ((keep & (1u << i)) != 0 && !KeptClearHolds(*finds[i].clear)) {
+			keep &= ~(1u << i);
+		}
+	}
+	return keep;
 }
 
 // The search of FindImage, under m_lock. Returns an empty id when an image heap must wait for

@@ -89,6 +89,63 @@ enum class Counter : uint32_t {
 	BindObtainNs,      // of buffers: NativeStorageBuffer (buffer cache, uploads)
 	BindUploadNs,      // of buffers: flattened SRT + shader data stream uploads
 	BindViewNs,        // of images: TextureCache::FindTexture (views)
+	// KYTY_BIND_PROF (1 or 2): CP back thread only (records of KYTY_CP_PIPELINE), "PERF bindback" line.
+	BackResolveNs,     // PrepareDrawRenderState after the lookup: color/depth target resolution
+	BackTargetsNs,     // AcquireRenderTargets
+	BackPipelineNs,    // FindGraphicsPipeline / GetGraphicsPipeline (key + lookup)
+	BackVertexNs,      // vertex/index/indirect-args buffers (AcquireVertexBuffers, PrepareIndexBuffer)
+	BackDynamicNs,     // dynamic state update + commit
+	BackRecordNs,      // the per-pass recording loop, whole (commit, dynamic state, barriers, emission)
+	BackFlushNs,       // CommandScheduler::Flush: submission + next command buffer
+	BackFlushCount,
+	// KYTY_BIND_PROF (1 or 2), CP back thread: target resolution split and repeats ("PERF tgtback" line).
+	TgtRecords,        // records that resolved their targets on the back
+	TgtFindNs,         // TextureCache::FindImage of the targets (search + access tick + metadata clear)
+	TgtFindCount,
+	TgtFindKept,       // searches FindImageMemo may keep (same result while the image epoch holds)
+	TgtRememberNs,     // RememberTarget (KYTY_PIPELINE_PARALLEL prediction): key hash + map write
+	TgtMergeNs,        // MergeAliasedColorTargets + per-target pass slots
+	TgtKeyNs,          // exact target inputs: compare with the previous record + capture
+	TgtHashNs,         // the prediction keys (ColorTargetKey/DepthTargetKey) of every record (profiling only)
+	TgtSameHash,       // records with mrt_mask and prediction keys equal to the previous record's
+	TgtSameHashNs,     // their resolution time (whole block)
+	TgtSameExact,      // records with exact target inputs equal to the previous record's
+	TgtSameExactNs,
+	TgtReusable,       // of exact: previous searches kept and the image epoch unchanged
+	TgtReusableNs,
+	TgtReusableMeta,   // targets of reusable records with DCC/CMASK metadata (clear replay needed)
+	TgtUnkept,         // of exact: a previous search not keepable (insert, alias, heap wait)
+	TgtEpochMoved,     // of exact: kept, but an image was (un)registered since
+	TgtReused,         // KYTY_TARGET_REUSE=1: records that took the previous resolution
+	TgtReplayRefused,  // =1: reusable, but the replay found the epoch moved or an image gone
+	TgtVerified,       // KYTY_TARGET_REUSE=2: reusable records resolved anyway and compared
+	TgtMismatch,       // =2: of verified, resolution differs from the previous record's
+	// KYTY_BIND_PROF + KYTY_TARGET_REUSE=1, reused records ("PERF tgtreuse"): chained timestamps; the
+	// last bucket is empty (the clock's own cost, to subtract once per bucket when reading them).
+	TgtReuseCmpNs,     // SameTargetInputs
+	TgtReuseEpochNs,   // the image epoch read before the replay (m_lock)
+	TgtReuseLockNs,    // the kept finds + ReplayKeptFinds (one locked section)
+	TgtReuseClearNs,   // color metadata clear replay (MaterializeColorClear per target)
+	TgtReuseBindNs,    // BindRenderTarget per target
+	TgtReuseCopyNs,    // infos into the draw state
+	TgtReuseEmptyNs,   // nothing: the clock
+	TgtReuseMergeNs,   // MergeAliasedColorTargets + pass slots
+	TgtReuseTargets,   // replayed targets
+	// Replayed MaterializeColorClear: return taken (TextureCache::ColorClearResult::Path order), effects.
+	TgtClearNoMeta,
+	TgtClearNoRange,
+	TgtClearNoMip,
+	TgtClearSameCheck,
+	TgtClearChecked,
+	TgtClearGpu,
+	TgtClearReadMemory,
+	TgtClearPlain,
+	TgtClearMetaChanged, // image.info.metadata differed from the description's
+	TgtClearErased,      // a surface metadata entry was removed
+	TgtClearCleared,     // a slice cleared from CPU-read metadata
+	TgtClearActed,       // any effect (the above, a check stored, a GPU clear)
+	TgtClearKept,        // not run again: it would do nothing (KYTY_TARGET_REUSE=1)
+	TgtVerifiedKeeps,    // =2: kept clears checked against the resolution
 	// KYTY_ASYNC_PIPELINE (default on): draws skipped while their pipeline is created, guest frames
 	// with a skipped draw, and the misses that waited, by why the draw could not be skipped.
 	AsyncSkipped,
@@ -105,8 +162,11 @@ enum class Counter : uint32_t {
 };
 
 [[nodiscard]] bool Enabled() noexcept;
-// KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases.
+// KYTY_BIND_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): times the binding phases;
+// =2: only on the CP back thread (KYTY_CP_PIPELINE), so they add up against its back_busy.
 [[nodiscard]] bool BindProfEnabled() noexcept;
+// KYTY_BIND_PROF=1 or 2, on the CP back thread: the back-only phases (Back* counters).
+[[nodiscard]] bool BackProfEnabled() noexcept;
 // KYTY_SRT_PROF=1 (measurement, default off; needs KYTY_PERF_STATS=1): splits program lookups (walk,
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
@@ -144,6 +204,9 @@ inline std::atomic<uint64_t> t_work_recorded {0};
 inline void                  NoteWork() noexcept {
     t_work_recorded.fetch_add(1, std::memory_order_relaxed);
 }
+
+// KYTY_BIND_PROF: set on the CP back thread while PrepareDrawRenderState resolves its targets.
+inline thread_local bool t_target_prof = false;
 
 class ScopedTimer {
 public:

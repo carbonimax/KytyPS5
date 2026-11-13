@@ -65,12 +65,21 @@ bool Enabled() noexcept {
 	return enabled;
 }
 
-bool BindProfEnabled() noexcept {
-	static const bool enabled = [] {
+static int BindProfMode() noexcept {
+	static const int mode = [] {
 		const char* value = std::getenv("KYTY_BIND_PROF");
-		return Enabled() && value != nullptr && std::atoi(value) != 0;
+		return Enabled() && value != nullptr ? std::atoi(value) : 0;
 	}();
-	return enabled;
+	return mode;
+}
+
+bool BindProfEnabled() noexcept {
+	const int mode = BindProfMode();
+	return mode != 0 && (mode != 2 || CpPipeline::IsBackThread());
+}
+
+bool BackProfEnabled() noexcept {
+	return BindProfMode() != 0 && CpPipeline::IsBackThread();
 }
 
 bool SrtProfEnabled() noexcept {
@@ -253,7 +262,38 @@ void MaybeReport() noexcept {
 	std::printf("PERF staging %.1fs: write=%.1fms bytes=%.1fMB copies=%" PRIu64 "\n", seconds,
 	            ms(Counter::StagingWriteNs), static_cast<double>(n(Counter::StagingWriteBytes)) / 1048576.0,
 	            n(Counter::StagingWriteCount));
-	if (BindProfEnabled()) {
+	if (BindProfMode() != 0) {
+		std::printf("PERF bindback %.1fs: resolve=%.0fms targets=%.0fms pipeline=%.0fms vertex=%.0fms"
+		            " dynamic=%.0fms record=%.0fms flush=%.0fms(%" PRIu64 ")\n",
+		            seconds, ms(Counter::BackResolveNs), ms(Counter::BackTargetsNs), ms(Counter::BackPipelineNs),
+		            ms(Counter::BackVertexNs), ms(Counter::BackDynamicNs), ms(Counter::BackRecordNs),
+		            ms(Counter::BackFlushNs), n(Counter::BackFlushCount));
+		std::printf("PERF tgtback %.1fs: records=%" PRIu64 " find=%.0fms(%" PRIu64 ",kept=%" PRIu64
+		            ") remember=%.0fms merge=%.0fms key=%.0fms hash=%.0fms same_hash=%" PRIu64
+		            "(%.0fms) same=%" PRIu64 "(%.0fms) reusable=%" PRIu64 "(%.0fms,meta=%" PRIu64 ") unkept=%" PRIu64
+		            " epoch_moved=%" PRIu64 " reused=%" PRIu64 " refused=%" PRIu64 " verified=%" PRIu64
+		            " mismatch=%" PRIu64 "\n",
+		            seconds, n(Counter::TgtRecords), ms(Counter::TgtFindNs), n(Counter::TgtFindCount),
+		            n(Counter::TgtFindKept),
+		            ms(Counter::TgtRememberNs), ms(Counter::TgtMergeNs), ms(Counter::TgtKeyNs), ms(Counter::TgtHashNs),
+		            n(Counter::TgtSameHash), ms(Counter::TgtSameHashNs), n(Counter::TgtSameExact),
+		            ms(Counter::TgtSameExactNs), n(Counter::TgtReusable), ms(Counter::TgtReusableNs),
+		            n(Counter::TgtReusableMeta), n(Counter::TgtUnkept), n(Counter::TgtEpochMoved),
+		            n(Counter::TgtReused), n(Counter::TgtReplayRefused), n(Counter::TgtVerified),
+		            n(Counter::TgtMismatch));
+		std::printf("PERF tgtreuse %.1fs: reused=%" PRIu64 " targets=%" PRIu64 " cmp=%.1fms epoch=%.1fms lock=%.1fms"
+		            " clear=%.1fms bind=%.1fms copy=%.1fms empty=%.1fms merge=%.1fms paths=%" PRIu64 "/%" PRIu64
+		            "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " meta_changed=%" PRIu64
+		            " erased=%" PRIu64 " cleared=%" PRIu64 " acted=%" PRIu64 " kept=%" PRIu64
+		            " verified_keeps=%" PRIu64 "\n",
+		            seconds, n(Counter::TgtReused), n(Counter::TgtReuseTargets), ms(Counter::TgtReuseCmpNs),
+		            ms(Counter::TgtReuseEpochNs), ms(Counter::TgtReuseLockNs), ms(Counter::TgtReuseClearNs),
+		            ms(Counter::TgtReuseBindNs), ms(Counter::TgtReuseCopyNs), ms(Counter::TgtReuseEmptyNs),
+		            ms(Counter::TgtReuseMergeNs), n(Counter::TgtClearNoMeta), n(Counter::TgtClearNoRange),
+		            n(Counter::TgtClearNoMip), n(Counter::TgtClearSameCheck), n(Counter::TgtClearChecked),
+		            n(Counter::TgtClearGpu), n(Counter::TgtClearReadMemory), n(Counter::TgtClearPlain),
+		            n(Counter::TgtClearMetaChanged), n(Counter::TgtClearErased), n(Counter::TgtClearCleared),
+		            n(Counter::TgtClearActed), n(Counter::TgtClearKept), n(Counter::TgtVerifiedKeeps));
 		std::printf("PERF bind %.1fs: prepare=%.0fms find_buffers=%.0fms heap=%.0fms images=%.0fms buffers=%.0fms"
 		            " commit=%.0fms(%" PRIu64 ") check=%.0fms transit=%.0fms push=%.0fms writes=%" PRIu64
 		            " descriptors=%" PRIu64 "\n",

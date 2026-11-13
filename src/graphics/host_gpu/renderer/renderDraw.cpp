@@ -42,6 +42,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +52,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -973,17 +975,22 @@ static void MergeAliasedColorTargets(DrawRenderState& state) {
 	std::array<uint32_t, 8> slots {};
 	for (uint32_t index = 0; index < 8u; index++) slots[index] = ShaderPixelExportTarget(pixel.target_shader_mask, index);
 	uint32_t kept = 0;
+	// Kept colors move down to `kept` (< i once one merged): color_info[i] is read before it moves.
+	const auto keep = [&](uint32_t i) {
+		if (kept != i) state.color_info[kept] = state.color_info[i];
+		kept++;
+	};
 	for (uint32_t i = 0; i < state.color_count; i++) {
-		const auto color       = state.color_info[i];
-		const auto slot        = color.target_slot;
+		const auto& color = state.color_info[i];
+		const auto  slot  = color.target_slot;
 		const auto index = static_cast<uint32_t>(std::find(slots.begin(), slots.end(), slot) - slots.begin());
 		if (index >= 8u || pixel.target_merge_mask[index] == 0) {
-			state.color_info[kept++] = color;
+			keep(i);
 			continue;
 		}
 		const auto destination = slots[pixel.target_merge_slot[index]];
 		if (destination == slot) {
-			state.color_info[kept++] = color;
+			keep(i);
 			continue;
 		}
 		RenderColorInfo* primary = nullptr;
@@ -1071,6 +1078,184 @@ static void RememberTarget(std::unordered_map<uint64_t, Info>& targets, uint64_t
 	targets[key] = info;
 }
 
+// The registers target resolution reads (ResolveRenderColorTarget for the mrt_mask slots,
+// ResolveRenderDepthTarget), as bytes: equal bytes resolve to equal descriptions.
+struct TargetInputs {
+	uint32_t                                                   mrt_mask = 0;
+	uint32_t                                                   rt_mask  = 0;
+	std::array<HW::RenderTarget, RENDER_COLOR_ATTACHMENTS_MAX> rt {};
+	HW::DepthRenderTarget                                      z {};
+	HW::RenderControl                                          rc {};
+	HW::DepthControl                                           dc {};
+	HW::StencilControl                                         sc {};
+	HW::StencilMask                                            sm {};
+	float                                                      depth_clear   = 0.0f;
+	uint8_t                                                    stencil_clear = 0;
+};
+
+template <typename T>
+static bool SameBytes(const T& kept, const T& current) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	return std::memcmp(&kept, &current, sizeof(T)) == 0;
+}
+
+template <typename T>
+static void CopyBytes(T& kept, const T& current) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	std::memcpy(&kept, &current, sizeof(T));
+}
+
+static bool SameTargetInputs(const TargetInputs& in, const HW::Context& hw, uint32_t mrt_mask) {
+	if (in.mrt_mask != mrt_mask || in.rt_mask != hw.GetRenderTargetMask()) return false;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((mrt_mask & (1u << slot)) != 0 && !SameBytes(in.rt[slot], hw.GetRenderTarget(slot))) return false;
+	}
+	const float   depth_clear   = hw.GetDepthClearValue();
+	const uint8_t stencil_clear = hw.GetStencilClearValue();
+	return SameBytes(in.z, hw.GetDepthRenderTarget()) && SameBytes(in.rc, hw.GetRenderControl()) &&
+	       SameBytes(in.dc, hw.GetDepthControl()) && SameBytes(in.sc, hw.GetStencilControl()) &&
+	       SameBytes(in.sm, hw.GetStencilMask()) && SameBytes(in.depth_clear, depth_clear) &&
+	       in.stencil_clear == stencil_clear;
+}
+
+static void CaptureTargetInputs(TargetInputs& in, const HW::Context& hw, uint32_t mrt_mask) {
+	in.mrt_mask = mrt_mask;
+	in.rt_mask  = hw.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((mrt_mask & (1u << slot)) != 0) CopyBytes(in.rt[slot], hw.GetRenderTarget(slot));
+	}
+	CopyBytes(in.z, hw.GetDepthRenderTarget());
+	CopyBytes(in.rc, hw.GetRenderControl());
+	CopyBytes(in.dc, hw.GetDepthControl());
+	CopyBytes(in.sc, hw.GetStencilControl());
+	CopyBytes(in.sm, hw.GetStencilMask());
+	CopyBytes(in.depth_clear, hw.GetDepthClearValue());
+	in.stencil_clear = hw.GetStencilClearValue();
+}
+
+// KYTY_TARGET_REUSE (default 1; 0 turns it off): on the CP back thread, a record whose target registers equal the
+// previous record's takes that record's resolution while its searches stay valid (FindImageMemo:
+// kept, image epoch unchanged); FindImage's other effects and BindRenderTarget are replayed, except
+// a color metadata clear that would do nothing again (TextureCache::KeepColorClear).
+// 2: resolve anyway and count records whose resolution differs (PERF tgtback mismatch), whose kept
+// clears acted or whose bound targets differ from what the replay binds.
+static int TargetReuseMode() noexcept {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_TARGET_REUSE");
+		return value != nullptr ? std::atoi(value) : 1;
+	}();
+	return mode;
+}
+
+// The last target resolution of the CP back thread (KYTY_TARGET_REUSE, KYTY_BIND_PROF repeats).
+struct PreviousTargets {
+	bool         valid = false;
+	TargetInputs inputs;
+	// The colors as the slot loop left them (before aliased merges), the depth as resolved.
+	uint32_t                                                  color_count = 0;
+	std::array<RenderColorInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
+	RenderDepthInfo                                           depth {};
+	// Every search of the record may be kept (FindImageMemo), all at this image epoch.
+	bool     kept  = false;
+	uint64_t epoch = 0;
+	uint32_t meta  = 0; // targets with DCC/CMASK metadata (FindImage materializes their clears)
+	std::array<uint64_t, RENDER_COLOR_ATTACHMENTS_MAX + 1> hash {}; // prediction keys, depth last
+	// The last color metadata clear result of each color, depth last (KYTY_TARGET_REUSE keeps it).
+	std::array<TextureCache::ColorClearResult, RENDER_COLOR_ATTACHMENTS_MAX + 1> clears {};
+	// The slot loop wrote colors[color_count] (a slot without image); otherwise it is as constructed.
+	bool tail = false;
+};
+
+// Two buffers, swapped when a record resolves: the kept targets are not copied per record.
+static thread_local std::array<PreviousTargets, 2> t_targets;
+static thread_local uint32_t                       t_targets_current = 0;
+
+static uint32_t KeptColorEntries(uint32_t color_count) {
+	return std::min(color_count + 1u, RENDER_COLOR_ATTACHMENTS_MAX);
+}
+
+static bool SameDesc(const TextureCache::ImageDesc& a, const TextureCache::ImageDesc& b) {
+	const auto& x = a.info;
+	const auto& y = b.info;
+	const auto& m = x.metadata;
+	const auto& n = y.metadata;
+	return a.type == b.type && a.heap == b.heap && a.view_info == b.view_info && x.data == y.data &&
+	       x.stencil == y.stencil && m.range == n.range && m.kind == n.kind && m.clear_word == n.clear_word &&
+	       m.compression == n.compression && m.stencil_compressed == n.stencil_compressed &&
+	       m.clear_register_valid == n.clear_register_valid && m.dcc_alpha_msb == n.dcc_alpha_msb &&
+	       x.htile_initial_clear == y.htile_initial_clear && x.pixel_format == y.pixel_format &&
+	       x.guest_format == y.guest_format && x.type == y.type && x.extent == y.extent &&
+	       x.resources == y.resources && x.pitch == y.pitch && x.bytes_per_block == y.bytes_per_block &&
+	       x.samples == y.samples && x.tile_mode == y.tile_mode && x.bgra16 == y.bgra16 &&
+	       x.tiled_slice_stride == y.tiled_slice_stride && x.linear_slice_stride == y.linear_slice_stride &&
+	       x.first_tail_level == y.first_tail_level;
+}
+
+static bool SameColor(const RenderColorInfo& a, const RenderColorInfo& b) {
+	return a.image_id == b.image_id && a.target_slot == b.target_slot && a.guest_mip_level == b.guest_mip_level &&
+	       a.guest_array_layer == b.guest_array_layer && a.export_mapping == b.export_mapping &&
+	       a.merged_slots == b.merged_slots && a.pass_slots == b.pass_slots && SameDesc(a.desc, b.desc);
+}
+
+static bool SameDepth(const RenderDepthInfo& a, const RenderDepthInfo& b) {
+	return a.image_id == b.image_id && SameDesc(a.desc, b.desc) && a.depth_clear_enable == b.depth_clear_enable &&
+	       a.load_clear_aspects == b.load_clear_aspects &&
+	       SameBytes(a.depth_clear_value, b.depth_clear_value) && a.depth_test_enable == b.depth_test_enable &&
+	       a.depth_write_enable == b.depth_write_enable && a.depth_compare_op == b.depth_compare_op &&
+	       a.depth_bounds_test_enable == b.depth_bounds_test_enable &&
+	       a.stencil_clear_enable == b.stencil_clear_enable && a.stencil_clear_value == b.stencil_clear_value &&
+	       a.stencil_test_enable == b.stencil_test_enable && a.stencil_front == b.stencil_front &&
+	       a.stencil_back == b.stencil_back;
+}
+
+using KeptFinds  = std::array<TextureCache::KeptFind, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+using FindMemos  = std::array<TextureCache::FindImageMemo, RENDER_COLOR_ATTACHMENTS_MAX + 1>;
+// Scratch of the back's target resolution, written before read (no per-record construction).
+static thread_local KeptFinds  t_kept_finds;
+static thread_local FindMemos  t_find_memos;
+
+// The searches of a kept resolution, colors then depth (the order the slot loop binds them).
+static uint32_t GetKeptFinds(const PreviousTargets& kept, KeptFinds& finds) {
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < kept.color_count; i++) {
+		const auto& color = kept.colors[i];
+		finds[count++]    = {color.image_id, &color.desc, color.guest_array_layer, &kept.clears[i]};
+	}
+	if (kept.depth.image_id) {
+		finds[count++] = {kept.depth.image_id, &kept.depth.desc, 0, &kept.clears[RENDER_COLOR_ATTACHMENTS_MAX]};
+	}
+	return count;
+}
+
+// KYTY_TARGET_REUSE=2: which part of a resolution differs from the kept one ("" when none).
+static const char* TargetMismatch(const PreviousTargets& kept, const PreviousTargets& resolved) {
+	if (kept.color_count != resolved.color_count) return "color_count";
+	for (uint32_t i = 0; i < KeptColorEntries(kept.color_count); i++) {
+		if (!SameColor(kept.colors[i], resolved.colors[i])) return i < kept.color_count ? "color" : "color_tail";
+	}
+	return SameDepth(kept.depth, resolved.depth) ? "" : "depth";
+}
+
+// One target of a resolution: whether its search may be kept, at which epoch.
+static void NoteTargetFind(PreviousTargets& next, const TextureCache::ImageDesc& desc, ImageId id,
+                           const TextureCache::FindImageMemo& memo, bool prof) {
+	if (!id) {
+		// Nothing bound: no search (decided by the registers alone), or a heap wait (not kept).
+		if (desc.info.data.address != 0) next.kept = false;
+		return;
+	}
+	if (prof) PerfStats::Add(PerfStats::Counter::TgtFindCount, 1);
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc || desc.info.metadata.kind == ImageMetadataKind::Cmask) {
+		next.meta++;
+	}
+	if (memo.id != id || (next.epoch != 0 && memo.epoch != next.epoch)) {
+		next.kept = false;
+		return;
+	}
+	next.epoch = memo.epoch;
+	if (prof) PerfStats::Add(PerfStats::Counter::TgtFindKept, 1);
+}
+
 // The targets of a queued draw from the remembered ones; false when one is unknown or the draw would
 // take another path (aliased targets, mixed sample counts, nothing to draw, another pixel permutation).
 static bool PredictTargets(const CpPipeline::DrawRecord& record, DrawRenderState& state) {
@@ -1127,33 +1312,236 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	const bool remember = m_context.GetPipelineCache().ParallelEnabled() && CpPipeline::Mode() != 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, state.color_info[state.color_count], slot);
-			if (remember) {
-				RememberTarget(g_color_targets, ColorTargetKey(buffer.GetRegisters(), slot),
-				               state.color_info[state.color_count]);
+	{ // KYTY_BIND_PROF: target resolution
+		using Clock = std::chrono::steady_clock;
+		const bool  prof  = PerfStats::BackProfEnabled();
+		const auto& hw    = buffer.GetRegisters();
+		auto&       cache = m_context.GetTextureCache();
+		const int reuse_mode = CpPipeline::IsBackThread() ? TargetReuseMode() : 0;
+		// Repeats are taken for records that start with no target (all do today).
+		const bool track = (prof || reuse_mode != 0) && state.color_count == 0 && !state.depth_info.image_id;
+		auto&      previous = t_targets[t_targets_current];
+		auto&      next     = t_targets[t_targets_current ^ 1u];
+		if (track) {
+			next.valid = true;
+			next.kept  = true;
+			next.epoch = 0;
+			next.meta  = 0;
+			next.hash  = {};
+			next.tail  = false;
+		}
+		if (track && prof) { // the prediction keys (registers hashed), outside the resolve bucket
+			PerfStats::ScopedTimer hash_timer(PerfStats::Counter::TgtHashNs, true);
+			for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+				if ((state.mrt_mask & (1u << slot)) != 0) next.hash[slot] = ColorTargetKey(hw, slot);
 			}
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+			next.hash[RENDER_COLOR_ATTACHMENTS_MAX] = DepthTargetKey(hw);
+		}
+		const auto start    = prof ? Clock::now() : Clock::time_point {};
+		bool       same     = false;
+		bool       reusable = false;
+		// KYTY_BIND_PROF with KYTY_TARGET_REUSE=1: the reuse path in chained timestamps (PERF tgtreuse).
+		const bool                       split = prof && reuse_mode == 1;
+		std::array<Clock::time_point, 8> mark {};
+		if (track) {
+			PerfStats::ScopedTimer key_timer(PerfStats::Counter::TgtKeyNs, prof);
+			if (split) mark[0] = Clock::now();
+			same = previous.valid && SameTargetInputs(previous.inputs, hw, state.mrt_mask);
+			if (split) mark[1] = Clock::now();
+			// Mode 1: the replay checks the epoch under its own lock.
+			reusable = same && previous.kept && (reuse_mode == 1 || previous.epoch == cache.ImageIndexEpoch());
+			if (split) mark[2] = Clock::now();
+		}
+		bool     reused       = false;
+		uint32_t reused_finds = 0; // KYTY_BIND_PROF: the reused record's counts are added after its timed span
+		if (reusable && reuse_mode == 1) {
+			auto&          finds = t_kept_finds;
+			const uint32_t count = GetKeptFinds(previous, finds);
+			uint32_t       keep  = 0;
+			reused = cache.ReplayKeptFinds(std::span {finds.data(), count}, previous.epoch, keep);
+			if (split) mark[3] = Clock::now();
+			if (reused) {
+				// A clear that would do nothing again (same metadata, check still stored and valid) is kept.
+				// The result is updated in place: finds[i].clear points to it.
+				for (uint32_t i = 0; i < count; i++) {
+					cache.ReplayColorClear(finds[i], (keep >> i & 1u) != 0,
+					                       previous.clears[i < previous.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX]);
+				}
+				if (split) mark[4] = Clock::now();
+				// shortcut: RememberTarget is skipped; equal registers already map to these targets unless
+				// an inline draw cleared the map meanwhile (one misprediction). Upgrade if mispredictions rise.
+				for (uint32_t i = 0; i < count; i++) BindRenderTarget(finds[i].id);
+				if (split) mark[5] = Clock::now();
+				// The draw state starts as constructed (DrawRecord reset): only written entries are copied.
+				std::copy_n(previous.colors.begin(),
+				            previous.tail ? KeptColorEntries(previous.color_count) : previous.color_count,
+				            state.color_info);
+				state.color_count = previous.color_count;
+				state.depth_info  = previous.depth;
+				if (split) {
+					mark[6] = Clock::now();
+					mark[7] = Clock::now();
+				}
+				reused_finds = count;
+			}
+			if (prof && !reused) PerfStats::Add(PerfStats::Counter::TgtReplayRefused, 1);
+		}
+		// =2: what the replay would keep and bind, checked against the resolution below.
+		auto&      verify_finds = t_kept_finds;
+		uint32_t   verify_count = 0;
+		uint32_t   verify_keep  = 0;
+		const auto bound_before = m_bound_images.size();
+		if (reusable && reuse_mode == 2) {
+			verify_count = GetKeptFinds(previous, verify_finds);
+			verify_keep  = cache.KeptColorClears(std::span {verify_finds.data(), verify_count});
+		}
+		auto& memos = t_find_memos;
+		if (track && !reused) memos.fill({});
+		PerfStats::t_target_prof = prof;
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX && !reused; slot++) {
+			if ((state.mrt_mask & (1u << slot)) != 0) {
+				auto& color = state.color_info[state.color_count];
+				ResolveRenderColorTarget(buffer, color, slot, false, false, track ? &memos[slot] : nullptr);
+				if (track) NoteTargetFind(next, color.desc, color.image_id, memos[slot], prof);
+				if (track && !color.image_id) next.tail = true;
+				if (remember) {
+					PerfStats::ScopedTimer remember_timer(PerfStats::Counter::TgtRememberNs, prof);
+					RememberTarget(g_color_targets, ColorTargetKey(hw, slot), color);
+				}
+				if (color.image_id) {
+					if (track) next.clears[state.color_count] = memos[slot].clear;
+					state.color_count++;
+				}
 			}
 		}
-	}
-	MergeAliasedColorTargets(state);
-	if (state.aliased_passes != 0) {
-		uint32_t resolved = 0;
-		for (uint32_t i = 0; i < state.color_count; i++) {
-			resolved |= 1u << state.color_info[i].target_slot;
-			state.color_info[i].pass_slots = state.aliased_passes;
+		if (track && !reused) {
+			next.color_count = state.color_count;
+			std::copy_n(state.color_info, KeptColorEntries(state.color_count), next.colors.begin());
 		}
-		if (resolved != state.aliased_passes) {
-			EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
-			     resolved, state.aliased_passes);
+		const auto merge_start = prof ? Clock::now() : Clock::time_point {};
+		MergeAliasedColorTargets(state);
+		if (state.aliased_passes != 0) {
+			uint32_t resolved = 0;
+			for (uint32_t i = 0; i < state.color_count; i++) {
+				resolved |= 1u << state.color_info[i].target_slot;
+				state.color_info[i].pass_slots = state.aliased_passes;
+			}
+			if (resolved != state.aliased_passes) {
+				EXIT("aliased color targets: per-target passes resolved slots 0x%x of group 0x%x\n",
+				     resolved, state.aliased_passes);
+			}
 		}
-	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
-	if (remember) {
-		RememberTarget(g_depth_targets, DepthTargetKey(buffer.GetRegisters()), state.depth_info);
+		uint64_t merge_ns = 0;
+		if (prof) {
+			merge_ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - merge_start).count());
+			if (!reused) PerfStats::Add(PerfStats::Counter::TgtMergeNs, merge_ns);
+		}
+		if (!reused) {
+			ResolveRenderDepthTarget(buffer, state.depth_info,
+			                         track ? &memos[RENDER_COLOR_ATTACHMENTS_MAX] : nullptr);
+		}
+		PerfStats::t_target_prof = false;
+		if (track && !reused) {
+			NoteTargetFind(next, state.depth_info.desc, state.depth_info.image_id,
+			               memos[RENDER_COLOR_ATTACHMENTS_MAX], prof);
+			next.depth                                = state.depth_info;
+			next.clears[RENDER_COLOR_ATTACHMENTS_MAX] = memos[RENDER_COLOR_ATTACHMENTS_MAX].clear;
+		}
+		if (reusable && reuse_mode == 2) {
+			const char* mismatch = TargetMismatch(previous, next);
+			if (mismatch[0] == '\0') {
+				// A kept clear must be one the resolution did nothing in, along the same return.
+				for (uint32_t i = 0; i < verify_count && mismatch[0] == '\0'; i++) {
+					if ((verify_keep >> i & 1u) == 0) continue;
+					if (prof) PerfStats::Add(PerfStats::Counter::TgtVerifiedKeeps, 1);
+					const auto& real = next.clears[i < next.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX];
+					auto        path = verify_finds[i].clear->path;
+					if (path == TextureCache::ColorClearResult::Checked) path = TextureCache::ColorClearResult::SameCheck;
+					if (real.Acted() || real.path != path) mismatch = "clear_kept";
+				}
+				// The replay binds the kept images in the order the resolution did.
+				const bool same_binds = m_bound_images.size() - bound_before == verify_count &&
+				                        std::equal(verify_finds.begin(), verify_finds.begin() + verify_count,
+				                                   m_bound_images.begin() + static_cast<ptrdiff_t>(bound_before),
+				                                   [](const auto& find, ImageId id) { return find.id == id; });
+				if (mismatch[0] == '\0' && !same_binds) mismatch = "bind";
+			}
+			if (prof) {
+				PerfStats::Add(PerfStats::Counter::TgtVerified, 1);
+				if (mismatch[0] != '\0') PerfStats::Add(PerfStats::Counter::TgtMismatch, 1);
+			}
+			static std::atomic_uint logged = 0;
+			if (mismatch[0] != '\0' && logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("KYTY_TARGET_REUSE=2: %s differs (mrt=0x%x colors=%u/%u depth=%u/%u)\n", mismatch,
+				            state.mrt_mask, previous.color_count, next.color_count,
+				            static_cast<uint32_t>(previous.depth.image_id.index),
+				            static_cast<uint32_t>(next.depth.image_id.index));
+			}
+		}
+		if (remember && !reused) {
+			PerfStats::ScopedTimer remember_timer(PerfStats::Counter::TgtRememberNs, prof);
+			RememberTarget(g_depth_targets, DepthTargetKey(hw), state.depth_info);
+		}
+		if (track && !reused) {
+			PerfStats::ScopedTimer key_timer(PerfStats::Counter::TgtKeyNs, prof);
+			CaptureTargetInputs(next.inputs, hw, state.mrt_mask);
+		}
+		if (prof) {
+			const auto ns = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+			PerfStats::Add(PerfStats::Counter::BackResolveNs, ns);
+			PerfStats::Add(PerfStats::Counter::TgtRecords, 1);
+			if (reused) { // outside the span: only clock reads stay inside it (and the key timer's add)
+				using C = PerfStats::Counter;
+				PerfStats::Add(C::TgtMergeNs, merge_ns);
+				PerfStats::Add(C::TgtReuseMergeNs, merge_ns);
+				if (split) {
+					constexpr std::array<C, 7> buckets {C::TgtReuseCmpNs,  C::TgtReuseEpochNs, C::TgtReuseLockNs,
+					                                    C::TgtReuseClearNs, C::TgtReuseBindNs, C::TgtReuseCopyNs,
+					                                    C::TgtReuseEmptyNs};
+					for (uint32_t i = 0; i < buckets.size(); i++) {
+						PerfStats::Add(buckets[i], static_cast<uint64_t>(
+						                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+						                                   mark[i + 1] - mark[i])
+						                                   .count()));
+					}
+				}
+				PerfStats::Add(C::TgtReused, 1);
+				PerfStats::Add(C::TgtReuseTargets, reused_finds);
+				for (uint32_t i = 0; i < reused_finds; i++) {
+					const auto& r = previous.clears[i < previous.color_count ? i : RENDER_COLOR_ATTACHMENTS_MAX];
+					PerfStats::Add(static_cast<C>(static_cast<uint32_t>(C::TgtClearNoMeta) + r.path), 1);
+					if (r.meta_changed) PerfStats::Add(C::TgtClearMetaChanged, 1);
+					if (r.erased) PerfStats::Add(C::TgtClearErased, 1);
+					if (r.cleared) PerfStats::Add(C::TgtClearCleared, 1);
+					if (r.Acted()) PerfStats::Add(C::TgtClearActed, 1);
+					if (r.kept) PerfStats::Add(C::TgtClearKept, 1);
+				}
+			}
+			if (track && previous.valid && previous.inputs.mrt_mask == state.mrt_mask && previous.hash == next.hash) {
+				PerfStats::Add(PerfStats::Counter::TgtSameHash, 1);
+				PerfStats::Add(PerfStats::Counter::TgtSameHashNs, ns);
+			}
+			if (same) {
+				PerfStats::Add(PerfStats::Counter::TgtSameExact, 1);
+				PerfStats::Add(PerfStats::Counter::TgtSameExactNs, ns);
+				if (!previous.kept) {
+					PerfStats::Add(PerfStats::Counter::TgtUnkept, 1);
+				} else if (!reusable) {
+					PerfStats::Add(PerfStats::Counter::TgtEpochMoved, 1);
+				} else {
+					PerfStats::Add(PerfStats::Counter::TgtReusable, 1);
+					PerfStats::Add(PerfStats::Counter::TgtReusableNs, ns);
+					PerfStats::Add(PerfStats::Counter::TgtReusableMeta, previous.meta);
+				}
+			}
+		}
+		if (!track) {
+			previous.valid = false;
+		} else if (!reused) {
+			t_targets_current ^= 1u;
+		}
 	}
 	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
 	// keep those matching the raster count instead of resolving multisampled shadows.
@@ -1460,6 +1848,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	std::pair<Buffer*, uint64_t> args_buffer {};
 	uint64_t                     args_size = 0;
 	{
+		PerfStats::ScopedTimer   back_timer(PerfStats::Counter::BackVertexNs, PerfStats::BackProfEnabled());
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
 		if (!mesh_active) {
 			vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
@@ -1523,9 +1912,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	std::array<RenderState, RENDER_COLOR_ATTACHMENTS_MAX>              renderings {};
 	std::array<vk::ImageAspectFlags, RENDER_COLOR_ATTACHMENTS_MAX>     feedback {};
 	auto& pipeline_cache = m_context.GetPipelineCache();
+	const bool back_prof  = PerfStats::BackProfEnabled();
 	if (pipeline_cache.AsyncEnabled()) {
 		const auto colors = std::span {state.color_info, passes ? 1u : state.color_count};
-		pipelines[0]      = pipeline_cache.FindGraphicsPipeline(buffer, state, colors, depth_feedback);
+		{
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackPipelineNs, back_prof);
+			pipelines[0] = pipeline_cache.FindGraphicsPipeline(buffer, state, colors, depth_feedback);
+		}
 		if (pipelines[0] == nullptr) {
 			// KYTY_ASYNC_PIPELINE: only a draw whose effects are this frame's colors may be skipped while
 			// its pipeline is created; any other miss waits (below), counted by reason.
@@ -1552,9 +1945,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 		auto* colors = passes ? state.color_info + pass : state.color_info;
 		const auto count = passes ? 1u : state.color_count;
 		if (pipelines[pass] == nullptr) {
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackPipelineNs, back_prof);
 			pipelines[pass] = &pipeline_cache.GetGraphicsPipeline(buffer, state, std::span {colors, count},
 			                                                      depth_feedback);
 		}
+		PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackTargetsNs, back_prof);
 		renderings[pass] = AcquireRenderTargets(buffer, colors, count, state.depth_info, feedback[pass], stages);
 	}
 	vk::DeviceAddress task_params = 0;
@@ -1605,6 +2000,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	if (buffer.DrawWritesStale(sync_epoch)) {
 		m_context.GetCommandScheduler().EndRendering();
 	}
+	PerfStats::ScopedTimer record_timer(PerfStats::Counter::BackRecordNs, back_prof);
 	for (uint32_t pass = 0; pass < pass_count; pass++) {
 		auto& pipeline = *pipelines[pass];
 		if (!mesh_active) {
@@ -1641,11 +2037,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			                        buffer.GetRegisters().GetUserClipPlanes().data());
 		}
 
-		auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
-		                           renderings[pass]);
-		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
-		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		{
+			PerfStats::ScopedTimer back_timer(PerfStats::Counter::BackDynamicNs, back_prof);
+			auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+			UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
+			                           renderings[pass]);
+			dynamic_state.SetAttachmentFeedbackLoopAspects(feedback[pass]);
+			dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+		}
 
 		if (pass != 0) {
 			m_context.GetCommandScheduler().EndRendering();

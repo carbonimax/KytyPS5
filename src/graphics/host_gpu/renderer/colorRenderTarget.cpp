@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -46,7 +47,7 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
                                               uint32_t rt_slot, bool ignore_target_mask,
-                                              bool exact_format) {
+                                              bool exact_format, TextureCache::FindImageMemo* memo) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
@@ -254,8 +255,11 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.guest_mip_level          = mip;
 	r.guest_array_layer        = view.base_layer;
-	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
-	r.export_mapping           = target_format.export_mapping;
+	{
+		PerfStats::ScopedTimer find_timer(PerfStats::Counter::TgtFindNs, PerfStats::t_target_prof);
+		r.image_id = texture_cache.FindImage(r.desc, exact_format, memo);
+	}
+	r.export_mapping = target_format.export_mapping;
 	BindRenderTarget(r.image_id);
 }
 
