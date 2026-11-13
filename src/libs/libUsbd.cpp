@@ -42,7 +42,14 @@ static const Options& Opts() {
 		o.log            = log != nullptr && log[0] == '1';
 		if (text != nullptr && !Host::ParseIds(text, &o.ids)) {
 			LOGF("KYTY_USB_PASSTHRU: bad list '%s' (want VVVV:PPPP[,VVVV:PPPP])\n", text);
+			o.ids.clear(); // a half-parsed list must not turn the option on
 		}
+#if !defined(_WIN32)
+		if (!o.ids.empty()) {
+			LOGF("KYTY_USB_PASSTHRU: not supported on this platform (WinUSB only), option off\n");
+			o.ids.clear();
+		}
+#endif
 		return o;
 	}();
 	return opts;
