@@ -1472,6 +1472,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
+			if (is_texel_buffer && PerfStats::CrwdProfEnabled()) [[unlikely]] {
+				// #2193: this read skips SynchronizeBufferFromImage.
+				if (const auto image = m_texture_cache.FindImageFromRange(vaddr, size)) {
+					bool gpu = false;
+					{
+						std::scoped_lock lock {m_texture_cache.m_lock};
+						gpu = m_texture_cache.m_slot_images[image].IsGpuModified();
+					}
+					PerfStats::Add(PerfStats::Counter::CrwdSmallRead, 1);
+					PerfStats::Add(PerfStats::Counter::CrwdSmallReadGpu, gpu ? 1 : 0);
+					PerfStats::Add(PerfStats::Counter::CrwdSmallReadBytes, size);
+				}
+			}
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}

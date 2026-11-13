@@ -82,6 +82,14 @@ bool BackProfEnabled() noexcept {
 	return BindProfMode() != 0 && CpPipeline::IsBackThread();
 }
 
+bool CrwdProfEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_CRWD_PROF");
+		return Enabled() && value != nullptr && std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
 bool SrtProfEnabled() noexcept {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_SRT_PROF");
@@ -342,6 +350,15 @@ void MaybeReport() noexcept {
 		// Totals since launch; nonzero_loads must stay 0.
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
 		            bounds[0], bounds[1], bounds[2], bounds[3]);
+	}
+	if (CrwdProfEnabled()) {
+		const auto r = [&](Counter c) { return static_cast<double>(n(c)) / seconds; };
+		std::printf("PERF crwd %.1fs: small_read=%.1f/s(gpu=%.1f/s,%.0fB/s) cp_miss=%.1f/s(gpu=%.1f/s,%.0fB/s)"
+		            " meta_clear=%.1f/s(unsafe=%.1f/s) mip_reuse=%.1f/s(overlap=%.1f/s)\n",
+		            seconds, r(Counter::CrwdSmallRead), r(Counter::CrwdSmallReadGpu), r(Counter::CrwdSmallReadBytes),
+		            r(Counter::CrwdCpMiss), r(Counter::CrwdCpMissGpu), r(Counter::CrwdCpMissBytes),
+		            r(Counter::CrwdMetaClear), r(Counter::CrwdMetaClearUnsafe), r(Counter::CrwdMipReuse),
+		            r(Counter::CrwdMipReuseOverlap));
 	}
 	CmdRecord::Report(seconds);
 	EopAtGpu::Report(seconds);

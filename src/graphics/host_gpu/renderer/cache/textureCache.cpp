@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -171,6 +172,18 @@ TextureCache::~TextureCache() {
 			UnregisterImage(id);
 		}
 	});
+}
+
+// #1781 counter: a level both chains have sits elsewhere (guest chains run backwards).
+static bool CrwdSharedLevelsDiffer(const ImageInfo& left, const ImageInfo& right) {
+	if (left.resources.levels == right.resources.levels) return false;
+	const auto shared = std::min(left.resources.levels, right.resources.levels);
+	return !std::equal(left.mip_layout.begin(), left.mip_layout.begin() + shared, right.mip_layout.begin(),
+	                   [](const ImageMipInfo& a, const ImageMipInfo& b) {
+		                   return a.offset == b.offset && a.size == b.size && a.pitch == b.pitch &&
+		                          a.height == b.height && a.tail_x == b.tail_x && a.tail_y == b.tail_y &&
+		                          a.surface_z == b.surface_z;
+	                   });
 }
 
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -856,6 +869,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		if (PerfStats::CrwdProfEnabled() && CrwdSharedLevelsDiffer(requested, cached.info)) [[unlikely]] {
+			// #1781: the overlap path below may hand back the cached image for this request.
+			PerfStats::Add(PerfStats::Counter::CrwdMipReuseOverlap, 1);
+		}
 		bool keep_both = false;
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id, keep_both)) {
 			return {depth_id};
@@ -1672,6 +1689,9 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 				break;
 			}
 			if (SameBacking(image.info, desc.info, exact_format)) {
+				if (PerfStats::CrwdProfEnabled() && CrwdSharedLevelsDiffer(image.info, desc.info)) [[unlikely]] {
+					PerfStats::Add(PerfStats::Counter::CrwdMipReuse, 1);
+				}
 				result = id;
 			} else if (BcAlias::Matches(desc.info, image.info)) {
 				// SafeToDownload changes without an epoch bump: a possible alias is not kept.
@@ -2485,6 +2505,15 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, uint
 	for (const auto id: FindImagesInRegion(address, size)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
+			if (reason != RefreshProf::GpuStorage && PerfStats::CrwdProfEnabled()) [[unlikely]] {
+				// #2225: this write never reaches the image.
+				const auto& data = image.info.data;
+				const auto  lo   = std::max(address, data.address);
+				const auto  hi   = std::min(address + size, data.End());
+				PerfStats::Add(PerfStats::Counter::CrwdCpMiss, 1);
+				PerfStats::Add(PerfStats::Counter::CrwdCpMissGpu, image.IsGpuModified() ? 1 : 0);
+				PerfStats::Add(PerfStats::Counter::CrwdCpMissBytes, hi > lo ? hi - lo : 0);
+			}
 			continue;
 		}
 		if (RefreshProf::Enabled()) [[unlikely]] {

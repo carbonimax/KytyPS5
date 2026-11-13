@@ -158,6 +158,17 @@ enum class Counter : uint32_t {
 	StagingWriteNs,      // guest bytes written into the upload staging ring (any thread)
 	StagingWriteBytes,
 	StagingWriteCount,
+	// KYTY_CRWD_PROF=1: stale-data code holes that open upstream PRs close ("PERF crwd" line).
+	CrwdSmallRead,        // #2193: small texel read streamed from guest memory over a cached image
+	CrwdSmallReadGpu,     //        ... whose image is GPU-written (the guest bytes are stale)
+	CrwdSmallReadBytes,
+	CrwdCpMiss,           // #2225: CP copy/fill overlapping an image that does not start at the write
+	CrwdCpMissGpu,        //        ... GPU-written image
+	CrwdCpMissBytes,      //        overlap bytes
+	CrwdMetaClear,        // #1803: dispatch consumed as a metadata clear
+	CrwdMetaClearUnsafe,  //        ... that upstream would run (other writes, big reads, images, raw/GDS)
+	CrwdMipReuse,         // #1781: equal-backing reuse of a longer chain whose shared levels differ
+	CrwdMipReuseOverlap,  //        overlap path keeping a cached image whose shared levels differ
 	Count
 };
 
@@ -171,6 +182,8 @@ enum class Counter : uint32_t {
 // descriptor evaluation, specialization, permutation search), counts what changes between lookups and
 // which resources they bind, and splits texture/sampler/buffer resolution ("PERF srtsplit" line).
 [[nodiscard]] bool SrtProfEnabled() noexcept;
+// KYTY_CRWD_PROF=1 (diagnostic, default off; needs KYTY_PERF_STATS=1): Crwd* counters.
+[[nodiscard]] bool CrwdProfEnabled() noexcept;
 void               Add(Counter counter, uint64_t value) noexcept;
 // GPU thread: marks the calling thread (wait attribution) and prints the report when due.
 void               MarkGpuThread() noexcept;

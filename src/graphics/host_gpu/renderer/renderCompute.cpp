@@ -57,6 +57,47 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+// #1803 counter: a consumed dispatch that upstream would run (it writes or reads more than one
+// metadata surface and a few constants, writes images, or touches memory by address or GDS).
+template <typename Stage, typename Resources>
+static void NoteCrwdMetaClear(const Stage& stage, const Resources& resources, TextureCache& cache) {
+	const auto& program = *stage.program;
+	bool        unsafe  = program.has_address_writes || program.info.uses_dma || program.info.uses_gds;
+	for (const auto& image: program.info.images) {
+		unsafe |= image.written;
+	}
+	char     list[256] = {};
+	uint32_t used      = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		const auto& resource   = program.info.buffers[i];
+		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (descriptor.Base48() == 0) continue;
+		const bool meta = cache.IsMeta(descriptor.Base48());
+		if (resource.written) {
+			unsafe |= resource.read || !meta;
+		} else if (resource.read) {
+			unsafe |= descriptor.NumRecords() == UINT32_MAX || descriptor.GetSize() > 4096;
+		}
+		if (used < sizeof(list) - 48) {
+			used += std::snprintf(list + used, sizeof(list) - used, " %s%s%s:%" PRIu64, resource.read ? "r" : "",
+			                      resource.written ? "w" : "", meta ? "m" : "", descriptor.GetSize());
+		}
+	}
+	PerfStats::Add(PerfStats::Counter::CrwdMetaClear, 1);
+	PerfStats::Add(PerfStats::Counter::CrwdMetaClearUnsafe, unsafe ? 1 : 0);
+	// Once per shader: what a consumed dispatch binds (r/w/m = read/written/metadata, then bytes).
+	static std::mutex                   mutex;
+	static std::unordered_map<uint64_t, bool> seen;
+	std::lock_guard                     lock(mutex);
+	if (seen.emplace(program.shader_hash, unsafe).second) {
+		std::printf("CRWD meta_clear cs=%016" PRIx64 " unsafe=%d images_written=%d addr_writes=%d buffers:%s\n",
+		            program.shader_hash, unsafe ? 1 : 0,
+		            static_cast<int>(std::count_if(program.info.images.begin(), program.info.images.end(),
+		                                           [](const auto& image) { return image.written; })),
+		            program.has_address_writes ? 1 : 0, list);
+	}
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -82,6 +123,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				if (cache.ClearMeta(descriptor.Base48())) {
+					if (PerfStats::CrwdProfEnabled()) [[unlikely]] {
+						NoteCrwdMetaClear(input.stage, resources, cache);
+					}
 					return true;
 				}
 			}
