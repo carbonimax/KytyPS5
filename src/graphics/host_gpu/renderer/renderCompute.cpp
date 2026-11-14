@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/dispatchChainPolicy.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -60,7 +61,8 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 // #1803 counter: a consumed dispatch that upstream would run (it writes or reads more than one
 // metadata surface and a few constants, writes images, or touches memory by address or GDS).
 template <typename Stage, typename Resources>
-static void NoteCrwdMetaClear(const Stage& stage, const Resources& resources, TextureCache& cache) {
+static void NoteCrwdMetaClear(const Stage& stage, const Resources& resources, TextureCache& cache,
+                              const ShaderBufferResource& written) {
 	const auto& program = *stage.program;
 	bool        unsafe  = program.has_address_writes || program.info.uses_dma || program.info.uses_gds;
 	for (const auto& image: program.info.images) {
@@ -96,6 +98,22 @@ static void NoteCrwdMetaClear(const Stage& stage, const Resources& resources, Te
 		                                           [](const auto& image) { return image.written; })),
 		            program.has_address_writes ? 1 : 0, list);
 	}
+	if (CrwdProf::Enabled()) {
+		// #1803 (a), (b): the consumed write against the HTile size registered at its address.
+		const auto registered = cache.MetaSize(written.Base48());
+		const bool unbounded  = written.NumRecords() == UINT32_MAX;
+		const auto bytes      = written.GetSize();
+		PerfStats::Add(PerfStats::Counter::CrwdMetaOver, registered != 0 && !unbounded && bytes > registered ? 1 : 0);
+		PerfStats::Add(PerfStats::Counter::CrwdMetaUnknown, registered == 0 || unbounded ? 1 : 0);
+		static std::unordered_map<uint64_t, bool> sizes_seen;
+		const auto key = program.shader_hash ^ (registered * 0x9E3779B97F4A7C15ull) ^ (bytes << 1u) ^ (unbounded ? 1 : 0);
+		if (sizes_seen.size() < 64 && sizes_seen.emplace(key, true).second) {
+			std::printf("CRWD meta_size cs=%016" PRIx64 " addr=%012" PRIx64 " htile=%" PRIu64 " written=%" PRIu64
+			            " num_records=%u%s\n",
+			            program.shader_hash, written.Base48(), registered, bytes, written.NumRecords(),
+			            unbounded ? " unbounded" : "");
+		}
+	}
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
@@ -124,7 +142,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				if (cache.ClearMeta(descriptor.Base48())) {
 					if (PerfStats::CrwdProfEnabled()) [[unlikely]] {
-						NoteCrwdMetaClear(input.stage, resources, cache);
+						NoteCrwdMetaClear(input.stage, resources, cache, descriptor);
 					}
 					return true;
 				}

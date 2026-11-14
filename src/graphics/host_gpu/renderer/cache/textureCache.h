@@ -133,6 +133,8 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// HTile bytes registered at `address` (0: none or unknown).
+	[[nodiscard]] uint64_t MetaSize(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -159,6 +161,7 @@ private:
 		std::bitset<8192> clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
+		uint64_t size = 0; // its HTile bytes (KYTY_CRWD_PROF=2 log)
 	};
 
 	struct OverlapResult {

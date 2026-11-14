@@ -169,6 +169,11 @@ enum class Counter : uint32_t {
 	CrwdMetaClearUnsafe,  //        ... that upstream would run (other writes, big reads, images, raw/GDS)
 	CrwdMipReuse,         // #1781: equal-backing reuse of a longer chain whose shared levels differ
 	CrwdMipReuseOverlap,  //        overlap path keeping a cached image whose shared levels differ
+	// KYTY_CRWD_PROF=2 only.
+	CrwdMetaOver,         // #1803: consumed write larger than the HTILE size registered at its address
+	CrwdMetaUnknown,      //        ... registered size 0 or unbounded descriptor (NumRecords = ~0)
+	CrwdLateJoinDraws,    // #2224: draws whose vertex/index/args acquisition joined buffers after the shader bindings
+	CrwdLateJoins,        //        buffers joined there
 	Count
 };
 

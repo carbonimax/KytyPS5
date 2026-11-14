@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -1846,7 +1847,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	PreparedVertexBuffers        vertex_bindings;
 	PreparedIndexBuffer          index_binding;
 	std::pair<Buffer*, uint64_t> args_buffer {};
-	uint64_t                     args_size = 0;
+	uint64_t                     args_size  = 0;
+	const uint64_t               crwd_joins = CrwdProf::g_joins;
 	{
 		PerfStats::ScopedTimer   back_timer(PerfStats::Counter::BackVertexNs, PerfStats::BackProfEnabled());
 		BufferCache::UploadBatch upload_batch(m_context.GetBufferCache(), true);
@@ -1862,6 +1864,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 			    m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, args_size, false);
 			EXIT_IF((args_buffer.second & 3u) != 0);
 		}
+	}
+	if (CrwdProf::g_joins != crwd_joins) [[unlikely]] {
+		// #2224: the shader bindings above may hold a buffer joined here.
+		PerfStats::Add(PerfStats::Counter::CrwdLateJoinDraws, 1);
+		PerfStats::Add(PerfStats::Counter::CrwdLateJoins, CrwdProf::g_joins - crwd_joins);
 	}
 	// Without the dynamic loop state the loop is a pipeline property: find out before the pipeline.
 	bool depth_feedback = false;
@@ -2082,6 +2089,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer,
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
+	if (CrwdProf::Enabled()) [[unlikely]] {
+		CrwdProf::NoteDraw(state.vertex_info[0].stage.program->shader_hash,
+		                   state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0,
+		                   draw.instance_count, emit.indirect.address != 0);
+	}
 
 	if (chain_writes) {
 		buffer.DeferDrawWrites(shader_write_stages, sync_epoch);

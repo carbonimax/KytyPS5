@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/guestStacks.h"
 #include "graphics/shader/shaderPretranslate.h"
@@ -14,6 +15,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -351,7 +353,20 @@ void MaybeReport() noexcept {
 		std::printf("PERF bounds verify: oob_loads=%u nonzero_loads=%u oob_stores=%u tail_reads=%u\n",
 		            bounds[0], bounds[1], bounds[2], bounds[3]);
 	}
-	if (CrwdProfEnabled()) {
+	if (CrwdProf::Enabled()) {
+		// Integer counts per window (KYTY_CRWD_PROF=2), then the frame-to-frame toggle tables.
+		std::string line;
+		CrwdProf::Report(line);
+		std::printf("PERF crwd2 %02d:%02d:%02d %.1fs: small_read=%" PRIu64 "(gpu=%" PRIu64 ",%" PRIu64 "B) cp_miss=%" PRIu64
+		            "(gpu=%" PRIu64 ",%" PRIu64 "B) meta_clear=%" PRIu64 "(unsafe=%" PRIu64 ",over=%" PRIu64 ",unknown=%" PRIu64
+		            ") mip_reuse=%" PRIu64 "(overlap=%" PRIu64 ") late_join=%" PRIu64 "(joins=%" PRIu64 ")%s\n",
+		            local.tm_hour, local.tm_min, local.tm_sec, seconds, n(Counter::CrwdSmallRead),
+		            n(Counter::CrwdSmallReadGpu), n(Counter::CrwdSmallReadBytes), n(Counter::CrwdCpMiss),
+		            n(Counter::CrwdCpMissGpu), n(Counter::CrwdCpMissBytes), n(Counter::CrwdMetaClear),
+		            n(Counter::CrwdMetaClearUnsafe), n(Counter::CrwdMetaOver), n(Counter::CrwdMetaUnknown),
+		            n(Counter::CrwdMipReuse), n(Counter::CrwdMipReuseOverlap), n(Counter::CrwdLateJoinDraws),
+		            n(Counter::CrwdLateJoins), line.c_str());
+	} else if (CrwdProfEnabled()) {
 		const auto r = [&](Counter c) { return static_cast<double>(n(c)) / seconds; };
 		std::printf("PERF crwd %.1fs: small_read=%.1f/s(gpu=%.1f/s,%.0fB/s) cp_miss=%.1f/s(gpu=%.1f/s,%.0fB/s)"
 		            " meta_clear=%.1f/s(unsafe=%.1f/s) mip_reuse=%.1f/s(overlap=%.1f/s)\n",

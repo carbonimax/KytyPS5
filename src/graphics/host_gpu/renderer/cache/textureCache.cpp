@@ -174,6 +174,9 @@ TextureCache::~TextureCache() {
 	});
 }
 
+// #1781: set by ResolveOverlap when it meets such a cached image; its caller logs the outcome.
+static thread_local bool g_crwd_overlap_hit = false;
+
 // #1781 counter: a level both chains have sits elsewhere (guest chains run backwards).
 static bool CrwdSharedLevelsDiffer(const ImageInfo& left, const ImageInfo& right) {
 	if (left.resources.levels == right.resources.levels) return false;
@@ -872,6 +875,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (PerfStats::CrwdProfEnabled() && CrwdSharedLevelsDiffer(requested, cached.info)) [[unlikely]] {
 			// #1781: the overlap path below may hand back the cached image for this request.
 			PerfStats::Add(PerfStats::Counter::CrwdMipReuseOverlap, 1);
+			g_crwd_overlap_hit = true;
 		}
 		bool keep_both = false;
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id, keep_both)) {
@@ -1706,7 +1710,27 @@ ImageId TextureCache::FindImageLocked(CommandBuffer& command, ImageDesc& desc, b
 			keepable = false;
 			for (const auto candidate: candidates) {
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				// Read before: ResolveOverlap may free or expand the cached image.
+				const auto& crwd_cached = m_slot_images[candidate].info;
+				const std::array<uint64_t, 6> crwd_info {
+				    crwd_cached.resources.levels, merged_info.resources.levels,
+				    static_cast<uint64_t>(crwd_cached.pixel_format), static_cast<uint64_t>(merged_info.pixel_format),
+				    crwd_cached.data.size, merged_info.data.size};
+				const auto crwd_address = merged_info.data.address;
+				g_crwd_overlap_hit      = false;
 				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
+				if (g_crwd_overlap_hit) [[unlikely]] {
+					// cached = the cached image is handed back, kept = the request stays separate, new = expanded
+					// or replaced.
+					const char* exit = overlap.image == candidate                    ? "cached"
+					                   : !overlap.image || overlap.image == result ? "kept"
+					                                                                 : "new";
+					std::printf("CRWD overlap addr=%012" PRIx64 " levels cached=%" PRIu64 " requested=%" PRIu64
+					            " format cached=%" PRIu64 " requested=%" PRIu64 " size cached=%" PRIu64
+					            " requested=%" PRIu64 " exit=%s\n",
+					            crwd_address, crwd_info[0], crwd_info[1], crwd_info[2], crwd_info[3], crwd_info[4],
+					            crwd_info[5], exit);
+				}
 				if (overlap.image) {
 					result = overlap.image;
 				}
@@ -1932,6 +1956,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 			metadata->second.clear_mask.set();
 		}
 		metadata->second.owner = id;
+		metadata->second.size  = desc.info.metadata.range.size;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2650,6 +2675,12 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+uint64_t TextureCache::MetaSize(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	return found != m_surface_metas.end() ? found->second.size : 0;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

@@ -13,6 +13,8 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/cpPipeline.h"
 #include "graphics/host_gpu/renderer/cpSplitProf.h"
+#include "graphics/host_gpu/renderer/cache/refreshProf.h"
+#include "graphics/host_gpu/renderer/crwdProf.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/perfStats.h"
@@ -1077,6 +1079,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			PerfStats::Add(PerfStats::Counter::Frames, 1);
+			if (CrwdProf::Enabled()) [[unlikely]] {
+				CrwdProf::EndFrame();
+			}
 			// Age caches at the frame boundary, not once per command list.
 			m_renderer.RunGarbageCollector();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -1525,6 +1530,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                                   .index_type_and_size = m_index_type_and_size,
 	                                   .indirect            = records})
 	             : executor.DrawAuto(CurrentBuffer(), {.indirect = records}))) {
+		if (CrwdProf::Enabled()) [[unlikely]] {
+			CrwdProf::NoteIndirect(args_addr, draw_count, false, 0);
+		}
 		return;
 	}
 
@@ -1552,6 +1560,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		                                     .base_vertex         = args.vertexOffset,
 		                                     .first_instance      = args.firstInstance,
 		                                     .offset_source = DrawOffsetSource::IndirectArgs});
+	}
+	if (CrwdProf::Enabled()) [[unlikely]] {
+		// After the loop: its reads published any GPU-written record (a backing read never faults).
+		CrwdProf::NoteIndirect(args_addr, draw_count, true,
+		                       RefreshProf::HashGuest(args_addr, uint64_t {draw_count} * stride_in_bytes));
 	}
 }
 
