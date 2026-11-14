@@ -55,7 +55,7 @@ int main(int, char**) {
 	Check(PthreadAttrDestroy(&attr) == 0, "attribute destroy");
 	std::printf("guest thread: x87 control word 0x%04x, mxcsr 0x%08x\n", g_fcw, g_mxcsr);
 	Check(g_fcw == 0x037f, "guest thread starts with x87 control word 0x037F");
-	Check((g_mxcsr & ~0x3fu) == 0x1f80u, "MXCSR control bits keep the host default 0x1F80");
+	Check((g_mxcsr & ~0x3fu) == 0x9fc0u, "MXCSR control bits are the console's 0x9FC0 (FTZ+DAZ)");
 	std::puts("PASS: guest thread x87 control word");
 	return 0;
 #endif

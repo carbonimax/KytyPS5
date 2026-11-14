@@ -73,9 +73,9 @@ using pthread_key_destructor_func_t = KYTY_SYSV_ABI void (*)(void*);
 
 void  PthreadInitSelfForMainThread();
 void* PthreadCreateMainGuestStack();
-// Sets the console's x87 control word 0x037F (64-bit precision, all exceptions masked, round to
-// nearest) on the calling thread before it runs guest code; Windows starts threads at 0x027F
-// (53-bit precision), which rounds guest long double math short. MXCSR keeps the host value.
+// Writes the guest FP environment (Common::GuestFpEnv) on the calling thread before it runs guest
+// code: x87 control word 0x037F (64-bit precision, all exceptions masked, round to nearest) and
+// MXCSR. Windows starts threads at x87 0x027F (53-bit precision), which rounds long double math short.
 // KYTY_X87_LOG=1 prints the word found at entry (first two threads).
 void  PthreadSetGuestFpuControl();
 void  PthreadDeleteStaticObjects(Loader::Program* program);
