@@ -3392,6 +3392,29 @@ public:
             "alignment");
     download.Commit();
 
+    // A wrap over a range a pending priority operation still reads: wait_priority = false
+    // refuses instead of waiting, and MapDownload falls back to a buffer of its own.
+    StreamBuffer parked_ring(m_runtime_context, scheduler, MemoryUsage::Download, 4096);
+    const auto [parked_first, parked_first_offset] = parked_ring.Map(2048, 4);
+    Require("StreamBufferRing", "parked ring allocation",
+            parked_first != nullptr && parked_first_offset == 0,
+            "download stream is not host visible");
+    parked_ring.Commit();
+    std::binary_semaphore priority_parked{0};
+    scheduler.DeferPriorityOperation([&] { priority_parked.acquire(); });
+    scheduler.Flush();
+    const auto [refused, refused_offset] = parked_ring.Map(2049, 4, true, false);
+    const auto fallback = parked_ring.MapDownload(2049, 4, false);
+    priority_parked.release();
+    Require("StreamBufferRing", "priority wait refused",
+            refused == nullptr && fallback.owner != nullptr && fallback.mapped != nullptr,
+            "download wrap waited for a pending priority operation");
+    const auto [waited, waited_offset] = parked_ring.Map(2049, 4);
+    Require("StreamBufferRing", "priority wait",
+            waited != nullptr && waited_offset == 0,
+            "download wrap did not reuse the range after its priority operation");
+    parked_ring.Commit();
+
     scheduler.Finish();
     download.Invalidate(download_offset, 16);
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");

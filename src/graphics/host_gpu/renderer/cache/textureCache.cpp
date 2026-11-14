@@ -54,6 +54,17 @@ bool MsaaZeroInit() {
 	return enabled;
 }
 
+// KYTY_TC_LOCK_ORDER=1 (default 0): image downloads under m_lock never wait for priority
+// operations. Those operations deliver guest labels (KYTY_EOP_AT_GPU) through InvalidateMemory,
+// which takes m_lock, so the wait could deadlock; the download takes a buffer of its own instead.
+bool TcLockOrder() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TC_LOCK_ORDER");
+		return value != nullptr && std::strtol(value, nullptr, 10) != 0;
+	}();
+	return enabled;
+}
+
 // KYTY_IMAGE_CHURN_OPT: 0 = off, 1 = on (default), 2 = on and verify against guest bytes.
 uint32_t ImageChurnOpt() {
 	static const uint32_t mode = [] {
@@ -2415,7 +2426,8 @@ bool TextureCache::DownloadImageMemory(ImageId id, Buffer* staging, bool capture
 	auto download = staging != nullptr
 	                    ? StreamBuffer::Download {staging, staging->Mapped().data(), 0, nullptr}
 	                    : m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
-	                          .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	                          .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4),
+	                                       !TcLockOrder());
 	if (!LibKernel::Memory::TryReadBacking(range.address, download.mapped, range.size)) {
 		return false;
 	}

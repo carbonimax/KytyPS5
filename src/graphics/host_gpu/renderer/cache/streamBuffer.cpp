@@ -265,7 +265,7 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 }
 
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
-                                                bool allow_wait) {
+                                                bool allow_wait, bool wait_priority) {
 	if (Mapped().empty()) {
 		return {nullptr, 0};
 	}
@@ -294,7 +294,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	    wrap ? std::optional<size_t> {m_current_watch_cursor} : m_invalidation_mark;
 	auto& pending_watches = wrap ? m_current_watches : m_previous_watches;
 	if (!WaitPendingOperations(pending_watches, invalidation_mark, aligned_offset + mapped_size,
-	                           allow_wait, wait_cursor, wait_bound)) {
+	                           allow_wait, wait_priority, wait_cursor, wait_bound)) {
 		return {nullptr, 0};
 	}
 
@@ -329,8 +329,9 @@ void StreamBuffer::Commit() {
 	watch.tick        = tick;
 }
 
-StreamBuffer::Download StreamBuffer::MapDownload(uint64_t size, uint64_t alignment) {
-	if (const auto [mapped, offset] = Map(size, alignment); mapped != nullptr) {
+StreamBuffer::Download StreamBuffer::MapDownload(uint64_t size, uint64_t alignment,
+                                                 bool wait_priority) {
+	if (const auto [mapped, offset] = Map(size, alignment, true, wait_priority); mapped != nullptr) {
 		Commit();
 		return {this, mapped, offset, nullptr};
 	}
@@ -350,7 +351,8 @@ uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignmen
 bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
                                          uint64_t requested_upper_bound, bool allow_wait,
-                                         size_t& wait_cursor, uint64_t& wait_bound) {
+                                         bool wait_priority, size_t& wait_cursor,
+                                         uint64_t& wait_bound) {
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}
@@ -361,6 +363,10 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		}
 		Scheduler().Wait(watch.tick);
 		if (Usage() == MemoryUsage::Download) {
+			// After Wait(), no new priority operation can take a tick at or before watch.tick.
+			if (!wait_priority && Scheduler().PriorityOperationsPending(watch.tick)) {
+				return false;
+			}
 			Scheduler().WaitPriorityOperations(watch.tick);
 		}
 		wait_bound = watch.upper_bound;

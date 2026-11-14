@@ -50,6 +50,8 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// True while WaitPriorityOperations(tick) would block.
+	[[nodiscard]] bool        PriorityOperationsPending(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferRelease(Common::UniqueFunction<void>&& operation);

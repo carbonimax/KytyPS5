@@ -363,6 +363,12 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	});
 }
 
+bool CommandScheduler::PriorityOperationsPending(uint64_t tick) {
+	std::lock_guard lock(m_operation_mutex);
+	return (m_priority_active_tick != 0 && m_priority_active_tick <= tick) ||
+	       (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick);
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;

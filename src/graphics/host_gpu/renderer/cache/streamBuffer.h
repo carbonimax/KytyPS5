@@ -112,9 +112,11 @@ public:
 	             uint64_t size);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
-	                                                bool allow_wait = true);
+	                                                bool allow_wait = true, bool wait_priority = true);
 	void                                        Commit();
-	[[nodiscard]] Download                      MapDownload(uint64_t size, uint64_t alignment);
+	// wait_priority = false: a download range still read by a pending priority operation is not
+	// waited for; the range goes to a buffer of its own instead.
+	[[nodiscard]] Download MapDownload(uint64_t size, uint64_t alignment, bool wait_priority = true);
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
 private:
@@ -130,7 +132,8 @@ private:
 	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,
 	                                                std::optional<size_t>     invalidation_mark,
 	                                                uint64_t requested_upper_bound, bool allow_wait,
-	                                                size_t& wait_cursor, uint64_t& wait_bound);
+	                                                bool wait_priority, size_t& wait_cursor,
+	                                                uint64_t& wait_bound);
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
