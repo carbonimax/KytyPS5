@@ -109,6 +109,14 @@ int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
 int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
 } // namespace Libs::Controller
 
+namespace Libs::UsbPad {
+// No passed-through USB wheel in these tests (libUsbd.cpp is not linked here).
+int  OpenExt(int, const void*) { return Controller::PAD_ERROR_DEVICE_NOT_CONNECTED; }
+bool IsHandle(int) { return false; }
+int  Close(int) { return Controller::PAD_ERROR_INVALID_HANDLE; }
+int  Read(int, Controller::PadData*, int) { return 0; }
+} // namespace Libs::UsbPad
+
 namespace Libs::Controller::DualSenseHaptics {
 bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
 	haptics.push_back({large_motor, small_motor, duration_ms});
