@@ -21,8 +21,9 @@ void NoteIndirect(uint64_t args_addr, uint32_t count, bool cpu, uint64_t records
 void NoteSideRead(uint64_t address, uint64_t size, const void* data) noexcept;
 // GPU thread, at each frame boundary.
 void EndFrame() noexcept;
-// Appends the window's tables and top toggling keys to `out` and starts a new window.
-void Report(std::string& out) noexcept;
+// Appends the window's tables and top toggling keys to `out`, one "PERF crwd2 hot" line per table with
+// keys at >= 20 % to `hot`, and starts a new window.
+void Report(std::string& out, std::string& hot) noexcept;
 // Buffer joins made by this thread (#2224: a draw input acquisition joining a bound buffer).
 inline thread_local uint64_t g_joins = 0;
 
@@ -39,6 +40,8 @@ public:
 		uint8_t  have      = 0;  // bit 0: present at N-1, bit 1: present at N-2
 		uint32_t idle      = 0;
 		uint32_t evaluated = 0, changes = 0, toggles = 0;
+		uint64_t tog_v0 = 0, tog_v1 = 0; // values at N and N-1 of the latest toggle
+		uint8_t  tog_have = 0;           // bit 0: present at N, bit 1: present at N-1
 	};
 
 	explicit ToggleTable(bool absent_counts): m_absent_counts(absent_counts) {}
@@ -63,7 +66,12 @@ public:
 				const auto same = [](bool pa, uint64_t va, bool pb, uint64_t vb) { return pa == pb && (!pa || va == vb); };
 				e.evaluated++;
 				e.changes += same(p0, e.cur, p1, e.v1) ? 0u : 1u;
-				e.toggles += same(p0, e.cur, p2, e.v2) && !same(p0, e.cur, p1, e.v1) ? 1u : 0u;
+				if (same(p0, e.cur, p2, e.v2) && !same(p0, e.cur, p1, e.v1)) {
+					e.toggles++;
+					e.tog_v0   = e.cur;
+					e.tog_v1   = e.v1;
+					e.tog_have = static_cast<uint8_t>((p0 ? 1u : 0u) | (p1 ? 2u : 0u));
+				}
 			}
 			e.v2   = e.v1;
 			e.v1   = e.cur;

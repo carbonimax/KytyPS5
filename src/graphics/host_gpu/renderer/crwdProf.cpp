@@ -85,7 +85,7 @@ void EndFrame() noexcept {
 	t.frames++;
 }
 
-void Report(std::string& out) noexcept {
+void Report(std::string& out, std::string& hot) noexcept {
 	struct Top {
 		char     tag;
 		uint64_t a, b;
@@ -97,15 +97,29 @@ void Report(std::string& out) noexcept {
 	char             text[256];
 	std::snprintf(text, sizeof(text), " frames=%" PRIu64 " side_bytes=%" PRIu64, t.frames, t.side_bytes);
 	out += text;
+	// A per-frame value: draws and instances for the draw tables, else the low bits of the hash; - = absent.
+	const auto value = [&](bool present, uint64_t v, bool sum) {
+		if (!present) return std::string("-");
+		if (sum) {
+			std::snprintf(text, sizeof(text), "d%" PRIu64 "i%" PRIu64, v >> 40u, v & ((uint64_t {1} << 40u) - 1));
+		} else {
+			std::snprintf(text, sizeof(text), "%08" PRIx64, v & 0xFFFFFFFFu);
+		}
+		return std::string(text);
+	};
 	const auto table = [&](const char* name, char tag, ToggleTable& table) {
-		uint64_t evaluated = 0, changes = 0, toggles = 0, hot = 0, max_pct = 0;
+		uint64_t evaluated = 0, changes = 0, toggles = 0, hot_keys = 0, max_pct = 0;
+		std::vector<const ToggleTable::Entry*> hot_list;
 		for (const auto& [key, e]: table.Entries()) {
 			evaluated += e.evaluated;
 			changes += e.changes;
 			toggles += e.toggles;
 			// Gate keys: >= 20 % of at least 20 frame pairs.
 			if (e.evaluated >= 20) {
-				hot += e.toggles * 5 >= e.evaluated ? 1 : 0;
+				if (e.toggles * 5 >= e.evaluated) {
+					hot_keys++;
+					hot_list.push_back(&e);
+				}
 				max_pct = std::max<uint64_t>(max_pct, uint64_t {e.toggles} * 100 / e.evaluated);
 			}
 			if (e.toggles != 0) {
@@ -114,8 +128,25 @@ void Report(std::string& out) noexcept {
 		}
 		std::snprintf(text, sizeof(text),
 		              " %s=keys:%zu,eval:%" PRIu64 ",chg:%" PRIu64 ",tog:%" PRIu64 ",hot20:%" PRIu64 ",max:%" PRIu64 "%%",
-		              name, table.Entries().size(), evaluated, changes, toggles, hot, max_pct);
+		              name, table.Entries().size(), evaluated, changes, toggles, hot_keys, max_pct);
 		out += text;
+		if (!hot_list.empty()) {
+			// Every gate key (at most 100), with the two values it alternates between.
+			std::sort(hot_list.begin(), hot_list.end(), [](const auto* l, const auto* r) { return l->toggles > r->toggles; });
+			hot += "PERF crwd2 hot ";
+			hot += name;
+			hot += ":";
+			const bool sum = tag == 'D' || tag == 'd';
+			for (size_t i = 0; i < std::min<size_t>(hot_list.size(), 100); i++) {
+				const auto& e  = *hot_list[i];
+				const auto  v0 = value((e.tog_have & 1u) != 0, e.tog_v0, sum);
+				const auto  v1 = value((e.tog_have & 2u) != 0, e.tog_v1, sum);
+				std::snprintf(text, sizeof(text), " %016" PRIx64 "/%" PRIx64 ":%u/%u=%u%%[%s|%s]", e.a, e.b, e.toggles,
+				              e.evaluated, e.toggles * 100 / e.evaluated, v0.c_str(), v1.c_str());
+				hot += text;
+			}
+			hot += "\n";
+		}
 		table.Clear();
 	};
 	table("draw", 'D', t.draw);

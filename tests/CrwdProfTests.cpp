@@ -33,6 +33,7 @@ void TestToggles() {
 	ToggleTable flip(false);
 	const auto& f = Run(flip, {5, 7, 5, 7, 5});
 	Check(f.evaluated == 3 && f.changes == 3 && f.toggles == 3, "A,B,A,B,A: every pair toggles");
+	Check(f.tog_v0 == 5 && f.tog_v1 == 7 && f.tog_have == 3, "the latest toggle keeps the two values");
 
 	ToggleTable drift(false);
 	const auto& d = Run(drift, {1, 2, 3, 4, 5});
@@ -45,6 +46,7 @@ void TestToggles() {
 	ToggleTable draws(true);
 	const auto& w = Run(draws, {5, 0, 5, 0, 5});
 	Check(w.evaluated == 5 && w.toggles == 4, "draws: a key present every other frame toggles");
+	Check(w.tog_have == 1 && w.tog_v0 == 5, "absent at N-1: only the value at N is present");
 
 	ToggleTable sum(false);
 	for (int i = 0; i < 4; i++) {

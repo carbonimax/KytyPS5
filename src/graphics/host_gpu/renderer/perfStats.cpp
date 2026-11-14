@@ -355,8 +355,8 @@ void MaybeReport() noexcept {
 	}
 	if (CrwdProf::Enabled()) {
 		// Integer counts per window (KYTY_CRWD_PROF=2), then the frame-to-frame toggle tables.
-		std::string line;
-		CrwdProf::Report(line);
+		std::string line, hot;
+		CrwdProf::Report(line, hot);
 		std::printf("PERF crwd2 %02d:%02d:%02d %.1fs: small_read=%" PRIu64 "(gpu=%" PRIu64 ",%" PRIu64 "B) cp_miss=%" PRIu64
 		            "(gpu=%" PRIu64 ",%" PRIu64 "B) meta_clear=%" PRIu64 "(unsafe=%" PRIu64 ",over=%" PRIu64 ",unknown=%" PRIu64
 		            ") mip_reuse=%" PRIu64 "(overlap=%" PRIu64 ") late_join=%" PRIu64 "(joins=%" PRIu64 ")%s\n",
@@ -366,6 +366,7 @@ void MaybeReport() noexcept {
 		            n(Counter::CrwdMetaClearUnsafe), n(Counter::CrwdMetaOver), n(Counter::CrwdMetaUnknown),
 		            n(Counter::CrwdMipReuse), n(Counter::CrwdMipReuseOverlap), n(Counter::CrwdLateJoinDraws),
 		            n(Counter::CrwdLateJoins), line.c_str());
+		std::fputs(hot.c_str(), stdout);
 	} else if (CrwdProfEnabled()) {
 		const auto r = [&](Counter c) { return static_cast<double>(n(c)) / seconds; };
 		std::printf("PERF crwd %.1fs: small_read=%.1f/s(gpu=%.1f/s,%.0fB/s) cp_miss=%.1f/s(gpu=%.1f/s,%.0fB/s)"
