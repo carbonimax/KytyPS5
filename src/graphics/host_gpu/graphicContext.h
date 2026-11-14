@@ -54,6 +54,8 @@ struct GraphicContext {
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_EXT_shader_float8 shaderFloat8, enabled for FSR only (FSR 4 then runs natively).
+	bool                               shader_float8_enabled                 = false;
 	bool                                      mesh_shader_enabled                   = false;
 	// Task shaders, for indirect mesh draws from GPU-read records (KYTY_MESH_INDIRECT_GPU).
 	bool                                      task_shader_enabled                   = false;

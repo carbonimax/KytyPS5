@@ -174,9 +174,18 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
 }
 
+// KYTY_SHADER_DUMP_HASH=<hex> (diagnosis, default off): dump the code and the IR of that one shader.
+bool IsDumpedShader(uint64_t shader_hash) {
+	static const uint64_t hash = [] {
+		const char* value = std::getenv("KYTY_SHADER_DUMP_HASH");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0;
+	}();
+	return hash != 0 && hash == shader_hash;
+}
+
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() && !IsDumpedShader(shader_hash)) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -637,7 +646,8 @@ struct PipelineCache::ProgramCache {
 			options.shader_hash = params.hash;
 			options.user_data   = user_data;
 			options.back_code      = params.back_code;
-			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+			options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent ||
+			                      IsDumpedShader(params.hash);
 			options.early_dump  = options.dump_ir;
 			options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 			options.dump_label  = label;

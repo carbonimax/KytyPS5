@@ -1,5 +1,6 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
+#include "graphics/guest_gpu/pssrProf.h"
 #include "graphics/shader/shaderBindings.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -7,9 +8,11 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -24,6 +27,8 @@ namespace {
 
 namespace Pm4  = Graphics::Pm4;
 namespace Pssr = Graphics::Pssr;
+namespace Prof = Graphics::Pssr::Prof;
+using Entry    = Prof::Entry;
 
 constexpr int      NOT_INITIALIZED           = static_cast<int>(0x8a810001u);
 constexpr int      ALREADY_INITIALIZED       = static_cast<int>(0x8a810002u);
@@ -167,8 +172,9 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 	                       .x            = params.x,
 	                       .y            = params.y,
 	                       .jitter       = {params.jitter[0], params.jitter[1]},
-	                       .motion_scale = {params.motion_scale[0], params.motion_scale[1]},
-	                       .pre_exposure = pre_exposure};
+	                       .motion_scale  = {params.motion_scale[0], params.motion_scale[1]},
+	                       .motion_offset = {params.motion_offset[0], params.motion_offset[1]},
+	                       .pre_exposure  = pre_exposure};
 	CopyDescriptor(request.output, params.output);
 	CopyDescriptor(request.input, params.color);
 	CopyDescriptor(request.depth, params.depth);
@@ -178,10 +184,47 @@ Pssr::Request MakeRequest(const void* context, const Parameters& params, uint32_
 		flags |= Pssr::kReset;
 	}
 	if (params.motion_offset[0] != 0.0f || params.motion_offset[1] != 0.0f) {
-		flags |= Pssr::kSpatialOnly;
+		Prof::Call(Entry::WhyMotionOffset); // counted only: the request carries the offset
 	}
 	request.flags = flags;
 	return request;
+}
+
+// KYTY_PSSR_PROF=1: the raw motion parameters of runs of 8 consecutive dispatches every 300, and of
+// the first 16 dispatches with a zero motion_offset ("PSSRPARAM" lines).
+template <typename Parameters>
+void SampleMotion(const void* context, const Parameters& params, const char* api) {
+	if (!Prof::Enabled()) {
+		return;
+	}
+	static std::atomic<uint64_t> dispatches {}, zero_logged {};
+	const uint64_t index = dispatches.fetch_add(1, std::memory_order_relaxed);
+	const bool     zero  = params.motion_offset[0] == 0.0f && params.motion_offset[1] == 0.0f;
+	if (index % 300 >= 8 && !(zero && zero_logged.fetch_add(1, std::memory_order_relaxed) < 16)) {
+		return;
+	}
+	Graphics::ShaderTextureResource color {}, motion {}, depth {}, output {};
+	CopyDescriptor(color.fields, params.color);
+	CopyDescriptor(motion.fields, params.motion);
+	CopyDescriptor(depth.fields, params.depth);
+	CopyDescriptor(output.fields, params.output);
+	uint32_t raw[6];
+	std::memcpy(raw, params.jitter, sizeof(raw)); // jitter, motion_scale, motion_offset: contiguous floats
+	std::printf("PSSRPARAM %s i=%llu ctx=%llx in=%ux%u render=%ux%u at=%u,%u out=%ux%u jitter=%g,%g "
+	            "mscale=%g,%g moff=%g,%g raw=%08x,%08x,%08x,%08x,%08x,%08x reset=%u flags=0x%x pre=%g "
+	            "motion=fmt%u,%ux%u,tile%u,type%u,dst%03x,base%llx depth=fmt%u,%ux%u exposure=%d\n",
+	            api, static_cast<unsigned long long>(index),
+	            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(context)), color.Width5() + 1u,
+	            color.Height5() + 1u, params.width, params.height, params.x, params.y, output.Width5() + 1u,
+	            output.Height5() + 1u, params.jitter[0], params.jitter[1], params.motion_scale[0],
+	            params.motion_scale[1], params.motion_offset[0], params.motion_offset[1], raw[0], raw[1], raw[2],
+	            raw[3], raw[4], raw[5], unsigned {params.reset}, params.flags, params.pre_exposure,
+	            static_cast<uint32_t>(motion.Format()), motion.Width5() + 1u, motion.Height5() + 1u,
+	            static_cast<uint32_t>(motion.TileMode()), static_cast<uint32_t>(motion.Type()),
+	            motion.DstSelXYZW(), static_cast<unsigned long long>(motion.Base40()),
+	            static_cast<uint32_t>(depth.Format()), depth.Width5() + 1u, depth.Height5() + 1u,
+	            params.exposure != nullptr ? 1 : 0);
+	std::fflush(stdout);
 }
 
 void WritePacket(const CommandSpace& space, const Pssr::Request& request) {
@@ -191,6 +234,7 @@ void WritePacket(const CommandSpace& space, const Pssr::Request& request) {
 }
 
 int KYTY_SYSV_ABI Initialize() {
+	Prof::Call(Entry::Initialize);
 	std::lock_guard lock(g_mutex);
 	if (!Loader::SystemContentIsTrinityMode()) {
 		return NOT_TRINITY_MODE;
@@ -203,6 +247,7 @@ int KYTY_SYSV_ABI Initialize() {
 }
 
 int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const MemoryParameters* params) {
+	Prof::Call(Entry::GetSharedRequirements);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -219,6 +264,7 @@ int KYTY_SYSV_ABI GetSharedRequirements(MemoryRequirements* out, const MemoryPar
 }
 
 int KYTY_SYSV_ABI CreateSharedResources(void** out, const SharedParameters* params) {
+	Prof::Call(Entry::CreateSharedResources);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -257,6 +303,7 @@ int KYTY_SYSV_ABI ReleaseSharedResources(void* resources) {
 }
 
 int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const void* params) {
+	Prof::Call(Entry::GetContextRequirements);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -270,6 +317,7 @@ int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const void* pa
 
 int CreateContext(void** out, const MemoryParameters* memory, uint32_t width, uint32_t height,
                   void* shared, bool use_shared) {
+	Prof::Call(Entry::CreateContext);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -321,6 +369,7 @@ int KYTY_SYSV_ABI CreateSharedContext(void** out, const ContextParameters* param
 }
 
 int KYTY_SYSV_ABI ReleaseContext(void* context) {
+	Prof::Call(Entry::ReleaseContext);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -334,6 +383,7 @@ int KYTY_SYSV_ABI ReleaseContext(void* context) {
 }
 
 int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
+	Prof::Call(Entry::GetPacketSize);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -347,6 +397,7 @@ int KYTY_SYSV_ABI GetPacketSize(const void* context, uint32_t* out_size) {
 
 int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
                            const DispatchParameters* params) {
+	Prof::Call(Entry::Dispatch);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -400,8 +451,22 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 	uint32_t flags = (params->flags >> 15) & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if ((params->flags & (VIEW_DEPTH | PASS_THROUGH)) != 0 || params->vr_lookup != nullptr ||
 	    (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f)) {
+		if ((params->flags & VIEW_DEPTH) != 0) {
+			Prof::Call(Entry::WhyViewDepth);
+		}
+		if ((params->flags & PASS_THROUGH) != 0) {
+			Prof::Call(Entry::WhyPassThrough);
+		}
+		if (params->vr_lookup != nullptr) {
+			Prof::Call(Entry::WhyVrLookup);
+		}
+		if (params->motion_gamma != 0.0f && params->motion_gamma != 1.0f) {
+			Prof::Call(Entry::WhyMotionGamma);
+		}
 		flags |= Pssr::kSpatialOnly;
 	}
+	Prof::Call(Entry::DispatchOk);
+	SampleMotion(context, *params, "psml");
 	WritePacket(*space, MakeRequest(context, *params, flags,
 	                                params->pre_exposure == 0.0f ? 1.0f : params->pre_exposure));
 	return OK;
@@ -409,6 +474,7 @@ int KYTY_SYSV_ABI Dispatch(const void* context, const CommandSpace* space,
 
 int KYTY_SYSV_ABI LegacyDispatch(const void* context, const CommandSpace* space,
                                  const LegacyDispatchParameters* legacy) {
+	Prof::Call(Entry::LegacyDispatch);
 	if (legacy == nullptr) {
 		return Dispatch(context, space, nullptr);
 	}
@@ -422,6 +488,7 @@ int KYTY_SYSV_ABI LegacyDispatch(const void* context, const CommandSpace* space,
 }
 
 int KYTY_SYSV_ABI GetMipmapBias(const void* context, float* bias, uint32_t width, uint32_t height) {
+	Prof::Call(Entry::GetMipmapBias);
 	std::lock_guard lock(g_mutex);
 	if (const int error = CheckContext(context); error != OK) {
 		return error;
@@ -592,6 +659,7 @@ int CheckDispatch(const Context* context, const DispatchParameters* params) {
 }
 
 int KYTY_SYSV_ABI Initialize() {
+	Prof::Call(Entry::Mfsr2Initialize);
 	std::lock_guard lock(g_mutex);
 	if (g_initialized) {
 		return ALREADY_INITIALIZED;
@@ -656,6 +724,7 @@ int KYTY_SYSV_ABI GetContextRequirements(MemoryRequirements* out, const ContextP
 }
 
 int KYTY_SYSV_ABI CreateContext(Context** out, const ContextParameters* params) {
+	Prof::Call(Entry::Mfsr2CreateContext);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -695,6 +764,7 @@ int KYTY_SYSV_ABI GetDispatchDwords(const Context* /*context*/, uint32_t* out) {
 
 int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace* space,
                                      const DispatchParameters* params) {
+	Prof::Call(Entry::Mfsr2Dispatch);
 	std::lock_guard lock(g_mutex);
 	if (!g_initialized) {
 		return NOT_INITIALIZED;
@@ -707,8 +777,16 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	// Reverse depth and auto exposure are bits 0 and 1.
 	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
+		if (params->encoding != 0) {
+			Prof::Call(Entry::WhyMfsr2Encoding);
+		}
+		if ((params->flags & DILATED_MOTION) != 0) {
+			Prof::Call(Entry::WhyMfsr2Dilated);
+		}
 		flags |= Pssr::kSpatialOnly;
 	}
+	Prof::Call(Entry::Mfsr2DispatchOk);
+	SampleMotion(context, *params, "mfsr2");
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
 }

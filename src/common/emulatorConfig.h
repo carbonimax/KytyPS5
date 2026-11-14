@@ -26,6 +26,8 @@ enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
+enum class PssrUpscaler { Linear, DLSS, FSR };
+
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
@@ -66,6 +68,12 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	std::filesystem::path  dlss_folder;
+	uint32_t               dlss_preset                 = 0; // 0 is the model default
+	std::filesystem::path  fsr_folder;
+	// FSR version: empty picks per GPU, "linear" keeps PSSR linear, else a version prefix ("4", "3.1").
+	std::string            fsr_version;
 	bool                   amd_cpu_enabled             = false;
 	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
@@ -132,6 +140,11 @@ bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
+PssrUpscaler GetPssrUpscaler();
+const std::filesystem::path& GetDlssFolder();
+uint32_t GetDlssPreset();
+const std::filesystem::path& GetFsrFolder();
+const std::string&           GetFsrVersion();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();

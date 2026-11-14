@@ -171,6 +171,18 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
 		            log == Configuration::LogDirection::File);
 	        });
+	// Pro mode shows the upscaler and its folder.
+	const auto show_pssr = [this] {
+		const bool pro = m_ui->checkBox_pro->isChecked();
+		const auto upscaler =
+		    TextToEnum<Configuration::PssrUpscaler>(m_ui->comboBox_pssr_upscaler->currentText());
+		m_ui->pssrLayout->setRowVisible(0, pro);
+		m_ui->pssrLayout->setRowVisible(1, pro && upscaler == Configuration::PssrUpscaler::DLSS);
+		m_ui->pssrLayout->setRowVisible(2, pro && upscaler == Configuration::PssrUpscaler::FSR);
+		m_ui->pssrLayout->setRowVisible(3, pro && upscaler == Configuration::PssrUpscaler::FSR);
+	};
+	connect(m_ui->checkBox_pro, &QCheckBox::toggled, this, show_pssr);
+	connect(m_ui->comboBox_pssr_upscaler, &QComboBox::currentTextChanged, this, show_pssr);
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
 	connect(m_ui->comboBox_printf_direction, &QComboBox::currentTextChanged, this,
@@ -327,8 +339,22 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
 	m_ui->checkBox_pro->setChecked(info.pro_enabled);
+	ListInit(m_ui->comboBox_pssr_upscaler, info.pssr_upscaler);
+	m_ui->lineEdit_dlss_folder->setText(info.dlss_folder);
+	m_ui->lineEdit_fsr_folder->setText(info.fsr_folder);
+	m_ui->comboBox_fsr_version->setCurrentIndex(
+	    qMax(0, m_ui->comboBox_fsr_version->findText(info.fsr_version)));
 	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
 	m_ui->checkBox_guest_tsc->setChecked(info.guest_tsc_enabled);
+#if !defined(_WIN32)
+	// Unsupported upscalers are hidden; their saved choice falls back to Linear.
+	auto* upscaler = m_ui->comboBox_pssr_upscaler;
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::FSR)));
+#if defined(__APPLE__)
+	upscaler->removeItem(upscaler->findText(EnumToText(Configuration::PssrUpscaler::DLSS)));
+#endif
+	upscaler->setCurrentIndex(qMax(0, upscaler->findText(EnumToText(info.pssr_upscaler))));
+#endif
 #if defined(__APPLE__)
 	m_ui->checkBox_amd_cpu->setVisible(false);
 	// The emulator ignores --guest-tsc under Rosetta.
@@ -563,6 +589,13 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
 	info.pro_enabled               = ui.checkBox_pro->isChecked();
+	info.pssr_upscaler =
+	    TextToEnum<Configuration::PssrUpscaler>(ui.comboBox_pssr_upscaler->currentText());
+	info.dlss_folder               = ui.lineEdit_dlss_folder->text();
+	info.fsr_folder                = ui.lineEdit_fsr_folder->text();
+	// Auto is saved empty, so a configuration without the field picks per GPU.
+	info.fsr_version =
+	    ui.comboBox_fsr_version->currentIndex() == 0 ? QString() : ui.comboBox_fsr_version->currentText();
 	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
 	info.guest_tsc_enabled         = ui.checkBox_guest_tsc->isChecked();
 #if defined(_WIN32)
@@ -580,10 +613,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
-	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
-	                   m_ui->lineEdit_cmd_dump_folder}) {
-		if (field->isEnabled() && field->text().isEmpty()) {
-			ShowTab(m_ui->debug_tab);
+	for (auto* field:
+	     {m_ui->lineEdit_dlss_folder, m_ui->lineEdit_fsr_folder, m_ui->lineEdit_shader_log_folder,
+	      m_ui->lineEdit_printf_file, m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && !field->isHidden() && field->text().isEmpty()) {
+			ShowTab(field);
 			field->setFocus();
 			break;
 		}

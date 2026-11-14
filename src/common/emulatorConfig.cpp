@@ -118,6 +118,26 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+PssrUpscaler GetPssrUpscaler() {
+	return g_config->pssr_upscaler;
+}
+
+const std::filesystem::path& GetDlssFolder() {
+	return g_config->dlss_folder;
+}
+
+uint32_t GetDlssPreset() {
+	return g_config->dlss_preset;
+}
+
+const std::filesystem::path& GetFsrFolder() {
+	return g_config->fsr_folder;
+}
+
+const std::string& GetFsrVersion() {
+	return g_config->fsr_version;
+}
+
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }

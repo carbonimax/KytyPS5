@@ -298,6 +298,17 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
 	AddFlag(args, info.pro_enabled, "--trinity");
+	if (info.pro_enabled) {
+		args << "--pssr-upscaler" << EnumToText(info.pssr_upscaler);
+		if (info.pssr_upscaler == Configuration::PssrUpscaler::DLSS) {
+			args << "--dlss-folder" << info.dlss_folder;
+		} else if (info.pssr_upscaler == Configuration::PssrUpscaler::FSR) {
+			args << "--fsr-folder" << info.fsr_folder;
+			if (!info.fsr_version.isEmpty()) {
+				args << "--fsr-version" << info.fsr_version;
+			}
+		}
+	}
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
 	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
 #if defined(_WIN32)

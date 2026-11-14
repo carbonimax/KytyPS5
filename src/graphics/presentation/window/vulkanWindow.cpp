@@ -13,6 +13,8 @@
 #include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/upscaler/dlss.h"
+#include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
@@ -618,6 +620,22 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		device_fault.pNext        = supported_features2.pNext;
 		supported_features2.pNext = &device_fault;
 	}
+	// FSR's ML upscalers run on cooperative matrices (CreateVulkan adds the extensions with FSR).
+	const bool fsr = Fsr::Enabled();
+	const bool cooperative_matrix_extension =
+	    fsr && HasExtension(device_extensions, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+	vk::PhysicalDeviceCooperativeMatrixFeaturesKHR cooperative_matrix {};
+	if (cooperative_matrix_extension) {
+		cooperative_matrix.pNext  = supported_features2.pNext;
+		supported_features2.pNext = &cooperative_matrix;
+	}
+	const bool float8_extension =
+	    fsr && HasExtension(device_extensions, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderFloat8FeaturesEXT float8 {};
+	if (float8_extension) {
+		float8.pNext              = supported_features2.pNext;
+		supported_features2.pNext = &float8;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.device_fault_enabled = device_fault_extension && device_fault.deviceFault == VK_TRUE;
 	const bool barycentric_supported =
@@ -809,6 +827,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	if (fsr) {
+		device_features.shaderInt16            = supported_features2.features.shaderInt16;
+		features12.shaderFloat16               = supported_features12.shaderFloat16;
+		features12.shaderInt8                  = supported_features12.shaderInt8;
+		features12.separateDepthStencilLayouts = supported_features12.separateDepthStencilLayouts;
+		features13.shaderIntegerDotProduct     = supported_features13.shaderIntegerDotProduct;
+		features13.computeFullSubgroups        = supported_features13.computeFullSubgroups;
+	}
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -861,6 +887,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	// The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates its
 	// PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when a
 	// depth- or stencil-writing fragment shader needs an epilog.
+	if (cooperative_matrix.cooperativeMatrix) {
+		cooperative_matrix.pNext                               = const_cast<void*>(create_info.pNext);
+		cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+		create_info.pNext                                      = &cooperative_matrix;
+	}
+	graphics.shader_float8_enabled = float8.shaderFloat8 != VK_FALSE;
+	if (float8.shaderFloat8) {
+		float8.pNext      = const_cast<void*>(create_info.pNext);
+		float8.shaderFloat8CooperativeMatrix = float8.shaderFloat8CooperativeMatrix && cooperative_matrix.cooperativeMatrix;
+		create_info.pNext = &float8;
+	}
 	vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT extended_dynamic_state {};
 	extended_dynamic_state.extendedDynamicState = VK_TRUE;
 	if (HasExtension(device_extensions, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
@@ -1076,10 +1113,13 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	Vr::OpenXrInit();
+	Dlss::Load();
+	Fsr::Load();
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
+	Dlss::AppendExtensions(r.required_extensions, r.available_extensions, false);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1281,6 +1321,15 @@ void WindowContext::CreateVulkan() {
 			}
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		Dlss::AppendExtensions(device_extensions, available_extensions, true);
+		if (Fsr::Enabled()) {
+			for (const auto* extension: {VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+			                             VK_EXT_SHADER_FLOAT8_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, extension)) {
+					device_extensions.push_back(extension);
+				}
+			}
+		}
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
@@ -1296,6 +1345,9 @@ void WindowContext::CreateVulkan() {
 		                            graphic_ctx.readback_family == graphic_ctx.queue_family ? 1u : 0u,
 		                            &graphic_ctx.readback_queue);
 	}
+	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1337,6 +1389,8 @@ WindowContext::~WindowContext() {
 	presenter.reset();
 	LibKernel::Memory::InstallGpuResources(nullptr);
 	render_context.reset();
+	Dlss::Shutdown();
+	Fsr::Shutdown();
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");

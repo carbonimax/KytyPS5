@@ -256,9 +256,59 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
+              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. Disabled by default.</string></property>
               <property name="text"><string>PS5 Pro mode (experimental)</string></property>
              </widget>
+            </item>
+            <item>
+             <layout class="QFormLayout" name="pssrLayout">
+              <item row="0" column="0">
+               <widget class="QLabel" name="label_pssr_upscaler">
+                <property name="text"><string>PSSR upscaler:</string></property>
+               </widget>
+              </item>
+              <item row="0" column="1">
+               <widget class="QComboBox" name="comboBox_pssr_upscaler">
+                <property name="toolTip"><string>DLSS needs an NVIDIA RTX GPU</string></property>
+               </widget>
+              </item>
+              <item row="1" column="0">
+               <widget class="QLabel" name="label_dlss_folder">
+                <property name="text"><string>DLSS model folder:</string></property>
+               </widget>
+              </item>
+              <item row="1" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_dlss_folder">
+                <property name="toolTip"><string>Folder with nvngx_dlss.dll (Windows) or libnvidia-ngx-dlss.so.* (Linux)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+              <item row="2" column="0">
+               <widget class="QLabel" name="label_fsr_folder">
+                <property name="text"><string>FSR folder:</string></property>
+               </widget>
+              </item>
+              <item row="2" column="1">
+               <widget class="MandatoryLineEdit" name="lineEdit_fsr_folder">
+                <property name="toolTip"><string>Folder with amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (AMD FidelityFX SDK 2.4 or later)</string></property>
+                <property name="clearButtonEnabled"><bool>true</bool></property>
+               </widget>
+              </item>
+              <item row="3" column="0">
+               <widget class="QLabel" name="label_fsr_version">
+                <property name="text"><string>FSR version:</string></property>
+               </widget>
+              </item>
+              <item row="3" column="1">
+               <widget class="QComboBox" name="comboBox_fsr_version">
+                <property name="toolTip"><string>Auto: 4.x on GPUs with FP8 (RDNA 4), else 3.1 (FSR 4 costs about 8 times more on RDNA 2). Linear: no FSR for this game</string></property>
+                <item><property name="text"><string>Auto</string></property></item>
+                <item><property name="text"><string>4.x</string></property></item>
+                <item><property name="text"><string>3.1</string></property></item>
+                <item><property name="text"><string>Linear</string></property></item>
+               </widget>
+              </item>
+             </layout>
             </item>
             <item>
              <widget class="QCheckBox" name="checkBox_fullscreen">
