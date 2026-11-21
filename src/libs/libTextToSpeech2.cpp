@@ -21,6 +21,12 @@ static int KYTY_SYSV_ABI TextToSpeech2Open() {
 	return OK;
 }
 
+static int KYTY_SYSV_ABI TextToSpeech2GetSystemStatus() {
+	PRINT_NAME();
+
+	return OK;
+}
+
 static int KYTY_SYSV_ABI TextToSpeech2GetSpeechStatus() {
 	PRINT_NAME();
 
@@ -38,6 +44,7 @@ static int KYTY_SYSV_ABI TextToSpeech2Cancel() {
 LIB_DEFINE(InitTextToSpeech2_1) {
 	LIB_FUNC("UOjiprYwVNw", TextToSpeech2::TextToSpeech2Initialize);
 	LIB_FUNC("X0HZNbSiqyg", TextToSpeech2::TextToSpeech2Open);
+	LIB_FUNC("+352WTlGCQI", TextToSpeech2::TextToSpeech2GetSystemStatus);
 	LIB_FUNC("08JSg9p6bgQ", TextToSpeech2::TextToSpeech2GetSpeechStatus);
 	LIB_FUNC("2jiIxUmcsGo", TextToSpeech2::TextToSpeech2Cancel);
 }

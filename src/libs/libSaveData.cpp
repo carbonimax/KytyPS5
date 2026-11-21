@@ -14,6 +14,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -502,31 +503,25 @@ static void queue_save_data_event(uint32_t type, int32_t user_id,
 	}
 }
 
+// '%' matches any run of characters, including none; '_' matches exactly one.
 static bool dir_name_match(const char* str, const char* pattern) {
-	while (*str != '\0' && *pattern != '\0') {
+	for (; *pattern != '\0'; pattern++) {
 		if (*pattern == '%') {
 			for (const char* s = str;; s++) {
 				if (dir_name_match(s, pattern + 1)) {
 					return true;
 				}
 				if (*s == '\0') {
-					break;
+					return false;
 				}
 			}
-			return false;
 		}
-		if (*pattern == '_') {
-			str++;
-			pattern++;
-			continue;
-		}
-		if (*pattern != *str) {
+		if (*str == '\0' || (*pattern != '_' && *pattern != *str)) {
 			return false;
 		}
 		str++;
-		pattern++;
 	}
-	return *str == '\0' && *pattern == '\0';
+	return *str == '\0';
 }
 
 static int mount_save_data(int slot, const std::filesystem::path& directory,
@@ -1182,17 +1177,25 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataGetEventResult(const void* /*event_param*/, SaveDataEvent* event) {
-	PRINT_NAME();
-
+int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (g_save_data_events.empty()) {
+		// Titles poll this in a tight loop from a worker thread; logging every empty poll wrote
+		// tens of gigabytes and slowed the whole emulator.
+		static std::atomic<uint32_t> empty_polls = 0;
+		if (empty_polls.fetch_add(1) < 4) {
+			PRINT_NAME();
+			LOGF("\t event_param = 0x%016" PRIx64 " (no event queued; later empty polls are not "
+			     "logged)\n",
+			     reinterpret_cast<uint64_t>(event_param));
+		}
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
+	PRINT_NAME();
 
 	*event = g_save_data_events.front();
 	g_save_data_events.pop_front();
@@ -1246,34 +1249,54 @@ int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvert* convert) {
 	        save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id))) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
-	uint64_t blocks = 0;
-	int      status = read_save_blocks(source, &blocks);
-	if (status == OK) {
+	uint64_t   blocks       = 0;
+	const bool known_blocks = read_save_blocks(source, &blocks) == OK;
+	if (known_blocks) {
 		if (convert->dst_blocks == blocks) {
 			return SAVE_DATA_ERROR_NO_NEED_CONVERT;
 		}
 		if (convert->dst_blocks < blocks) {
 			return SAVE_DATA_ERROR_BLOCKS_FEWER_THAN_SRC;
 		}
-		status = write_save_file(source / "sce_sys" / "blocks.bin", &convert->dst_blocks,
-		                         sizeof(convert->dst_blocks));
 	}
-	const auto* dir_name = convert->src_dir_name;
-	if (status == OK && convert->dst_dir_name != nullptr) {
-		std::error_code error;
-		std::filesystem::rename(
-		    source, save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id),
-		    error);
-		if (error) {
-			status = SAVE_DATA_ERROR_INTERNAL;
-		} else {
-			dir_name = convert->dst_dir_name;
+	// Kyty keeps a single save format, so there is nothing to rewrite: the conversion ends at
+	// once and reports a CONVERT_END event. A named destination gets a copy, never a rename, so
+	// the source save stays intact whatever happens to the copy.
+	const auto* dst    = convert->dst_dir_name != nullptr ? convert->dst_dir_name : convert->src_dir_name;
+	auto        target = source;
+	int32_t     error  = OK;
+	if (convert->dst_dir_name != nullptr) {
+		target = save_directory(get_title_id(), convert->dst_dir_name->data, convert->user_id);
+		std::error_code ec;
+		std::filesystem::copy(source, target, std::filesystem::copy_options::recursive, ec);
+		if (ec) {
+			LOGF("\t copy of %s to %s failed: %s\n", convert->src_dir_name->data,
+			     convert->dst_dir_name->data, ec.message().c_str());
+			error = SAVE_DATA_ERROR_INTERNAL;
 		}
 	}
+	if (error == OK && known_blocks) {
+		error = write_save_file(target / "sce_sys" / "blocks.bin", &convert->dst_blocks,
+		                        sizeof(convert->dst_blocks));
+	}
+	if (error != OK && convert->dst_dir_name != nullptr) {
+		// A partial copy would make the next attempt fail with SAVE_DATA_ERROR_EXISTS.
+		std::error_code ec;
+		std::filesystem::remove_all(target, ec);
+	}
+	LOGF("\t result = 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
 	SceSaveDataTitleId title {};
 	std::snprintf(title.data, sizeof(title.data), "%s", get_title_id().c_str());
-	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dir_name,
-	                      status);
+	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, &title, dst, error);
+	return OK;
+}
+
+int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
+	PRINT_NAME();
+	if (progress == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	*progress = 1.0f; // conversion ends inside SaveDataConvert
 	return OK;
 }
 
@@ -1411,6 +1434,7 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("wiT9jeC7xPw", ::Libs::SaveData::SaveDataSyncSaveDataMemory);
 	LIB_FUNC("j8xKtiFj0SY", ::Libs::SaveData::SaveDataGetEventResult);
 	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 	LIB_FUNC("WAzWTZm1H+I", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("RjMlsR8EXrw", ::Libs::SaveData::SaveDataTransferringMount);
 	LIB_FUNC("z1JA8-iJt3k", ::Libs::SaveData::SaveDataBackup);
@@ -1442,6 +1466,7 @@ LIB_DEFINE(InitSaveData_1) {
 	LIB_FUNC("wiT9jeC7xPw", SaveData::SaveDataSyncSaveDataMemory);
 	LIB_FUNC("j8xKtiFj0SY", SaveData::SaveDataGetEventResult);
 	LIB_FUNC("2mfSRGdshtk", SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", SaveData::SaveDataGetConvertProgress);
 	LIB_FUNC("WAzWTZm1H+I", SaveData::SaveDataTransferringMount);
 	LIB_FUNC("RjMlsR8EXrw", SaveData::SaveDataTransferringMount);
 	LIB_FUNC("z1JA8-iJt3k", SaveData::SaveDataBackup);

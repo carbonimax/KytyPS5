@@ -393,6 +393,8 @@ constexpr int SAVE_STATUS_NONE        = 0;
 constexpr int SAVE_STATUS_INITIALIZED = 1;
 constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
+constexpr int SAVE_MODE_LIST          = 1;
+constexpr int SAVE_MODE_PROGRESS_BAR  = 5;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
 
@@ -464,8 +466,9 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
-	// Some games require a RUNNING update before FINISHED.
-	if (g_save_status == SAVE_STATUS_RUNNING) {
+	// Some games require a RUNNING update before FINISHED. A progress bar has no button: it
+	// runs until the title closes it.
+	if (g_save_status == SAVE_STATUS_RUNNING && g_save_mode != SAVE_MODE_PROGRESS_BAR) {
 		if (g_save_running_polled) {
 			g_save_status = SAVE_STATUS_FINISHED;
 		}
@@ -482,9 +485,11 @@ int KYTY_SYSV_ABI SaveDataDialogGetResult(void* result) {
 		auto* r      = static_cast<SaveDataDialogResult*>(result);
 		r->mode      = g_save_mode;
 		r->result    = SAVE_RESULT_OK;
-		r->button_id = SAVE_BUTTON_ID_OK;
+		r->button_id = g_save_mode == SAVE_MODE_LIST ? 0 : SAVE_BUTTON_ID_OK;
 		r->user_data = g_save_user_data;
-		if (r->dir_name != nullptr && g_save_dir_name[0] != '\0') {
+		// An empty directory selects a new save. Clear the caller's output too,
+		// otherwise it can retain a directory from a previous dialog result.
+		if (r->dir_name != nullptr) {
 			std::snprintf(static_cast<SaveDataDirName*>(r->dir_name)->data,
 			              sizeof(SaveDataDirName::data), "%s", g_save_dir_name);
 		}
@@ -590,9 +595,11 @@ LIB_NAME("MsgDialog.native", "MsgDialog");
 
 constexpr int STATUS_NONE        = 0;
 constexpr int STATUS_INITIALIZED = 1;
+constexpr int STATUS_RUNNING     = 2;
 constexpr int STATUS_FINISHED    = 3;
 constexpr int RESULT_OK          = 0;
 constexpr int BUTTON_ID_OK       = 1;
+constexpr int MODE_PROGRESS_BAR  = 2;
 
 struct MsgDialogParam {
 	uint8_t  base_param[48];
@@ -667,7 +674,7 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		}
 	}
 
-	g_status = STATUS_FINISHED;
+	g_status = (p != nullptr && p->mode == MODE_PROGRESS_BAR) ? STATUS_RUNNING : STATUS_FINISHED;
 
 	return OK;
 }
