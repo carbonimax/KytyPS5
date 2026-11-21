@@ -330,7 +330,7 @@ public:
 		}
 	}
 
-	// KYTY_SPARSE_COPY_CACHE: 0 (default) always takes the locks, 1 copies a range that lies inside
+	// KYTY_SPARSE_COPY_CACHE: 0 always takes the locks, 1 (default) copies a range that lies inside
 	// one recently used backing mapping without any lock (TryCopyCached), 2 also re-checks every
 	// lock-free copy's translation under the locks and exits on a difference. Read once, at the
 	// first copy. With 1 or 2, a copy that misses the cache takes one address-space lock, not two.
@@ -342,9 +342,10 @@ public:
 #endif
 		static const int mode = [] {
 			const char* value = std::getenv("KYTY_SPARSE_COPY_CACHE");
-			const int   m     = value == nullptr ? 0 : static_cast<int>(std::strtol(value, nullptr, 10));
-			if (m != 0) {
-				std::printf("KYTY_SPARSE_COPY_CACHE=%d: lock-free sparse guest copies\n", m);
+			const int   m     = value == nullptr ? 1 : static_cast<int>(std::strtol(value, nullptr, 10));
+			if (value != nullptr) {
+				std::printf("KYTY_SPARSE_COPY_CACHE=%d: %s sparse guest copies\n", m,
+				            m != 0 ? "lock-free" : "locked");
 				std::fflush(stdout);
 			}
 			return m;
@@ -843,7 +844,7 @@ public:
 		});
 	}
 
-	// Nothing (all zero) with KYTY_SPARSE_COPY_CACHE off.
+	// Nothing (all zero) with KYTY_SPARSE_COPY_CACHE=0.
 	[[nodiscard]] SparseCopyStats GetSparseCopyStats() const {
 		SparseCopyStats stats {};
 		stats.mode        = GuestBackingStore::SparseCopyCacheMode();
@@ -917,7 +918,7 @@ public:
 
 	template <bool copy_private>
 	bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
-		// Lock-free path (KYTY_SPARSE_COPY_CACHE, off by default). Invariants it relies on:
+		// Lock-free path (KYTY_SPARSE_COPY_CACHE, on by default). Invariants it relies on:
 		// - Memory safety: the copy only dereferences the store's writable alias
 		//   [m_backing_base, +m_size), never a guest view. The alias is mapped once by the store's
 		//   constructor, never protected, resized or unmapped before ~GuestBackingStore, and the
